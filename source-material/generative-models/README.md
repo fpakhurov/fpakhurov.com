@@ -12,11 +12,11 @@ The scan contains handwriting, printed slides and pasted explanation screenshots
 
 ## Associated seminar notebooks
 
-The presenter identified [HSE-LAMBDA/DeepGenerativeModels](https://github.com/HSE-LAMBDA/DeepGenerativeModels) as a source of notebooks shown during the seminars. The [notebook context map](notebooks.md) connects comments and topics to specific files and cells in a pinned repository snapshot. The six transcribed notes now link their relevant notebook sections. Notebook implementation details are attributed separately from the handwritten material, and code/formula discrepancies are recorded for review.
+The presenter identified [HSE-LAMBDA/DeepGenerativeModels](https://github.com/HSE-LAMBDA/DeepGenerativeModels) as a source of notebooks shown during the seminars. The [notebook context map](notebooks.md) connects comments and topics to specific files and cells in a pinned repository snapshot. The nine transcribed notes link their relevant notebook sections. Notebook implementation details are attributed separately from the handwritten material, and code/formula discrepancies are recorded for review.
 
 ## Topic map and progress
 
-The first two batches reorganize the foundations and evaluation material into six English topic notes. All 44 source pages have been visually inspected for this map. A mapped topic is not a completed transcription.
+The first three batches reorganize the foundations, evaluation and adversarial-model material into nine English topic notes. All 44 source pages have been visually inspected for this map. A mapped topic is not a completed transcription.
 
 | Topic | Source pages | Contents and boundary | Progress |
 | --- | --- | --- | --- |
@@ -27,9 +27,9 @@ The first two batches reorganize the foundations and evaluation material into si
 | [Inception Score](../../src/content/notes/generative-models/inception-score.mdx) | 15-17 | Confidence/diversity, conditional and marginal entropy, expected-KL derivation, exponentiation; FID begins at bottom 17. | Transcribed and technically reviewed |
 | [Fréchet Inception Distance (FID)](../../src/content/notes/generative-models/fid.mdx) | 17-18 | Formula at bottom 17; covariance, Gaussian/Wasserstein interpretation and limitations in upper/middle 18. | Transcribed and technically reviewed |
 | [LPIPS](../../src/content/notes/generative-models/lpips.mdx) | 18-19 | Begins below divider on 18; feature extraction, normalization, weighted differences, interpretation, limits and uses; ends before KL questions on 19. | Transcribed and technically reviewed |
-| Fitting Gaussian parameters with KL | 19-20 | Begins below LPIPS; trainable parameters, density evaluations, backward/optimizer steps and support. Can extend the divergences article. | Planned |
-| GAN objective and optimality | 21-25 | Minimax objective, BCE, optimal discriminator, JS/global optimum, non-saturating generator loss; includes only very top of 25. | Planned |
-| WGAN and training constraints | 25 | Middle of page: Wasserstein losses, gradient penalty, spectral normalization; ends before “week 4-5.” | Planned |
+| [Fitting distributions with KL](../../src/content/notes/generative-models/fitting-distributions.mdx) | 19-20 | Begins below LPIPS; trainable parameters, density evaluations, backward/optimizer steps and support. Notebook-supplied covariance parameterization and log-space NLL example. | Transcribed and technically reviewed |
+| [GAN objective](../../src/content/notes/generative-models/gan-objective.mdx) | 21-25 | Minimax objective, BCE, optimal discriminator, JS/global optimum, non-saturating generator loss; includes only very top of 25. Conditional GAN and f-GAN expansions are attributed to the notebook and primary references. | Transcribed and technically reviewed |
+| [Wasserstein GAN](../../src/content/notes/generative-models/wgan.mdx) | 25 | Middle of page: Wasserstein losses, gradient penalty, spectral normalization; ends before “week 4-5.” Notebook and primary papers supply transport/dual definitions and training context. | Transcribed and technically reviewed |
 | Variational autoencoders | 25-31 | Begins at bottom 25: classical AE generation problem, Bayesian recap, prior/posterior, ELBO, reparameterization, Gaussian KL, log variance; ends at first line of 31. | Planned; existing `vae.mdx` is a short sample, not a transcription |
 | Normalizing flows: density and Jacobian | 31-35 | Begins below divider 31; change of variables, exact likelihood, invertibility, local volume scaling, triangular Jacobians; coupling starts lower 35. | Planned |
 | Flow architectures | 35-37 | Coupling/NICE/RealNVP: lower 35-36; autoregressive/MAF/IAF and masks: 36; Glow/LU: bottom 36-37. | Planned |
@@ -54,9 +54,17 @@ The articles are edited transcriptions, not literal OCR dumps. Equations and leg
 - **LPIPS:** normalize the channel vector independently at each spatial location. Preserve the source's learned-weight squared norm, spatial average and layer sum. The implementation's linear coefficient on squared differences is distinguished from weights inside the paper's squared norm. Qualify claims about blur, shift/noise robustness and semantic change. The pipeline and distinction between image-pair and collection-level evaluation are explanatory additions.
 - **Validation:** the complete site passed `npm run build` with zero Astro diagnostics. All six transcribed notes have valid figure/ARIA references and no KaTeX errors. The new diagrams and the scrollable IS table were reviewed at desktop width and a 390-pixel viewport; no page overflow or clipped SVG labels was found.
 
+## Distribution-fitting and adversarial-batch review record
+
+- **Fitting distributions:** forward KL evaluates both densities at the same target samples. NLL omits the fixed target term and preserves the empirical KL gradient, but its value is not a reported KL. The positive-diagonal Cholesky factor keeps the covariance positive definite in exact arithmetic. The code example uses direct `log_prob`; it is an editorial adaptation, not a notebook execution. Support coverage is one-sided absolute continuity, not merely overlapping supports.
+- **Notebook gradients:** `distances.ipynb` uses unequal JS weights and model draws from `sample()`. Ordinary backpropagation omits the model-dependent sampling contribution. The density-MSE loop also reuses `px` after drawing new points. Both issues are explained without reproducing those loops as verified optimization examples.
+- **GAN:** correct page 21's “optimal generator” to the discriminator optimal for a fixed generator; preserve BCE's negative signs and add the missing logarithm in page 23's second JS term. The ideal value is `C(G) = 2 JS - ln 4`. Derivatives with respect to the discriminator logit explain why the non-saturating generator loss gives a stronger early signal. The notebook's smoothed target `0.9` and f-GAN generator surrogate differ from the ideal objectives and are attributed explicitly.
+- **WGAN:** normalize critic/generator signs and sampling notation to minimized losses. Add finite-first-moment transport and the 1-Lipschitz dual constraint. A sampled gradient penalty is not a global Lipschitz guarantee; spectral normalization's exact-matrix argument requires further care for convolutions and InstanceNorm. The notebook's initial critic is an unconstrained teaching baseline.
+- **Validation:** `npm run build` passed with zero errors, warnings or hints (42 Astro files, 30 built pages). The three new notes have no KaTeX errors, duplicate IDs, unresolved SVG/ARIA references or broken internal links. New figure layouts were reviewed at desktop width and at 390 pixels; labels stay inside their SVGs and the pages have no horizontal overflow. The Python example passed a syntax check; the notebook and training loop were not executed.
+
 ## Sketches and visual explanations
 
-The six transcribed notes include eleven vector figures with English annotations and explanatory arrows:
+The nine transcribed notes include seventeen vector figures with English annotations and explanatory arrows:
 
 | Note | Figures | Source relationship |
 | --- | --- | --- |
@@ -66,6 +74,9 @@ The six transcribed notes include eleven vector figures with English annotations
 | Inception Score | Sharp predictions with one label versus varied labels; conditional probabilities averaged into a marginal. | An exact binary-class illustration expands pages 15-17's confidence/diversity explanation; those pages contain no corresponding plot. |
 | FID | Same covariance with shifted means; same mean with different spread/correlation. | Schematic feature clouds explain the two terms from pages 17-18. They are not measured features or FID results. |
 | LPIPS | Shared feature extraction, channel normalization, weighted squared differences, spatial averaging and layer sum. | An annotated pipeline expands the verbal algorithm and formula on pages 18-19. Boxes do not represent measured features. |
+| Fitting distributions with KL | Target/model contours and the log-density, loss, backward and parameter-update loop. | The loop expands pages 19-20; the target and initial model parameters come from `distances.ipynb`. The update arrow is schematic. |
+| GAN objective | Real/fake data flow; four stages of data/generated densities and discriminator probability; scalar generator losses and logit derivatives. | The flow and staged distributions redraw pages 21 and 24; exact scalar plots expand pages 24-25's gradient explanation. The stages are illustrative, not a convergence guarantee. |
+| Wasserstein GAN | Point-mass transport and distance versus displacement; gradient-norm penalty and linear-map directional stretch. | The point-mass example expands the WGAN motivation. The penalty and matrix sketch explain page 25's formulas; no training results are plotted. |
 
 Figures are built from SVG and mathematical coordinates, with accessible titles/descriptions. Their layouts adapt to the figure width: narrow flow diagrams become vertical, and adjacent plots stack. The shared `src/components/notes/NoteFigure.astro` wrapper supplies captions and stable figure anchors. Source attribution remains in each note.
 
@@ -73,15 +84,12 @@ Figures are built from SVG and mathematical coordinates, with accessible titles/
 
 Page 2 contains notebook setup notes: Black and pre-commit formatting, Matplotlib styles, `%matplotlib inline`, `torch.distributions`, a distribution wrapper, `requires_grad` and a `plot_2d_dots` helper. The associated `distances.ipynb` now supplies the scatter helper, Gaussian parameterization and sampling context; see the [notebook map](notebooks.md). The literal historical wrapper class and Black/pre-commit setup remain unconfirmed. Preserve those presenter notes for a future practical appendix.
 
-The final MSE scale remark on page 12 is included in the autoencoder note. BatchNorm fragments on pages 13-14 are reserved for the training background note. The Gaussian/KL fitting discussion on pages 19-20 remains to be transcribed even though its conceptual prerequisites are in the first batch.
+The final MSE scale remark on page 12 is included in the autoencoder note. BatchNorm fragments on pages 13-14 are reserved for the training background note. The Gaussian/KL fitting discussion on pages 19-20 now has a separate practical note linked from the foundations syllabus.
 
 ## Technical review needed in the remaining material
 
 | Pages | Check during transcription |
 | --- | --- |
-| 19-20 | Normalize continuous/discrete KL notation and support assumptions. Preserve optimizer details only when readable; pasted explanations need the same review as handwriting. |
-| 21 | The text says “If generator is optimal” before the JS reduction. Check against the optimal-discriminator derivation. Review labels in the GAN schematic. |
-| 21, 25 | Conditional GAN and f-GAN are headings only; the Fenchel fragment is incomplete. The PDF alone cannot support full standalone transcriptions. `GANs.ipynb` supplies practical sections that can be added with explicit notebook attribution. |
 | 29-30 | Normalize standard deviation versus variance notation and the signs of KL, negative ELBO and reconstruction terms. CVAE, beta-VAE and VQ-VAE are named without developed explanations. |
 | 31-33 | Choose one direction for the flow map and consistently distinguish forward/inverse Jacobians and their evaluation points. |
 | 36-37 | Carefully read masks, LU factors and absolute determinant conventions. |
@@ -91,6 +99,6 @@ The final MSE scale remark on page 12 is included in the autoencoder note. Batch
 
 ## Next batch
 
-Continue with the practical Gaussian/KL fitting discussion (19-20), then the GAN objective and optimal discriminator (21-25), followed by WGAN training constraints (25). Neural training background can be a separate supporting note. After adversarial models, replace the existing VAE sample with the transcription from pages 25-31.
+Replace the existing VAE sample with the transcription from pages 25-31, then continue to normalizing-flow theory and architectures (31-37). Neural training background can be a separate supporting note. Diffusion remains mapped but untranscribed beyond its short sample page.
 
 Reviewed local MDX notes use `status: published` to participate in the site's routes and navigation. This status alone does not deploy the site; remote publication is a separate repository action.
