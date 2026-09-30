@@ -10,6 +10,10 @@
 
 The scan contains handwriting, printed slides and pasted explanation screenshots. They are source material. Presenter reminders such as “skip,” “show …” and “See GPT” are not instructions for the transcription workflow.
 
+## Associated seminar notebooks
+
+The presenter identified [HSE-LAMBDA/DeepGenerativeModels](https://github.com/HSE-LAMBDA/DeepGenerativeModels) as a source of notebooks shown during the seminars. The [notebook context map](notebooks.md) connects comments and topics to specific files and cells in a pinned repository snapshot. The six transcribed notes now link their relevant notebook sections. Notebook implementation details are attributed separately from the handwritten material, and code/formula discrepancies are recorded for review.
+
 ## Topic map and progress
 
 The first two batches reorganize the foundations and evaluation material into six English topic notes. All 44 source pages have been visually inspected for this map. A mapped topic is not a completed transcription.
@@ -67,7 +71,7 @@ Figures are built from SVG and mathematical coordinates, with accessible titles/
 
 ## Material retained for later batches
 
-Page 2 contains notebook setup notes: Black and pre-commit formatting, Matplotlib styles, `%matplotlib inline`, `torch.distributions`, a distribution wrapper, `requires_grad` and a `plot_2d_dots` helper. These belong to a future practical appendix. The helper/wrapper source and exact notebook name are not supplied by this PDF; do not invent them.
+Page 2 contains notebook setup notes: Black and pre-commit formatting, Matplotlib styles, `%matplotlib inline`, `torch.distributions`, a distribution wrapper, `requires_grad` and a `plot_2d_dots` helper. The associated `distances.ipynb` now supplies the scatter helper, Gaussian parameterization and sampling context; see the [notebook map](notebooks.md). The literal historical wrapper class and Black/pre-commit setup remain unconfirmed. Preserve those presenter notes for a future practical appendix.
 
 The final MSE scale remark on page 12 is included in the autoencoder note. BatchNorm fragments on pages 13-14 are reserved for the training background note. The Gaussian/KL fitting discussion on pages 19-20 remains to be transcribed even though its conceptual prerequisites are in the first batch.
 
@@ -77,13 +81,13 @@ The final MSE scale remark on page 12 is included in the autoencoder note. Batch
 | --- | --- |
 | 19-20 | Normalize continuous/discrete KL notation and support assumptions. Preserve optimizer details only when readable; pasted explanations need the same review as handwriting. |
 | 21 | The text says “If generator is optimal” before the JS reduction. Check against the optimal-discriminator derivation. Review labels in the GAN schematic. |
-| 21, 25 | Conditional GAN and f-GAN are headings only; the Fenchel fragment is incomplete. There is not enough material for full standalone transcriptions of these topics. |
+| 21, 25 | Conditional GAN and f-GAN are headings only; the Fenchel fragment is incomplete. The PDF alone cannot support full standalone transcriptions. `GANs.ipynb` supplies practical sections that can be added with explicit notebook attribution. |
 | 29-30 | Normalize standard deviation versus variance notation and the signs of KL, negative ELBO and reconstruction terms. CVAE, beta-VAE and VQ-VAE are named without developed explanations. |
 | 31-33 | Choose one direction for the flow map and consistently distinguish forward/inverse Jacobians and their evaluation points. |
 | 36-37 | Carefully read masks, LU factors and absolute determinant conventions. |
 | 38-39 | Beta is used inconsistently as variance versus noise amplitude; some trial/final expressions omit square roots. Compare with the consistent reparameterization on page 44. |
 | 43 | Qualify the broad Gaussian reverse-chain claim; distinguish the model assumption from the true conditional posterior. |
-| 44 | The final objective is weighted noise MSE. An unweighted `L_simple` objective is not explicitly written in the source. |
+| 44 | The PDF's final objective is weighted noise MSE. Unweighted `L_simple` is supplied by `02_DPM_Models.ipynb` cells 42-43; distinguish this notebook addition from the handwritten derivation. |
 
 ## Next batch
 
