@@ -12,7 +12,7 @@ The scan contains handwriting, printed slides and pasted explanation screenshots
 
 ## Topic map and progress
 
-The first batch reorganizes the opening material into three English topic notes. All 44 source pages have been visually inspected for this map. A mapped topic is not a completed transcription.
+The first two batches reorganize the foundations and evaluation material into six English topic notes. All 44 source pages have been visually inspected for this map. A mapped topic is not a completed transcription.
 
 | Topic | Source pages | Contents and boundary | Progress |
 | --- | --- | --- | --- |
@@ -20,9 +20,9 @@ The first batch reorganizes the opening material into three English topic notes.
 | [Gaussian distributions](../../src/content/notes/generative-models/gaussian-distributions.mdx) | 2-4 | Mean, covariance, bivariate density, spectral factor and affine sampling; ends at the printed slide on page 4. | Transcribed and technically reviewed |
 | [Entropy and divergences](../../src/content/notes/generative-models/entropy-and-divergences.mdx) | 4-12 | Begins below the slide on page 4; surprise, entropy, cross-entropy, KL, fitting objective, support, JS. | Transcribed and technically reviewed |
 | Neural training background | 13-15 | BatchNorm: bottom 13 to top 14; gradients: 14; convolution aside: middle 15. | Planned |
-| Inception Score | 15-17 | Confidence/diversity, conditional and marginal entropy, expected-KL derivation, exponentiation; FID begins at bottom 17. | Planned |
-| Fréchet Inception Distance (FID) | 17-18 | Formula at bottom 17; covariance, Gaussian/Wasserstein interpretation and limitations in upper/middle 18. | Planned |
-| LPIPS | 18-19 | Begins below divider on 18; feature extraction, normalization, weighted differences, interpretation, limits and uses; ends before KL questions on 19. | Planned |
+| [Inception Score](../../src/content/notes/generative-models/inception-score.mdx) | 15-17 | Confidence/diversity, conditional and marginal entropy, expected-KL derivation, exponentiation; FID begins at bottom 17. | Transcribed and technically reviewed |
+| [Fréchet Inception Distance (FID)](../../src/content/notes/generative-models/fid.mdx) | 17-18 | Formula at bottom 17; covariance, Gaussian/Wasserstein interpretation and limitations in upper/middle 18. | Transcribed and technically reviewed |
+| [LPIPS](../../src/content/notes/generative-models/lpips.mdx) | 18-19 | Begins below divider on 18; feature extraction, normalization, weighted differences, interpretation, limits and uses; ends before KL questions on 19. | Transcribed and technically reviewed |
 | Fitting Gaussian parameters with KL | 19-20 | Begins below LPIPS; trainable parameters, density evaluations, backward/optimizer steps and support. Can extend the divergences article. | Planned |
 | GAN objective and optimality | 21-25 | Minimax objective, BCE, optimal discriminator, JS/global optimum, non-saturating generator loss; includes only very top of 25. | Planned |
 | WGAN and training constraints | 25 | Middle of page: Wasserstein losses, gradient penalty, spectral normalization; ends before “week 4-5.” | Planned |
@@ -43,15 +43,25 @@ The articles are edited transcriptions, not literal OCR dumps. Equations and leg
 - **KL/JS:** clarify the support condition, finite-quantity subtraction identity, forward/reverse-KL tendencies and the distinction between an unknown exact entropy and entropy estimation. The formal JS mixture definition expands the brief source outline.
 - **Validation:** the first three notes passed a static site build and KaTeX rendering checks. Provenance ranges are recorded in each article.
 
+## Evaluation-batch review record
+
+- **Inception Score:** preserve the marginal probability explanation, entropy-to-KL derivation and linearity of expectation. Use natural logarithms with `exp`, or base-2 logarithms with base-2 exponentiation. The information is bounded by `ln K`, while the exponentiated score is bounded by `K`. Binary examples and the mutual-information interpretation are editorial additions. The page 15 convolution aside remains reserved for training background.
+- **FID:** use the symmetric positive-semidefinite covariance sandwich in the matrix-square-root expression, and explain the source's product shorthand inside the trace. Zero means equal Gaussian means/covariances, not proven equality of image distributions. The sample-statistics equations, one-dimensional example and feature-cloud drawing expand the source. Feature layer and numerical conventions were checked against the original paper and authors' implementation.
+- **LPIPS:** normalize the channel vector independently at each spatial location. Preserve the source's learned-weight squared norm, spatial average and layer sum. The implementation's linear coefficient on squared differences is distinguished from weights inside the paper's squared norm. Qualify claims about blur, shift/noise robustness and semantic change. The pipeline and distinction between image-pair and collection-level evaluation are explanatory additions.
+- **Validation:** the complete site passed `npm run build` with zero Astro diagnostics. All six transcribed notes have valid figure/ARIA references and no KaTeX errors. The new diagrams and the scrollable IS table were reviewed at desktop width and a 390-pixel viewport; no page overflow or clipped SVG labels was found.
+
 ## Sketches and visual explanations
 
-The first three notes now include eight vector figures with English annotations and curved explanatory arrows:
+The six transcribed notes include eleven vector figures with English annotations and explanatory arrows:
 
 | Note | Figures | Source relationship |
 | --- | --- | --- |
 | Autoencoders | Encoder/bottleneck/decoder with reconstruction comparison; noisy input versus clean target; exact ReLU and sigmoid plots. | Flow diagrams expand the descriptions on pages 1 and 13; activation curves reproduce page 1's sketches using the exact functions. |
 | Gaussian distributions | Independent versus correlated coordinates; draw noise, transform by A, shift by the mean. | Pages 2-4 supply the covariance example and affine sampling idea. The independent comparison and simulated dots are illustrative additions. |
 | Entropy and divergences | Surprisal curve; fair versus biased symbol sketches; P/Q annotations and entropy-plus-KL bar. | Pages 5-6 and 9-10 supply the sketches and annotations. Numerical curve markers and the 0.469 + 0.531 = 1 bit bar expand the same coin example. |
+| Inception Score | Sharp predictions with one label versus varied labels; conditional probabilities averaged into a marginal. | An exact binary-class illustration expands pages 15-17's confidence/diversity explanation; those pages contain no corresponding plot. |
+| FID | Same covariance with shifted means; same mean with different spread/correlation. | Schematic feature clouds explain the two terms from pages 17-18. They are not measured features or FID results. |
+| LPIPS | Shared feature extraction, channel normalization, weighted squared differences, spatial averaging and layer sum. | An annotated pipeline expands the verbal algorithm and formula on pages 18-19. Boxes do not represent measured features. |
 
 Figures are built from SVG and mathematical coordinates, with accessible titles/descriptions. Their layouts adapt to the figure width: narrow flow diagrams become vertical, and adjacent plots stack. The shared `src/components/notes/NoteFigure.astro` wrapper supplies captions and stable figure anchors. Source attribution remains in each note.
 
@@ -77,6 +87,6 @@ The final MSE scale remark on page 12 is included in the autoencoder note. Batch
 
 ## Next batch
 
-Continue with the evaluation topics: Inception Score (15-17), FID (17-18) and LPIPS (18-19). Then transcribe the practical KL fitting discussion and adversarial models. Neural training background can be a separate supporting note.
+Continue with the practical Gaussian/KL fitting discussion (19-20), then the GAN objective and optimal discriminator (21-25), followed by WGAN training constraints (25). Neural training background can be a separate supporting note. After adversarial models, replace the existing VAE sample with the transcription from pages 25-31.
 
 Reviewed local MDX notes use `status: published` to participate in the site's routes and navigation. This status alone does not deploy the site; remote publication is a separate repository action.

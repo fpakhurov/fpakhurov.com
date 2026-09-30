@@ -26,7 +26,7 @@ export const courses = {
       { title: 'GANs', topics: ['Adversarial training', 'GAN objective', 'Training instability', 'GAN variants'] },
       { title: 'Normalizing Flows', topics: ['Change of variables', 'Invertible transformations', 'Flow architectures'] },
       { title: 'Diffusion Models', topics: ['Forward process', 'Reverse process', 'DDPM', 'Score matching', 'Sampling', 'Latent diffusion'] },
-      { title: 'Evaluation', topics: ['Likelihood', 'FID', 'Precision / Recall', 'Human evaluation', 'Hallucination analysis'] },
+      { title: 'Evaluation', topics: ['Likelihood', 'Inception Score', 'FID', 'LPIPS', 'Precision / Recall', 'Human evaluation', 'Hallucination analysis'] },
     ],
   },
 } as const;
