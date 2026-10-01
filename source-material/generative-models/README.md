@@ -12,18 +12,18 @@ The scan contains handwriting, printed slides and pasted explanation screenshots
 
 ## Associated seminar notebooks
 
-The presenter identified [HSE-LAMBDA/DeepGenerativeModels](https://github.com/HSE-LAMBDA/DeepGenerativeModels) as a source of notebooks shown during the seminars. The [notebook context map](notebooks.md) connects comments and topics to specific files and cells in a pinned repository snapshot. The fifteen transcribed notes link their relevant notebook sections. Notebook implementation details are attributed separately from the handwritten material, and code/formula discrepancies are recorded for review.
+The presenter identified [HSE-LAMBDA/DeepGenerativeModels](https://github.com/HSE-LAMBDA/DeepGenerativeModels) as a source of notebooks shown during the seminars. The [notebook context map](notebooks.md) connects comments and topics to specific files and cells in a pinned repository snapshot. The sixteen transcribed notes link their relevant notebook sections. Notebook implementation details are attributed separately from the handwritten material, and code/formula discrepancies are recorded for review.
 
 ## Topic map and progress
 
-The first six batches reorganize the foundations, evaluation, adversarial-model, VAE, normalizing-flow and DDPM material into fifteen English topic notes. All 44 source pages have been visually inspected for this map. A mapped topic is not a completed transcription.
+Seven batches reorganize the foundations, training background, evaluation, adversarial-model, VAE, normalizing-flow and DDPM material into sixteen English topic notes. All 44 source pages have been visually inspected. The readable technical blocks are represented in the topic map below; presenter logistics are retained separately.
 
 | Topic | Source pages | Contents and boundary | Progress |
 | --- | --- | --- | --- |
 | [Autoencoders](../../src/content/notes/generative-models/autoencoders.mdx) | 1, 12 (MSE scale remark), 13 | Representation, reconstruction, bottleneck, MSE, denoising, sparsity, ReLU/sigmoid; page 13's BatchNorm fragment belongs to the next background topic. | Transcribed and technically reviewed |
 | [Gaussian distributions](../../src/content/notes/generative-models/gaussian-distributions.mdx) | 2-4 | Mean, covariance, bivariate density, spectral factor and affine sampling; ends at the printed slide on page 4. | Transcribed and technically reviewed |
 | [Entropy and divergences](../../src/content/notes/generative-models/entropy-and-divergences.mdx) | 4-12 | Begins below the slide on page 4; surprise, entropy, cross-entropy, KL, fitting objective, support, JS. | Transcribed and technically reviewed |
-| Neural training background | 13-15 | BatchNorm: bottom 13 to top 14; gradients: 14; convolution aside: middle 15. | Planned |
+| [Neural training background](../../src/content/notes/generative-models/neural-training-background.mdx) | 13-15 | BatchNorm: bottom 13 to top 14; gradients: 14; convolution aside: middle 15, excluding adjacent metric recaps. | Transcribed and technically reviewed |
 | [Inception Score](../../src/content/notes/generative-models/inception-score.mdx) | 15-17 | Confidence/diversity, conditional and marginal entropy, expected-KL derivation, exponentiation; FID begins at bottom 17. | Transcribed and technically reviewed |
 | [Fréchet Inception Distance (FID)](../../src/content/notes/generative-models/fid.mdx) | 17-18 | Formula at bottom 17; covariance, Gaussian/Wasserstein interpretation and limitations in upper/middle 18. | Transcribed and technically reviewed |
 | [LPIPS](../../src/content/notes/generative-models/lpips.mdx) | 18-19 | Begins below divider on 18; feature extraction, normalization, weighted differences, interpretation, limits and uses; ends before KL questions on 19. | Transcribed and technically reviewed |
@@ -49,7 +49,7 @@ The articles are edited transcriptions, not literal OCR dumps. Equations and leg
 
 ## Evaluation-batch review record
 
-- **Inception Score:** preserve the marginal probability explanation, entropy-to-KL derivation and linearity of expectation. Use natural logarithms with `exp`, or base-2 logarithms with base-2 exponentiation. The information is bounded by `ln K`, while the exponentiated score is bounded by `K`. Binary examples and the mutual-information interpretation are editorial additions. The page 15 convolution aside remains reserved for training background.
+- **Inception Score:** preserve the marginal probability explanation, entropy-to-KL derivation and linearity of expectation. Use natural logarithms with `exp`, or base-2 logarithms with base-2 exponentiation. The information is bounded by `ln K`, while the exponentiated score is bounded by `K`. Binary examples and the mutual-information interpretation are editorial additions. The page 15 convolution aside is covered separately in the training-background note.
 - **FID:** use the symmetric positive-semidefinite covariance sandwich in the matrix-square-root expression, and explain the source's product shorthand inside the trace. Zero means equal Gaussian means/covariances, not proven equality of image distributions. The sample-statistics equations, one-dimensional example and feature-cloud drawing expand the source. Feature layer and numerical conventions were checked against the original paper and authors' implementation.
 - **LPIPS:** normalize the channel vector independently at each spatial location. Preserve the source's learned-weight squared norm, spatial average and layer sum. The implementation's linear coefficient on squared differences is distinguished from weights inside the paper's squared norm. Qualify claims about blur, shift/noise robustness and semantic change. The pipeline and distinction between image-pair and collection-level evaluation are explanatory additions.
 - **Validation:** the complete site passed `npm run build` with zero Astro diagnostics. All six transcribed notes have valid figure/ARIA references and no KaTeX errors. The new diagrams and the scrollable IS table were reviewed at desktop width and a 390-pixel viewport; no page overflow or clipped SVG labels was found.
@@ -88,15 +88,24 @@ The articles are edited transcriptions, not literal OCR dumps. Equations and leg
 - **Notebook evidence:** inspect 49 cells, including 25 code cells, with null counts and empty outputs. The active 100-step sigmoid schedule leaves alpha-bar about 0.605, so it does not remove nearly all signal. Record incorrect early ELBO/endpoints, zero-based coefficient indexing, the incompatible variational helper, final sampler noise and EMA shadow weights that are tracked but not applied to sampling. Code settings and exact scalar calculations are distinguished from training results.
 - **Validation:** `npm run build` passed with zero errors, warnings or hints (59 Astro files, 34 built pages). The three DDPM notes have two figures each, with no KaTeX errors, duplicate IDs, unresolved SVG/ARIA references or broken internal route/fragment links. All three titles link from both the course list and syllabus. Desktop and 390-pixel layouts were visually reviewed; the pages have no horizontal overflow and SVG labels remain within their viewports. Notebook and model code were not executed.
 
+## Training-background batch review record
+
+- **BatchNorm:** retain the source's mean, biased variance and epsilon inside the square root. The exact normalized variance is v / (v + epsilon). Learned affine parameters, per-channel N/H/W reductions and running-statistics evaluation are attributed additions. Disabling gradient recording does not switch module mode or stop training-mode running-buffer updates.
+- **Gradients:** the shared-weight sketch becomes an exact scalar state derivative `w^K`, with growing and shrinking cases. Distinguish this from the shared-parameter derivative `K w^(K - 1) h0`. General nonlinear networks multiply ordered full Jacobians; individual weight magnitudes alone do not establish growth or contraction. The finite training-budget remark does not guarantee an optimizer outcome.
+- **Convolution:** use output-first kernel indices and the Cout/Cin/kH/kW tensor shape for groups = 1. Explain cross-correlation, shared spatial weights, optional biases and fixed architecture hyperparameters. The scan's possible Xavier initializer is not a claim about the notebook's initialization.
+- **Notebook evidence:** AE cell 11 uses Conv → BatchNorm → LeakyReLU, while VAE cells 10/12 put LeakyReLU before BatchNorm in their normalized blocks. AE explicitly switches to evaluation; VAE generation omits that switch. AE saved outputs and empty VAE outputs do not validate a gradient-stability experiment. No notebook training was executed.
+- **Validation:** `npm run build` passed with zero errors, warnings or hints (62 Astro files, 35 built pages). All sixteen notes have thirty-seven figures, with no KaTeX errors, duplicate IDs, unresolved SVG/ARIA references or broken internal route/fragment links. Published note orders are unique from 1 through 16; the new note links from both the article list and syllabus. Its three figures were visually reviewed at desktop width and 390 pixels, with no page overflow or clipped SVG labels.
+
 ## Sketches and visual explanations
 
-The fifteen transcribed notes include thirty-four vector figures with English annotations and explanatory arrows:
+The sixteen transcribed notes include thirty-seven vector figures with English annotations and explanatory arrows:
 
 | Note | Figures | Source relationship |
 | --- | --- | --- |
 | Autoencoders | Encoder/bottleneck/decoder with reconstruction comparison; noisy input versus clean target; exact ReLU and sigmoid plots. | Flow diagrams expand the descriptions on pages 1 and 13; activation curves reproduce page 1's sketches using the exact functions. |
 | Gaussian distributions | Independent versus correlated coordinates; draw noise, transform by A, shift by the mean. | Pages 2-4 supply the covariance example and affine sampling idea. The independent comparison and simulated dots are illustrative additions. |
 | Entropy and divergences | Surprisal curve; fair versus biased symbol sketches; P/Q annotations and entropy-plus-KL bar. | Pages 5-6 and 9-10 supply the sketches and annotations. Numerical curve markers and the 0.469 + 0.531 = 1 bit bar expand the same coin example. |
+| Neural training background | Exact BatchNorm example and affine transform; growing/shrinking derivative chains; input/output channels and kernel tensor. | Expands the formulas on pages 13-15 and redraws page 14's recurrent sketch. Batch values and the two-channel convolution are editorial illustrations; affine/evaluation behavior is attributed implementation context. |
 | Inception Score | Sharp predictions with one label versus varied labels; conditional probabilities averaged into a marginal. | An exact binary-class illustration expands pages 15-17's confidence/diversity explanation; those pages contain no corresponding plot. |
 | FID | Same covariance with shifted means; same mean with different spread/correlation. | Schematic feature clouds explain the two terms from pages 17-18. They are not measured features or FID results. |
 | LPIPS | Shared feature extraction, channel normalization, weighted squared differences, spatial averaging and layer sum. | An annotated pipeline expands the verbal algorithm and formula on pages 18-19. Boxes do not represent measured features. |
@@ -112,18 +121,14 @@ The fifteen transcribed notes include thirty-four vector figures with English an
 
 Figures are built from SVG and mathematical coordinates, with accessible titles/descriptions. Their layouts adapt to the figure width: narrow flow diagrams become vertical, and adjacent plots stack. The shared `src/components/notes/NoteFigure.astro` wrapper supplies captions and stable figure anchors. Source attribution remains in each note.
 
-## Material retained for later batches
+## Presenter remarks retained with the source
 
-Page 2 contains notebook setup notes: Black and pre-commit formatting, Matplotlib styles, `%matplotlib inline`, `torch.distributions`, a distribution wrapper, `requires_grad` and a `plot_2d_dots` helper. The associated `distances.ipynb` now supplies the scatter helper, Gaussian parameterization and sampling context; see the [notebook map](notebooks.md). The literal historical wrapper class and Black/pre-commit setup remain unconfirmed. Preserve those presenter notes for a future practical appendix.
+Page 2 contains notebook setup notes: Black and pre-commit formatting, Matplotlib styles, `%matplotlib inline`, `torch.distributions`, a distribution wrapper, `requires_grad` and a `plot_2d_dots` helper. The associated `distances.ipynb` supplies the scatter helper, Gaussian parameterization and sampling context; see the [notebook map](notebooks.md). The literal historical wrapper class and Black/pre-commit setup remain unconfirmed. These presenter remarks are preserved in the archived scan and context map; they are not converted into invented setup instructions.
 
-The final MSE scale remark on page 12 is included in the autoencoder note. BatchNorm fragments on pages 13-14 are reserved for the training background note. The Gaussian/KL fitting discussion on pages 19-20 now has a separate practical note linked from the foundations syllabus.
+The final MSE scale remark on page 12 is included in the autoencoder note. BatchNorm fragments on pages 13-14 and the convolution aside on page 15 are included in neural training background. The Gaussian/KL fitting discussion on pages 19-20 has a separate practical note linked from the foundations syllabus.
 
-## Remaining source material
+## Coverage
 
-The main generative-model and evaluation topics through page 44 are transcribed. Neural training background on pages 13-15 and presenter tooling remarks on page 2 remain supporting material, rather than completed standalone notes. The background transcription should check BatchNorm training versus evaluation behavior, the gradient examples and the convolution aside against their exact source context.
-
-## Next batch
-
-Continue to the neural training background (13-15), then review cross-topic consistency and any practical appendix needed for the presenter tooling remarks. The former diffusion sample has been expanded into three full topic notes.
+This completes the topic-based transcription of the PDF's readable technical material through page 44. Notebook-dependent comments are linked to pinned source cells, with implementation discrepancies and saved-output limits recorded separately. The broader course syllabus still includes future topics that this scan does not cover; those entries remain planned.
 
 Reviewed local MDX notes use `status: published` to participate in the site's routes and navigation. This status alone does not deploy the site; remote publication is a separate repository action.

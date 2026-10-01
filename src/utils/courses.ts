@@ -20,7 +20,7 @@ export const courses = {
     shortTitle: 'Generative Models',
     description: 'Probability, latent variables and the main families of modern generative models.',
     sections: [
-      { title: 'Foundations', topics: ['Autoencoders', 'Probability review', 'Gaussian distributions', 'Entropy and divergences', 'Fitting distributions with KL', 'Maximum likelihood', 'Latent variables'] },
+      { title: 'Foundations', topics: ['Autoencoders', 'Probability review', 'Gaussian distributions', 'Entropy and divergences', 'Neural training background', 'Fitting distributions with KL', 'Maximum likelihood', 'Latent variables'] },
       { title: 'Autoregressive Models', topics: ['Factorization', 'PixelRNN / PixelCNN', 'Autoregressive transformers'] },
       { title: 'Variational Autoencoders', topics: ['Latent-variable models', 'ELBO', 'Reparameterization trick', 'VAE variants'] },
       { title: 'GANs', topics: ['Adversarial training', 'GAN objective', 'Wasserstein GAN', 'Training instability', 'GAN variants'] },
