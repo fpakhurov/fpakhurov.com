@@ -12,11 +12,11 @@ The scan contains handwriting, printed slides and pasted explanation screenshots
 
 ## Associated seminar notebooks
 
-The presenter identified [HSE-LAMBDA/DeepGenerativeModels](https://github.com/HSE-LAMBDA/DeepGenerativeModels) as a source of notebooks shown during the seminars. The [notebook context map](notebooks.md) connects comments and topics to specific files and cells in a pinned repository snapshot. The nine transcribed notes link their relevant notebook sections. Notebook implementation details are attributed separately from the handwritten material, and code/formula discrepancies are recorded for review.
+The presenter identified [HSE-LAMBDA/DeepGenerativeModels](https://github.com/HSE-LAMBDA/DeepGenerativeModels) as a source of notebooks shown during the seminars. The [notebook context map](notebooks.md) connects comments and topics to specific files and cells in a pinned repository snapshot. The ten transcribed notes link their relevant notebook sections. Notebook implementation details are attributed separately from the handwritten material, and code/formula discrepancies are recorded for review.
 
 ## Topic map and progress
 
-The first three batches reorganize the foundations, evaluation and adversarial-model material into nine English topic notes. All 44 source pages have been visually inspected for this map. A mapped topic is not a completed transcription.
+The first four batches reorganize the foundations, evaluation, adversarial-model and VAE material into ten English topic notes. All 44 source pages have been visually inspected for this map. A mapped topic is not a completed transcription.
 
 | Topic | Source pages | Contents and boundary | Progress |
 | --- | --- | --- | --- |
@@ -30,7 +30,7 @@ The first three batches reorganize the foundations, evaluation and adversarial-m
 | [Fitting distributions with KL](../../src/content/notes/generative-models/fitting-distributions.mdx) | 19-20 | Begins below LPIPS; trainable parameters, density evaluations, backward/optimizer steps and support. Notebook-supplied covariance parameterization and log-space NLL example. | Transcribed and technically reviewed |
 | [GAN objective](../../src/content/notes/generative-models/gan-objective.mdx) | 21-25 | Minimax objective, BCE, optimal discriminator, JS/global optimum, non-saturating generator loss; includes only very top of 25. Conditional GAN and f-GAN expansions are attributed to the notebook and primary references. | Transcribed and technically reviewed |
 | [Wasserstein GAN](../../src/content/notes/generative-models/wgan.mdx) | 25 | Middle of page: Wasserstein losses, gradient penalty, spectral normalization; ends before “week 4-5.” Notebook and primary papers supply transport/dual definitions and training context. | Transcribed and technically reviewed |
-| Variational autoencoders | 25-31 | Begins at bottom 25: classical AE generation problem, Bayesian recap, prior/posterior, ELBO, reparameterization, Gaussian KL, log variance; ends at first line of 31. | Planned; existing `vae.mdx` is a short sample, not a transcription |
+| [Variational autoencoders](../../src/content/notes/generative-models/vae.mdx) | 25-31 | Begins at bottom 25: classical AE generation problem, Bayesian recap, prior/posterior, ELBO, reparameterization, Gaussian KL, log variance; ends at first line of 31. Notebook beta-VAE context is attributed separately. | Transcribed and technically reviewed |
 | Normalizing flows: density and Jacobian | 31-35 | Begins below divider 31; change of variables, exact likelihood, invertibility, local volume scaling, triangular Jacobians; coupling starts lower 35. | Planned |
 | Flow architectures | 35-37 | Coupling/NICE/RealNVP: lower 35-36; autoregressive/MAF/IAF and masks: 36; Glow/LU: bottom 36-37. | Planned |
 | DDPM forward process | 38-40 | Motivation/history, noising chain, contraction, variance, direct noisy-sample formula and schedule; ends above dated divider on 40. | Planned |
@@ -62,9 +62,18 @@ The articles are edited transcriptions, not literal OCR dumps. Equations and leg
 - **WGAN:** normalize critic/generator signs and sampling notation to minimized losses. Add finite-first-moment transport and the 1-Lipschitz dual constraint. A sampled gradient penalty is not a global Lipschitz guarantee; spectral normalization's exact-matrix argument requires further care for convolutions and InstanceNorm. The notebook's initial critic is an unconstrained teaching baseline.
 - **Validation:** `npm run build` passed with zero errors, warnings or hints (42 Astro files, 30 built pages). The three new notes have no KaTeX errors, duplicate IDs, unresolved SVG/ARIA references or broken internal links. New figure layouts were reviewed at desktop width and at 390 pixels; labels stay inside their SVGs and the pages have no horizontal overflow. The Python example passed a syntax check; the notebook and training loop were not executed.
 
+## VAE-batch review record
+
+- **Probability roles:** distinguish the chosen prior, decoder likelihood, true model posterior and learned approximate posterior. The encoder and decoder are conditional distributions rather than inverse functions. The standard-normal prior is fixed in this example; input-dependent posterior parameters are learned.
+- **ELBO:** page 27's early expected-log joint term double-counts the prior when paired with KL to the prior. Follow page 29's conditional-likelihood expansion. Its generic Jensen box has the convex direction; the ELBO needs log concavity. Distinguish the KL-to-prior regularizer from the KL-to-true-posterior gap. The exact gap identity is an attributed editorial expansion.
+- **Reconstruction and sampling:** squared error follows from a fixed-variance Gaussian observation model, with its scale retained. Predict log variance, recover standard deviation with exp(logvar / 2), and draw independent standard-normal noise. Log variance does not guarantee numerical stability at extreme scales. Prior generation and posterior reconstruction are separate paths; decoder means are distinct from sampled observations.
+- **Gaussian KL and interpretation:** preserve the signed component sum and correct standard-deviation/variance notation. KL trades off reconstruction against prior proximity; it does not guarantee identical input posteriors, exact aggregate prior matching, semantic interpolation or disentanglement. CVAE and VQ-VAE remain named future topics. Beta-VAE is a notebook expansion, with the reviewed training call using beta = 1.
+- **Notebook evidence:** inspect the source cells and empty saved-output fields, without executing training. Cell 16's final L1(log standard deviation) formula is wrong, while cell 17's KL code is correct apart from its variance floor at extreme values. Reconstruction is summed over pixels and averaged over the batch. Reporting divides batch means again; generated grids use decoder outputs without observation noise or eval mode. Residual widget metadata does not prove a completed run or output quality.
+- **Validation:** `npm run build` passed with zero errors, warnings or hints (47 Astro files, 30 built pages). The VAE page has five figures, no KaTeX errors, duplicate IDs, unresolved SVG/ARIA references or broken internal route/fragment links. Desktop and 390-pixel figure layouts were visually reviewed; the mobile page has no horizontal overflow and SVG labels remain within their viewports. The notebook was inspected but not executed.
+
 ## Sketches and visual explanations
 
-The nine transcribed notes include seventeen vector figures with English annotations and explanatory arrows:
+The ten transcribed notes include twenty-two vector figures with English annotations and explanatory arrows:
 
 | Note | Figures | Source relationship |
 | --- | --- | --- |
@@ -77,6 +86,7 @@ The nine transcribed notes include seventeen vector figures with English annotat
 | Fitting distributions with KL | Target/model contours and the log-density, loss, backward and parameter-update loop. | The loop expands pages 19-20; the target and initial model parameters come from `distances.ipynb`. The update arrow is schematic. |
 | GAN objective | Real/fake data flow; four stages of data/generated densities and discriminator probability; scalar generator losses and logit derivatives. | The flow and staged distributions redraw pages 21 and 24; exact scalar plots expand pages 24-25's gradient explanation. The stages are illustrative, not a convergence guarantee. |
 | Wasserstein GAN | Point-mass transport and distance versus displacement; gradient-norm penalty and linear-map directional stretch. | The point-mass example expands the WGAN motivation. The penalty and matrix sketch explain page 25's formulas; no training results are plotted. |
+| Variational autoencoders | Reference codes versus a Gaussian approximate posterior; joint density and marginals; evidence versus ELBO; reparameterized training and prior generation; exact Gaussian KL slices. | Pages 26-28 supply latent, marginal and encoder/sampler sketches. The posterior-gap visualization expands page 29's derivation; exact KL plots expand pages 29-30. Toy densities, illustrative dots and qualitative heights are not notebook results. |
 
 Figures are built from SVG and mathematical coordinates, with accessible titles/descriptions. Their layouts adapt to the figure width: narrow flow diagrams become vertical, and adjacent plots stack. The shared `src/components/notes/NoteFigure.astro` wrapper supplies captions and stable figure anchors. Source attribution remains in each note.
 
@@ -90,7 +100,6 @@ The final MSE scale remark on page 12 is included in the autoencoder note. Batch
 
 | Pages | Check during transcription |
 | --- | --- |
-| 29-30 | Normalize standard deviation versus variance notation and the signs of KL, negative ELBO and reconstruction terms. CVAE, beta-VAE and VQ-VAE are named without developed explanations. |
 | 31-33 | Choose one direction for the flow map and consistently distinguish forward/inverse Jacobians and their evaluation points. |
 | 36-37 | Carefully read masks, LU factors and absolute determinant conventions. |
 | 38-39 | Beta is used inconsistently as variance versus noise amplitude; some trial/final expressions omit square roots. Compare with the consistent reparameterization on page 44. |
@@ -99,6 +108,6 @@ The final MSE scale remark on page 12 is included in the autoencoder note. Batch
 
 ## Next batch
 
-Replace the existing VAE sample with the transcription from pages 25-31, then continue to normalizing-flow theory and architectures (31-37). Neural training background can be a separate supporting note. Diffusion remains mapped but untranscribed beyond its short sample page.
+Continue to normalizing-flow theory and architectures (31-37). Neural training background can be a separate supporting note. Diffusion remains mapped but untranscribed beyond its short sample page.
 
 Reviewed local MDX notes use `status: published` to participate in the site's routes and navigation. This status alone does not deploy the site; remote publication is a separate repository action.
