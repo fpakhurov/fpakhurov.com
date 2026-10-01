@@ -12,11 +12,11 @@ The scan contains handwriting, printed slides and pasted explanation screenshots
 
 ## Associated seminar notebooks
 
-The presenter identified [HSE-LAMBDA/DeepGenerativeModels](https://github.com/HSE-LAMBDA/DeepGenerativeModels) as a source of notebooks shown during the seminars. The [notebook context map](notebooks.md) connects comments and topics to specific files and cells in a pinned repository snapshot. The twelve transcribed notes link their relevant notebook sections. Notebook implementation details are attributed separately from the handwritten material, and code/formula discrepancies are recorded for review.
+The presenter identified [HSE-LAMBDA/DeepGenerativeModels](https://github.com/HSE-LAMBDA/DeepGenerativeModels) as a source of notebooks shown during the seminars. The [notebook context map](notebooks.md) connects comments and topics to specific files and cells in a pinned repository snapshot. The fifteen transcribed notes link their relevant notebook sections. Notebook implementation details are attributed separately from the handwritten material, and code/formula discrepancies are recorded for review.
 
 ## Topic map and progress
 
-The first five batches reorganize the foundations, evaluation, adversarial-model, VAE and normalizing-flow material into twelve English topic notes. All 44 source pages have been visually inspected for this map. A mapped topic is not a completed transcription.
+The first six batches reorganize the foundations, evaluation, adversarial-model, VAE, normalizing-flow and DDPM material into fifteen English topic notes. All 44 source pages have been visually inspected for this map. A mapped topic is not a completed transcription.
 
 | Topic | Source pages | Contents and boundary | Progress |
 | --- | --- | --- | --- |
@@ -33,9 +33,9 @@ The first five batches reorganize the foundations, evaluation, adversarial-model
 | [Variational autoencoders](../../src/content/notes/generative-models/vae.mdx) | 25-31 | Begins at bottom 25: classical AE generation problem, Bayesian recap, prior/posterior, ELBO, reparameterization, Gaussian KL, log variance; ends at first line of 31. Notebook beta-VAE context is attributed separately. | Transcribed and technically reviewed |
 | [Normalizing flows](../../src/content/notes/generative-models/normalizing-flows.mdx) | 31-35 | Begins below divider 31; change of variables, exact likelihood, invertibility, local volume scaling, triangular Jacobians; coupling starts lower 35. | Transcribed and technically reviewed |
 | [Flow architectures](../../src/content/notes/generative-models/flow-architectures.mdx) | 35-37 | Coupling/NICE/RealNVP: lower 35-36; autoregressive/MAF/IAF and masks: 36; Glow/LU: bottom 36-37. Notebook spline coupling is attributed separately. | Transcribed and technically reviewed |
-| DDPM forward process | 38-40 | Motivation/history, noising chain, contraction, variance, direct noisy-sample formula and schedule; ends above dated divider on 40. | Planned |
-| DDPM reverse process and variational objective | 40-43 | Begins below divider 40; reverse model, marginal likelihood, chain factorization, Jensen/ELBO, posterior KL and Gaussian mean matching. | Planned |
-| DDPM noise prediction | 44 | Posterior mean, reparameterization, epsilon prediction, weighted noise MSE, random timestep sampling. | Planned; existing `diffusion.mdx` is a short sample, not a transcription |
+| [DDPM forward process](../../src/content/notes/generative-models/diffusion.mdx) | 38-40 | Motivation/history, noising chain, contraction, variance, direct noisy-sample formula and schedule; ends above dated divider on 40. Replaces the former short sample at the same route. | Transcribed and technically reviewed |
+| [DDPM reverse process and variational objective](../../src/content/notes/generative-models/diffusion-reverse.mdx) | 40-43 | Begins below divider 40; reverse model, marginal likelihood, chain factorization, Jensen/ELBO, posterior KL and Gaussian mean matching. | Transcribed and technically reviewed |
+| [DDPM noise prediction](../../src/content/notes/generative-models/diffusion-noise-prediction.mdx) | 44 | Posterior mean, reparameterization, epsilon prediction, weighted noise MSE, random timestep sampling. The unweighted objective and sampling endpoint are separately attributed. | Transcribed and technically reviewed |
 
 ## First-batch review record
 
@@ -80,9 +80,17 @@ The articles are edited transcriptions, not literal OCR dumps. Equations and leg
 - **Notebook evidence:** inspect nf.ipynb and imported library source without execution; all code-cell outputs are empty. The active model has a logistic base and three ActNorm/mixing/rational-quadratic spline-coupling groups. Each spline module composes two triangular stages; the complete module's Jacobian need not be triangular. Cell 19 omits the Jacobian from its density coloring. A prior-sample shape mistake and a visualization loop that breaks after one update are recorded in the notebook map; no saved plots establish convergence.
 - **Validation:** `npm run build` passed with zero errors, warnings or hints (53 Astro files, 32 built pages). Both new notes have three figures each, with no KaTeX errors, duplicate IDs, unresolved SVG/ARIA references or broken internal route/fragment links. Desktop and 390-pixel figure layouts were visually reviewed; both mobile pages have no horizontal overflow and SVG labels remain within their viewports. The notebook and imported implementations were inspected without execution.
 
+## DDPM-batch review record
+
+- **Forward variance and limits:** use beta as variance and its square root as noise amplitude. Independent additive steps have variance t beta, not t squared beta. DDPM contracts the signal and has accumulated conditional variance 1 - alpha-bar. Direct noisy sampling produces the selected marginal, not a jointly correlated forward trajectory. Distinguish conditional Gaussian noise from the generally non-Gaussian data marginal; a finite terminal approximation depends on the accumulated schedule.
+- **Reverse posterior and bound:** distinguish the exact Gaussian posterior conditioned on both noisy and clean data from the learned Gaussian model conditioned only on noisy data and time. Preserve Jensen's concave direction and the ELBO/negative-ELBO signs. Keep terminal prior KL, interior posterior KL from t = 2, and reconstruction at t = 1 separate. The zero posterior variance at the endpoint cannot enter an ordinary Gaussian KL.
+- **Noise prediction and generation:** restore page 44's missing beta factor and accumulated-alpha notation. Derive the timestep-dependent noise-MSE weights for fixed interior reverse variance; distinguish the full bound from the simplified unweighted objective. Give the sampled-timestep estimator's scaling. The illustrated ancestral sampler uses posterior variance for interior steps and no fresh noise at the final step, with that convention attributed to the original paper.
+- **Notebook evidence:** inspect 49 cells, including 25 code cells, with null counts and empty outputs. The active 100-step sigmoid schedule leaves alpha-bar about 0.605, so it does not remove nearly all signal. Record incorrect early ELBO/endpoints, zero-based coefficient indexing, the incompatible variational helper, final sampler noise and EMA shadow weights that are tracked but not applied to sampling. Code settings and exact scalar calculations are distinguished from training results.
+- **Validation:** `npm run build` passed with zero errors, warnings or hints (59 Astro files, 34 built pages). The three DDPM notes have two figures each, with no KaTeX errors, duplicate IDs, unresolved SVG/ARIA references or broken internal route/fragment links. All three titles link from both the course list and syllabus. Desktop and 390-pixel layouts were visually reviewed; the pages have no horizontal overflow and SVG labels remain within their viewports. Notebook and model code were not executed.
+
 ## Sketches and visual explanations
 
-The twelve transcribed notes include twenty-eight vector figures with English annotations and explanatory arrows:
+The fifteen transcribed notes include thirty-four vector figures with English annotations and explanatory arrows:
 
 | Note | Figures | Source relationship |
 | --- | --- | --- |
@@ -98,6 +106,9 @@ The twelve transcribed notes include twenty-eight vector figures with English an
 | Variational autoencoders | Reference codes versus a Gaussian approximate posterior; joint density and marginals; evidence versus ELBO; reparameterized training and prior generation; exact Gaussian KL slices. | Pages 26-28 supply latent, marginal and encoder/sampler sketches. The posterior-gap visualization expands page 29's derivation; exact KL plots expand pages 29-30. Toy densities, illustrative dots and qualitative heights are not notebook results. |
 | Normalizing flows | Generation versus density direction and a layer chain; square scaling and reflection; triangular Jacobian and coordinate dependencies. | Redraws pages 31-35 with an exact toy shear, area factors and triangular-matrix example. Dots are illustrative, not learned embeddings. |
 | Flow architectures | Coupling split and conditioner; autoregressive dependencies and MAF/IAF direction costs; invertible channel mixing and LU/Glow step. | Expands pages 35-37's algebra and sketches, with primary-paper architecture context. These are construction diagrams, not notebook training outputs. |
+| DDPM forward process | Sequential noising versus a direct chosen-timestep draw; exact Gaussian-mixture marginals approaching a normal reference. | Reconstructs pages 38-40's chain and density sketches. The mixture and noise levels are exact illustrative choices, separate from the notebook's configured schedule. |
+| DDPM reverse process | Conditioned training posterior versus generation inputs; endpoint-separated bound and Gaussian mean matching. | Expands pages 40-43's arrows and Gaussian drawings with corrected conditioning, signs and endpoint terms. No quantitative losses are plotted. |
+| DDPM noise prediction | Construct a noisy input and retain the noise target; predict noise, form a mean and take a stochastic reverse step. | Reconstructs page 44's learning argument and adds original-paper sampling context. These are algorithm diagrams, not generated samples. |
 
 Figures are built from SVG and mathematical coordinates, with accessible titles/descriptions. Their layouts adapt to the figure width: narrow flow diagrams become vertical, and adjacent plots stack. The shared `src/components/notes/NoteFigure.astro` wrapper supplies captions and stable figure anchors. Source attribution remains in each note.
 
@@ -107,16 +118,12 @@ Page 2 contains notebook setup notes: Black and pre-commit formatting, Matplotli
 
 The final MSE scale remark on page 12 is included in the autoencoder note. BatchNorm fragments on pages 13-14 are reserved for the training background note. The Gaussian/KL fitting discussion on pages 19-20 now has a separate practical note linked from the foundations syllabus.
 
-## Technical review needed in the remaining material
+## Remaining source material
 
-| Pages | Check during transcription |
-| --- | --- |
-| 38-39 | Beta is used inconsistently as variance versus noise amplitude; some trial/final expressions omit square roots. Compare with the consistent reparameterization on page 44. |
-| 43 | Qualify the broad Gaussian reverse-chain claim; distinguish the model assumption from the true conditional posterior. |
-| 44 | The PDF's final objective is weighted noise MSE. Unweighted `L_simple` is supplied by `02_DPM_Models.ipynb` cells 42-43; distinguish this notebook addition from the handwritten derivation. |
+The main generative-model and evaluation topics through page 44 are transcribed. Neural training background on pages 13-15 and presenter tooling remarks on page 2 remain supporting material, rather than completed standalone notes. The background transcription should check BatchNorm training versus evaluation behavior, the gradient examples and the convolution aside against their exact source context.
 
 ## Next batch
 
-Continue to DDPM: forward process (38-40), reverse process and variational objective (40-43), then noise prediction (44). Neural training background can be a separate supporting note. Diffusion remains mapped but untranscribed beyond its short sample page.
+Continue to the neural training background (13-15), then review cross-topic consistency and any practical appendix needed for the presenter tooling remarks. The former diffusion sample has been expanded into three full topic notes.
 
 Reviewed local MDX notes use `status: published` to participate in the site's routes and navigation. This status alone does not deploy the site; remote publication is a separate repository action.

@@ -25,7 +25,7 @@ export const courses = {
       { title: 'Variational Autoencoders', topics: ['Latent-variable models', 'ELBO', 'Reparameterization trick', 'VAE variants'] },
       { title: 'GANs', topics: ['Adversarial training', 'GAN objective', 'Wasserstein GAN', 'Training instability', 'GAN variants'] },
       { title: 'Normalizing Flows', topics: ['Normalizing flows', 'Change of variables', 'Invertible transformations', 'Flow architectures'] },
-      { title: 'Diffusion Models', topics: ['Forward process', 'Reverse process', 'DDPM', 'Score matching', 'Sampling', 'Latent diffusion'] },
+      { title: 'Diffusion Models', topics: ['Diffusion: forward process', 'Diffusion: reverse process', 'Diffusion: noise prediction', 'DDPM', 'Score matching', 'Sampling', 'Latent diffusion'] },
       { title: 'Evaluation', topics: ['Likelihood', 'Inception Score', 'FID', 'LPIPS', 'Precision / Recall', 'Human evaluation', 'Hallucination analysis'] },
     ],
   },
