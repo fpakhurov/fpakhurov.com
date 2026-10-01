@@ -12,11 +12,11 @@ The scan contains handwriting, printed slides and pasted explanation screenshots
 
 ## Associated seminar notebooks
 
-The presenter identified [HSE-LAMBDA/DeepGenerativeModels](https://github.com/HSE-LAMBDA/DeepGenerativeModels) as a source of notebooks shown during the seminars. The [notebook context map](notebooks.md) connects comments and topics to specific files and cells in a pinned repository snapshot. The ten transcribed notes link their relevant notebook sections. Notebook implementation details are attributed separately from the handwritten material, and code/formula discrepancies are recorded for review.
+The presenter identified [HSE-LAMBDA/DeepGenerativeModels](https://github.com/HSE-LAMBDA/DeepGenerativeModels) as a source of notebooks shown during the seminars. The [notebook context map](notebooks.md) connects comments and topics to specific files and cells in a pinned repository snapshot. The twelve transcribed notes link their relevant notebook sections. Notebook implementation details are attributed separately from the handwritten material, and code/formula discrepancies are recorded for review.
 
 ## Topic map and progress
 
-The first four batches reorganize the foundations, evaluation, adversarial-model and VAE material into ten English topic notes. All 44 source pages have been visually inspected for this map. A mapped topic is not a completed transcription.
+The first five batches reorganize the foundations, evaluation, adversarial-model, VAE and normalizing-flow material into twelve English topic notes. All 44 source pages have been visually inspected for this map. A mapped topic is not a completed transcription.
 
 | Topic | Source pages | Contents and boundary | Progress |
 | --- | --- | --- | --- |
@@ -31,8 +31,8 @@ The first four batches reorganize the foundations, evaluation, adversarial-model
 | [GAN objective](../../src/content/notes/generative-models/gan-objective.mdx) | 21-25 | Minimax objective, BCE, optimal discriminator, JS/global optimum, non-saturating generator loss; includes only very top of 25. Conditional GAN and f-GAN expansions are attributed to the notebook and primary references. | Transcribed and technically reviewed |
 | [Wasserstein GAN](../../src/content/notes/generative-models/wgan.mdx) | 25 | Middle of page: Wasserstein losses, gradient penalty, spectral normalization; ends before “week 4-5.” Notebook and primary papers supply transport/dual definitions and training context. | Transcribed and technically reviewed |
 | [Variational autoencoders](../../src/content/notes/generative-models/vae.mdx) | 25-31 | Begins at bottom 25: classical AE generation problem, Bayesian recap, prior/posterior, ELBO, reparameterization, Gaussian KL, log variance; ends at first line of 31. Notebook beta-VAE context is attributed separately. | Transcribed and technically reviewed |
-| Normalizing flows: density and Jacobian | 31-35 | Begins below divider 31; change of variables, exact likelihood, invertibility, local volume scaling, triangular Jacobians; coupling starts lower 35. | Planned |
-| Flow architectures | 35-37 | Coupling/NICE/RealNVP: lower 35-36; autoregressive/MAF/IAF and masks: 36; Glow/LU: bottom 36-37. | Planned |
+| [Normalizing flows](../../src/content/notes/generative-models/normalizing-flows.mdx) | 31-35 | Begins below divider 31; change of variables, exact likelihood, invertibility, local volume scaling, triangular Jacobians; coupling starts lower 35. | Transcribed and technically reviewed |
+| [Flow architectures](../../src/content/notes/generative-models/flow-architectures.mdx) | 35-37 | Coupling/NICE/RealNVP: lower 35-36; autoregressive/MAF/IAF and masks: 36; Glow/LU: bottom 36-37. Notebook spline coupling is attributed separately. | Transcribed and technically reviewed |
 | DDPM forward process | 38-40 | Motivation/history, noising chain, contraction, variance, direct noisy-sample formula and schedule; ends above dated divider on 40. | Planned |
 | DDPM reverse process and variational objective | 40-43 | Begins below divider 40; reverse model, marginal likelihood, chain factorization, Jensen/ELBO, posterior KL and Gaussian mean matching. | Planned |
 | DDPM noise prediction | 44 | Posterior mean, reparameterization, epsilon prediction, weighted noise MSE, random timestep sampling. | Planned; existing `diffusion.mdx` is a short sample, not a transcription |
@@ -71,9 +71,18 @@ The articles are edited transcriptions, not literal OCR dumps. Equations and leg
 - **Notebook evidence:** inspect the source cells and empty saved-output fields, without executing training. Cell 16's final L1(log standard deviation) formula is wrong, while cell 17's KL code is correct apart from its variance floor at extreme values. Reconstruction is summed over pixels and averaged over the batch. Reporting divides batch means again; generated grids use decoder outputs without observation noise or eval mode. Residual widget metadata does not prove a completed run or output quality.
 - **Validation:** `npm run build` passed with zero errors, warnings or hints (47 Astro files, 30 built pages). The VAE page has five figures, no KaTeX errors, duplicate IDs, unresolved SVG/ARIA references or broken internal route/fragment links. Desktop and 390-pixel figure layouts were visually reviewed; the mobile page has no horizontal overflow and SVG labels remain within their viewports. The notebook was inspected but not executed.
 
+## Normalizing-flow batch review record
+
+- **Directions and likelihood:** fix f: latent to data, g = inverse f: data to latent. Density uses the inverse-map determinant at x, or the reciprocal generation determinant at its corresponding z. The recap and notebook name their computational forward direction differently; normalize those conventions explicitly. Layer Jacobians are evaluated at their own intermediate inputs, and log absolute determinants add.
+- **Geometry and conditions:** 2I doubles lengths and multiplies area by 4; the reflected diagonal (2, -2) has the same absolute area factor. Zero determinant at one point does not alone prove global non-injectivity. Standard smooth layers need a differentiable inverse and nonsingular Jacobian; dimension collapse does not admit this ordinary full-dimensional density formula. Exact density evaluation does not imply perfect data modeling or arithmetic.
+- **Architecture:** distinguish additive NICE from affine Real NVP; invert the coupling coordinates while re-evaluating, rather than inverting, the conditioner networks. Triangularity is a determinant shortcut and needs additional invertibility conditions. Explain strict output masks, MAF/IAF directional costs and the distinction between an arbitrary external observation and an IAF-generated sample.
+- **Glow:** retain absolute values, nonzero signed diagonals, unit-diagonal L and a fixed permutation in the LU parameterization. Include the spatial multiplier HW for image-channel mixing, while the notebook's two-dimensional example has no image multiplier. ActNorm and the complete Glow step are primary-paper expansions of the brief source heading.
+- **Notebook evidence:** inspect nf.ipynb and imported library source without execution; all code-cell outputs are empty. The active model has a logistic base and three ActNorm/mixing/rational-quadratic spline-coupling groups. Each spline module composes two triangular stages; the complete module's Jacobian need not be triangular. Cell 19 omits the Jacobian from its density coloring. A prior-sample shape mistake and a visualization loop that breaks after one update are recorded in the notebook map; no saved plots establish convergence.
+- **Validation:** `npm run build` passed with zero errors, warnings or hints (53 Astro files, 32 built pages). Both new notes have three figures each, with no KaTeX errors, duplicate IDs, unresolved SVG/ARIA references or broken internal route/fragment links. Desktop and 390-pixel figure layouts were visually reviewed; both mobile pages have no horizontal overflow and SVG labels remain within their viewports. The notebook and imported implementations were inspected without execution.
+
 ## Sketches and visual explanations
 
-The ten transcribed notes include twenty-two vector figures with English annotations and explanatory arrows:
+The twelve transcribed notes include twenty-eight vector figures with English annotations and explanatory arrows:
 
 | Note | Figures | Source relationship |
 | --- | --- | --- |
@@ -87,6 +96,8 @@ The ten transcribed notes include twenty-two vector figures with English annotat
 | GAN objective | Real/fake data flow; four stages of data/generated densities and discriminator probability; scalar generator losses and logit derivatives. | The flow and staged distributions redraw pages 21 and 24; exact scalar plots expand pages 24-25's gradient explanation. The stages are illustrative, not a convergence guarantee. |
 | Wasserstein GAN | Point-mass transport and distance versus displacement; gradient-norm penalty and linear-map directional stretch. | The point-mass example expands the WGAN motivation. The penalty and matrix sketch explain page 25's formulas; no training results are plotted. |
 | Variational autoencoders | Reference codes versus a Gaussian approximate posterior; joint density and marginals; evidence versus ELBO; reparameterized training and prior generation; exact Gaussian KL slices. | Pages 26-28 supply latent, marginal and encoder/sampler sketches. The posterior-gap visualization expands page 29's derivation; exact KL plots expand pages 29-30. Toy densities, illustrative dots and qualitative heights are not notebook results. |
+| Normalizing flows | Generation versus density direction and a layer chain; square scaling and reflection; triangular Jacobian and coordinate dependencies. | Redraws pages 31-35 with an exact toy shear, area factors and triangular-matrix example. Dots are illustrative, not learned embeddings. |
+| Flow architectures | Coupling split and conditioner; autoregressive dependencies and MAF/IAF direction costs; invertible channel mixing and LU/Glow step. | Expands pages 35-37's algebra and sketches, with primary-paper architecture context. These are construction diagrams, not notebook training outputs. |
 
 Figures are built from SVG and mathematical coordinates, with accessible titles/descriptions. Their layouts adapt to the figure width: narrow flow diagrams become vertical, and adjacent plots stack. The shared `src/components/notes/NoteFigure.astro` wrapper supplies captions and stable figure anchors. Source attribution remains in each note.
 
@@ -100,14 +111,12 @@ The final MSE scale remark on page 12 is included in the autoencoder note. Batch
 
 | Pages | Check during transcription |
 | --- | --- |
-| 31-33 | Choose one direction for the flow map and consistently distinguish forward/inverse Jacobians and their evaluation points. |
-| 36-37 | Carefully read masks, LU factors and absolute determinant conventions. |
 | 38-39 | Beta is used inconsistently as variance versus noise amplitude; some trial/final expressions omit square roots. Compare with the consistent reparameterization on page 44. |
 | 43 | Qualify the broad Gaussian reverse-chain claim; distinguish the model assumption from the true conditional posterior. |
 | 44 | The PDF's final objective is weighted noise MSE. Unweighted `L_simple` is supplied by `02_DPM_Models.ipynb` cells 42-43; distinguish this notebook addition from the handwritten derivation. |
 
 ## Next batch
 
-Continue to normalizing-flow theory and architectures (31-37). Neural training background can be a separate supporting note. Diffusion remains mapped but untranscribed beyond its short sample page.
+Continue to DDPM: forward process (38-40), reverse process and variational objective (40-43), then noise prediction (44). Neural training background can be a separate supporting note. Diffusion remains mapped but untranscribed beyond its short sample page.
 
 Reviewed local MDX notes use `status: published` to participate in the site's routes and navigation. This status alone does not deploy the site; remote publication is a separate repository action.
