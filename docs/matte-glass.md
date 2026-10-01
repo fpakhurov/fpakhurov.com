@@ -1,6 +1,6 @@
 # Research studio design system
 
-The site presents applied AI work, research and teaching as parts of one personal practice. The visual direction is a research studio: warm neutral surfaces, rounded typography, clear diagrams and quiet blue accents. The homepage, work pages, collections and articles share this system.
+The site presents applied AI work, research and teaching as parts of one personal practice. The visual direction is a research studio: balanced neutral surfaces, rounded typography, clear diagrams and quiet blue accents. The homepage, work pages, collections and articles share this system.
 
 This document replaces the earlier material-only glass treatment. Typography, spacing, surfaces and component shapes are designed together. The filename is retained for existing documentation links.
 
@@ -8,17 +8,17 @@ This document replaces the earlier material-only glass treatment. Typography, sp
 
 | Role | Light mode | Dark mode | Use |
 | --- | --- | --- | --- |
-| Page background | Warm neutral | Graphite | Continuous background across routes. |
-| Reading surface | Dense warm neutral | Dense graphite | Articles, equations, tables, code and figures. |
-| Navigation and card surface | High-opacity frosted neutral | High-opacity frosted graphite | Header, menus, reading rails and collection cards. |
-| Primary text | Near-black | Warm near-white | Headings, prose and control labels. |
+| Page background | Neutral gray | Graphite | Continuous background across routes. |
+| Reading surface | Dense neutral gray | Dense graphite | Articles, equations, tables, code and figures. |
+| Navigation and card surface | Translucent frosted neutral | Translucent frosted graphite | Header, menus, reading rails and collection cards. |
+| Primary text | Near-black | Neutral near-white | Headings, prose and control labels. |
 | Secondary text | Muted neutral | Muted light neutral | Descriptions and supporting labels. |
 | Accent | Restrained blue | Lighter blue | Links, current items, focus and diagram emphasis. |
 | Ambient wash | Faint blue tint | Faint blue tint | A broad background cue that stays behind content. |
 
-Use the existing semantic color tokens (`--paper`, `--paper-strong`, `--ink`, `--muted`, `--line`, `--accent`, `--accent-ink` and `--code`) for content. All tokens, component rules, page geometry and responsive fallbacks live together in `src/styles/global.css`. There is no second material stylesheet overriding an earlier design. `--surface-*` tokens describe the 94% frosted fills, opaque fallbacks, borders, highlights, shadows and blur; `--action` and `--action-ink` define primary controls.
+Use the existing semantic color tokens (`--paper`, `--paper-strong`, `--ink`, `--muted`, `--line`, `--accent`, `--accent-ink` and `--code`) for content. All tokens, component rules, page geometry and responsive fallbacks live together in `src/styles/global.css`. There is no second material stylesheet overriding an earlier design. `--surface-*` tokens describe frosted fills, opaque fallbacks, borders, shadows and blur; `--action` and `--action-ink` define primary controls.
 
-The frosted fill is deliberately dense. A fine border and restrained shadow define a panel; backdrop blur adds material depth where useful. Prose, mathematical notation and diagrams remain on unblurred reading surfaces. The background wash must stay subtle enough that it does not become the strongest element on a page.
+The palette uses balanced grays without a green countertone. Cards use a 68% neutral fill in both themes; floating navigation uses 84% in light mode and 86% in dark mode so it remains readable over scrolling content. Navigation has dedicated stronger label and blue-link colors. A fine border and soft shadow define the glass, with 24px backdrop blur on desktop and 18px on small screens. There is no directional reflection gradient; the inner edge highlight is restrained (16% white in light mode, 2.5% in dark mode). Prose, mathematical notation and diagrams remain on unblurred reading surfaces. The background wash must stay subtle enough that it does not become the strongest element on a page.
 
 Featured cards use an accent border within the same matte material. The solid accent fill is reserved for primary actions.
 
@@ -78,7 +78,7 @@ Sequential arrows show progression within and between groups. Each group has the
 
 ## States and accessible behavior
 
-Hover changes a surface fill or border gently. Current navigation receives a clear accent cue. Keyboard focus uses a visible outline that remains distinguishable on neutral and accent surfaces. Avoid layout movement or animated blur when an element becomes active.
+Hover changes a surface fill or border gently. Card and secondary-action hover fills remain translucent when filtering is supported; opaque and reduced-transparency fallbacks use solid hover fills. Current navigation receives a clear accent cue. Keyboard focus uses a visible outline that remains distinguishable on neutral and accent surfaces. Avoid layout movement or animated blur when an element becomes active.
 
 Use native links, buttons and disclosure elements for their existing interactions. Decorative arrows do not replace the underlying labels or reading order. The systems chain is readable as an ordered sequence without its visual connectors.
 
@@ -93,6 +93,9 @@ Opaque surfaces provide the baseline. Browsers that support backdrop filtering m
 - Primary and secondary hero buttons measure 48px high. The mobile menu opens with Enter, shows a visible focus outline and navigates successfully. Course contents expand, identify the current article and navigate to another note.
 - Reading rails are height-bounded and scrollable: at a 720px viewport, the 586px course rail scrolls through its 650px content to expose the final entry. Wide mobile equations scroll locally while the page remains 390px wide; tables use the same containment.
 - Reviewed VAE and neural-training SVG labels stay within their diagrams. Prose and figures have no backdrop filter. Existing diagram geometry and mathematical font roles are preserved.
-- Independent source review covered responsive rules, selector coverage, opaque fallback, reduced transparency, reduced motion and forced colors. These preference fallbacks were source-reviewed, not browser-emulated.
+- The neutral/material refinement was checked at 1280px and 390px: card fill is 68%, navigation uses its denser fill, both have no reflection image, and blur measures 24px desktop / 18px mobile. The native menu opens with Enter and remains within the mobile viewport. Light and dark neutral appearances were visually reviewed.
+- Independent source review covered responsive rules, selector coverage, opaque fallback, reduced transparency, reduced motion and forced colors. Translucent hover is enabled only with filter support; reduced-transparency and forced-color hover remain opaque. These preference fallbacks were source-reviewed, not browser-emulated.
 
-Conservative token calculations over black/white backdrops give muted material-text contrast of at least 4.81:1 light and 5.43:1 dark. Accent material text is at least 5.06:1 and 6.31:1; primary action labels are 6.00:1 and 8.99:1. The current navigation tint is tighter (4.55:1 light, 5.25:1 dark), so its accent text override must remain. These calculations and browser checks are not a full accessibility audit.
+For the revised transparent material, conservative navigation checks over black/white backdrops give muted-label contrast of 5.96:1 light and 4.69:1 dark. Active blue navigation labels are 4.96:1 and 4.75:1 with the quieter 4% tint. The dedicated navigation colors must remain when changing its fill opacity.
+
+Stationary card checks cover this site's neutral page backgrounds and the full 8% accent ambient wash, including hover. Muted card labels are at least 5.23:1 light and 6.52:1 dark; blue card links are at least 5.33:1 and 7.13:1. These card bounds do not cover arbitrary black/white imagery behind the cards. Primary action-label contrast remains 6.00:1 and 8.99:1. These calculations and browser checks are not a full accessibility audit.
