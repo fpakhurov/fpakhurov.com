@@ -20,13 +20,13 @@ export const courses = {
     shortTitle: 'Generative Models',
     description: 'Probability, latent variables and the main families of modern generative models.',
     sections: [
-      { title: 'Foundations', topics: ['Probability review', 'Maximum likelihood', 'Latent variables', 'Divergences'] },
+      { title: 'Foundations', topics: ['Autoencoders', 'Probability review', 'Gaussian distributions', 'Entropy and divergences', 'Neural training background', 'Fitting distributions with KL', 'Maximum likelihood', 'Latent variables'] },
       { title: 'Autoregressive Models', topics: ['Factorization', 'PixelRNN / PixelCNN', 'Autoregressive transformers'] },
       { title: 'Variational Autoencoders', topics: ['Latent-variable models', 'ELBO', 'Reparameterization trick', 'VAE variants'] },
-      { title: 'GANs', topics: ['Adversarial training', 'GAN objective', 'Training instability', 'GAN variants'] },
-      { title: 'Normalizing Flows', topics: ['Change of variables', 'Invertible transformations', 'Flow architectures'] },
-      { title: 'Diffusion Models', topics: ['Forward process', 'Reverse process', 'DDPM', 'Score matching', 'Sampling', 'Latent diffusion'] },
-      { title: 'Evaluation', topics: ['Likelihood', 'FID', 'Precision / Recall', 'Human evaluation', 'Hallucination analysis'] },
+      { title: 'GANs', topics: ['Adversarial training', 'GAN objective', 'Wasserstein GAN', 'Training instability', 'GAN variants'] },
+      { title: 'Normalizing Flows', topics: ['Normalizing flows', 'Change of variables', 'Invertible transformations', 'Flow architectures'] },
+      { title: 'Diffusion Models', topics: ['Diffusion: forward process', 'Diffusion: reverse process', 'Diffusion: noise prediction', 'DDPM', 'Score matching', 'Sampling', 'Latent diffusion'] },
+      { title: 'Evaluation', topics: ['Likelihood', 'Inception Score', 'FID', 'LPIPS', 'Precision / Recall', 'Human evaluation', 'Hallucination analysis'] },
     ],
   },
 } as const;

@@ -1,0 +1,255 @@
+---
+title: Flow architectures
+description: Coupling layers, autoregressive masks and invertible channel mixing make flow likelihoods practical.
+course: generative-models
+section: Normalizing Flows
+order: 13
+status: published
+tags: [normalizing-flows, NICE, RealNVP, MAF, IAF, Glow, coupling, autoregressive]
+prerequisites: [Normalizing flows, Neural networks, Backpropagation]
+---
+
+import FlowCoupling from '../../../components/notes/FlowCoupling.astro';
+import FlowAutoregressive from '../../../components/notes/FlowAutoregressive.astro';
+import FlowGlow from '../../../components/notes/FlowGlow.astro';
+
+The change-of-variables formula gives an exact flow density, but a generic neural network is difficult to invert and its Jacobian determinant is expensive to compute. Coupling, autoregressive layers and invertible channel mixing build those operations into the architecture.
+
+The [normalizing-flows note](/notes/generative-models/normalizing-flows) uses $f:z\mapsto x$ for generation and $g=f^{-1}:x\mapsto z$ for density evaluation. Below, $h:u\mapsto v$ denotes one layer in its stated direction. Its log-determinant changes sign when we reverse that layer.
+
+## Triangular structure makes the determinant simple
+
+For a triangular $d\times d$ Jacobian,
+
+$$
+\det J_h(u)=\prod_{i=1}^{d}(J_h(u))_{ii},
+\qquad
+\log|\det J_h(u)|=\sum_{i=1}^{d}\log|(J_h(u))_{ii}|.
+$$
+
+Once the diagonal entries are available, this reduction costs $O(d)$ rather than the usual $O(d^3)$ factorization of a dense matrix. It does not mean that the entire neural-network evaluation costs $O(d)$, or that we should construct the full Jacobian. The layer designs below give the diagonal directly.
+
+Triangularity also does not, by itself, guarantee invertibility. The coordinate transformations must be invertible, with nonzero diagonal derivatives where the density formula is used.
+
+## Affine coupling: transform one part using the other
+
+Split the input into two groups, $u=(u_a,u_b)$. Leave the first group unchanged and use it to predict the second group's scale and translation:
+
+$$
+v_a=u_a,
+\qquad
+v_b=u_b\odot\exp(s(u_a))+t(u_a).
+$$
+
+The functions $s$ and $t$ can be ordinary neural networks. Exponentiation and multiplication are elementwise. Crucially, $s$ and $t$ depend on $u_a$, which passes through unchanged, rather than on the coordinates $u_b$ being transformed.
+
+The Jacobian has the block form drawn in the scan:
+
+$$
+J_h(u)=
+\begin{bmatrix}
+I & 0\\
+\displaystyle\frac{\partial v_b}{\partial u_a}
+&\operatorname{diag}\!\left(\exp(s(u_a))\right)
+\end{bmatrix}.
+$$
+
+Its lower-left block can be complicated. It does not contribute to the determinant:
+
+$$
+\det J_h(u)=\prod_j e^{s_j(u_a)},
+\qquad
+\log|\det J_h(u)|=\sum_j s_j(u_a).
+$$
+
+To invert, recover the unchanged group first:
+
+$$
+u_a=v_a,
+\qquad
+u_b=\bigl(v_b-t(v_a)\bigr)\odot\exp(-s(v_a)).
+$$
+
+We evaluate the same scale and translation networks on $v_a$; we do not invert those networks. Both directions can transform all coordinates in group $b$ in parallel. This is the affine coupling construction of [Real NVP, sections 3.2–3.3](https://arxiv.org/html/1605.08803v3#S3.SS2).
+
+<FlowCoupling />
+
+<aside class="callout"><strong>Numerical qualification.</strong> Finite real log scales produce strictly positive scales in exact arithmetic. Extremely large or small predicted scales can still overflow, underflow or amplify inversion errors. A tractable determinant is not a guarantee of good numerical conditioning.</aside>
+
+## NICE, alternating splits and permutations
+
+An additive coupling layer sets the log scale to zero:
+
+$$
+v_a=u_a,
+\qquad v_b=u_b+t(u_a),
+\qquad \log|\det J_h|=0.
+$$
+
+It preserves volume, even though the translation can bend the distribution nonlinearly. **NICE** uses additive coupling layers and a separate learned diagonal scaling layer, so its complete transform need not preserve volume. This distinction comes from [NICE, sections 3.2–3.3](https://arxiv.org/html/1410.8516v6#S3.SS2); the scan names NICE alongside Real NVP but writes the latter's affine formula.
+
+One coupling layer leaves group $a$ unchanged. Stack layers that exchange the groups, change the masks or mix coordinates between layers, so later transformations can update every coordinate. For images, a mask can select channels or alternate spatial locations.
+
+A fixed permutation $v=Pu$ is easy to reverse. Its determinant is $+1$ or $-1$, so
+
+$$
+\log|\det P|=0.
+$$
+
+It changes which coordinates can influence a later coupling layer without adding a volume correction. The determinant's absolute value is essential: a permutation can reverse orientation while remaining a valid flow layer.
+
+## Autoregressive layers: depend only on earlier coordinates
+
+Page 36 gives the dependency pattern
+
+$$
+v_i=h_i(u_1,\ldots,u_i).
+$$
+
+There is no dependence on $u_j$ for $j>i$, hence
+
+$$
+\frac{\partial v_i}{\partial u_j}=0\quad(j>i).
+$$
+
+This makes the Jacobian lower triangular. Its diagonal is $\partial h_i/\partial u_i$, and the determinant is again their product.
+
+A useful invertible version is affine in the current coordinate:
+
+$$
+v_i=\mu_i(u_{<i})+e^{\alpha_i(u_{<i})}u_i,
+\qquad
+\log|\det J_h(u)|=\sum_i\alpha_i(u_{<i}).
+$$
+
+Here $u_{<i}=(u_1,\ldots,u_{i-1})$. The scale and translation depend strictly on earlier coordinates; $u_i$ enters through an invertible affine transformation. Recovery proceeds in order: recover $u_1$, then use it to recover $u_2$, and continue.
+
+<aside class="callout"><strong>Editorial clarification.</strong> The generic dependency formula in the scan establishes triangularity, but an arbitrary $h_i$ can still collapse its current coordinate or be many-to-one. The positive-scale affine form supplies the additional invertibility needed by these flow layers.</aside>
+
+## Masks enforce the dependency pattern
+
+The handwritten masked-weight operation is
+
+$$
+r=(W\odot M)u+b,
+$$
+
+where $M$ is a fixed binary mask. Setting a weight to zero removes that edge from the network's dependency graph. Masks across successive layers must ensure that the parameters for coordinate $i$ cannot see input $i$ or any later input.
+
+One degree-based convention gives input coordinate $j$ degree $j$, and assigns each hidden unit a degree $m$. A connection from a hidden unit of degree $m_{\mathrm{in}}$ to one of degree $m_{\mathrm{out}}$ is allowed when
+
+$$
+m_{\mathrm{in}}\le m_{\mathrm{out}}.
+$$
+
+For the final output predicting $\mu_i$ or $\alpha_i$, the condition is stricter:
+
+$$
+m_{\mathrm{in}}<i.
+$$
+
+This yields the required dependence on $u_{<i}$. The scale then multiplies $u_i$ outside the masked parameter network. The rule follows [MADE, section 4](https://proceedings.mlr.press/v37/germain15.pdf).
+
+<aside class="callout"><strong>Editorial clarification.</strong> Page 36 writes one non-strict degree inequality. It is suitable between hidden layers under this degree convention; the parameter outputs need the strict inequality to exclude their own coordinate. A triangular weight matrix alone does not describe every layer of a MADE network.</aside>
+
+## MAF and IAF put the fast direction on different sides
+
+An autoregressive dependency graph permits a simple determinant, but one direction may require a sequence of coordinate recoveries. **Masked Autoregressive Flow (MAF)** and **Inverse Autoregressive Flow (IAF)** make different choices about that direction.
+
+For a MAF density layer, define
+
+$$
+z_i=g_i(x)
+=\bigl(x_i-\mu_i(x_{<i})\bigr)e^{-\alpha_i(x_{<i})}.
+$$
+
+All coordinates of an observed $x$ are known. A masked network computes every $\mu_i$ and $\alpha_i$ in one pass, and the coordinates of $z$ are then obtained in parallel:
+
+$$
+\log|\det J_g(x)|=-\sum_i\alpha_i(x_{<i}).
+$$
+
+Generation reverses this transformation:
+
+$$
+x_i=\mu_i(x_{<i})+e^{\alpha_i(x_{<i})}z_i.
+$$
+
+The earlier generated coordinates $x_{<i}$ are not known in advance, so standard generation proceeds sequentially over coordinates. See [MAF, section 3.1](https://arxiv.org/html/1705.07057v4#S3.SS1).
+
+An IAF generation layer instead predicts its parameters from the already known noise coordinates:
+
+$$
+x_i=f_i(z)
+=\mu_i(z_{<i})+e^{\alpha_i(z_{<i})}z_i.
+$$
+
+All of $z$ is supplied, so sampling and its log-determinant are computed in parallel. Recovering $z$ from an arbitrary external $x$ requires the sequential inverse. IAF was introduced for flexible variational posteriors, where drawing samples and evaluating the density of those same samples are central operations. See the [original IAF paper, section 3](https://arxiv.org/pdf/1606.04934).
+
+<FlowAutoregressive />
+
+| Layer family | Density of an arbitrary observed $x$ | Generation from known noise $z$ |
+| --- | --- | --- |
+| Additive or affine coupling | Parallel within each layer | Parallel within each layer |
+| MAF | One masked-network pass per layer | Sequential over coordinates |
+| IAF | Sequential inverse over coordinates | One masked-network pass per layer |
+
+Layers themselves are composed in sequence. “Parallel” here concerns coordinates within a layer. IAF can also compute the density of its own generated sample cheaply because its generating noise and volume corrections are already available; the expensive case is a new externally supplied $x$.
+
+If a model is conditional, an external condition $c$ can enter the parameter networks while being held fixed during the transformation. Invertibility is then required in $x$ and $z$ for each fixed $c$. Conditional generation is an architectural extension, rather than an automatic consequence of triangularity.
+
+## Glow learns how to mix channels
+
+The scan's third construction is Glow's invertible $1\times1$ convolution. At each spatial position $(r,c)$, let $u_{r,c}$ be the vector of channel values. A shared square matrix mixes them:
+
+$$
+v_{r,c}=\mathbf W u_{r,c},
+\qquad
+u_{r,c}=\mathbf W^{-1}v_{r,c}.
+$$
+
+For a tensor with $H\times W$ spatial positions, the full Jacobian repeats this matrix, giving
+
+$$
+\log|\det J_h|=HW\log|\det\mathbf W|.
+$$
+
+The weight matrix must be nonsingular. This operation generalizes a fixed channel permutation: it learns linear combinations rather than only reordering channels.
+
+### LU parameterization
+
+Page 37 writes $\mathbf W=LU$, sketches a unit-diagonal $L$ and simplifies the determinant to the diagonal of the upper factor. Glow makes the parameterization explicit:
+
+$$
+\mathbf W=P L\bigl(U+\operatorname{diag}(a)\bigr),
+$$
+
+with a fixed permutation $P$, unit-diagonal lower-triangular $L$, strictly upper-triangular $U$ and nonzero diagonal entries $a_i$. Therefore
+
+$$
+\log|\det\mathbf W|=\sum_i\log|a_i|.
+$$
+
+For example, use $a_i=\operatorname{sign}(a_i^{(0)})e^{\rho_i}$ with fixed nonzero signs and learned real $\rho_i$. Then the diagonal cannot become zero in exact arithmetic, and the sum is simply $\sum_i\rho_i$.
+
+<aside class="callout"><strong>Editorial correction.</strong> The scan omits the absolute value inside $\log U_{ii}$; signed upper diagonals require $\log|U_{ii}|$. Its unit-diagonal $L$ contributes zero. With a general lower-triangular factor, the log absolute diagonals of that factor would also contribute. The fixed permutation and explicit nonzero diagonal parameterization above expand the source sketch; a permutation has zero log absolute determinant.</aside>
+
+Reducing the determinant to a diagonal sum avoids a fresh dense determinant calculation. Applying the channel-mixing matrix still has its own computational cost.
+
+### One complete Glow step
+
+A Glow step combines **ActNorm**, **invertible channel mixing** and **affine coupling**. ActNorm applies a trainable per-channel scale and bias, initialized from a data minibatch. After initialization, those are ordinary learned parameters; normalization statistics are not recomputed for each input. Its scales must remain nonzero.
+
+<FlowGlow />
+
+The ActNorm context, spatial determinant multiplier and precise LU structure expand the brief Glow heading in the scan. They follow [Glow, section 3 and table 1](https://arxiv.org/html/1807.03039v2#S3).
+
+## Seminar notebook
+
+The associated [normalizing-flows notebook](https://github.com/HSE-LAMBDA/DeepGenerativeModels/blob/42dd64b535f5bedf1d2b3db28f2f21ce96c9f09f/seminars/09_Normalizing-Flows/nf.ipynb) is supplementary implementation context. Its flow setup uses spline coupling rather than the affine coupling written above, alongside ActNorm and invertible $1\times1$ convolutions. The [normalizing-flows note](/notes/generative-models/normalizing-flows#seminar-notebook) records the inspected notebook cells, direction convention and density-plot qualification.
+
+## Source
+
+Edited from *Gen Models Seminars (1).pdf*, the coupling-layer section at the bottom of page 35, page 36 and page 37. The figures redraw the coupling split, annotate autoregressive direction costs and expand the channel-mixing sketch into a Glow step. They illustrate architecture and exact algebra, rather than measured training outcomes.
+
+Explicit additions include the coupling inverse, additive NICE distinction, output-mask inequality, MAF/IAF operation comparison and Glow's full LU parameterization. Triangularity is separated from invertibility and numerical conditioning. The source's broad claim that enough layers can model arbitrarily complicated densities is qualified in the preceding [normalizing-flows note](/notes/generative-models/normalizing-flows).
