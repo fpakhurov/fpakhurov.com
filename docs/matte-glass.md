@@ -88,7 +88,7 @@ Opaque surfaces provide the baseline. Browsers that support backdrop filtering m
 
 ## Completed validation
 
-- `npm run build`: 63 Astro files checked, zero errors, warnings or hints; 35 static pages built.
+- `npm run build`: 64 Astro files checked, zero errors, warnings or hints; 35 static pages built.
 - Browser review covered the homepage, work, projects, notes index, Generative Models overview, VAE and neural-training articles, CV, contact, about, Russian home/work and the 404 page at 1280px and 390px. Reviewed routes had no horizontal page overflow.
 - The light palette was also reviewed from a temporary local copy of the production build with only its dark-mode media rules disabled. The main preview was reviewed in the available dark and light appearances. No theme override or fixture is shipped.
 - At 600px, 900px and 1280px, Systems labels fit their panels and header content stays within its surface. At 390px the chain follows a vertical sequence. Section targets clear the sticky header, including their metadata.
