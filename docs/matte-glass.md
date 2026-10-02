@@ -14,11 +14,13 @@ This document replaces the earlier material-only glass treatment. Typography, sp
 | Primary text | Near-black | Neutral near-white | Headings, prose and control labels. |
 | Secondary text | Muted neutral | Muted light neutral | Descriptions and supporting labels. |
 | Accent | Restrained blue | Lighter blue | Links, current items, focus and diagram emphasis. |
-| Ambient wash | Faint blue tint | Faint blue tint | A broad background cue that stays behind content. |
+| Ambient wash | Faint blue tint | Quiet warm sand with faint blue | A broad background cue that stays behind content. |
 
 Use the existing semantic color tokens (`--paper`, `--paper-strong`, `--ink`, `--muted`, `--line`, `--accent`, `--accent-ink` and `--code`) for content. All tokens, component rules, page geometry and responsive fallbacks live together in `src/styles/global.css`. There is no second material stylesheet overriding an earlier design. `--surface-*` tokens describe frosted fills, opaque fallbacks, borders, shadows and blur; `--action` and `--action-ink` define primary controls.
 
-The palette uses balanced grays without a green countertone. Cards use a 68% neutral fill in both themes; floating navigation uses 84% in light mode and 86% in dark mode so it remains readable over scrolling content. Navigation has dedicated stronger label and blue-link colors. A fine border and soft shadow define the glass, with 24px backdrop blur on desktop and 18px on small screens. There is no directional reflection gradient; the inner edge highlight is restrained (16% white in light mode, 2.5% in dark mode). Prose, mathematical notation and diagrams remain on unblurred reading surfaces. The background wash must stay subtle enough that it does not become the strongest element on a page.
+The dark palette uses equal-channel graphite: `#1b1b1b` for the page and `#262626` for glass fills, so neither introduces a violet or red cast. Blue accents remain `#a5baff`, with `#aec2ff` for primary actions. Blue's warm complement appears only as diffuse sand light (`#c6b18a` at 4.5% maximum opacity), alongside a quieter 2.5% blue wash. The light palette is unchanged. `--ambient-wash` holds these theme-specific background layers.
+
+Cards use a 68% neutral fill in both themes; floating navigation uses 84% in light mode and 86% in dark mode so it remains readable over scrolling content. Navigation has dedicated stronger label and blue-link colors. A fine border and soft shadow define the glass, with 24px backdrop blur on desktop and 18px on small screens. There is no directional reflection gradient; the inner edge highlight is restrained (16% white in light mode, 2.5% in dark mode). Prose, mathematical notation and diagrams remain on unblurred reading surfaces. The background wash must stay subtle enough that it does not become the strongest element on a page.
 
 Featured cards use an accent border within the same matte material. The solid accent fill is reserved for primary actions.
 
@@ -59,7 +61,7 @@ Lists and course rows should feel related to cards without adding a large panel 
 | --- | --- |
 | Header and mobile menu | Floating matte navigation panel. Keep clear active states, visible focus and usable menu spacing. |
 | Selected-work and course cards | Separate rounded surfaces with a balanced title, description and action. Featured cards use an accent border. |
-| Project and syllabus lists | Rounded rows, consistent gaps, and a clear distinction between navigable and planned items. |
+| Project and syllabus lists | Rounded rows, consistent gaps, and a clear distinction between navigable and planned items. The course plan is the only overview list; published topics explicitly link to article IDs and section anchors. |
 | Article navigation | Course rail and table of contents share the navigation material. Long rails scroll independently; anchor targets clear the sticky header. |
 | Reading components | Unblurred prose and mathematics, rounded callouts and figures, and matching previous/next panels. |
 | Systems chain | One reusable component for the existing AI transformation sequence on the homepage and work page. |
@@ -96,6 +98,8 @@ Opaque surfaces provide the baseline. Browsers that support backdrop filtering m
 - The neutral/material refinement was checked at 1280px and 390px: card fill is 68%, navigation uses its denser fill, both have no reflection image, and blur measures 24px desktop / 18px mobile. The native menu opens with Enter and remains within the mobile viewport. Light and dark neutral appearances were visually reviewed.
 - Independent source review covered responsive rules, selector coverage, opaque fallback, reduced transparency, reduced motion and forced colors. Translucent hover is enabled only with filter support; reduced-transparency and forced-color hover remain opaque. These preference fallbacks were source-reviewed, not browser-emulated.
 
-For the revised transparent material, conservative navigation checks over black/white backdrops give muted-label contrast of 5.96:1 light and 4.69:1 dark. Active blue navigation labels are 4.96:1 and 4.75:1 with the quieter 4% tint. The dedicated navigation colors must remain when changing its fill opacity.
+The 2026-10-02 refinement has passed a production build and static route/fragment checks. Every published note is represented in the course plan (16 Generative Models notes and two NLP notes). The redundant Published notes list is removed, and the VAE and DDPM derivations have direct topic links. Build-time guards reject missing referenced articles and published articles omitted from the plan. A fresh browser visual check was blocked by an unavailable administrative-policy check; the earlier browser review above predates this palette and navigation refinement.
 
-Stationary card checks cover this site's neutral page backgrounds and the full 8% accent ambient wash, including hover. Muted card labels are at least 5.23:1 light and 6.52:1 dark; blue card links are at least 5.33:1 and 7.13:1. These card bounds do not cover arbitrary black/white imagery behind the cards. Primary action-label contrast remains 6.00:1 and 8.99:1. These calculations and browser checks are not a full accessibility audit.
+For the current transparent material, conservative navigation checks over black/white backdrops give muted-label contrast of 5.96:1 light and 4.72:1 dark. Active blue navigation labels are 4.96:1 and 4.74:1 with the quieter 4% tint. The dedicated navigation colors must remain when changing its fill opacity.
+
+Stationary card checks cover this site's neutral page backgrounds and ambient washes, including hover. The dark bound conservatively combines both washes at maximum opacity. Muted card labels are at least 5.23:1 light and 6.60:1 dark; blue card links are at least 5.33:1 and 7.13:1. These card bounds do not cover arbitrary black/white imagery behind the cards. Primary action-label contrast remains 6.00:1 and 8.99:1. These calculations and browser checks are not a full accessibility audit.

@@ -559,7 +559,7 @@ Do not publish these directories automatically.
 
 The current direction is **Research studio**: a coherent visual system for applied AI work, research and teaching. This supersedes the earlier serif-led editorial treatment and the blanket prohibition on glass surfaces.
 
-Use balanced neutral gray light-mode surfaces and graphite dark-mode surfaces, with a faint blue ambient wash and no green countertone. Navigation and cards use translucent matte frosted fills, fine borders and soft shadows. Cards use 68% fills; floating navigation uses 84% light and 86% dark fills with dedicated readable label colors. Glass has diffuse blur and a subtle edge, without directional reflection gradients. Prose, equations, code and figures stay on unblurred reading surfaces.
+Use balanced neutral gray light-mode surfaces and neutral graphite dark-mode surfaces. Keep the light theme's faint blue wash; in the dark theme, pair blue accents with very quiet warm sand ambient light. The dark page and glass fills have equal RGB channels to prevent a violet or red cast. Navigation and cards use translucent matte frosted fills, fine borders and soft shadows. Cards use 68% fills; floating navigation uses 84% light and 86% dark fills with dedicated readable label colors. Glass has diffuse blur and a subtle edge, without directional reflection gradients. Prose, equations, code and figures stay on unblurred reading surfaces.
 
 Typography:
 
