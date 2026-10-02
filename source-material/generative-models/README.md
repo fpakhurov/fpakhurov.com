@@ -18,9 +18,11 @@ The presenter identified [HSE-LAMBDA/DeepGenerativeModels](https://github.com/HS
 
 Seven batches reorganize the foundations, training background, evaluation, adversarial-model, VAE, normalizing-flow and DDPM material into sixteen English topic notes. All 44 source pages have been visually inspected. The readable technical blocks are represented in the topic map below; presenter logistics are retained separately.
 
+A fresh [page-by-page coverage audit](coverage.md), dated 2026-10-02, checks the source against the actual articles and figures. It distinguishes material already present, small omissions restored during the audit, presenter logistics and undeveloped future headings. The complete VAE/ELBO derivation was already present; the course overview's title-matching navigation incorrectly labeled its subtopics Planned.
+
 | Topic | Source pages | Contents and boundary | Progress |
 | --- | --- | --- | --- |
-| [Autoencoders](../../src/content/notes/generative-models/autoencoders.mdx) | 1, 12 (MSE scale remark), 13 | Representation, reconstruction, bottleneck, MSE, denoising, sparsity, ReLU/sigmoid; page 13's BatchNorm fragment belongs to the next background topic. | Transcribed and technically reviewed |
+| [Autoencoders](../../src/content/notes/generative-models/autoencoders.mdx) | 1, 13 | Representation, reconstruction, bottleneck, MSE, denoising, sparsity, ReLU/sigmoid; page 13's BatchNorm fragment belongs to the next background topic. | Transcribed and technically reviewed |
 | [Gaussian distributions](../../src/content/notes/generative-models/gaussian-distributions.mdx) | 2-4 | Mean, covariance, bivariate density, spectral factor and affine sampling; ends at the printed slide on page 4. | Transcribed and technically reviewed |
 | [Entropy and divergences](../../src/content/notes/generative-models/entropy-and-divergences.mdx) | 4-12 | Begins below the slide on page 4; surprise, entropy, cross-entropy, KL, fitting objective, support, JS. | Transcribed and technically reviewed |
 | [Neural training background](../../src/content/notes/generative-models/neural-training-background.mdx) | 13-15 | BatchNorm: bottom 13 to top 14; gradients: 14; convolution aside: middle 15, excluding adjacent metric recaps. | Transcribed and technically reviewed |
@@ -28,7 +30,7 @@ Seven batches reorganize the foundations, training background, evaluation, adver
 | [Fréchet Inception Distance (FID)](../../src/content/notes/generative-models/fid.mdx) | 17-18 | Formula at bottom 17; covariance, Gaussian/Wasserstein interpretation and limitations in upper/middle 18. | Transcribed and technically reviewed |
 | [LPIPS](../../src/content/notes/generative-models/lpips.mdx) | 18-19 | Begins below divider on 18; feature extraction, normalization, weighted differences, interpretation, limits and uses; ends before KL questions on 19. | Transcribed and technically reviewed |
 | [Fitting distributions with KL](../../src/content/notes/generative-models/fitting-distributions.mdx) | 19-20 | Begins below LPIPS; trainable parameters, density evaluations, backward/optimizer steps and support. Notebook-supplied covariance parameterization and log-space NLL example. | Transcribed and technically reviewed |
-| [GAN objective](../../src/content/notes/generative-models/gan-objective.mdx) | 21-25 | Minimax objective, BCE, optimal discriminator, JS/global optimum, non-saturating generator loss; includes only very top of 25. Conditional GAN and f-GAN expansions are attributed to the notebook and primary references. | Transcribed and technically reviewed |
+| [GAN objective](../../src/content/notes/generative-models/gan-objective.mdx) | 21-25 | Minimax objective, BCE, optimal discriminator, JS/global optimum and the opening non-saturating-loss remark on 25; also includes that page's Fenchel-conjugate geometry reminder. Conditional GAN and f-GAN expansions are attributed to the notebook and primary references. | Transcribed and technically reviewed |
 | [Wasserstein GAN](../../src/content/notes/generative-models/wgan.mdx) | 25 | Middle of page: Wasserstein losses, gradient penalty, spectral normalization; ends before “week 4-5.” Notebook and primary papers supply transport/dual definitions and training context. | Transcribed and technically reviewed |
 | [Variational autoencoders](../../src/content/notes/generative-models/vae.mdx) | 25-31 | Begins at bottom 25: classical AE generation problem, Bayesian recap, prior/posterior, ELBO, reparameterization, Gaussian KL, log variance; ends at first line of 31. Notebook beta-VAE context is attributed separately. | Transcribed and technically reviewed |
 | [Normalizing flows](../../src/content/notes/generative-models/normalizing-flows.mdx) | 31-35 | Begins below divider 31; change of variables, exact likelihood, invertibility, local volume scaling, triangular Jacobians; coupling starts lower 35. | Transcribed and technically reviewed |
@@ -98,7 +100,7 @@ The articles are edited transcriptions, not literal OCR dumps. Equations and leg
 
 ## Sketches and visual explanations
 
-The sixteen transcribed notes include thirty-seven vector figures with English annotations and explanatory arrows:
+The sixteen transcribed notes include thirty-eight vector figures with English annotations and explanatory arrows:
 
 | Note | Figures | Source relationship |
 | --- | --- | --- |
@@ -116,7 +118,7 @@ The sixteen transcribed notes include thirty-seven vector figures with English a
 | Normalizing flows | Generation versus density direction and a layer chain; square scaling and reflection; triangular Jacobian and coordinate dependencies. | Redraws pages 31-35 with an exact toy shear, area factors and triangular-matrix example. Dots are illustrative, not learned embeddings. |
 | Flow architectures | Coupling split and conditioner; autoregressive dependencies and MAF/IAF direction costs; invertible channel mixing and LU/Glow step. | Expands pages 35-37's algebra and sketches, with primary-paper architecture context. These are construction diagrams, not notebook training outputs. |
 | DDPM forward process | Sequential noising versus a direct chosen-timestep draw; exact Gaussian-mixture marginals approaching a normal reference. | Reconstructs pages 38-40's chain and density sketches. The mixture and noise levels are exact illustrative choices, separate from the notebook's configured schedule. |
-| DDPM reverse process | Conditioned training posterior versus generation inputs; endpoint-separated bound and Gaussian mean matching. | Expands pages 40-43's arrows and Gaussian drawings with corrected conditioning, signs and endpoint terms. No quantitative losses are plotted. |
+| DDPM reverse process | Conditioned training posterior versus generation inputs; many latent trajectories for one observation; endpoint-separated bound and Gaussian mean matching. | Reconstructs page 41's paths and expands pages 40-43's arrows and Gaussian drawings with corrected conditioning, signs and endpoint terms. No quantitative losses are plotted. |
 | DDPM noise prediction | Construct a noisy input and retain the noise target; predict noise, form a mean and take a stochastic reverse step. | Reconstructs page 44's learning argument and adds original-paper sampling context. These are algorithm diagrams, not generated samples. |
 
 Figures are built from SVG and mathematical coordinates, with accessible titles/descriptions. Their layouts adapt to the figure width: narrow flow diagrams become vertical, and adjacent plots stack. The shared `src/components/notes/NoteFigure.astro` wrapper supplies captions and stable figure anchors. Source attribution remains in each note.
@@ -125,7 +127,7 @@ Figures are built from SVG and mathematical coordinates, with accessible titles/
 
 Page 2 contains notebook setup notes: Black and pre-commit formatting, Matplotlib styles, `%matplotlib inline`, `torch.distributions`, a distribution wrapper, `requires_grad` and a `plot_2d_dots` helper. The associated `distances.ipynb` supplies the scatter helper, Gaussian parameterization and sampling context; see the [notebook map](notebooks.md). The literal historical wrapper class and Black/pre-commit setup remain unconfirmed. These presenter remarks are preserved in the archived scan and context map; they are not converted into invented setup instructions.
 
-The final MSE scale remark on page 12 is included in the autoencoder note. BatchNorm fragments on pages 13-14 and the convolution aside on page 15 are included in neural training background. The Gaussian/KL fitting discussion on pages 19-20 has a separate practical note linked from the foundations syllabus.
+The final MSE scale remark on page 12 concerns comparing evaluated distribution densities; it is included in the entropy/divergences note, alongside the KL/JS discussion. BatchNorm fragments on pages 13-14 and the convolution aside on page 15 are included in neural training background. The Gaussian/KL fitting discussion on pages 19-20 has a separate practical note linked from the foundations syllabus.
 
 ## Coverage
 
