@@ -557,35 +557,24 @@ Do not publish these directories automatically.
 
 # 14. Design
 
-Direction:
+The current direction is **Research studio**: a coherent visual system for applied AI work, research and teaching. This supersedes the earlier serif-led editorial treatment and the blanket prohibition on glass surfaces.
 
-* minimal;
-* technical;
-* editorial;
-* typography-focused;
-* restrained;
-* high information density without visual clutter.
+Use balanced neutral gray light-mode surfaces and neutral graphite dark-mode surfaces. Keep the light theme's faint blue wash; in the dark theme, pair blue accents with very quiet warm sand ambient light. The dark page and glass fills have equal RGB channels to prevent a violet or red cast. Navigation and cards use translucent matte frosted fills, fine borders and soft shadows. Cards use 68% fills; floating navigation uses 84% light and 86% dark fills with dedicated readable label colors. Glass has diffuse blur and a subtle edge, without directional reflection gradients. Prose, equations, code and figures stay on unblurred reading surfaces.
 
-Avoid:
+Typography:
 
-* résumé-template aesthetics;
-* gradients everywhere;
-* glassmorphism;
-* excessive animations;
-* stock illustrations;
-* generic AI imagery;
-* glowing neural-network graphics.
+* system rounded sans for display and section headings, with a system sans fallback;
+* comfortable heading line-height around 1.08–1.16;
+* 17px sans reading text with 1.75 line-height, 16px on small screens;
+* monospace for numbers and code.
 
-Prefer:
+Use a shared radius scale: 12px for small elements, 20px for panels, 28px for feature surfaces and 999px for pill controls. Buttons have compact content-sized widths and a 48px target height. Selected work, course cards, project rows, syllabus items, callouts, figures and pagination share this shape and spacing language.
 
-* large clean typography;
-* subtle borders;
-* monospace for metadata;
-* diagrams;
-* equations;
-* generous whitespace.
+The AI transformation sequence uses one shared systems-chain component on the homepage and work page. Group its existing steps as **Foundation** (Paper, Digitalization, Decision history, Business rules), **Delivery** (Dataset, ML, MLOps, Infrastructure) and **Agency** (LLM, Agents). Preserve sequential arrows and use a vertical flow on mobile.
 
-Support light and dark mode.
+Keep the site's technical character through clear diagrams, equations and useful hierarchy. Use restrained interaction feedback, visible keyboard focus and opaque surface fallbacks. Support light/dark mode, reduced transparency and reduced motion across the whole system.
+
+The component rules, surface roles and completed validation checks are documented in [the Research studio design system](docs/matte-glass.md). Implementation and visual review should follow that document; completed verification must be recorded separately from the design direction.
 
 ---
 
