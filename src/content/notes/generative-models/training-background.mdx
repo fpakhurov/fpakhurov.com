@@ -1,0 +1,190 @@
+---
+title: Batch normalization, gradients and convolutions
+description: The training machinery behind every neural generative model in the course — batch normalization, the vanishing and exploding gradient problem, and the shapes and parameters of a convolution layer.
+course: generative-models
+section: Foundations
+order: 4
+status: published
+tags: [batch-normalization, vanishing-gradients, exploding-gradients, convolutions, initialization]
+prerequisites: [Neural networks, Backpropagation, Gradient descent]
+---
+
+import BatchNormHistogram from '../../../components/figures/training-background/BatchNormHistogram.astro';
+import RnnUnrolled from '../../../components/figures/training-background/RnnUnrolled.astro';
+import GradientFactor from '../../../components/figures/training-background/GradientFactor.astro';
+import StepSizes from '../../../components/figures/training-background/StepSizes.astro';
+import ConvShapes from '../../../components/figures/training-background/ConvShapes.astro';
+
+The [previous note](/notes/generative-models/fitting-distributions-with-kl) fitted a model with a handful of parameters. From here on the models are neural networks. The [autoencoders](/notes/generative-models/autoencoders) of the next note are built from blocks of *convolution → batch normalization → activation*, and every later model is trained by backpropagating gradients through many such layers. The evaluation metrics later in the course also run images through pretrained convolutional networks. This note collects that background: what batch normalization computes, why gradients can vanish or explode, and how a convolution layer is shaped.
+
+## Batch normalization
+
+Batch normalization ([Ioffe and Szegedy, 2015](#references)) standardizes the activations of a layer using statistics of the current mini-batch. Take one feature (in a convolutional network, one channel) and a mini-batch of $n$ values $x_1, \dots, x_n$ of it. The layer first computes the **batch mean** and **batch variance**
+
+$$
+\mu_B = \frac1n\sum_{i=1}^{n} x_i,
+\qquad
+\sigma_B^2 = \frac1n\sum_{i=1}^{n} \left(x_i - \mu_B\right)^2,
+$$
+
+and then standardizes every value:
+
+$$
+\hat x_i = \frac{x_i - \mu_B}{\sqrt{\sigma_B^2 + \varepsilon}} .
+$$
+
+The small constant $\varepsilon > 0$ (PyTorch uses $10^{-5}$) keeps the division safe when a batch has almost no spread. After this step the batch has mean $0$ and variance $\sigma_B^2/(\sigma_B^2 + \varepsilon) \approx 1$.
+
+<BatchNormHistogram />
+
+**A small worked example.** For the batch $x = (1, 2, 3, 6)$ with $\varepsilon = 10^{-5}$:
+
+| | first | second | third | fourth |
+| --- | --- | --- | --- | --- |
+| $x_i$ | $1$ | $2$ | $3$ | $6$ |
+| $x_i - \mu_B$ | $-2$ | $-1$ | $0$ | $3$ |
+| $\hat x_i$ | $-1.069$ | $-0.535$ | $0$ | $1.604$ |
+
+Here $\mu_B = 12/4 = 3$ and $\sigma_B^2 = (4 + 1 + 0 + 9)/4 = 3.5$, so every centred value is divided by $\sqrt{3.5 + 10^{-5}} \approx 1.871$. The variance divides by $n$, not $n - 1$: it is the plain variance of the batch.
+
+### The rest of the layer
+
+A full batch-norm layer has two learnable parameters per feature, a scale $\gamma$ and a shift $\beta$, and outputs
+
+$$
+y_i = \gamma\,\hat x_i + \beta .
+$$
+
+With $\gamma = \sqrt{\sigma_B^2 + \varepsilon}$ and $\beta = \mu_B$ the layer would reproduce its input, so standardization never removes what the network could otherwise represent; it only changes the parametrization so that the scale of each feature is controlled by one parameter.
+
+Training and inference behave differently. During training the layer uses the batch statistics $\mu_B, \sigma_B^2$ and also keeps running averages of them. In PyTorch, with the default momentum $0.1$, these are $\mu_{\text{run}} \leftarrow 0.9\,\mu_{\text{run}} + 0.1\,\mu_B$ and $\sigma^2_{\text{run}} \leftarrow 0.9\,\sigma^2_{\text{run}} + 0.1\,\tfrac{n}{n-1}\sigma_B^2$; the running variance stores the unbiased estimate. At inference, when a "batch" may be a single image, the running averages are used instead, so the output of one example no longer depends on the other examples in the batch. In PyTorch the switch is `model.eval()`. Turning off gradients with `torch.no_grad()` does *not* switch batch norm to its running statistics.
+
+In a convolutional network, `BatchNorm2d` normalizes each channel over all values of that channel in the batch: batch size × height × width of them. A convolution followed by batch norm is usually created with `bias=False`, because subtracting $\mu_B$ cancels any constant bias, and $\beta$ takes over its role.
+
+Why does it help? The original paper motivated batch norm by reducing "internal covariate shift", the drift of each layer's input distribution during training. Later work found that the main benefit is a smoother loss landscape, which tolerates larger learning rates ([Santurkar et al., 2018](#references)). Either way, it keeps the scale of activations under control, which is exactly the issue of the next section.
+
+## Vanishing and exploding gradients
+
+We train by computing the gradient of the loss with respect to every weight (backpropagation) and stepping against it. By the chain rule, the gradient that reaches an early layer is a **product** of one factor per layer, or per time step, that it passed through. In the simplest picture, one unit per layer, each factor is essentially a weight. For layers with many units the factors are Jacobian matrices, and what matters is their size: the product of many Jacobians tends to grow or shrink geometrically with depth, at a rate set by their singular values ([Pascanu, Mikolov and Bengio, 2013](#references)). So if at initialization the weights are mostly
+
+- $|w_i| \gg 1$, the product grows quickly: **exploding gradients**;
+- $|w_i| \ll 1$, the product shrinks quickly: **vanishing gradients**.
+
+The problem was first analysed for recurrent networks ([Hochreiter, 1991](#references); [Bengio, Simard and Frasconi, 1994](#references)), where it is easiest to see.
+
+### Example: an RNN
+
+A recurrent network applies the *same* weight at every time step. Take a single recurrent unit with a ReLU, $h_t = \operatorname{ReLU}(w\,h_{t-1} + u\,x_t + b)$, and recurrent weight $w = 2$.
+
+<RnnUnrolled />
+
+Along the recurrent path, one step multiplies by $2$, two steps by $4$, three by $8$, and so on. Formally, while the ReLU is in its active region ($\operatorname{ReLU}' = 1$), and with the loss computed only from the last state $h_{k+t}$ (as in Figure 2, where only the last output is used),
+
+$$
+\frac{\partial h_t}{\partial h_{t-1}} = w
+\quad\Longrightarrow\quad
+\frac{\partial h_{k+t}}{\partial h_k} = \prod_{s=k+1}^{k+t} \frac{\partial h_s}{\partial h_{s-1}} = w^{t},
+\qquad
+\frac{\partial L}{\partial h_k} = \frac{\partial L}{\partial h_{k+t}}\; w^{t} .
+$$
+
+The gradient sent back $t$ steps carries the factor $w^t$:
+
+| weight | after 3 steps | after 10 steps | after 50 steps |
+| --- | --- | --- | --- |
+| $w = 2$ | $8$ | $1024$ | $\approx 1.1\cdot 10^{15}$ |
+| $w = 1.1$ | $1.33$ | $2.59$ | $117$ |
+| $w = 1$ | $1$ | $1$ | $1$ |
+| $w = 0.9$ | $0.73$ | $0.35$ | $0.0052$ |
+| $w = 0.5$ | $0.125$ | $\approx 9.8\cdot 10^{-4}$ | $\approx 8.9\cdot 10^{-16}$ |
+
+Even a weight only 10 % away from $1$ changes the gradient by two orders of magnitude over 50 steps.
+
+<GradientFactor />
+
+### What this does to training
+
+A gradient-descent step is $\theta \leftarrow \theta - \eta\,\nabla_\theta L$, so the size of the step is proportional to the gradient.
+
+- **Exploding:** the gradient arrives multiplied by a huge factor, so the update takes a very large step in the loss landscape. Each update overshoots, and the loss jumps around or diverges.
+- **Vanishing:** a deep stack of layers multiplies its input by one weight per layer, and the gradient picks up the same factors. If they are small, the product goes to zero and the steps become tiny: the early weights barely move, and the training budget runs out long before the minimum is reached.
+
+<StepSizes />
+
+### Common remedies
+
+The rest of the course relies on the standard fixes:
+
+- **Initialization** that keeps the scale of signals near 1: Xavier/Glorot initialization for saturating activations ([Glorot and Bengio, 2010](#references)) and He initialization for ReLUs ([He et al., 2015](#references)).
+- **Normalization layers** such as batch norm above.
+- **Non-saturating activations**, ReLU and LeakyReLU instead of sigmoids, whose derivative is at most $\tfrac14$.
+- **Gradient clipping** against explosions ([Pascanu, Mikolov and Bengio, 2013](#references)).
+- **Gated recurrent cells**, LSTM ([Hochreiter and Schmidhuber, 1997](#references)) and GRU, whose additive memory path keeps the factor close to 1.
+- **Residual connections** ([He et al., 2016](#references)), which add an identity path whose factor is exactly 1.
+
+## A convolution layer
+
+How a 2-D convolution layer (`nn.Conv2d`) is parametrized and trained ([Goodfellow, Bengio and Courville, 2016](#references), chapter 9; [Dumoulin and Visin, 2016](#references)):
+
+- **The kernels are trained.** All entries of the weight tensor and the bias are learned by gradient descent:
+
+  $$
+  W \in \mathbb R^{\text{out}_c \times \text{in}_c \times k_H \times k_W},
+  \qquad
+  b \in \mathbb R^{\text{out}_c} .
+  $$
+
+- **Notation.** $\text{in}[c]$ is input channel number $c$, an $H_{\text{in}} \times W_{\text{in}}$ plane (subscripted $W_{\text{in}}, W_{\text{out}}$ are widths; $W$, $W_j$, $W_{j,c}$ are always weights). $W_{j,c}$ is the $k_H \times k_W$ kernel that output channel $j$ applies to input channel $c$. Collected over $c$, $W_j \in \mathbb R^{\text{in}_c \times k_H \times k_W}$ is the **filter** for output channel $j$.
+- **Output channel $j$** sums the per-channel results and adds one scalar bias:
+
+  $$
+  \text{out}[j] = \sum_{c=1}^{\text{in}_c} W_{j,c} \star \text{in}[c] + b_j,
+  \qquad j = 1, \dots, \text{out}_c .
+  $$
+
+  Each $\text{out}[j]$ is an $H_{\text{out}} \times W_{\text{out}}$ plane. There is one bias per output channel, so the bias vector has $\text{out}_c$ entries.
+
+<ConvShapes />
+
+Written out entry by entry for stride $s$ and dilation $d$, the operation $\star$ is a sliding dot product. Deep-learning libraries compute a cross-correlation and do not flip the kernel, unlike the convolution of signal processing; since the kernel is learned, the difference does not matter.
+
+$$
+\text{out}[j]_{y,x} = b_j + \sum_{c=1}^{\text{in}_c}\sum_{m=0}^{k_H-1}\sum_{l=0}^{k_W-1} W_{j,c,m,l}\;\text{in}[c]_{\,s y + d m,\; s x + d l} ,
+$$
+
+where $y = 0, \dots, H_{\text{out}} - 1$, $x = 0, \dots, W_{\text{out}} - 1$, and $\text{in}[c]$ denotes the input after zero-padding by $p$ on each side, indexed from $0$. The formula assumes one group, so every output channel sees every input channel; grouped convolutions restrict these connections.
+
+- **Hyperparameters, not trained:** stride, padding, kernel size and dilation are fixed when the layer is built. They determine the output size ([PyTorch documentation](#references)):
+
+  $$
+  H_{\text{out}} = \left\lfloor \frac{H_{\text{in}} + 2p - d\,(k_H - 1) - 1}{s} \right\rfloor + 1 ,
+  $$
+
+  and the same for $W_{\text{out}}$ with $W_{\text{in}}$ and $k_W$. In the autoencoder of the next note each of the four encoder blocks has $k = 3,\ p = 1,\ s = 2,\ d = 1$, so $H_{\text{out}} = \lfloor (H_{\text{in}} - 1)/2 \rfloor + 1$ halves even sizes: $64 \to 32 \to 16 \to 8 \to 4$.
+- **Initialization.** The kernels start random. Xavier/Glorot initialization draws weights with variance $2/(\text{fan}_{\text{in}} + \text{fan}_{\text{out}})$, where $\text{fan}_{\text{in}} = \text{in}_c\, k_H k_W$ and $\text{fan}_{\text{out}} = \text{out}_c\, k_H k_W$. PyTorch's default for `Conv2d` is a similar fan-based rule, a uniform distribution on $\pm 1/\sqrt{\text{fan}_{\text{in}}}$ (implemented as `kaiming_uniform_` with $a = \sqrt5$). The goal is the one from the previous section: keep signals and gradients from exploding or vanishing.
+- **What the weights learn.** Each kernel becomes a small pattern detector that responds to a line or edge, a spot, or a texture. Deeper layers combine these into larger structures over larger receptive fields ([Zeiler and Fergus, 2014](#references)). This is why pretrained convolutional networks are useful as feature extractors for the [evaluation metrics](/notes/generative-models/inception-score) of the course.
+
+For scale: a layer with $\text{in}_c = 16$, $\text{out}_c = 32$ and $3 \times 3$ kernels has $32 \cdot 16 \cdot 3 \cdot 3 = 4608$ weights plus $32$ biases.
+
+## Notebooks
+
+Two notebooks of the HSE-LAMBDA *Deep Generative Models* repository (pinned commit; cell numbers count every cell from 1) use these pieces.
+
+- The [autoencoder notebook](https://github.com/HSE-LAMBDA/DeepGenerativeModels/blob/42dd64b535f5bedf1d2b3db28f2f21ce96c9f09f/seminars/00_Autoencoders/autoencoders.ipynb), **cell 11**, defines `Block`: `Conv2d(..., bias=False)` → `BatchNorm2d` → `LeakyReLU(0.2)`, kernel 3, padding `(kernel − 1) // 2` and stride 2 in the encoder. Four blocks map a $1 \times 64 \times 64$ MNIST image to $32 \times 4 \times 4$, and a final stride-1 $3\times 3$ convolution keeps that size, giving a 512-dimensional latent. **Cells 17 and 22** switch explicitly between `ae.train()` and `ae.eval()`, so batch norm uses batch statistics while training and running averages while reconstructing test images.
+- The [VAE notebook](https://github.com/HSE-LAMBDA/DeepGenerativeModels/blob/42dd64b535f5bedf1d2b3db28f2f21ce96c9f09f/seminars/06_Variational-Autoencoders/VAE.ipynb), **cells 10 and 12**, orders its blocks as convolution → LeakyReLU → BatchNorm. Its generation code in **cells 18 and 23** wraps sampling in `torch.no_grad()` without calling `eval()`, so batch norm still normalizes with the statistics of the generated batch and keeps updating its running buffers. This is the train/inference distinction from above in practice.
+
+## References
+
+- S. Ioffe, C. Szegedy. [Batch normalization: Accelerating deep network training by reducing internal covariate shift](https://arxiv.org/abs/1502.03167). ICML, 2015.
+- S. Santurkar, D. Tsipras, A. Ilyas, A. Mądry. [How does batch normalization help optimization?](https://arxiv.org/abs/1805.11604) NeurIPS, 2018.
+- S. Hochreiter. *Untersuchungen zu dynamischen neuronalen Netzen*. Diploma thesis, TU München, 1991.
+- Y. Bengio, P. Simard, P. Frasconi. [Learning long-term dependencies with gradient descent is difficult](https://doi.org/10.1109/72.279181). *IEEE Transactions on Neural Networks*, 5(2), 1994.
+- R. Pascanu, T. Mikolov, Y. Bengio. [On the difficulty of training recurrent neural networks](https://arxiv.org/abs/1211.5063). ICML, 2013.
+- S. Hochreiter, J. Schmidhuber. [Long short-term memory](https://doi.org/10.1162/neco.1997.9.8.1735). *Neural Computation*, 9(8), 1997.
+- X. Glorot, Y. Bengio. [Understanding the difficulty of training deep feedforward neural networks](https://proceedings.mlr.press/v9/glorot10a.html). AISTATS, 2010.
+- K. He, X. Zhang, S. Ren, J. Sun. [Delving deep into rectifiers](https://arxiv.org/abs/1502.01852). ICCV, 2015.
+- K. He, X. Zhang, S. Ren, J. Sun. [Deep residual learning for image recognition](https://arxiv.org/abs/1512.03385). CVPR, 2016.
+- M. D. Zeiler, R. Fergus. [Visualizing and understanding convolutional networks](https://arxiv.org/abs/1311.2901). ECCV, 2014.
+- V. Dumoulin, F. Visin. [A guide to convolution arithmetic for deep learning](https://arxiv.org/abs/1603.07285). arXiv:1603.07285, 2016.
+- I. Goodfellow, Y. Bengio, A. Courville. [*Deep Learning*](https://www.deeplearningbook.org/). MIT Press, 2016. Chapter 8 (optimization) and chapter 9 (convolutional networks).
+- PyTorch documentation: [`BatchNorm2d`](https://pytorch.org/docs/stable/generated/torch.nn.BatchNorm2d.html) and [`Conv2d`](https://pytorch.org/docs/stable/generated/torch.nn.Conv2d.html).

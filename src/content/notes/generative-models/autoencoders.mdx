@@ -1,0 +1,207 @@
+---
+title: Autoencoders
+description: Reconstruction as a route to representation — a convolutional autoencoder on MNIST, the reconstruction loss, denoising and sparse variants, and why a plain autoencoder is not yet a generative model.
+course: generative-models
+section: Foundations
+order: 5
+status: published
+tags: [autoencoders, representation-learning, denoising, sparsity, latent-space]
+prerequisites: [Neural networks, Convolutions]
+---
+
+import AEPipeline from '../../../components/figures/autoencoders/AEPipeline.astro';
+import DenoisingPipeline from '../../../components/figures/autoencoders/DenoisingPipeline.astro';
+import SparseActivations from '../../../components/figures/autoencoders/SparseActivations.astro';
+import Activations from '../../../components/figures/autoencoders/Activations.astro';
+
+The first neural model of the course does not generate anything yet. An autoencoder is trained to reproduce its own input, but the reconstruction is only the pretext. What we actually want is the **representation**: the compact code the network is forced to build on the way ([Hinton and Salakhutdinov, 2006](#references); [Goodfellow, Bengio and Courville, 2016](#references), chapter 14). This note trains a plain, a denoising and a sparse convolutional autoencoder on MNIST, looks at what their codes capture, and ends with the gap that the [variational autoencoder](/notes/generative-models/vae) will close.
+
+## Architecture: downsample, bottleneck, upsample
+
+An **encoder** $f_\theta$ maps an input $x$ to a latent code $z$, and a **decoder** $g_\varphi$ maps the code back to input space:
+
+$$
+z = f_\theta(x), \qquad \hat{x} = g_\varphi(z) = g_\varphi\big(f_\theta(x)\big).
+$$
+
+The data path has a simple shape:
+
+$$
+\text{input} \;\xrightarrow{\ \text{downsample}\ }\; \text{bottleneck } z \;\xrightarrow{\ \text{upsample}\ }\; \text{reconstruction } \hat{x}.
+$$
+
+The bottleneck is smaller than the input, so the network cannot pass the pixels through unchanged. It has to keep what it needs to rebuild the input and drop the rest. This is the **latent space** idea: every input becomes a point in a lower-dimensional space that is learned from the data.
+
+**Input resolution: $28 \times 28 \to 64 \times 64$.** The MNIST digits are resized to $64 \times 64$ (`transforms.Resize((64, 64))`, then `ToTensor()`, which already gives pixel values in $[0, 1]$). The larger image lets the model downsample step by step. The encoder halves the spatial size four times: a stride-2 convolution with kernel 3 and padding 1 maps $H$ to $\lfloor (H-1)/2 \rfloor + 1$ ([output-size formula](/notes/generative-models/training-background#a-convolution-layer)). The decoder doubles the size four times:
+
+| Side | Encoder, 4 halvings | Decoder, 4 doublings | Restores input? |
+| --- | --- | --- | --- |
+| $64$ | $64 \to 32 \to 16 \to 8 \to 4$ | $4 \to 8 \to 16 \to 32 \to 64$ | yes |
+| $28$ | $28 \to 14 \to 7 \to 4 \to 2$ | $2 \to 4 \to 8 \to 16 \to 32$ | no ($32 \ne 28$) |
+
+With a side divisible by $2^4 = 16$, such as $64$, every stage halves exactly and the mirrored decoder returns to the input size. At $28 \times 28$ the same four stages would leave a $2 \times 2$ map and a $32 \times 32$ output.
+
+<AEPipeline />
+
+**The model.** Every encoder stage is a block of a $3\times 3$ convolution with stride 2, batch normalization and LeakyReLU with slope $0.2$ (all explained in the [previous note](/notes/generative-models/training-background)). A last $3 \times 3$ convolution with stride 1 produces the code. Each decoder stage upsamples by a factor of 2 with bilinear interpolation and then applies a $3\times 3$ convolution, batch norm and LeakyReLU. A final convolution maps 16 channels to 1, followed by a sigmoid.
+
+| Tensor | Shape (channels × height × width) | Numbers |
+| --- | --- | --- |
+| input $x$ | $1 \times 64 \times 64$ | $4096$ |
+| after encoder block 1 | $16 \times 32 \times 32$ | $16384$ |
+| after encoder block 2 | $32 \times 16 \times 16$ | $8192$ |
+| after encoder block 3 | $32 \times 8 \times 8$ | $2048$ |
+| after encoder block 4 and the last conv: code $z$ | $32 \times 4 \times 4$ | $512$ |
+| after decoder block 1 | $32 \times 8 \times 8$ | $2048$ |
+| after decoder block 2 | $32 \times 16 \times 16$ | $8192$ |
+| after decoder block 3 | $32 \times 32 \times 32$ | $32768$ |
+| after decoder block 4 | $16 \times 64 \times 64$ | $65536$ |
+| output $\hat x$ | $1 \times 64 \times 64$ | $4096$ |
+
+**Latent size.** The bottleneck has shape $32 \times 4 \times 4$, so it holds $512$ numbers: the latent code is 512-dimensional when flattened. That is $4096 / 512 = 8$ times fewer numbers than the resized input, but only about $1.5$ times fewer than the original $28 \times 28 = 784$ pixels. The compression is mild; the point is the structure of the code, not its size.
+
+## How to read the encoder and decoder
+
+- **The encoder works as a learned filter, not a fixed compression.** Every downsampling step is a learned $3\times3$ convolution with stride 2. The filters extract features while the stride reduces the resolution, so the network itself decides what survives each halving, which a fixed resize could not do.
+- **The decoder is not an upscaler.** It works as *upsample + conv*. The bilinear upsampling is a fixed operation with no parameters; the learned convolution after it fills in the detail.
+- **Compression comes from the architecture, not from an explicit squeeze.** No layer is told to compress. The first encoder block even expands $4096$ input values to $16384$ activations. The code becomes small only because the shapes narrow towards the bottleneck.
+- **Layers learn features, not pixels.** Early layers respond to local patterns such as edges and stroke fragments. Deeper layers see a larger part of the image through their receptive field and combine these into larger parts of a digit, so the channels encode features rather than individual pixel values.
+
+## Reconstruction loss
+
+The loss compares the output with the input. The standard choice is the mean squared error over all $n$ scalar components:
+
+$$
+\mathrm{MSE}(\hat y, y) = \frac{1}{n}\sum_{i=1}^{n} \left(y_i - \hat{y}_i\right)^2,
+\qquad
+\mathcal L_{\text{recon}}(\theta, \varphi) = \mathbb E_{x}\Big[\mathrm{MSE}\big(g_\varphi(f_\theta(x)),\ x\big)\Big].
+$$
+
+For an autoencoder $y = x$ and $\hat y = \hat x$. PyTorch's `nn.MSELoss()` averages over every pixel of the batch: $n = 64 \cdot 64 \cdot 64 = 262144$ for a batch of 64 images.
+
+**MSE or BCE.** Pixel values are in $[0, 1]$, so binary cross-entropy is a natural alternative:
+
+$$
+\mathrm{BCE}(\hat x, x) = -\frac{1}{n}\sum_{i=1}^{n}\Big[x_i \log \hat x_i + (1 - x_i)\log(1 - \hat x_i)\Big],
+$$
+
+averaged over pixels as `nn.BCELoss` does by default. It treats each pixel as the probability of being "on", which suits nearly binary MNIST digits. The two losses correspond to two likelihoods: MSE is the negative log-likelihood of a Gaussian decoder with fixed variance, up to constants, and BCE that of a Bernoulli decoder. This reading returns in the VAE. With a sigmoid already applied in `forward`, BCE must be `nn.BCELoss`; `nn.BCEWithLogitsLoss` expects raw logits and applies the sigmoid itself, so combining it with a sigmoid output would apply the sigmoid twice. The numerically more stable option is to drop the sigmoid and use `nn.BCEWithLogitsLoss` on the logits.
+
+The input range must suit both the output activation and the loss. MNIST is already in $[0, 1]$ after `ToTensor()`, so no extra normalization is needed here; with other data it usually is.
+
+## Emergent structure
+
+Nothing in the loss asks for an organized latent space, and no labels are used in training. Still, structure emerges. Projecting the 512-dimensional codes of the test set to 2-D with t-SNE ([van der Maaten and Hinton, 2008](#references)) and colouring the points by digit shows ten compact, well-separated clusters after training: the codes are organized by content, not by individual pixel values.
+
+<aside class="callout"><strong>Read the before/after plots with care.</strong> The t-SNE of the <em>randomly initialized</em> encoder already shows clear clusters for most digits; the main overlap is between 4 and 9. Random convolutional features are known to be surprisingly discriminative (<a href="#references">Saxe et al., 2011</a>). Training makes the clusters tighter and better separated, but it does not create them from nothing.</aside>
+
+Two experiments probe the latent space directly:
+
+- **Interpolation.** Encode a "7" and a "2" and decode $z_\alpha = (1 - \alpha) z_1 + \alpha z_2$ for 8 frames, $\alpha = 0, \tfrac17, \dots, 1$. The endpoints are clean digits, but the middle frames look like overlays of the two strokes rather than digits that morph into each other.
+- **Sampling.** Fit an axis-aligned (diagonal) Gaussian per digit class to the codes, using the per-coordinate mean and standard deviation of $z$, so that the 512 coordinates are sampled independently. Draw one code per class and decode it. Most samples are recognisable digits, but several (the 4, 5 and 8) are badly distorted.
+
+Both experiments show why a plain autoencoder is a representation learner but **not yet a generative model**. Nothing in training makes an arbitrary point of the latent space decode to a plausible image, and the codes do not follow any distribution we know how to sample from: a diagonal Gaussian ignores the correlations between coordinates, and the regions between clusters were never trained to decode to anything. [Variational autoencoders](/notes/generative-models/vae) close exactly this gap by making the code distribution part of the training objective.
+
+## Variants
+
+### Denoising autoencoder
+
+A denoising autoencoder ([Vincent et al., 2008](#references)) changes the task rather than the architecture:
+
+1. **Corrupt** the input: $\tilde x = x + \text{noise}$.
+2. **Reconstruct the clean input** from the corrupted one, $\hat x = g_\varphi(f_\theta(\tilde x))$, and compute the loss against $x$, not $\tilde x$.
+3. The result is a more **robust** representation.
+
+The network cannot succeed by learning the identity map, so it has to learn which structure in the data is signal and which is noise. Later this idea becomes central: a [diffusion model](/notes/generative-models/ddpm-forward-process) is, in essence, a denoiser trained at many noise levels.
+
+<DenoisingPipeline />
+
+Here the corruption is additive Gaussian noise,
+
+$$
+\tilde x = x + 0.2\,\varepsilon, \qquad \varepsilon \sim \mathcal N(0, I),
+$$
+
+without clipping, so corrupted pixels can leave $[0, 1]$. Every block of the encoder and decoder also applies `Dropout2d(0.3)`, which drops whole feature maps at random during training: a second, internal kind of corruption. The loss is the same MSE against the clean image. After 5 epochs the denoising model's training loss is $0.0102$, compared with $0.0021$ for the plain autoencoder. The numbers are not directly comparable: the denoising model solves a harder task, with noisy input and dropout active.
+
+### Sparse autoencoder
+
+A sparse autoencoder keeps the reconstruction loss and adds a **sparsity penalty** that encourages **rare activations**: for each input, only a few units should be strongly active ([Ng, 2011](#references)). The code can then be larger than the input and still be informative, because each input uses only a few of its units.
+
+<SparseActivations />
+
+Two variants are common.
+
+**KL penalty on intermediate layers.** Hidden units use sigmoid activations after batch norm, so every activation lies in $(0, 1)$ and can be read as a firing rate. For each unit $j$, let $\hat\rho_j$ be its mean activation over the batch. The penalty compares $\hat\rho_j$ with a target rate $\rho$ through the KL divergence between two Bernoulli distributions:
+
+$$
+\mathcal L = \mathrm{MSE}(\hat x, x) + \beta \sum_{j} D_{\mathrm{KL}}(\rho \,\|\, \hat\rho_j),
+\qquad
+D_{\mathrm{KL}}(\rho \,\|\, \hat\rho_j) = \rho \log\frac{\rho}{\hat\rho_j} + (1-\rho)\log\frac{1-\rho}{1-\hat\rho_j},
+$$
+
+with $\rho = 0.05$ and $\beta = 0.001$ here. This is the [KL divergence](/notes/generative-models/entropy-and-divergences#kullbackleibler-divergence) between a "fires with probability $\rho$" coin and a "fires with probability $\hat\rho_j$" coin. It is zero only when the average firing rate equals $\rho$. The sum runs over every channel and position of the four intermediate encoder layers: $16\cdot 32^2 + 32 \cdot 16^2 + 32 \cdot 8^2 + 32 \cdot 4^2 = 27136$ terms. This model's decoder also differs from the others: it uses transposed convolutions (kernel 4, stride 2, padding 1) instead of upsample + conv. Each doubles the side:
+
+$$
+H_{\text{out}} = (H - 1)\cdot 2 - 2\cdot 1 + 4 = 2H.
+$$
+
+**L1 penalty on the code.** This is the plain architecture plus a penalty on the mean absolute value of the 512 code entries, averaged over the batch as well:
+
+$$
+\mathcal L = \mathrm{MSE}(\hat x, x) + \lambda \cdot \frac{1}{512}\sum_{k=1}^{512} |z_k|, \qquad \lambda = 0.001.
+$$
+
+The $L_1$ norm pushes entries to exactly zero, unlike a squared penalty, which only shrinks them.
+
+**Neither variant works well here, and the reasons are instructive.** If the hidden sigmoids start with batch means near $0.5$, as batch norm centres their inputs at initialization, the KL term starts at roughly $27136 \cdot 0.001 \cdot D_{\mathrm{KL}}(0.05\,\|\,0.5) \approx 13$. This is an order-of-magnitude estimate, since the per-unit means vary. The total training loss falls from $8.85$ in the first epoch to $0.214$ in the fifth. That is still about 100 times the plain autoencoder's reconstruction error of $0.0021$, while even an all-black output scores an MSE of only about $0.1$ on MNIST. So the penalty dominates the objective, and the KL model's reconstructions are visibly worse and its t-SNE plot is fragmented.
+
+The L1 variant has the opposite problem. With $\lambda = 0.001$ the penalty does not visibly change training: the loss ends at $0.0022$, essentially the plain model's $0.0021$, and with one run each the gap is within noise. Worse, the first decoder block normalizes with batch norm after a bias-free convolution, so the decoder is insensitive to the overall scale of $z$. The encoder can make every entry of $z$ small by shrinking the scale, without making the code sparse. Sparsity penalties need their weight tuned against the reconstruction loss, and they need an architecture in which they cannot be bypassed.
+
+### Transposed convolution or upsample + conv?
+
+Both double the spatial size. A transposed convolution learns its own upsampling filter, but when the kernel size is not divisible by the stride, overlapping kernel footprints produce checkerboard artifacts. Fixed interpolation followed by a convolution avoids them and is the usual safer default ([Odena, Dumoulin and Olah, 2016](#references)). Kernel 4 with stride 2 divides evenly, which reduces the risk. The two decoders here are not compared under equal conditions, so the choice is a design option rather than a measured result.
+
+## Activation functions
+
+**ReLU** is zero for negative inputs and the identity for positive ones ([Nair and Hinton, 2010](#references)):
+
+$$
+\mathrm{ReLU}(x) = \max(0, x).
+$$
+
+**Sigmoid** squashes any real number into $(0, 1)$, which makes it the natural output activation for pixel intensities in $[0, 1]$. It passes through $0.5$ at $x = 0$:
+
+$$
+\sigma(x) = \frac{1}{1 + e^{-x}}, \qquad \sigma(0) = \tfrac12 .
+$$
+
+<Activations />
+
+The convolutional blocks use **LeakyReLU** with slope $0.2$, $\max(0.2x,\ x)$, which keeps a small gradient for negative inputs ([Maas, Hannun and Ng, 2013](#references)). The sigmoid is the output activation of every model. In the KL-sparse model it is also the hidden activation, because the Bernoulli penalty needs activations that can be read as firing rates in $(0, 1)$.
+
+## Notebook
+
+The experiments follow the [autoencoder notebook](https://github.com/HSE-LAMBDA/DeepGenerativeModels/blob/42dd64b535f5bedf1d2b3db28f2f21ce96c9f09f/seminars/00_Autoencoders/autoencoders.ipynb) of the HSE-LAMBDA *Deep Generative Models* repository (pinned commit; cell numbers count every cell from 1). All loss values and observations about plots above come from its stored outputs.
+
+- **Cells 5–7**: MNIST resized to $64 \times 64$ and loaded as tensors in $[0, 1]$.
+- **Cell 9**: `visualize_latent_space`, which flattens the codes and projects them with t-SNE (perplexity 30); it is called before and after training in **cells 15 and 20**.
+- **Cell 11**: `Block` and `AutoEncoder`, with the shapes of the tables above. **Cells 12–13** choose `nn.MSELoss` and Adam with learning rate $10^{-3}$; the markdown suggests `nn.BCEWithLogitsLoss` as an alternative, which, as explained above, would double the sigmoid. **Cell 17** trains for 5 epochs.
+- **Cells 22–25**: test reconstructions, latent interpolation and per-class diagonal-Gaussian sampling (`compute_activation_stats`).
+- **Cells 26–37**: the denoising autoencoder (`add_noise` with factor 0.2 at test time, `DenoisingBlock` with `Dropout2d(0.3)`), its training and sampling.
+- **Cells 38–49**: the KL-sparse autoencoder (`kl_divergence_activations`, `SparseAE_KL` with transposed-convolution decoder, $\rho = 0.05$, $\beta = 0.001$).
+- **Cells 50–59**: the L1-sparse autoencoder ($\lambda = 0.001$).
+
+## References
+
+- D. E. Rumelhart, G. E. Hinton, R. J. Williams. [Learning representations by back-propagating errors](https://doi.org/10.1038/323533a0). *Nature*, 323, 1986.
+- G. E. Hinton, R. R. Salakhutdinov. [Reducing the dimensionality of data with neural networks](https://doi.org/10.1126/science.1127647). *Science*, 313(5786), 2006.
+- P. Vincent, H. Larochelle, Y. Bengio, P.-A. Manzagol. [Extracting and composing robust features with denoising autoencoders](https://doi.org/10.1145/1390156.1390294). ICML, 2008.
+- A. Ng. [Sparse autoencoder](https://web.stanford.edu/class/cs294a/sparseAutoencoder.pdf). CS294A lecture notes, Stanford, 2011.
+- I. Goodfellow, Y. Bengio, A. Courville. [*Deep Learning*](https://www.deeplearningbook.org/). MIT Press, 2016. Chapter 14: autoencoders.
+- L. van der Maaten, G. Hinton. [Visualizing data using t-SNE](https://www.jmlr.org/papers/v9/vandermaaten08a.html). *JMLR*, 9, 2008.
+- A. Saxe, P. W. Koh, Z. Chen, M. Bhand, B. Suresh, A. Ng. [On random weights and unsupervised feature learning](https://icml.cc/2011/papers/551_icmlpaper.pdf). ICML, 2011.
+- A. Odena, V. Dumoulin, C. Olah. [Deconvolution and checkerboard artifacts](https://distill.pub/2016/deconv-checkerboard/). *Distill*, 2016.
+- V. Nair, G. E. Hinton. [Rectified linear units improve restricted Boltzmann machines](https://icml.cc/Conferences/2010/papers/432.pdf). ICML, 2010.
+- A. L. Maas, A. Y. Hannun, A. Y. Ng. [Rectifier nonlinearities improve neural network acoustic models](https://ai.stanford.edu/~amaas/papers/relu_hybrid_icml2013_final.pdf). ICML Workshop on Deep Learning for Audio, Speech and Language Processing, 2013.
+- HSE-LAMBDA, *Deep Generative Models* course repository: [`autoencoders.ipynb`](https://github.com/HSE-LAMBDA/DeepGenerativeModels/blob/42dd64b535f5bedf1d2b3db28f2f21ce96c9f09f/seminars/00_Autoencoders/autoencoders.ipynb).
