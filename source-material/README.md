@@ -1,8 +1,7 @@
 # Source material
 
-Original scans and photos for future transcription live here and are not part of the Astro public directory.
+This repository is public, so original scans, photos and recordings are **not** stored here. Keep them in a local folder outside the working copy; `.gitignore` blocks common scan formats in this directory as a safeguard.
 
-- `nlp/` — handwritten NLP material
-- `generative-models/` — handwritten generative-models material
+- `nlp/`, `generative-models/`: placeholders for non-sensitive working files, such as topic maps that do not contain the originals.
 
-Workflow: scan → transcribe → review → add an MDX note under `src/content/notes/`.
+How notes are written from private material is described in [docs/course-writing.md](../docs/course-writing.md).

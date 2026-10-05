@@ -1,0 +1,198 @@
+---
+title: "DDPM: the forward process"
+description: How denoising diffusion models destroy data on purpose. A naive add-noise chain explodes in variance, and DDPM's rescaled step √(1 − β) x + √β ε gives a closed-form jump q(xₜ | x₀) that ends at N(0, I), with a β schedule in practice.
+course: generative-models
+section: Diffusion Models
+order: 14
+status: published
+tags: [diffusion, ddpm, forward-process, noise-schedule, variance-preserving]
+prerequisites: [Gaussian distributions, Variational autoencoders]
+---
+
+import ForwardChain from '../../../components/figures/ddpm-forward-process/ForwardChain.astro';
+import StepVsShortcut from '../../../components/figures/ddpm-forward-process/StepVsShortcut.astro';
+import VarianceExplodingVsPreserving from '../../../components/figures/ddpm-forward-process/VarianceExplodingVsPreserving.astro';
+import MarginalEvolution from '../../../components/figures/ddpm-forward-process/MarginalEvolution.astro';
+import LinearSchedule from '../../../components/figures/ddpm-forward-process/LinearSchedule.astro';
+
+Flows obtained an exact likelihood by making every layer invertible. Diffusion models take a different route. **DDPM**, *Denoising Diffusion Probabilistic Models* ([Ho, Jain and Abbeel, 2020](#references)), is the model that made diffusion the standard way to generate images. This note covers its first half, the **forward process**: a fixed procedure that slowly turns an image into pure Gaussian noise. The second half, a neural network that runs the procedure backwards, is in [the next note](/notes/generative-models/ddpm-training-objective).
+
+## A little history
+
+- In 2015, when [GANs](/notes/generative-models/gans) were the state of the art in image generation, [Sohl-Dickstein et al. (2015)](#references) published *Deep Unsupervised Learning using Nonequilibrium Thermodynamics*. It introduced the idea of diffusion models: destroy the structure of the data with a slow noising process, then learn to reverse it.
+- Five years later DDPM simplified the parameterization and the loss and reached image quality competitive with GANs. Its training objective is still derived from a **variational** lower bound on the likelihood, the same tool as in the [VAE](/notes/generative-models/vae).
+- Shortly afterwards diffusion models overtook GANs on standard image benchmarks ([Dhariwal and Nichol, 2021](#references)).
+
+## The problem
+
+We do not know $p(x)$, the distribution of real images, but we want to pull new images out of it. This is the same as sampling new points from $p(x)$.
+
+The diffusion idea is to connect $p(x)$ to a distribution we *can* sample from. Take a real image $x_0$, the original photo, and add a little noise to get $x_1$, then a little more to get $x_2$, and so on until $x_T$ is pure noise. Each forward step is fixed and needs no learning. The model, written $s_\theta(x_t)$ in the diagram, goes the other way: from $x_t$ it produces $x_{t-1}$, one step back towards the image. To generate, we sample pure noise $x_T$ and apply the model $T$ times.
+
+$$
+\begin{gathered}
+\underset{\text{original photo}}{x_0} \;\longrightarrow\; x_1 \;\longrightarrow\; \cdots \;\longrightarrow\; \underset{\text{pure noise}}{x_T}, \\
+x_{t-1} \;\xleftarrow{\;s_\theta(x_t)\;}\; x_t .
+\end{gathered}
+$$
+
+<ForwardChain />
+
+**Notation.** $q(\cdot)$ is the forward (noising) process, $\varepsilon \sim \mathcal N(0, 1)$ is standard Gaussian noise drawn fresh at every step, and the second argument of $\mathcal N(\mu, \sigma^2)$ is the **variance**. We work in one dimension; for images every pixel is noised independently and $1$ becomes the identity matrix $I$, so the target is $\mathcal N(0, I)$.
+
+## A first attempt: just add noise
+
+The simplest step adds noise with variance $\beta$:
+
+$$
+\begin{gathered}
+x_1 = x_0 + \sqrt{\beta}\,\varepsilon, \quad \varepsilon \sim \mathcal N(0, 1)
+\\ \Longrightarrow\quad
+q(x_1 \mid x_0) = \mathcal N(x_0, \beta),
+\end{gathered}
+$$
+
+where $\beta$ is the **noise variance**. Note the square root: $c\,\varepsilon$ has variance $c^2$, so noise with variance $\beta$ is $\sqrt\beta\,\varepsilon$. The next step does the same to $x_1$: $q(x_2 \mid x_1) = \mathcal N(x_1, \beta)$.
+
+**Now we can shorten the chain.** Two steps add two independent noises, and the variances of independent Gaussians add up:
+
+$$
+\begin{aligned}
+x_2 &= x_1 + \sqrt\beta\,\varepsilon_2 = x_0 + \sqrt\beta\,\varepsilon_1 + \sqrt\beta\,\varepsilon_2 \\
+&= x_0 + \sqrt{2\beta}\,\varepsilon, \\
+q(x_2 \mid x_0) &= \mathcal N(x_0, 2\beta),
+\end{aligned}
+$$
+
+where $\varepsilon = (\varepsilon_1 + \varepsilon_2)/\sqrt2$ is again a standard normal. Whenever several noises are merged below, $\varepsilon$ denotes the merged standard normal in this sense, so such equalities hold in distribution.
+
+Continuing in the same way, after $t$ steps
+
+$$
+x_t = x_0 + \sqrt{t\beta}\,\varepsilon,
+\qquad
+q(x_t \mid x_0) = \mathcal N(x_0, t\beta).
+$$
+
+This is a useful shortcut: we can jump from $x_0$ to any $x_t$ in one draw. But look at the two parameters:
+
+- the **mean does not change**: it stays $x_0$ forever;
+- the **variance increases indefinitely**: $t\beta \to \infty$.
+
+So there is no chance of ever reaching $\mathcal N(0, 1)$. The end of the chain still depends on the image and is infinitely spread out. This process is called **variance-exploding** diffusion; continuous-time versions of it are used by score-based models ([Song et al., 2021](#references)).
+
+## The objective, and DDPM's step
+
+What we want is
+
+$$
+q(x_t \mid x_0) \xrightarrow[t\to\infty]{} \mathcal N(0, 1),
+$$
+
+whatever the starting image. This needs a new way to go from step $t-1$ to step $t$, and in particular the step has to **change the mean** each time, pulling it towards $0$. So we look for a step of the form $x_t = [\,?\,]\,x_{t-1} + \sqrt\beta\,\varepsilon$. DDPM's answer is to scale the previous point by $\sqrt{1-\beta}$:
+
+$$
+\begin{gathered}
+x_t = \sqrt{1-\beta}\;x_{t-1} + \sqrt{\beta}\;\varepsilon, \\
+q(x_t \mid x_{t-1}) = \mathcal N\!\big(\sqrt{1-\beta}\;x_{t-1},\; \beta\big).
+\end{gathered}
+$$
+
+<StepVsShortcut />
+
+**Why exactly $\sqrt{1-\beta}$?** Because it makes the process behave well in two ways, both shown in the callout below: it keeps the variance at $1$, and the jump from $x_0$ to any $x_t$ again has a closed form:
+
+$$
+x_t = \sqrt{\bar\alpha_t}\,x_0 + \sqrt{1-\bar\alpha_t}\;\varepsilon,
+\qquad
+\bar\alpha_t = (1-\beta)^t,
+$$
+
+$$
+q(x_t \mid x_0) = \mathcal N\!\big(\sqrt{\bar\alpha_t}\,x_0,\; 1-\bar\alpha_t\big).
+$$
+
+So we can produce $x_t$ for any timestep directly from $x_0$, in one draw, without running the $t$ steps before it.
+
+<aside class="callout"><strong>Where √(1 − β) comes from.</strong> Two short facts explain the choice. (1) <em>It preserves unit variance.</em> If $\operatorname{Var}(x_{t-1}) = 1$, then $\operatorname{Var}(x_t) = (1-\beta)\cdot 1 + \beta = 1$: the shrinking of the old signal exactly pays for the new noise. That is why this is called a <em>variance-preserving</em> process, the opposite of the naive chain, where the variance grows to $1 + t\beta$. (2) <em>It gives the closed form.</em> By induction, suppose $x_{t-1} = \sqrt{\bar\alpha_{t-1}}\,x_0 + \sqrt{1-\bar\alpha_{t-1}}\,\varepsilon'$. Then $x_t = \sqrt{(1-\beta)\bar\alpha_{t-1}}\,x_0 + \sqrt{1-\beta}\sqrt{1-\bar\alpha_{t-1}}\,\varepsilon' + \sqrt\beta\,\varepsilon$. The mean coefficient is $\sqrt{\bar\alpha_t}$ with $\bar\alpha_t = (1-\beta)\bar\alpha_{t-1}$, and the two independent noises merge into one with variance $(1-\beta)(1-\bar\alpha_{t-1}) + \beta = 1 - (1-\beta)\bar\alpha_{t-1} = 1-\bar\alpha_t$.</aside>
+
+### Why this reaches N(0, 1)
+
+If $\beta \in (0, 1)$, then $\bar\alpha_t = (1-\beta)^t \to 0$ as $t \to \infty$. Then the image term $\sqrt{\bar\alpha_t}\,x_0 \to 0$, while the noise coefficient $\sqrt{1-\bar\alpha_t} \to 1$, so the noise term tends to plain $\varepsilon$ with variance $1$:
+
+$$
+q(x_t \mid x_0) \xrightarrow[t\to\infty]{} \mathcal N(0, 1).
+$$
+
+For example, with a constant $\beta = 0.02$:
+
+| $t$ | $\bar\alpha_t = 0.98^t$ | mean coefficient $\sqrt{\bar\alpha_t}$ | noise std $\sqrt{1-\bar\alpha_t}$ | naive noise std $\sqrt{t\beta}$ |
+| --- | --- | --- | --- | --- |
+| 1 | 0.980 | 0.990 | 0.141 | 0.141 |
+| 10 | 0.817 | 0.904 | 0.428 | 0.447 |
+| 50 | 0.364 | 0.603 | 0.797 | 1.000 |
+| 100 | 0.133 | 0.364 | 0.931 | 1.414 |
+| 200 | 0.0176 | 0.133 | 0.991 | 2.000 |
+
+For small $t$ the two chains almost agree. Then the naive one passes the target spread and keeps growing, while DDPM's settles at $1$.
+
+<VarianceExplodingVsPreserving />
+
+In one dimension, a two-humped density becomes noisy and lumpy and ends as a single bell curve centred at $0$. Each data point is noised independently by the same rule, so the whole data distribution $q(x_t) = \int q(x_t \mid x_0)\,q(x_0)\,dx_0$ also flows into $\mathcal N(0, 1)$. For a mixture of Gaussians the marginal stays a mixture and can be written down exactly:
+
+$$
+\begin{aligned}
+q(x_0) &= \sum_k \pi_k\,\mathcal N(\mu_k, \sigma_k^2)
+\quad\Longrightarrow\quad \\
+q(x_t) &= \sum_k \pi_k\,\mathcal N\!\big(\sqrt{\bar\alpha_t}\,\mu_k,\; \bar\alpha_t\sigma_k^2 + 1 - \bar\alpha_t\big).
+\end{aligned}
+$$
+
+Both components are pulled towards mean $0$ and variance $1$, so they merge into one standard normal.
+
+<MarginalEvolution />
+
+## In practice: a β schedule
+
+In practice $\beta$ is not constant but varies with the step, $\beta_1, \dots, \beta_T$; this is the **schedule**. The derivation above goes through unchanged with $(1-\beta)$ replaced by $(1-\beta_t)$ at step $t$:
+
+$$
+q(x_t \mid x_{t-1}) = \mathcal N\!\big(\sqrt{1-\beta_t}\,x_{t-1},\; \beta_t\big),
+$$
+
+$$
+\bar\alpha_t = \prod_{i=1}^{t} (1-\beta_i),
+\qquad
+q(x_t \mid x_0) = \mathcal N\!\big(\sqrt{\bar\alpha_t}\,x_0,\; 1-\bar\alpha_t\big).
+$$
+
+The usual shorthand is $\alpha_t = 1-\beta_t$, so $\bar\alpha_t = \prod_{i \le t}\alpha_i$. The DDPM paper uses $T = 1000$ steps and a **linear schedule** from $\beta_1 = 10^{-4}$ to $\beta_T = 0.02$ ([Ho, Jain and Abbeel, 2020](#references), §4). Later work found that a cosine-shaped schedule, which destroys information more evenly over time, works better at low resolution ([Nichol and Dhariwal, 2021](#references)). Small steps at the start keep the early $x_t$ close to the image; larger steps later finish the job. With this schedule $\bar\alpha_t$ is about $0.5$ at $t \approx 259$ (it drops below $0.5$ at $t = 260$), falls below $0.01$ at $t = 674$ and ends at $\bar\alpha_{1000} \approx 4.0\times10^{-5}$, so $x_{1000}$ is noise for all practical purposes.
+
+<LinearSchedule />
+
+The course notebook uses toy settings on a 2-D Swiss roll with 100 steps. Its first demo runs the step-by-step chain with a constant $\beta = 0.0005$ ($\bar\alpha_{100} \approx 0.951$). The rest of the notebook uses a sigmoid-shaped schedule from $10^{-5}$ to $10^{-2}$ ($\bar\alpha_{100} \approx 0.605$) and samples $x_t$ directly with the closed form (`q_sample`, `alphas_bar_sqrt`, `one_minus_alphas_bar_sqrt`). Neither toy schedule gets close to $\bar\alpha = 0$: at $t = 100$ the mean coefficient $\sqrt{\bar\alpha_{100}}$ is still about $0.98$ and $0.78$, so $x_{100}$ carries much of the data signal. Real models need many more steps or larger $\beta$.
+
+## Next: invert it
+
+We now have a diffusion process that turns any image into $\mathcal N(0, I)$ noise. To generate, we have to **invert** it, and that is done with a deep neural network. How to set up and train that network is the topic of [DDPM: reverse process and training objective](/notes/generative-models/ddpm-training-objective).
+
+## Notebook
+
+The [diffusion notebook](https://github.com/HSE-LAMBDA/DeepGenerativeModels/blob/42dd64b535f5bedf1d2b3db28f2f21ce96c9f09f/seminars/10_Diffusion-Models/02_DPM_Models.ipynb) of the HSE-LAMBDA *Deep Generative Models* repository (pinned commit; cell numbers count every cell from 1) is based on the ACIDS-IRCAM [diffusion tutorial](https://github.com/acids-ircam/diffusion_models). It has no saved outputs, so it documents procedures rather than results.
+
+- **Cells 4–6** sample the 2-D Swiss roll used throughout.
+- **Cells 8–10**: `forward_process` implements $x_t = \sqrt{1-\beta_t}\,x_{t-1} + \sqrt{\beta_t}\,\varepsilon$, with $\beta$ as a variance and $\sqrt\beta$ as the noise amplitude, and runs it for 100 steps with constant $\beta = 0.0005$. The returned list starts with the clean data at index 0.
+- **Cell 12**: `make_beta_schedule` with linear, quadratic and sigmoid schedules (defaults $10^{-5}$ to $10^{-2}$).
+- **Cells 13–16**: the closed-form sampler `q_sample` with the sigmoid schedule, using `alphas_bar_sqrt` and `one_minus_alphas_bar_sqrt`. Coefficient index $i$ in the code corresponds to $t = i + 1$ in the formulas, so the plot label $x_0$ already refers to the first noised marginal. These are direct draws from $q(x_t \mid x_0)$ for each $t$, not one correlated trajectory.
+
+The reverse process, the training objective and the sampler are in cells 17–48; they are described in the [next note](/notes/generative-models/ddpm-training-objective#notebook).
+
+## References
+
+- J. Sohl-Dickstein, E. A. Weiss, N. Maheswaranathan, S. Ganguli. [Deep unsupervised learning using nonequilibrium thermodynamics](https://arxiv.org/abs/1503.03585). ICML, 2015.
+- J. Ho, A. Jain, P. Abbeel. [Denoising diffusion probabilistic models](https://arxiv.org/abs/2006.11239). NeurIPS, 2020.
+- A. Q. Nichol, P. Dhariwal. [Improved denoising diffusion probabilistic models](https://arxiv.org/abs/2102.09672). ICML, 2021.
+- P. Dhariwal, A. Nichol. [Diffusion models beat GANs on image synthesis](https://arxiv.org/abs/2105.05233). NeurIPS, 2021.
+- Y. Song, J. Sohl-Dickstein, D. P. Kingma, A. Kumar, S. Ermon, B. Poole. [Score-based generative modeling through stochastic differential equations](https://arxiv.org/abs/2011.13456). ICLR, 2021.
+- C. Luo. [Understanding diffusion models: A unified perspective](https://arxiv.org/abs/2208.11970). arXiv:2208.11970, 2022.
+- HSE-LAMBDA, *Deep Generative Models* course repository: [`02_DPM_Models.ipynb`](https://github.com/HSE-LAMBDA/DeepGenerativeModels/blob/42dd64b535f5bedf1d2b3db28f2f21ce96c9f09f/seminars/10_Diffusion-Models/02_DPM_Models.ipynb).
