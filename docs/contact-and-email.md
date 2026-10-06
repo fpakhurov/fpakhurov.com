@@ -24,7 +24,12 @@ DNS for `fpakhurov.com` is hosted at Beget. The A records (`185.199.108–111.15
 
 ### Option A: Beget mail
 
-If the Beget control panel offers **Почта** for the domain on the current plan, create the `fedor` address there as a mailbox or as a forward to the personal inbox. The MX (`mx1/mx2.beget.com`) and SPF (`v=spf1 redirect=beget.com`) records already point at Beget, so no DNS change is needed. If mail requires a paid hosting plan, use option B.
+The Beget account includes mail for `fpakhurov.com` at no cost (10 GB). The MX (`mx1/mx2.beget.com`) and SPF (`v=spf1 redirect=beget.com`) records already point at Beget, so no DNS change is needed. Without a paid virtual server, outgoing SMTP is limited: the mailbox receives, but sending from it is not reliable.
+
+1. Control panel → **Mail** → `fpakhurov.com` → create the mailbox `fedor` with a strong, unique password (keep it in a password manager).
+2. In the mailbox settings, forward incoming mail to the personal inbox and keep a copy in the mailbox.
+3. Send a test message from another account and check that it arrives at both the mailbox (webmail) and the personal inbox, including the spam folder.
+4. If forwarding does not deliver (it can fall under the outgoing limit), read the mailbox over IMAP in a mail app instead (the Mail page in the panel links to setup guides for Apple Mail, Thunderbird and Outlook), or switch to option B.
 
 ### Option B: ImprovMX forwarding (free)
 
