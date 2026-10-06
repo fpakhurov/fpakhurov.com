@@ -82,6 +82,11 @@ How the course notes are translated into Russian. The Russian notes live in `src
 | empirical distribution | эмпирическое распределение |
 | uniform distribution | равномерное распределение |
 | law of large numbers | закон больших чисел |
+| Monte Carlo estimate | оценка методом Монте-Карло |
+| importance weights | веса значимости (importance weights) † |
+| moment matching | сопоставление моментов (moment matching) † |
+| heavy / light tails | тяжёлые / лёгкие хвосты |
+| variational inference | вариационный вывод (variational inference) † |
 | fair / rigged coin; biased coin | честная / нечестная монета; несимметричная монета |
 | heads / tails | орёл / решка |
 
@@ -135,6 +140,11 @@ How the course notes are translated into Russian. The Russian notes live in `src
 | sampling, sample | сэмплирование, сэмпл (выборка — for a set of samples) |
 | timestep | шаг (временной шаг) |
 | exponential moving average (EMA) | экспоненциальное скользящее среднее (EMA) |
+| running average / running estimate | скользящее среднее / скользящая оценка |
+| least-squares loss | функция потерь наименьших квадратов (least-squares loss) † |
+| minimax objective | минимаксная целевая функция |
+| grid search | перебор по сетке |
+| underflow | обращение в 0 при потере точности (underflow) † |
 
 ### Evaluation
 
@@ -160,3 +170,4 @@ How the course notes are translated into Russian. The Russian notes live in `src
 | cell N | ячейка N |
 | worked example | разобранный пример |
 | callout titles | translate the title in `<strong>` |
+| callout: Intuition / Takeaway | Интуиция / Итог (not «Вывод», which means derivation or inference) |
