@@ -1,0 +1,169 @@
+---
+title: Word2Vec
+description: A prediction task on unlabelled text (guess the context from the centre word, or the centre from the context) trains an embedding table; the full softmax over the vocabulary makes each step cost millions of weights, and negative sampling cuts it to a few hundred.
+course: nlp
+section: Distributed Representations
+order: 7
+status: published
+tags: [word2vec, skip-gram, cbow, negative-sampling, embeddings, self-supervised]
+prerequisites: [Word embeddings, Logistic regression, Gradient descent]
+---
+
+import SkipGram from '../../../components/figures/word2vec/SkipGram.astro';
+
+The [previous note](/notes/nlp/word-embeddings) wanted an embedding table in which words used in similar contexts have similar vectors, and said that the table could be learned from unlabelled text. This note gives the training signal. The idea is older than the method: a word is characterized by the company it keeps ([Firth, 1957](#references)), so a model that must predict a word's neighbours from the word will be forced to give words with the same neighbours the same vector. Word2Vec ([Mikolov et al., 2013a](#references), [2013b](#references)) turns that into two small networks and one trick that makes them trainable on billions of tokens.
+
+**Notation.** The corpus is a token sequence $w_1, \dots, w_T$. For a position $t$, the *centre* word is $w_t$ and the *context* is the window $w_{t-m}, \dots, w_{t-1}, w_{t+1}, \dots, w_{t+m}$ of $2m$ neighbours. Each word $w$ has two vectors: $v_w \in \mathbb R^N$ when it is the centre (a row of $W \in \mathbb R^{|V| \times N}$) and $u_w \in \mathbb R^N$ when it is a context word (a column of $W' \in \mathbb R^{N \times |V|}$). $\sigma(x) = 1/(1 + e^{-x})$.
+
+## Baseline: fit the embeddings with a labelled task
+
+The [CNN note](/notes/nlp/cnn-text-classification#trainable-embeddings) trains an embedding table as part of a classifier. It works, and it needs labels: the table only learns about words that appear in the labelled set, and only the aspects of them that help the label. Labelled text is scarce; unlabelled text is almost unlimited. The question is what to predict when there is no label.
+
+<aside class="callout"><strong>Key idea.</strong> Make the text its own label. Hide one word and predict it from its neighbours, or take one word and predict its neighbours. A network with a single hidden layer of size $N$ solves this task, and the weights of its first layer are the embedding table.</aside>
+
+## Two prediction tasks: CBOW and skip-gram
+
+**Continuous bag of words (CBOW)** predicts the centre word from the context. The $2m$ context vectors are averaged into one hidden vector and that vector is used to classify among $|V|$ possible centre words:
+
+$$
+h = \frac{1}{2m}\sum_{-m \le j \le m,\, j \ne 0} v_{w_{t+j}},
+\qquad
+P(w_t = w \mid \text{context}) = \frac{\exp(u_w \cdot h)}{\sum_{w' \in V}\exp(u_{w'} \cdot h)}.
+$$
+
+**Skip-gram** reverses it: the centre word predicts each context word separately.
+
+$$
+P(w_{t+j} = o \mid w_t = c) = \frac{\exp(u_o \cdot v_c)}{\sum_{w \in V}\exp(u_w \cdot v_c)}.
+$$
+
+The network behind the second formula is the figure below. A one-hot input selects row $v_c$ of $W$; that row is the hidden layer, with no non-linearity; the product with $W'$ scores every vocabulary word; a softmax turns the scores into a distribution. Training maximizes the log-probability of the context words that actually occurred:
+
+$$
+\mathcal J = -\frac{1}{T}\sum_{t=1}^T \sum_{-m \le j \le m,\, j \ne 0} \log P(w_{t+j} \mid w_t).
+$$
+
+<SkipGram />
+
+A third variant is a plain next-word model, which predicts $w_{t+1}$ from $w_t$; it is a bigram language model with a bottleneck of size $N$, and the window-based objectives generalize it by predicting both directions and several neighbours.
+
+The two objectives behave differently in practice ([Mikolov et al., 2013a](#references), empirical, not derived): CBOW trains faster and does slightly better on frequent words, because averaging the context smooths the signal; skip-gram does better on rare words and small corpora, because every (centre, context) pair is a separate training example and a rare word still gets $2m$ examples per occurrence. The `gensim` implementation used in the notebooks defaults to CBOW (`sg=0`); skip-gram is selected with `sg=1`.
+
+## Why the softmax is the problem
+
+Take the gradient of the skip-gram log-probability with respect to the centre vector:
+
+$$
+\frac{\partial \log P(o \mid c)}{\partial v_c} = u_o - \sum_{w \in V} P(w \mid c)\,u_w .
+$$
+
+The first term pulls $v_c$ towards the observed context vector; the second pushes it away from the *expected* context vector under the model. Computing the second term, and the gradient of every column of $W'$, touches all $|V|$ output vectors for every single (centre, context) pair.
+
+Count the weights for a web-scale vocabulary: $|V| = 3 \times 10^6$ words and $N = 100$ dimensions give $3 \times 10^8$ entries in $W$ and the same in $W'$, $6 \times 10^8$ in total. Each training pair updates one row of $W$ and *every* column of $W'$: $3 \times 10^8$ weights per pair, times billions of pairs. The model is small; the softmax normalization makes training infeasible.
+
+## Negative sampling
+
+<aside class="callout"><strong>Key idea.</strong> Replace the $|V|$-way classification by a binary one. For each observed (centre, context) pair, ask "did these two occur together?", answer yes for the real pair and no for a few random words. Only the vectors of the words involved are touched.</aside>
+
+For a true pair $(c, o)$ and $K$ *negative* words $w_1, \dots, w_K$ drawn from a noise distribution $P_n$, the objective per pair is
+
+$$
+\mathcal J_{\text{neg}}(c, o) = \log \sigma(u_o \cdot v_c) + \sum_{k=1}^K \log \sigma(-u_{w_k} \cdot v_c).
+$$
+
+The first term is the log-probability, under a logistic model, that the real pair is a real pair; each remaining term is the log-probability that a random pair is *not* real ($\sigma(-x) = 1 - \sigma(x)$). Maximizing the sum raises $u_o \cdot v_c$ and lowers $u_{w_k} \cdot v_c$. The gradient with respect to $v_c$ now involves $K + 1$ output vectors instead of $|V|$:
+
+$$
+\frac{\partial \mathcal J_{\text{neg}}}{\partial v_c} = \big(1 - \sigma(u_o \cdot v_c)\big)\,u_o - \sum_{k=1}^K \sigma(u_{w_k} \cdot v_c)\,u_{w_k}.
+$$
+
+With $K = 2$ and $N = 100$ a training pair updates $(K + 1) \times 100 = 300$ output weights plus the 100 weights of $v_c$, instead of $3 \times 10^8$. The paper recommends $K$ between 5 and 20 for small datasets and 2 to 5 for large ones.
+
+Two details of the noise distribution matter. Negatives are sampled from the unigram distribution raised to the power $3/4$, $P_n(w) \propto \text{count}(w)^{0.75}$, which samples frequent words less often than their frequency and rare words more often than theirs; the exponent was found empirically. And very frequent words (`the`, `a`) are *subsampled* from the corpus before training, discarded with probability $1 - \sqrt{\theta / f(w)}$ for a threshold $\theta \approx 10^{-5}$, because they occur in every context and carry little information about their neighbours.
+
+Negative sampling is not an approximation of the softmax gradient; it is a different objective. [Levy and Goldberg (2014)](#references) showed that its optimum factorizes a matrix of shifted pointwise mutual information between words and contexts, $u_w \cdot v_c = \mathrm{PMI}(w, c) - \log K$, which explains why the learned space reflects co-occurrence statistics.
+
+### Worked example
+
+Toy dimension $N = 2$, one negative. Centre vector $v_c = (1, 0.5)$, observed context $u_o = (0.8, 0.6)$, sampled negative $u_k = (-0.4, 0.9)$.
+
+| Quantity | Value |
+| --- | --- |
+| $u_o \cdot v_c$ | $0.8 + 0.3 = 1.10$ |
+| $\sigma(1.10)$ | $0.750$ |
+| $u_k \cdot v_c$ | $-0.4 + 0.45 = 0.05$ |
+| $\sigma(-0.05)$ | $0.488$ |
+| $-\mathcal J_{\text{neg}}$ (loss) | $-\ln 0.750 - \ln 0.488 = 0.288 + 0.718 = 1.006$ |
+
+The gradient of the loss with respect to $v_c$ is $-(1 - 0.750)\,u_o + \sigma(0.05)\,u_k = -0.250\,(0.8, 0.6) + 0.513\,(-0.4, 0.9) = (-0.405, 0.311)$. One gradient step with learning rate $0.1$ moves $v_c$ to $(1.040, 0.469)$; the dot product with the true context rises from $1.10$ to $1.114$ and with the negative falls from $0.05$ to $0.006$. Three vectors were touched; the rest of the vocabulary was not read.
+
+## Hyperparameters and what they do
+
+| Parameter | Effect | Notebook values |
+| --- | --- | --- |
+| `vector_size` $N$ | Capacity; 50–300 is the usual range | 32 (Quora), 100 (AG News) |
+| `window` $m$ | Larger windows capture topic, smaller ones syntax | 5 |
+| `min_count` | Words seen fewer times are dropped; controls $|V|$ and noise | 5, 4 |
+| `sg` | 0 = CBOW, 1 = skip-gram | default (CBOW) |
+| `negative` $K$ | Number of negatives per pair | default 5 |
+
+After training there are two vectors per word. The usual choice is $W$ (the centre vectors); averaging $W$ and $W'^\top$ is also common and was used for the released GloVe vectors.
+
+## What changed
+
+| | Task-trained embeddings | Word2Vec |
+| --- | --- | --- |
+| Training signal | Labels of one task | The text itself |
+| Data available | Thousands of labelled examples | Billions of tokens |
+| Vocabulary coverage | Words in the labelled set | Words in the corpus |
+| Cost per step (softmax) | — | $|V| \times N$ output weights |
+| Cost per step (negative sampling) | — | $(K + 1) \times N$ output weights |
+| What the vectors encode | Whatever separates the labels | Co-occurrence structure |
+
+The result is a table that can be reused by any model. The [CNN note](/notes/nlp/cnn-text-classification) feeds it to a classifier on AG News and then asks whether the task-specific alternative is better after all.
+
+## GloVe and FastText
+
+Two later static-embedding methods appear in the course as downloaded tables. **GloVe** ([Pennington, Socher and Manning, 2014](#references)) does not sample windows; it builds the full word–word co-occurrence matrix $X$ once and fits $u_w \cdot v_c + b_w + b_c \approx \log X_{wc}$ by weighted least squares, so that every pair is used with a weight that caps the influence of very frequent pairs. The Twitter vectors used for the analogies in the previous note were trained this way. **FastText** ([Bojanowski et al., 2017](#references)) represents a word as the sum of vectors of its character n-grams (`where` → `<wh`, `whe`, `her`, `ere`, `re>`), so morphologically related words share parameters and a word never seen in training still gets a vector from its pieces. Both are planned topics of this course rather than full notes; the differences from Word2Vec are in the statistics used (global counts) and in the unit (character n-grams), not in the idea.
+
+## Limitations
+
+- **Static.** One vector per word type, whatever the sentence. The [BERT note](/notes/nlp/bert#from-static-to-contextual-embeddings) removes this.
+- **Window-bound.** Only neighbours within $m$ positions shape a vector; sentence-level structure, negation and long-range dependencies do not.
+- **Data-hungry.** A 32-dimensional model on a few hundred thousand questions gives sensible nearest neighbours; a model that supports analogies needs billions of tokens.
+- **Antonyms and co-hyponyms collapse.** `good` and `bad`, `Monday` and `Tuesday` share contexts and end up close. For sentiment that is the wrong geometry.
+- **Not a sentence representation.** Averaging the vectors of a sentence discards order; the next section of the course builds models that read the sequence.
+
+## What you should remember
+
+- Self-supervision: predict context from centre (skip-gram) or centre from context (CBOW). The first layer of the predictor is the embedding table.
+- The full softmax touches every output vector per training pair: $|V| \times N$ weights, infeasible for large vocabularies.
+- Negative sampling turns the task into logistic classification of real versus random pairs, updating $(K + 1)$ output vectors per pair, with negatives drawn from the $3/4$-power unigram distribution.
+- The optimum of negative sampling factorizes shifted PMI: the vectors are a compression of co-occurrence statistics.
+- Each word gets two vectors; use the centre vectors (or their average with the context vectors).
+
+## Notebook
+
+[`week01_word_embeddings.ipynb`](https://github.com/glkuzi/nlp_dsba/blob/4130e09940ddd363cee9fa3bd51b149466cfc6fb/seminars/week01_word_embeddings.ipynb). Cell numbers count every cell, markdown included, from 1.
+
+- Cells 52–56 introduce the skip-gram picture and `gensim`.
+- Cell 57 trains `Word2Vec(data_tok, vector_size=32, min_count=5, window=5)` on the tokenized Quora questions and keeps the key-vector table `.wv`; the call uses the library defaults for everything else, so this is CBOW with 5 negatives.
+- Cells 58–59 read one vector and the nearest neighbours of `word`.
+- Cells 60–65 load pretrained 100-dimensional GloVe Twitter vectors and run the analogies reported in the [previous note](/notes/nlp/word-embeddings#reading-a-vector-space).
+
+[`week02_NN_text_classification.ipynb`](https://github.com/glkuzi/nlp_dsba/blob/4130e09940ddd363cee9fa3bd51b149466cfc6fb/seminars/week02_NN_text_classification.ipynb), cell 12, trains a 100-dimensional model (`min_count=4`, `window=5`) on the preprocessed AG News training texts only, so that no test-set words leak into the vectors; cells 13–14 turn every article into a sequence of these vectors for the classifiers of the next note.
+
+## Next
+
+We have vectors in which similar words are close, trained without labels. The [next note](/notes/nlp/cnn-text-classification) returns to the AG News classification task from the [TF-IDF note](/notes/nlp/bag-of-words-and-tf-idf) with two questions: can a network that reads the sequence of embeddings beat a bag of counts, and are pretrained vectors better than vectors trained with the task?
+
+## References
+
+- J. R. Firth. A synopsis of linguistic theory 1930–1955. In *Studies in Linguistic Analysis*, Blackwell, 1957. The distributional hypothesis.
+- T. Mikolov, K. Chen, G. Corrado, J. Dean. [Efficient Estimation of Word Representations in Vector Space](https://arxiv.org/abs/1301.3781). ICLR Workshop, 2013. CBOW and skip-gram.
+- T. Mikolov, I. Sutskever, K. Chen, G. Corrado, J. Dean. [Distributed Representations of Words and Phrases and their Compositionality](https://arxiv.org/abs/1310.4546). NeurIPS, 2013. Negative sampling, the $3/4$ exponent and subsampling (§2.2–2.3).
+- O. Levy, Y. Goldberg. [Neural Word Embedding as Implicit Matrix Factorization](https://papers.nips.cc/paper/2014/hash/feab05aa91085b7a8012516bc3533958-Abstract.html). NeurIPS, 2014. Negative sampling as shifted-PMI factorization.
+- X. Rong. [word2vec Parameter Learning Explained](https://arxiv.org/abs/1411.2738). arXiv, 2014. The gradient derivations used above.
+- J. Pennington, R. Socher, C. D. Manning. [GloVe: Global Vectors for Word Representation](https://aclanthology.org/D14-1162/). EMNLP, 2014.
+- P. Bojanowski, E. Grave, A. Joulin, T. Mikolov. [Enriching Word Vectors with Subword Information](https://aclanthology.org/Q17-1010/). TACL, 5, 2017. FastText.
+- J. Alammar. [The Illustrated Word2vec](https://jalammar.github.io/illustrated-word2vec/). 2019. The pictures behind the figure above.
