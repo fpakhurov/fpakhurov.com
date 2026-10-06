@@ -65,6 +65,9 @@ Lists and course rows should feel related to cards without adding a large panel 
 | Article navigation | Course rail and table of contents share the navigation material. Long rails scroll independently; anchor targets clear the sticky header. |
 | Reading components | Unblurred prose and mathematics, rounded callouts and figures, and matching previous/next panels. |
 | Systems chain | One reusable component for the existing AI transformation sequence on the homepage and work page. |
+| Impact figures and case metrics | Typographic figures on the page background, divided by rules rather than panels. Display type for the value, muted sans for the label. Four columns on desktop, two at tablet width, one below 540px. |
+| Principles and writing lists | Numbered rows separated by rules, with monospace indices or years and links on the right. They stay on the page background so that About does not turn into a grid of cards. |
+| Project outcome | A ruled line inside the project row, labelled in accent, for the tested conclusion of a research or engineering project, including negative results. |
 
 ### Systems chain
 
