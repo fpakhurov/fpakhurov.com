@@ -111,6 +111,13 @@ How the course notes are translated into Russian. The Russian notes live in `src
 | class prior | априорная вероятность класса |
 | mode dropping | пропуск мод (mode dropping) † |
 | perfectly aligned manifolds (Arjovsky–Bottou) | идеально выровненные многообразия (perfectly aligned) † |
+| Wasserstein-1 distance | расстояние Вассерштейна-1 (Wasserstein-1 distance) † |
+| transport plan, coupling; optimal coupling | транспортный план (transport plan / coupling) †; оптимальный транспортный план |
+| Kantorovich–Rubinstein duality | двойственность Канторовича–Рубинштейна (Kantorovich–Rubinstein duality) † |
+| point mass | точечная масса |
+| operator norm | операторная норма |
+| mean value theorem | теорема о среднем |
+| proxy (stand-in quantity) | суррогат |
 
 ### Learning and networks
 
@@ -224,6 +231,12 @@ How the course notes are translated into Russian. The Russian notes live in `src
 | KL penalty ("fine") | штраф KL |
 | organized / disorganized latent space | упорядоченное / неупорядоченное латентное пространство |
 | (linear) heads of a network | линейные выходные слои (heads) |
+| Wasserstein GAN | GAN Вассерштейна (Wasserstein GAN) † |
+| critic score (output) | значение (выход) критика; not «оценка», which is reserved for estimate / bound. «критик» is animate: «обучаем критика» |
+| feedforward network | сеть прямого распространения (feedforward network) † |
+| hinge loss | кусочно-линейная функция потерь (hinge loss) † |
+| spectral norm | спектральная норма (spectral norm) † |
+| broadcast (tensors) | распространяется (broadcasting) † |
 
 ### Evaluation
 
