@@ -52,6 +52,9 @@ How the course notes are translated into Russian. The Russian notes live in `src
 | level set, contour | линия уровня |
 | change of variables | замена переменных |
 | Jacobian, Jacobian determinant | якобиан, определитель Якоби |
+| Jacobian matrix, singular values | матрица Якоби, сингулярные числа |
+| population statistics | статистики по генеральной совокупности |
+| unbiased estimate | несмещённая оценка |
 | marginal, marginalization | маргинальное распределение, маргинализация |
 | posterior, prior, likelihood | апостериорное распределение, априорное распределение, правдоподобие |
 | log-likelihood, negative log-likelihood (NLL) | логарифм правдоподобия, отрицательный логарифм правдоподобия (NLL) |
@@ -141,6 +144,28 @@ How the course notes are translated into Russian. The Russian notes live in `src
 | timestep | шаг (временной шаг) |
 | exponential moving average (EMA) | экспоненциальное скользящее среднее (EMA) |
 | running average / running estimate | скользящее среднее / скользящая оценка |
+| batch mean / batch variance | среднее по батчу / дисперсия по батчу |
+| momentum (BatchNorm running-average coefficient) | коэффициент обновления (momentum); not «момент», which reads as a statistical moment |
+| running statistics / running buffers | скользящие статистики / буферы скользящих средних |
+| internal covariate shift | внутренний ковариатный сдвиг (internal covariate shift) † |
+| pre-activation | предактивация (pre-activation) † |
+| loss landscape | ландшафт функции потерь |
+| unrolled RNN | развёрнутая RNN |
+| Xavier/Glorot initialization, He initialization | инициализация Ксавье/Глоро (Xavier/Glorot initialization) †, инициализация Хе (He initialization) † |
+| fan-in / fan-out | число входов / выходов (fan-in / fan-out) † |
+| saturating / non-saturating activation | насыщающаяся / ненасыщающаяся активация |
+| gated recurrent cell | рекуррентная ячейка с гейтами (gated recurrent cell) † |
+| forget gate / update gate | гейт забывания / гейт обновления (forget gate / update gate) † |
+| residual connection, identity skip | остаточная связь (residual connection) †, тождественный обход (identity skip) † |
+| filter (of a conv layer), bias (of a layer) | фильтр, смещение |
+| dilation | расширение (dilation) † |
+| cross-correlation | взаимная корреляция (cross-correlation) † |
+| zero-padding | дополнение нулями (zero-padding) † |
+| grouped convolution | групповая свёртка (grouped convolution) † |
+| receptive field | рецептивное поле |
+| feature extractor | экстрактор признаков |
+| edge detector | детектор границ (not «краёв») |
+| "size" of a matrix meaning its norm | величина (not «размер», which reads as dimensions) |
 | least-squares loss | функция потерь наименьших квадратов (least-squares loss) † |
 | minimax objective | минимаксная целевая функция |
 | grid search | перебор по сетке |
