@@ -103,6 +103,14 @@ How the course notes are translated into Russian. The Russian notes live in `src
 | KL to / from a distribution | KL-дивергенция относительно распределения (not «KL до») |
 | Jensen gap | зазор Йенсена |
 | quadrature | квадратурные формулы |
+| f-divergence | f-дивергенция (f-divergence) † |
+| generator (function) of an f-divergence | порождающая функция |
+| lower semicontinuous | полунепрерывная снизу |
+| Fenchel–Moreau theorem | теорема Фенхеля–Моро |
+| intercept (of a line) | свободный член |
+| class prior | априорная вероятность класса |
+| mode dropping | пропуск мод (mode dropping) † |
+| perfectly aligned manifolds (Arjovsky–Bottou) | идеально выровненные многообразия (perfectly aligned) † |
 
 ### Learning and networks
 
@@ -136,6 +144,14 @@ How the course notes are translated into Russian. The Russian notes live in `src
 | adversarial | состязательный |
 | saturating / non-saturating loss | насыщающаяся / ненасыщающаяся функция потерь (saturating / non-saturating loss) † |
 | label smoothing | сглаживание меток (label smoothing) † |
+| one-sided label smoothing | одностороннее сглаживание меток (one-sided label smoothing) † |
+| label flipping | инвертирование меток (label flipping) † |
+| generative adversarial network (GAN) | генеративно-состязательная сеть (generative adversarial network, GAN) † |
+| implicit model | неявная модель (implicit) † |
+| value function (GAN) | функция ценности (value function) † |
+| fake / real (labels, samples) | подделка / настоящие (not «фейк») |
+| infinite capacity (model) | неограниченная ёмкость (infinite capacity) † |
+| gradient ascent | градиентный подъём |
 | one-hot label | метка в виде one-hot-вектора |
 | gradient penalty | штраф на градиент (gradient penalty) † |
 | weight clipping | обрезка весов (weight clipping) † |
@@ -238,3 +254,4 @@ How the course notes are translated into Russian. The Russian notes live in `src
 | callout: Intuition / Takeaway | Интуиция / Итог (not «Вывод», which means derivation or inference) |
 | Summary (section) | Итоги |
 | panel letters (a)/(b) in figures | (а)/(б), Cyrillic |
+| citation parts: Algorithm, Proposition, Theorem, Lemma, Section, Equations, Table | алгоритм, предложение, теорема, лемма, раздел, формулы, таблица (lower case after the citation) |
