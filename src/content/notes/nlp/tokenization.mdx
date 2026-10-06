@@ -1,0 +1,177 @@
+---
+title: Tokenization
+description: Why word and character units both fail, how byte-pair encoding learns a subword vocabulary by merging frequent pairs, how WordPiece and SentencePiece differ from it, and the vocabulary-size trade-off that every later model inherits.
+course: nlp
+section: Text Foundations
+order: 2
+status: published
+tags: [tokenization, bpe, wordpiece, sentencepiece, vocabulary]
+prerequisites: [Text as data]
+---
+
+import BpeMerges from '../../../components/figures/tokenization/BpeMerges.astro';
+
+The [previous note](/notes/nlp/text-as-data) ended with two problems of word-level units. A word that the training corpus never contained has no vocabulary entry, so the model can only map it to a single `[UNK]` symbol and lose it. And the vocabulary of a real corpus is huge and long-tailed: most types occur a handful of times, which is too few to learn a vector for each. This note builds the standard answer, subword tokenization, from the two extremes it sits between.
+
+**Notation.** A *token* is a unit of the vocabulary $V$; a *tokenizer* maps a string to a sequence of tokens and back. For a corpus, $c(a)$ is the count of unit $a$ and $c(a, b)$ the count of the adjacent pair $ab$.
+
+## Baseline: words or characters
+
+**Words.** One token per word. Each token is meaningful, sequences are short (a sentence is 10–30 tokens), and the vocabulary is open: every misspelling, name, number and inflected form is a new type. A corpus of a few million words has $|V|$ in the hundreds of thousands, and the test set always contains words outside it.
+
+**Characters.** One token per character. The vocabulary is tiny and closed, so there is never an unknown token, and the model can in principle learn morphology. The price is sequence length: the same sentence is 5–6 times longer, every later model pays for that in compute (quadratically, for the attention of the [Transformer note](/notes/nlp/attention#complexity)), and a single character carries almost no meaning on its own, so the model must rebuild words from scratch.
+
+| | Word-level | Character-level |
+| --- | --- | --- |
+| Vocabulary | Open, $10^5$–$10^6$ | Closed, $10^2$–$10^3$ |
+| Unknown tokens | Frequent | Never |
+| Sequence length | Short | 5–6× longer |
+| Meaning per token | High | Almost none |
+
+<aside class="callout"><strong>Key idea.</strong> Learn a vocabulary of a chosen size between the two extremes. Frequent words stay whole; rare words are split into pieces that are themselves frequent. Every string can be encoded, because the pieces include all single characters, and the vocabulary size is a parameter rather than a property of the corpus.</aside>
+
+## Byte-pair encoding
+
+Byte-pair encoding (BPE) was a compression algorithm ([Gage, 1994](#references)); [Sennrich, Haddow and Birch (2016)](#references) turned it into a tokenizer for machine translation. Training is a greedy loop:
+
+1. Pre-tokenize the corpus into words (whitespace and punctuation), and count each word once per occurrence.
+2. Split every word into characters. The initial vocabulary is the set of characters.
+3. Count every adjacent pair of units across all words. Pick the most frequent pair $(a, b)$.
+4. Add the merged unit $ab$ to the vocabulary and record the merge rule $a + b \to ab$. Replace every occurrence of the adjacent pair by $ab$.
+5. Repeat from step 3 until the vocabulary reaches the target size, or until no pair occurs more than once.
+
+The output is a vocabulary and an ordered list of merges. Tokenizing a new word repeats the merges in the learned order: split into characters, then apply rule 1 wherever it fits, then rule 2, and so on.
+
+### Worked example
+
+Take the three-word corpus `deep learning engineer`. After step 2 the vocabulary is the nine characters $\{d, e, p, l, a, r, n, i, g\}$ and the splits are `d e e p`, `l e a r n i n g`, `e n g i n e e r`. Counting pairs:
+
+| Pair | Count | Where |
+| --- | --- | --- |
+| `ee` | 2 | d**ee**p, engin**ee**r |
+| `in` | 2 | learn**in**g, eng**in**eer |
+| `ng` | 2 | learni**ng**, e**ng**ineer |
+| all others | 1 | |
+
+Three pairs tie. Implementations break ties deterministically; we take the pair seen first while scanning the corpus, which is `ee` in `deep`. After the merge the splits are `d ee p`, `l e a r n i n g`, `e n g i n ee r`. Recounting, `in` and `ng` still tie at 2 and `in` is met first inside `learning`, so the second merge is `i + n → in`. After that every pair occurs once and a frequency-based stopping rule halts.
+
+<BpeMerges />
+
+The learned vocabulary is the nine characters plus `ee` and `in`, and the merge list is `[ee, in]`. Encoding the unseen word `deeper` goes: `d e e p e r` → (rule `ee`) → `d ee p e r` → (rule `in`: no match) → `d ee p e r`. No unknown token was needed, and the piece `ee` is shared with the training words, so whatever the model learns about it transfers. On a real corpus the same procedure runs for tens of thousands of merges, and frequent words such as `the` become single tokens after a handful of them.
+
+### What the merge count controls
+
+The number of merges is the single hyperparameter, and it sets the vocabulary size $|V|$ = number of characters + number of merges. More merges mean larger $|V|$, longer units, and shorter sequences; fewer merges mean the opposite. Two consequences follow for every model trained on top:
+
+- The embedding table has $|V| \times d$ parameters. With $|V| = 50{,}000$ and $d = 768$ that is 38.4 M parameters before any other layer; for the 128,256-token vocabulary of a modern model with $d = 2048$ it is 263 M.
+- The output softmax of a language model is over $|V|$ classes at every position, so the cost of the last layer grows with $|V|$ too.
+
+[Gage, 1994](#references) worked on bytes rather than characters, and GPT-2 ([Radford et al., 2019](#references)) returned to that: *byte-level* BPE starts from the 256 byte values, so any string in any script can be encoded with no unknown token at all.
+
+## WordPiece and SentencePiece
+
+**WordPiece** ([Schuster and Nakajima, 2012](#references); [Wu et al., 2016](#references)) is the tokenizer of BERT. It differs from BPE in two places. The merge criterion is not the raw pair count but the likelihood gain
+
+$$
+\text{score}(a, b) = \frac{c(a, b)}{c(a)\,c(b)},
+$$
+
+which prefers pairs whose parts are rare on their own, so a frequent pair of two very frequent characters is merged later than a pair that almost always occurs together. And encoding does not replay merges: it takes the longest vocabulary entry that matches the start of the word, then the longest match of the remainder, and so on, marking every non-initial piece with `##`:
+
+```python
+from transformers import AutoTokenizer
+tok = AutoTokenizer.from_pretrained("bert-base-uncased")   # |V| = 30,522
+tok("Random text to encode").tokens()
+# ['[CLS]', 'random', 'text', 'to', 'en', '##code', '[SEP]']
+```
+
+`encode` is not in the 30,522-entry vocabulary, so it became `en` + `##code`. The same BERT tokenizer on Russian text produces pieces such as `мечтае` + `##т` and `генера` + `##лом`: the stems are frequent enough to be units, the endings are attached as continuation pieces.
+
+**SentencePiece** ([Kudo and Richardson, 2018](#references)) removes the pre-tokenization step. The tokenizer is trained on raw text in which the space is an ordinary symbol written as `▁`, so it needs no language-specific word splitter and works for scripts without spaces. It supports BPE and a second algorithm, the **unigram language model** ([Kudo, 2018](#references)), which starts from a large candidate vocabulary and prunes it: each candidate is scored by how much the corpus likelihood drops without it, and the least useful ones are removed until the target size is reached. Unigram tokenization is probabilistic, which allows *subword regularization*, sampling different segmentations of the same word during training as a form of data augmentation. Because `▁` is kept, detokenization is exact: join the pieces and replace `▁` by a space.
+
+| | BPE | WordPiece | Unigram (SentencePiece) |
+| --- | --- | --- | --- |
+| Training | Merge most frequent pair | Merge pair with highest $c(a,b)/(c(a)c(b))$ | Prune candidates by likelihood loss |
+| Encoding | Replay merges in order | Greedy longest match | Most likely segmentation (Viterbi) |
+| Continuation mark | none (or `Ġ` for a leading space, byte-level) | `##` | `▁` for a leading space |
+| Used by | GPT-2, Llama (byte-level) | BERT | T5, Llama (via SentencePiece BPE) |
+
+## Special tokens, padding and masks
+
+A tokenizer's output is more than a list of ids. Models need sequence boundaries and batches need equal lengths:
+
+- `[CLS]` / `<s>` marks the start of a sequence and `[SEP]` / `</s>` its end (or the boundary between two segments, used in the [BERT note](/notes/nlp/bert)). The [GPT note](/notes/nlp/gpt) uses an end-of-text token to stop generation.
+- `[PAD]` fills short sequences up to the longest one in the batch, because a batch is a rectangular tensor of shape `[batch, max_len]`. An **attention mask** of the same shape holds 1 for real tokens and 0 for padding so that later layers ignore the filler.
+- `truncation=True, max_length=L` cuts longer sequences. The [translation note](/notes/nlp/transformer-machine-translation) fixes $L = 32$ after looking at the length histogram of its corpus; the [text classification note](/notes/nlp/text-classification) uses 128.
+
+```python
+tok(["First text to encode", "Second text"], padding=True,
+    max_length=3, truncation=True, return_tensors="pt")
+# input_ids:      [[101, 2034, 102], [101, 2117, 102]]
+# attention_mask: [[1, 1, 1],        [1, 1, 1]]
+```
+
+With `max_length=3` only the first word survives next to the two boundary tokens, which is a reminder that the limit counts special tokens too.
+
+## What changed
+
+The [previous note](/notes/nlp/text-as-data) could only shrink a word vocabulary by merging forms. Subword tokenization replaces it:
+
+| | Word-level pipeline | Subword tokenizer |
+| --- | --- | --- |
+| Vocabulary size | Property of the corpus | Hyperparameter |
+| Unseen words | `[UNK]` | Split into known pieces |
+| Morphology | Lost to stemming or kept as separate types | Shared pieces (`play`, `##ing`) |
+| Language dependence | Stopwords, stemmers per language | Trained from data; byte-level needs nothing |
+| Sequence length | 1 token per word | 1.2–1.5 tokens per English word; more for other languages |
+
+The effect on a downstream model is measurable. In the [n-gram note](/notes/nlp/n-gram-language-models) a unigram language model over Russian jokes has a held-out perplexity of about 40,000 with word tokens and about 2,700 with BPE tokens on the same text, because far fewer test tokens are unseen.
+
+## Limitations
+
+- A subword tokenizer is trained on a corpus and carries its statistics. A vocabulary learned on English encodes other languages into many short pieces: the same sentence costs more tokens, so more compute and context, and models trained with it do worse on those languages ([Rust et al., 2021](#references)).
+- Numbers and code are split by frequency, not by structure: `1234` may be one token and `1235` two. Arithmetic over such pieces is harder than it looks.
+- Pieces are not morphemes. `##code` in `en` + `##code` is a frequent string, not a unit of meaning, and the model has to learn that `encode` and `encoder` are related through `en` + `##code` versus `encoder` as one token.
+- The vocabulary is frozen after training. Adding domain terms later means new, untrained embeddings, which the [fine-tuning note](/notes/nlp/fine-tuning) has to initialize.
+- Lowercasing and accent stripping at tokenizer training time are irreversible, as in the previous note; `bert-base-uncased` cannot distinguish `US` from `us`.
+
+## What you should remember
+
+- Word units give an open vocabulary and unknown tokens; character units give long sequences and meaningless units. Subwords sit between them with a chosen vocabulary size.
+- BPE training: split into characters, repeatedly merge the most frequent adjacent pair, record the merge. Encoding replays the merges.
+- WordPiece merges by $c(a,b)/(c(a)c(b))$ and encodes by greedy longest match with `##`; SentencePiece drops pre-tokenization and adds the unigram model with likelihood-based pruning.
+- Vocabulary size trades embedding and softmax cost against sequence length; both costs flow into every model in the course.
+- Special tokens, padding and the attention mask are part of the tokenizer's contract with the model.
+
+## Notebook
+
+Two notebooks cover this note. Cell numbers count every cell, markdown included, from 1.
+
+[`week03_lm.ipynb`](https://github.com/glkuzi/nlp_dsba/blob/4130e09940ddd363cee9fa3bd51b149466cfc6fb/seminars/week03_lm.ipynb):
+
+- Cells 5–9 train a BPE tokenizer with a 50,000-entry target on a corpus of Russian jokes using a small pure-Python implementation (`bpe.Encoder` with `pct_bpe=0.95`, which reserves 5 % of the vocabulary for the most frequent whole words); the learned vocabulary has 47,500 subword entries.
+- Cell 10 tokenizes one joke and shows the raw output, which brackets split words with `__sow` and `__eow` markers; cells 11–15 convert that to the `##` continuation convention. The Russian examples above come from there.
+- Cells 37–42 compare n-gram perplexities with word and BPE tokens; the [n-gram note](/notes/nlp/n-gram-language-models#notebook) reports the numbers.
+
+[`week04_lstm_attention_transformer.ipynb`](https://github.com/glkuzi/nlp_dsba/blob/4130e09940ddd363cee9fa3bd51b149466cfc6fb/seminars/week04_lstm_attention_transformer.ipynb):
+
+- Cells 12–29 load pretrained WordPiece tokenizers for English (30,522 entries) and German (31,102), show the fast (Rust) versus slow (Python) variants, the `[CLS]`/`[SEP]` boundary tokens, `input_ids`, `attention_mask` and `token_type_ids`, padding and truncation, and decoding back to text. The `en` + `##code` example is cell 20.
+- Cells 31–34 plot token-length histograms for both languages and fix the maximum length at 32.
+
+[`week05_transformer.ipynb`](https://github.com/glkuzi/nlp_dsba/blob/4130e09940ddd363cee9fa3bd51b149466cfc6fb/seminars/week05_transformer.ipynb), cell 17, trains a WordPiece tokenizer from scratch on the AG News training texts with a 4,000-entry vocabulary, `min_frequency=5`, lowercasing and accent stripping; cells 19–27 reload it as a fast tokenizer and build padded batches of shape `[256, 128]`.
+
+## Next
+
+Tokens are now integers from a fixed vocabulary. Before building models we need to say what "a model works" means: which data it may be trained and tuned on, which numbers summarize its errors, and which evaluation pitfalls make a good number meaningless. The [next note](/notes/nlp/corpora-and-evaluation) sets those rules once, so that every later comparison in the course is a fair one.
+
+## References
+
+- P. Gage. [A new algorithm for data compression](https://dl.acm.org/doi/10.5555/177910.177914). *The C Users Journal*, 12(2), 1994. The original byte-pair compression algorithm.
+- R. Sennrich, B. Haddow, A. Birch. [Neural Machine Translation of Rare Words with Subword Units](https://aclanthology.org/P16-1162/). ACL, 2016. BPE as a tokenizer.
+- M. Schuster, K. Nakajima. [Japanese and Korean voice search](https://doi.org/10.1109/ICASSP.2012.6289079). ICASSP, 2012. The WordPiece criterion.
+- Y. Wu et al. [Google's Neural Machine Translation System](https://arxiv.org/abs/1609.08144). arXiv, 2016. WordPiece in a production translation system, §4.1.
+- T. Kudo, J. Richardson. [SentencePiece: A simple and language independent subword tokenizer and detokenizer](https://aclanthology.org/D18-2012/). EMNLP (demo), 2018.
+- T. Kudo. [Subword Regularization: Improving Neural Network Translation Models with Multiple Subword Candidates](https://aclanthology.org/P18-1007/). ACL, 2018. The unigram language model tokenizer.
+- A. Radford, J. Wu, R. Child, D. Luan, D. Amodei, I. Sutskever. [Language Models are Unsupervised Multitask Learners](https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf). OpenAI, 2019. §2.2, byte-level BPE.
+- P. Rust, J. Pfeiffer, I. Vulić, S. Ruder, I. Gurevych. [How Good is Your Tokenizer? On the Monolingual Performance of Multilingual Language Models](https://aclanthology.org/2021.acl-long.243/). ACL, 2021.
+- Hugging Face. [Summary of the tokenizers](https://huggingface.co/docs/transformers/tokenizer_summary). The BPE, WordPiece and SentencePiece comparison used above.
