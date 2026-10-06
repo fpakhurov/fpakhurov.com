@@ -10,7 +10,7 @@ highlights:
 outcome: New synapses were predictable on unseen neuron pairs, above every baseline. As a frozen prior for learning, the rule gave no benefit over uniform or degree-matched priors in the tested setting, a negative transfer result. The work makes no claim about biological plasticity mechanisms.
 tags: [Connectomics, Graph prediction, Structural priors, Reproducibility]
 year: 2026
-status: completed
+status: active
 category: research
 order: 1
 ru:
