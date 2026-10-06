@@ -72,6 +72,18 @@ How the course notes are translated into Russian. The Russian notes live in `src
 | evidence lower bound (ELBO) | нижняя оценка обоснованности (ELBO) † |
 | Fenchel conjugate | сопряжённая по Фенхелю функция (convex conjugate) † |
 | Lipschitz constant, K-Lipschitz | константа Липшица, K-липшицева функция |
+| self-information | собственная информация (self-information) |
+| bit, nat | бит, нат (1 бит, 0.469 бита, 0.693 ната; nats in parentheses at first use) |
+| relative entropy | относительная энтропия |
+| differential entropy | дифференциальная энтропия |
+| Gibbs' inequality | неравенство Гиббса (Gibbs' inequality) |
+| information inequality | информационное неравенство |
+| triangle inequality | неравенство треугольника |
+| empirical distribution | эмпирическое распределение |
+| uniform distribution | равномерное распределение |
+| law of large numbers | закон больших чисел |
+| fair / rigged coin; biased coin | честная / нечестная монета; несимметричная монета |
+| heads / tails | орёл / решка |
 
 ### Learning and networks
 
@@ -105,6 +117,7 @@ How the course notes are translated into Russian. The Russian notes live in `src
 | adversarial | состязательный |
 | saturating / non-saturating loss | насыщающаяся / ненасыщающаяся функция потерь (saturating / non-saturating loss) † |
 | label smoothing | сглаживание меток (label smoothing) † |
+| one-hot label | метка в виде one-hot-вектора |
 | gradient penalty | штраф на градиент (gradient penalty) † |
 | weight clipping | обрезка весов (weight clipping) † |
 | spectral normalization | спектральная нормализация |
