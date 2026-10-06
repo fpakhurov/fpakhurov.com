@@ -126,6 +126,14 @@ How the course notes are translated into Russian. The Russian notes live in `src
 | similar matrices / diagonalisable | подобные матрицы / диагонализуемая |
 | maximum entropy (principle) | принцип максимума энтропии (maximum entropy) † |
 | resampling | повторная выборка (resampling) †; not «перевыбор» |
+| base density | базовая плотность |
+| spherical Gaussian | сферическая гауссиана (spherical Gaussian) † |
+| diffeomorphism | диффеоморфизм |
+| inverse function theorem | теорема об обратной функции |
+| dequantization / dequantized | деквантование / деквантованные (dequantized) † |
+| cofactor expansion | разложение по алгебраическим дополнениям (cofactor expansion) † |
+| Gaussian elimination / LU decomposition | метод Гаусса / LU-разложение |
+| shear (linear map) | сдвиг |
 
 ### Learning and networks
 
@@ -265,6 +273,10 @@ How the course notes are translated into Russian. The Russian notes live in `src
 | cosine distance | косинусное расстояние |
 | element-wise product | поэлементное произведение |
 | wrapping around (circular boundary) | с переносом через край (циклически) |
+| masked / inverse autoregressive flow (MAF / IAF) | маскированный / обратный авторегрессионный поток (masked / inverse autoregressive flow) † |
+| neural spline coupling | слой связи на нейросетевых сплайнах (neural spline coupling) † |
+| tail bound (spline) | граница сплайна (tail bound) † |
+| weight decay | затухание весов (weight decay) † |
 
 ### Evaluation
 
@@ -301,5 +313,7 @@ How the course notes are translated into Russian. The Russian notes live in `src
 | callout titles | translate the title in `<strong>` |
 | callout: Intuition / Takeaway | Интуиция / Итог (not «Вывод», which means derivation or inference) |
 | Summary (section) | Итоги |
+| Recap (section) | Сводка (Summary stays «Итоги») |
+| cell outputs (notebook) | выходы ячеек; not «выводы», which means derivation or inference |
 | panel letters (a)/(b) in figures | (а)/(б), Cyrillic |
 | citation parts: Algorithm, Proposition, Theorem, Lemma, Section, Equations, Table | алгоритм, предложение, теорема, лемма, раздел, формулы, таблица (lower case after the citation) |
