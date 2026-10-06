@@ -170,6 +170,26 @@ How the course notes are translated into Russian. The Russian notes live in `src
 | minimax objective | минимаксная целевая функция |
 | grid search | перебор по сетке |
 | underflow | обращение в 0 при потере точности (underflow) † |
+| representation | представление (representation) † |
+| encoding problem (Rumelhart et al.) | задача кодирования (encoding problem) |
+| downsample / upsample | понижение / повышение разрешения |
+| mean squared error (MSE) | среднеквадратичная ошибка (MSE) † |
+| binary cross-entropy (BCE) | бинарная кросс-энтропия (BCE) † |
+| logits | логиты |
+| Bernoulli variable / distribution | бернуллиевская величина / распределение Бернулли |
+| corruption (denoising) | искажение (corruption) † |
+| dropout | дропаут (dropout) † |
+| pooling | пулинг (pooling) |
+| score matching | score matching (сопоставление градиентов логарифма плотности) †; keep the English term, as in the course map |
+| sparse autoencoder | разреженный автоэнкодер (sparse autoencoder) † |
+| sparsity penalty | штраф за разреженность (sparsity penalty) † |
+| hidden unit | скрытый нейрон |
+| firing rate | частота срабатывания (firing rate) † |
+| transposed convolution | транспонированная свёртка (transposed convolution) † |
+| output padding | выходное дополнение (output padding) † |
+| soft thresholding | мягкое пороговое отсечение (soft thresholding) † |
+| checkerboard artifacts | шахматные артефакты (checkerboard artifacts) † |
+| reconstruction loss | функция потерь реконструкции |
 
 ### Evaluation
 
@@ -193,6 +213,8 @@ How the course notes are translated into Russian. The Russian notes live in `src
 | Notation | Обозначения |
 | Figure N | Рисунок N |
 | cell N | ячейка N |
+| markdown cell | текстовая ячейка |
+| perplexity (t-SNE) | перплексия |
 | worked example | разобранный пример |
 | callout titles | translate the title in `<strong>` |
 | callout: Intuition / Takeaway | Интуиция / Итог (not «Вывод», which means derivation or inference) |
