@@ -121,6 +121,11 @@ How the course notes are translated into Russian. The Russian notes live in `src
 | conditional entropy / marginal entropy | условная энтропия / маргинальная энтропия |
 | law of total probability | формула полной вероятности |
 | peaked / flat (distribution) | с острым пиком / плоское |
+| 2-Wasserstein distance | расстояние Вассерштейна-2 (2-Wasserstein distance) † |
+| principal square root (of a matrix) | главный квадратный корень (principal square root) † |
+| similar matrices / diagonalisable | подобные матрицы / диагонализуемая |
+| maximum entropy (principle) | принцип максимума энтропии (maximum entropy) † |
+| resampling | повторная выборка (resampling) †; not «перевыбор» |
 
 ### Learning and networks
 
@@ -246,6 +251,10 @@ How the course notes are translated into Russian. The Russian notes live in `src
 | hyperparameter search / architecture search | подбор гиперпараметров / поиск архитектуры |
 | one-hot prediction | предсказание в виде one-hot-вектора |
 | Inception modules | модули Inception (Inception modules) |
+| coding layer | кодирующий слой (coding layer) † |
+| memorization (of training data) | запоминание (memorization) † |
+| antialiasing | сглаживание (antialiasing) † |
+| quantisation | квантование |
 
 ### Evaluation
 
@@ -259,6 +268,8 @@ How the course notes are translated into Russian. The Russian notes live in `src
 | fidelity / diversity | качество (fidelity) / разнообразие (diversity) † |
 | score (Inception Score etc.) | метрика, значение метрики; not «оценка», which is reserved for estimate / bound |
 | accuracy (classifier) | доля правильных ответов (accuracy) †; not «точность», which is reserved for precision |
+| mean term / covariance term (FID) | член средних / член ковариаций |
+| intra-FID | intra-FID (not translated) |
 
 ### Site and notebook vocabulary
 
