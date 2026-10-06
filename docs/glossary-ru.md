@@ -92,6 +92,17 @@ How the course notes are translated into Russian. The Russian notes live in `src
 | variational inference | вариационный вывод (variational inference) † |
 | fair / rigged coin; biased coin | честная / нечестная монета; несимметричная монета |
 | heads / tails | орёл / решка |
+| evidence (marginal likelihood) | обоснованность (evidence) † |
+| latent-variable model | модель с латентными переменными (latent-variable model) † |
+| intractable | вычислительно неразрешимый (intractable) † |
+| amortized inference | амортизированный вывод (amortized inference) † |
+| score-function estimator (REINFORCE) | оценка REINFORCE через градиент логарифма плотности (score-function estimator) † |
+| aggregate posterior | агрегированное апостериорное распределение (aggregate posterior) † |
+| mutual information | взаимная информация (mutual information) † |
+| marginal KL | маргинальная KL (marginal KL) † |
+| KL to / from a distribution | KL-дивергенция относительно распределения (not «KL до») |
+| Jensen gap | зазор Йенсена |
+| quadrature | квадратурные формулы |
 
 ### Learning and networks
 
@@ -190,6 +201,13 @@ How the course notes are translated into Russian. The Russian notes live in `src
 | soft thresholding | мягкое пороговое отсечение (soft thresholding) † |
 | checkerboard artifacts | шахматные артефакты (checkerboard artifacts) † |
 | reconstruction loss | функция потерь реконструкции |
+| posterior collapse | коллапс апостериорного распределения (posterior collapse) † |
+| disentangled / disentanglement | распутанный / распутывание (disentangled / disentanglement) † |
+| inductive bias | индуктивное смещение (inductive bias) † |
+| conditional VAE | условный VAE (conditional VAE) |
+| KL penalty ("fine") | штраф KL |
+| organized / disorganized latent space | упорядоченное / неупорядоченное латентное пространство |
+| (linear) heads of a network | линейные выходные слои (heads) |
 
 ### Evaluation
 
@@ -218,3 +236,5 @@ How the course notes are translated into Russian. The Russian notes live in `src
 | worked example | разобранный пример |
 | callout titles | translate the title in `<strong>` |
 | callout: Intuition / Takeaway | Интуиция / Итог (not «Вывод», which means derivation or inference) |
+| Summary (section) | Итоги |
+| panel letters (a)/(b) in figures | (а)/(б), Cyrillic |
