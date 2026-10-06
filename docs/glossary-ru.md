@@ -135,6 +135,12 @@ How the course notes are translated into Russian. The Russian notes live in `src
 | cofactor expansion | разложение по алгебраическим дополнениям (cofactor expansion) † |
 | Gaussian elimination / LU decomposition | метод Гаусса / LU-разложение |
 | shear (linear map) | сдвиг |
+| closed form | замкнутый вид, в замкнутом виде, замкнутая формула; not «явный вид» |
+| fixed point (of a recursion) | неподвижная точка |
+| convergence in distribution | сходимость по распределению |
+| transition kernel (Markov chain) | (гауссовское) переходное ядро; not bare «ядро», which reads as a convolution kernel |
+| mean coefficient | коэффициент среднего |
+| noise std | стандартное отклонение шума («σ шума» in figure labels) |
 
 ### Learning and networks
 
@@ -189,6 +195,13 @@ How the course notes are translated into Russian. The Russian notes live in `src
 | diffusion model | диффузионная модель |
 | forward process / reverse process | прямой процесс / обратный процесс |
 | noise schedule | расписание шума (noise schedule) † |
+| linear / cosine / sigmoid schedule | линейное / косинусное / сигмоидное расписание |
+| rescaled step (DDPM) | шаг с масштабированием |
+| one-jump shortcut | переход за один скачок |
+| sampler | сэмплер |
+| benchmark | бенчмарк |
+| toy setting / toy problem | игрушечная постановка / игрушечная задача; not «игрушечные настройки» |
+| Swiss roll (dataset) | «швейцарский рулет» (Swiss roll) † |
 | variance-preserving / variance-exploding | сохраняющий дисперсию / с растущей дисперсией (variance-preserving / variance-exploding) † |
 | denoiser | денойзер (модель шумоподавления) |
 | sampling, sample | сэмплирование, сэмпл (выборка — for a set of samples) |
