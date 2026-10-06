@@ -72,6 +72,7 @@ How the course notes are translated into Russian. The Russian notes live in `src
 | mixture of Gaussians | смесь гауссиан |
 | Jensen's inequality | неравенство Йенсена |
 | lower bound / upper bound | нижняя / верхняя оценка (граница) |
+| likelihood bound | нижняя оценка правдоподобия (not bare «оценка правдоподобия», which reads as an estimate) |
 | evidence lower bound (ELBO) | нижняя оценка обоснованности (ELBO) † |
 | Fenchel conjugate | сопряжённая по Фенхелю функция (convex conjugate) † |
 | Lipschitz constant, K-Lipschitz | константа Липшица, K-липшицева функция |
@@ -276,6 +277,22 @@ How the course notes are translated into Russian. The Russian notes live in `src
 | masked / inverse autoregressive flow (MAF / IAF) | маскированный / обратный авторегрессионный поток (masked / inverse autoregressive flow) † |
 | neural spline coupling | слой связи на нейросетевых сплайнах (neural spline coupling) † |
 | tail bound (spline) | граница сплайна (tail bound) † |
+| scale network / translation network (coupling) | сеть масштаба (scale) / сеть сдвига (translation) † |
+| additive / affine coupling | аддитивный / аффинный слой связи (additive / affine coupling) † |
+| identity block / identity map (in figure labels) | единичный блок / тождественно (not «тождество», which reads as an equation) |
+| masked autoencoder for distribution estimation (MADE) | маскированный автоэнкодер для оценивания распределений (MADE) |
+| degree (MADE unit) | степень (degree) † |
+| hidden mask / output mask (MADE) | маска скрытого слоя / маска выходного слоя (not «скрытая маска») |
+| unused (input that feeds nothing) | не нужен (not «лишний») |
+| latent-side coordinates (IAF) | латентные координаты; "before i" — с номерами меньше i |
+| pivoting / pivot | выбор ведущего элемента (pivoting) † / ведущий элемент |
+| permutation matrix | матрица перестановки |
+| mixing matrix | матрица перемешивания |
+| per-dimension affine layer (ActNorm) | покоординатный аффинный слой |
+| universal density approximator | универсальный аппроксиматор плотности (universal density approximator) † |
+| neural / spline transformer (flows) | нейросетевой / сплайновый преобразователь (transformer) † |
+| rational-quadratic spline | рационально-квадратичный сплайн (rational-quadratic spline) † |
+| push a grid backward through a flow | пропустить сетку через поток в обратном направлении (not «проталкивать назад») |
 | weight decay | затухание весов (weight decay) † |
 
 ### Evaluation
