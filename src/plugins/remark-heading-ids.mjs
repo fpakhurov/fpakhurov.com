@@ -7,10 +7,12 @@ export default function remarkHeadingIds() {
     visit(tree, 'heading', (node) => {
       const last = node.children[node.children.length - 1];
       if (!last || last.type !== 'text') return;
-      const match = last.value.match(/\s*\{#([a-z0-9-]+)\}\s*$/);
+      // Smartypants may already have turned a `--` in the id into a dash.
+      const match = last.value.match(/\s*\{#([a-z0-9\u2013\u2014-]+)\}\s*$/);
       if (!match) return;
       last.value = last.value.slice(0, match.index);
-      node.data = { ...node.data, hProperties: { ...node.data?.hProperties, id: match[1] } };
+      const id = match[1].replace(/[\u2013\u2014]/g, '--');
+      node.data = { ...node.data, hProperties: { ...node.data?.hProperties, id } };
     });
   };
 }
