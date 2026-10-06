@@ -2,9 +2,7 @@ import { defineCollection } from 'astro:content';
 import { glob } from 'astro/loaders';
 import { z } from 'astro/zod';
 
-const notes = defineCollection({
-  loader: glob({ pattern: '**/*.{md,mdx}', base: './src/content/notes' }),
-  schema: z.object({
+const noteSchema = z.object({
     title: z.string(),
     description: z.string(),
     course: z.enum(['nlp', 'generative-models']),
@@ -13,7 +11,17 @@ const notes = defineCollection({
     status: z.enum(['draft', 'published', 'needs-review']),
     tags: z.array(z.string()).default([]),
     prerequisites: z.array(z.string()).default([]),
-  }),
+});
+
+const notes = defineCollection({
+  loader: glob({ pattern: '**/*.{md,mdx}', base: './src/content/notes' }),
+  schema: noteSchema,
+});
+
+// Russian translations: same ids as `notes`, so each translation finds its original.
+const notesRu = defineCollection({
+  loader: glob({ pattern: '**/*.{md,mdx}', base: './src/content/notes-ru' }),
+  schema: noteSchema,
 });
 
 const projects = defineCollection({
@@ -47,4 +55,4 @@ const work = defineCollection({
   }),
 });
 
-export const collections = { notes, projects, work };
+export const collections = { notes, notesRu, projects, work };
