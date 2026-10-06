@@ -255,6 +255,16 @@ How the course notes are translated into Russian. The Russian notes live in `src
 | memorization (of training data) | запоминание (memorization) † |
 | antialiasing | сглаживание (antialiasing) † |
 | quantisation | квантование |
+| backbone (network) | базовая сеть (backbone) † |
+| adversarial perturbations | состязательные возмущения (adversarial perturbations) † |
+| perceptual loss | перцептивная функция потерь (perceptual loss) † |
+| super-resolution | сверхразрешение (super-resolution) † |
+| inpainting | заполнение пропущенных областей (inpainting) † |
+| style transfer | перенос стиля |
+| unit normalisation | нормировка (к единичной длине) |
+| cosine distance | косинусное расстояние |
+| element-wise product | поэлементное произведение |
+| wrapping around (circular boundary) | с переносом через край (циклически) |
 
 ### Evaluation
 
@@ -270,6 +280,9 @@ How the course notes are translated into Russian. The Russian notes live in `src
 | accuracy (classifier) | доля правильных ответов (accuracy) †; not «точность», which is reserved for precision |
 | mean term / covariance term (FID) | член средних / член ковариаций |
 | intra-FID | intra-FID (not translated) |
+| two-alternative forced choice (2AFC) | вынужденный выбор из двух альтернатив (two-alternative forced choice, 2AFC) † |
+| reference image | эталон (эталонное изображение) |
+| reference implementation | эталонная реализация |
 
 ### Site and notebook vocabulary
 
