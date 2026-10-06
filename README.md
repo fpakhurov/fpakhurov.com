@@ -21,6 +21,7 @@ npm run build
 - Project records: `src/content/projects/`
 - Work case studies: `src/content/work/`
 - Original handwritten material: `source-material/` (never copied to the built site)
+- Contacts and profiles: `src/config/profile.ts` (see `docs/contact-and-email.md`)
 
 Note URLs are permanent and never include dates. Each note declares its course, section, order, review status, tags and prerequisites in frontmatter.
 
