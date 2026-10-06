@@ -4,6 +4,7 @@ import sitemap from '@astrojs/sitemap';
 import { unified } from '@astrojs/markdown-remark';
 import remarkMath from 'remark-math';
 import rehypeKatex from 'rehype-katex';
+import remarkHeadingIds from './src/plugins/remark-heading-ids.mjs';
 
 export default defineConfig({
   site: 'https://fpakhurov.com',
@@ -11,7 +12,7 @@ export default defineConfig({
   integrations: [mdx(), sitemap()],
   markdown: {
     processor: unified({
-      remarkPlugins: [remarkMath],
+      remarkPlugins: [remarkMath, remarkHeadingIds],
       rehypePlugins: [rehypeKatex],
     }),
     shikiConfig: { theme: 'github-dark-default' },

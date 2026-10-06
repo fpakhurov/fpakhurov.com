@@ -84,7 +84,11 @@ Run after every change set:
 - Reviewers can be wrong. The fixer verifies every finding against the mathematics, the notebook or the paper, applies the valid ones and records why the others were rejected.
 - Work through topics one at a time and commit after each. Long multi-agent runs hit usage limits; a sequential run loses at most one topic when interrupted and resumes from cache.
 
-## 12. Working environment
+## 12. Russian translations
+
+Each note has a Russian translation in `src/content/notes-ru/`, served at `/ru/notes/...`. Notes without a translation open in English under the Russian URL with a notice. Translation rules, the glossary and the parity checks are in [glossary-ru.md](glossary-ru.md). When an English note changes, update its translation in the same commit.
+
+## 13. Working environment
 
 - Each agent runs its own dev server on its own port (for example 4400 for one, 4321 for another) and its own working copy or branch. Merge through git, not by editing the same files at once.
 - Screenshots and build outputs fill the disk quickly. Keep them in a scratch directory and delete them after the review.
