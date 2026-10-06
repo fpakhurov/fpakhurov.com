@@ -141,6 +141,16 @@ How the course notes are translated into Russian. The Russian notes live in `src
 | transition kernel (Markov chain) | (гауссовское) переходное ядро; not bare «ядро», which reads as a convolution kernel |
 | mean coefficient | коэффициент среднего |
 | noise std | стандартное отклонение шума («σ шума» in figure labels) |
+| precision (inverse variance) | обратная дисперсия (precision) †; not «точность», which is reserved for precision / recall |
+| chain rule of probability | формула умножения вероятностей (chain rule) † |
+| tower property | формула полного математического ожидания (tower property) † |
+| completing the square | выделение полного квадрата |
+| true posterior (diffusion) | истинное апостериорное распределение (true posterior) † |
+| Markov chain | марковская цепь |
+| telescoping (ratios / sum) | телескопически сокращаются |
+| antithetic samples / partners | антитетические пары (antithetic) † |
+| variance-reduction trick | приём снижения дисперсии |
+| conditions on (a variable) | в условии стоит …; not «обусловлено», which reads as «вызвано» |
 
 ### Learning and networks
 
@@ -206,6 +216,10 @@ How the course notes are translated into Russian. The Russian notes live in `src
 | denoiser | денойзер (модель шумоподавления) |
 | sampling, sample | сэмплирование, сэмпл (выборка — for a set of samples) |
 | timestep | шаг (временной шаг) |
+| timestep-conditioned (network) | получающая на вход шаг; not «обусловленная шагом» |
+| reverse diffusion step | шаг обратной диффузии |
+| discretized decoder | дискретизированный декодер |
+| pixel tile (figures) | пиксельная плитка; «Плитки — настоящие сэмплы…» |
 | exponential moving average (EMA) | экспоненциальное скользящее среднее (EMA) |
 | running average / running estimate | скользящее среднее / скользящая оценка |
 | batch mean / batch variance | среднее по батчу / дисперсия по батчу |
@@ -318,6 +332,7 @@ How the course notes are translated into Russian. The Russian notes live in `src
 | embedding | эмбеддинг (векторное представление) |
 | precision / recall | точность / полнота (precision / recall) † |
 | fidelity / diversity | качество (fidelity) / разнообразие (diversity) † |
+| bits per dimension | бит на размерность (bits per dimension) †; «3.70 бита на размерность» |
 | score (Inception Score etc.) | метрика, значение метрики; not «оценка», which is reserved for estimate / bound |
 | accuracy (classifier) | доля правильных ответов (accuracy) †; not «точность», which is reserved for precision |
 | mean term / covariance term (FID) | член средних / член ковариаций |
