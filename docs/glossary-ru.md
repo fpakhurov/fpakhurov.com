@@ -118,6 +118,9 @@ How the course notes are translated into Russian. The Russian notes live in `src
 | operator norm | операторная норма |
 | mean value theorem | теорема о среднем |
 | proxy (stand-in quantity) | суррогат |
+| conditional entropy / marginal entropy | условная энтропия / маргинальная энтропия |
+| law of total probability | формула полной вероятности |
+| peaked / flat (distribution) | с острым пиком / плоское |
 
 ### Learning and networks
 
@@ -237,6 +240,12 @@ How the course notes are translated into Russian. The Russian notes live in `src
 | hinge loss | кусочно-линейная функция потерь (hinge loss) † |
 | spectral norm | спектральная норма (spectral norm) † |
 | broadcast (tensors) | распространяется (broadcasting) † |
+| pretrained / frozen (network) | предобученный / замороженный |
+| adversarial examples | состязательные примеры (adversarial examples) † |
+| early stopping | ранняя остановка |
+| hyperparameter search / architecture search | подбор гиперпараметров / поиск архитектуры |
+| one-hot prediction | предсказание в виде one-hot-вектора |
+| Inception modules | модули Inception (Inception modules) |
 
 ### Evaluation
 
@@ -248,6 +257,8 @@ How the course notes are translated into Russian. The Russian notes live in `src
 | embedding | эмбеддинг (векторное представление) |
 | precision / recall | точность / полнота (precision / recall) † |
 | fidelity / diversity | качество (fidelity) / разнообразие (diversity) † |
+| score (Inception Score etc.) | метрика, значение метрики; not «оценка», which is reserved for estimate / bound |
+| accuracy (classifier) | доля правильных ответов (accuracy) †; not «точность», which is reserved for precision |
 
 ### Site and notebook vocabulary
 
