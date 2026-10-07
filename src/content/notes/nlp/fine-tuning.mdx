@@ -1,0 +1,123 @@
+---
+title: Fine-tuning
+description: "Continue training a pretrained model on a labelled task: what to train (everything, or only a new head), at what learning rate, and what it costs in memory. A GPT-2 model on sentiment gives 0.890 with everything trained, 0.737 with the head alone, and 0.900 when the head is trained first and everything second."
+course: nlp
+section: Adaptation and Efficient Models
+order: 21
+status: published
+tags: [fine-tuning, linear-probing, lp-ft, learning-rate, catastrophic-forgetting, sst-2]
+prerequisites: [Transfer learning in NLP, GPT and autoregressive language modeling, Gradient descent]
+---
+
+The [transfer learning note](/notes/nlp/transfer-learning) found that training all of a pretrained encoder on the task beats reading off its frozen features, 0.949 to 0.902 on AG News. That raises the practical questions this note answers: which parameters to train, at what learning rate, in what order, and what the choice costs. The experiments move to a decoder-only model and a new task, so that the conclusions are not specific to BERT.
+
+**Notation.** Pretrained parameters $\theta$ (the body), a task head with parameters $\phi$ initialized at random; learning rate $\eta$; the loss $\mathcal L$ is the task cross-entropy.
+
+## The setting
+
+Task: binary sentiment on the Stanford Sentiment Treebank (SST-2), movie-review phrases labelled positive or negative; 50,000 of the 67,349 training phrases are used, and the 872-phrase validation split is the test set (the official test labels are hidden). The classes are 44 % negative and 56 % positive in training, close to balanced, so accuracy is reported.
+
+Model: GPT-2 small (124 M parameters, from the [GPT note](/notes/nlp/gpt#two-models-by-the-numbers)) with a linear head $\phi \in \mathbb R^{768 \times 2}$ on the hidden state of the **last non-padding token**. In a causal model only the last position has attended to the whole input, so it is the one that can summarize the phrase; the `[CLS]` convention of BERT reads the first position instead because every position there sees everything. A `[PAD]` token is added to the tokenizer and the embedding table grows by one row.
+
+Training: AdamW, batch size 128, 1,000 steps (about 2.6 passes over the 50,000 phrases), mixed precision, evaluation every 250 steps.
+
+## Baseline: train everything
+
+Full fine-tuning updates $\theta$ and $\phi$ together with the same optimizer:
+
+$$
+(\theta, \phi) \leftarrow (\theta, \phi) - \eta\, \nabla_{\theta,\phi}\, \mathcal L .
+$$
+
+The learning rate is $2 \times 10^{-6}$, three orders of magnitude below the $10^{-3}$ used to train the small Transformer from scratch in the [architecture note](/notes/nlp/transformers#a-small-encoder-on-ag-news). Pretrained weights already encode what the model knows; a large step destroys that before the head has learned to use it, a failure called **catastrophic forgetting**. Small steps move the body only as far as the task requires.
+
+Result: **0.890** validation accuracy, loss 0.277.
+
+Cost: the optimizer keeps two moment estimates per parameter and the backward pass keeps a gradient per parameter. In 32-bit floats the 124 M weights take 0.46 GB, the gradients another 0.46 GB and the AdamW states 0.92 GB, before activations: about four times the memory of the model itself. For a 7 B-parameter model the same arithmetic gives 112 GB, more than one GPU holds, and that is the number the [PEFT note](/notes/nlp/peft) sets out to reduce.
+
+## Linear probing: train only the head
+
+Freeze $\theta$, train $\phi$ alone at a larger learning rate ($10^{-4}$, since the head starts from random values and has nothing to forget). The body's output is a fixed feature and the head is logistic regression on it, as in the frozen-features experiment of the previous note, except that here the features are computed on the fly.
+
+Result: **0.737**, loss 0.541.
+
+The gap to full fine-tuning is 15 points. The last-token hidden state of a language model was trained to predict the next token, not to separate sentiments, and a linear read-out finds only part of the signal. The BERT `[CLS]` vector on AG News gave 0.902 under the same regime; topic is more linearly present in a pretrained representation than sentiment, and a bidirectional summary token is a better feature than a last-position causal state. Linear probing is a measurement of what the representation contains, and a cheap but weak classifier.
+
+Wall-clock time was about the same as full fine-tuning (6.5 against 7.5 minutes): every step still runs the full forward pass, and the backward pass through the frozen body is skipped but was not the dominant cost at this size. Memory, not time, is what probing saves.
+
+## LP-FT: head first, then everything
+
+<aside class="callout"><strong>Key idea.</strong> At the start of full fine-tuning the head is random, so its gradient into the body is noise, and the first steps distort the pretrained features before the head is useful. Train the head alone first; then unfreeze the body and fine-tune everything from a head that already points in the right direction.</aside>
+
+[Kumar et al. (2022)](#references) showed this two-stage schedule (linear probing, then fine-tuning) preserves pretrained features better than fine-tuning from a random head, with the largest gains on data that differs from the fine-tuning distribution. Here the head saved from the probing run is loaded and full fine-tuning proceeds at $2 \times 10^{-6}$.
+
+Result: **0.900**, loss 0.258, one point above fine-tuning from scratch at the same cost plus one probing run.
+
+| Regime | Trainable | $\eta$ | Val. accuracy | Val. loss |
+| --- | --- | --- | --- | --- |
+| Full fine-tuning | 124 M | $2\times10^{-6}$ | 0.890 | 0.277 |
+| Linear probing | 1,536 | $10^{-4}$ | 0.737 | 0.541 |
+| LP-FT | 1,536, then 124 M | $10^{-4}$, then $2\times10^{-6}$ | 0.900 | 0.258 |
+
+The one-point difference between the first and third rows is at the edge of what 872 examples can resolve (one example is 0.11 %), so the reading is "LP-FT is at least as good, with a mechanism that predicts it should be", not a measured 1 % gain.
+
+## Hyperparameters that matter
+
+- **Learning rate** is the main one: $10^{-5}$ to $5 \times 10^{-5}$ for encoders, lower for larger decoders. Too high forgets; too low does not move.
+- **Schedule.** Linear warm-up over the first few hundred steps followed by decay is the default for post-norm models and harmless for pre-norm ones.
+- **Epochs.** Two to four over the labelled set; more overfits small datasets.
+- **Weight decay** of 0.01 and dropout at the pretrained rate; both regularize a model that has far more parameters than the task has examples.
+- **Seeds.** Runs on small datasets vary by a point or more with the seed and data order; a decision needs several runs ([Dodge et al., 2020](#references)).
+
+## What changed
+
+| | Frozen features + linear model | Fine-tuning |
+| --- | --- | --- |
+| Parameters updated | Head | Head and body |
+| Learning rate | Large (random head) | Small (pretrained body) |
+| Memory | Head only | ≈ 4× model size in fp32 |
+| Feature quality | Fixed by pretraining | Adapted to the task |
+| SST-2, GPT-2 small | 0.737 | 0.890 / 0.900 (LP-FT) |
+
+## Limitations
+
+- **One full copy per task.** The fine-tuned $\theta$ is a new 124 M-parameter (or 7 B) artefact; ten tasks are ten copies.
+- **Memory** scales with the model: weights, gradients and optimizer states.
+- **Forgetting.** The fine-tuned model is specialized; its general abilities degrade.
+- **Noise.** Small validation sets cannot resolve differences of a point.
+- **Last-token features are weak.** A causal model's representation is not designed for classification; an encoder of the same size is usually better and cheaper for this task.
+
+## What you should remember
+
+- Fine-tuning: train body and head together at a small learning rate ($10^{-6}$ to $10^{-5}$ range here); large rates erase pretraining.
+- Linear probing: freeze the body, train the head at a larger rate; cheap in memory, limited by what the representation already encodes (0.737 here).
+- LP-FT: probe first, then fine-tune from the trained head; at least as good as fine-tuning and better founded (0.900).
+- Memory for full fine-tuning is about four times the model's weights in fp32.
+- Every task fine-tuned this way produces a full copy of the model.
+
+## Notebook
+
+[`week10_PEFT.ipynb`](https://github.com/glkuzi/nlp_dsba/blob/4130e09940ddd363cee9fa3bd51b149466cfc6fb/seminars/week10_PEFT.ipynb). Cell numbers count every cell, markdown included, from 1.
+
+- Cells 3–6 load SST-2 (`train[:50000]` and `validation`); cell 18 prints the class proportions (0.442 / 0.558 train, 0.491 / 0.509 validation).
+- Cells 9–13 load GPT-2 with a sequence-classification head, add `[PAD]`, resize the embeddings and print 124,442,112 parameters. The `Model` wrapper's `forward` runs the transformer, selects the hidden state at index `attention_mask.sum(-1) - 1` (the last real token) and applies the `score` layer.
+- Cell 23 defines the training loop (AdamW, cross-entropy, `torch.autocast` in float16, evaluation every 250 of 1,000 steps with loss and accuracy curves) and `evaluate`.
+- Cells 25–27: full fine-tuning at $2\times10^{-6}$, validation loss 0.2772 and accuracy 0.8899.
+- Cells 31–34: linear probing (`AdamW(model.model.score.parameters(), lr=1e-4)`), 0.5412 and 0.7374; the head is saved to `head.pt`.
+- Cells 56–60: LP-FT, loading `head.pt` and fine-tuning everything at $2\times10^{-6}$: 0.2580 and 0.9002.
+- Cells 62–64 print predictions with probabilities for ten validation phrases.
+
+Cells 35–54 (LoRA and prompt tuning on the same setup) belong to the [next note](/notes/nlp/peft).
+
+## Next
+
+Full fine-tuning gives the best accuracy and costs a full copy of the model plus four times its memory during training. The [next note](/notes/nlp/peft) keeps the body frozen and adds a small number of new parameters in the right places, so that the same SST-2 task is learned to the same accuracy while training 0.24 % of the weights.
+
+## References
+
+- A. Kumar, A. Raghunathan, R. Jones, T. Ma, P. Liang. [Fine-Tuning can Distort Pretrained Features and Underperform Out-of-Distribution](https://arxiv.org/abs/2202.10054). ICLR, 2022. LP-FT.
+- J. Howard, S. Ruder. [Universal Language Model Fine-tuning for Text Classification](https://aclanthology.org/P18-1031/). ACL, 2018. Discriminative learning rates and gradual unfreezing.
+- J. Dodge, G. Ilharco, R. Schwartz, A. Farhadi, H. Hajishirzi, N. Smith. [Fine-Tuning Pretrained Language Models: Weight Initializations, Data Orders, and Early Stopping](https://arxiv.org/abs/2002.06305). arXiv, 2020.
+- R. Socher et al. [Recursive Deep Models for Semantic Compositionality Over a Sentiment Treebank](https://aclanthology.org/D13-1170/). EMNLP, 2013. SST.
+- A. Wang et al. [GLUE: A Multi-Task Benchmark and Analysis Platform for Natural Language Understanding](https://aclanthology.org/W18-5446/). BlackboxNLP, 2018. The SST-2 split used here.
+- I. Loshchilov, F. Hutter. [Decoupled Weight Decay Regularization](https://arxiv.org/abs/1711.05101). ICLR, 2019. AdamW.

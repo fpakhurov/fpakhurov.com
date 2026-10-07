@@ -1,0 +1,156 @@
+---
+title: GPT and autoregressive language modeling
+description: "A decoder-only Transformer trained on next-token prediction is the n-gram chain rule with unbounded context; the note gives the objective and the causal-mask trick that trains all positions at once, reads two model listings by the numbers, shows what a base model does when prompted, and works through the decoding strategies that turn its probabilities into text."
+course: nlp
+section: Pretrained Language Models
+order: 18
+status: published
+tags: [gpt, language-model, autoregressive, decoding, sampling, temperature, top-p, beam-search, speculative-decoding]
+prerequisites: [BERT and masked language modeling, N-gram language models]
+---
+
+The encoder of the [previous note](/notes/nlp/bert) fills in blanks and cannot continue a text. Generation needs the factorization of the [n-gram note](/notes/nlp/n-gram-language-models#from-a-joint-probability-to-a-product-of-conditionals), $P(w_{1:T}) = \prod_t P(w_t \mid w_{<t})$, with a model that conditions on the whole prefix. A Transformer decoder with a causal mask is exactly that model, and training it on a large corpus is what the GPT series did ([Radford et al., 2018](#references), [2019](#references); [Brown et al., 2020](#references)). This note covers the objective, the architecture in two concrete sizes, the behaviour of the resulting base model, and the decoding step that every use of it goes through.
+
+**Notation.** Tokens $w_{1:T}$; logits $z_t \in \mathbb R^{|V|}$ at position $t$; $P(w \mid w_{<t}) = \operatorname{softmax}(z_t)_w$. Temperature $\tau$.
+
+## Baseline: the recurrent language model
+
+The [RNN note](/notes/nlp/recurrent-networks#rnn-as-a-language-model) already trains a next-token predictor by teacher forcing. Its context is the whole prefix, through a state that forgets, and it processes positions one after another. Replacing the recurrence with causal self-attention keeps the objective and removes both constraints.
+
+<aside class="callout"><strong>Key idea.</strong> Stack decoder blocks whose self-attention is masked so that position $t$ sees positions $\le t$. One forward pass over a training sequence then produces, at every position, a prediction for the next token with no leakage, and the loss at all $T$ positions is computed at once.</aside>
+
+## The objective
+
+$$
+\mathcal L = -\frac1T\sum_{t=1}^{T} \log P(w_t \mid w_{<t}),
+$$
+
+the per-token cross-entropy, whose exponential is the perplexity. The input is the sequence, the target is the sequence shifted left by one, and the causal mask does the work that teacher forcing did: it is impossible for position $t$ to read $w_{t+1}$, so all positions can be trained in parallel on the same forward pass. This is the practical advantage over the recurrent model that the [Transformer note](/notes/nlp/transformers) promised: training cost per sequence is one pass of $T$ positions in parallel, not $T$ sequential steps.
+
+Nothing else is needed. No masking rule, no segment pairs, no auxiliary task: every token in the corpus is a training example, which is why decoder-only pretraining is more sample-efficient than MLM and why it scaled first.
+
+## Two models by the numbers
+
+The notebooks use two decoder-only models whose printed module trees make the architecture concrete.
+
+**GPT-2 small** ([Radford et al., 2019](#references)): byte-level BPE vocabulary of 50,257, learned positions up to 1,024, 12 pre-norm blocks with $d = 768$, 12 heads and $d_{\text{ff}} = 3{,}072$. The attention projections are fused into one $768 \times 2{,}304$ matrix producing $Q, K, V$ together. Parameters: $12 \times 12 \times 768^2 \approx 85$ M in the blocks plus $50{,}257 \times 768 \approx 38.6$ M in the embedding, which is also the output matrix (tied), plus $1{,}024 \times 768$ positions: 124 M in total, which is what the [fine-tuning note](/notes/nlp/fine-tuning) counts after adding one padding token.
+
+**Llama 3.2 1B**: vocabulary 128,256; 16 pre-norm blocks with $d = 2{,}048$; RMSNorm; rotary positions; a gated FFN with three $2{,}048 \times 8{,}192$ matrices; and **grouped-query attention**, visible in the listing as a $2{,}048 \times 2{,}048$ query projection next to $2{,}048 \times 512$ key and value projections: 32 query heads of width 64 share 8 key–value heads, which cuts the memory of cached keys and values by four at generation time. Per block: 10.5 M attention + 50.3 M FFN ≈ 60.8 M; 16 blocks ≈ 973 M; embeddings $128{,}256 \times 2{,}048 \approx 263$ M, tied with the output; about 1.24 B in all. The 1B model has 11 times GPT-2 small's parameters and a vocabulary 2.5 times larger, and the design changes (pre-norm, RMSNorm, RoPE, gated FFN, GQA) are the ones the [architecture note](/notes/nlp/transformers) listed as modern defaults.
+
+## What a base model does
+
+A pretrained decoder is a text continuer. Given `Find the value of n in the equation n + 2 = 6.`, a 1 B base model produces a plausible continuation of a web page containing that sentence: it restates the problem, solves it correctly, then keeps going with "If n is an integer, what is the value of n? n = 5", "n = 6", and so on until the token budget runs out, because such lists are what follows such sentences in its training data. Given the same problem written as a completion, `… Answer: n = `, it emits `4` and then continues with a numbered list of equations. The model has the knowledge; it does not have the behaviour of answering and stopping. That behaviour is added by the [instruction tuning note](/notes/nlp/instruction-tuning), and the base and tuned checkpoints there have identical architectures.
+
+## Decoding: turning probabilities into text
+
+The model outputs a distribution at each step; something has to pick a token from it, append the token, and repeat. The choice shapes the text as much as the model does.
+
+### Greedy and beam search
+
+**Greedy** takes $\arg\max_w P(w \mid w_{<t})$. It is deterministic and cheap, and on open-ended prompts it loops: a 135 M-parameter model asked to continue a story produces "Lily's mom, Mrs. Jenkins, was very kind and helpful" and then repeats the sentence, because once a phrase has been generated it is the most probable continuation of itself. **Beam search** (the [translation note](/notes/nlp/transformer-machine-translation#beam-search)) finds higher-probability sequences and makes the problem worse for open-ended text: the most probable long text is bland and repetitive ([Holtzman et al., 2020](#references)). It remains the right tool when there is a correct output, as in translation.
+
+### Temperature
+
+Divide the logits by $\tau$ before the softmax:
+
+$$
+P_\tau(w) = \frac{\exp(z_w / \tau)}{\sum_{w'} \exp(z_{w'} / \tau)}.
+$$
+
+$\tau = 1$ is the model's distribution; $\tau \to 0$ approaches greedy; $\tau > 1$ flattens. For three logits $(2, 1, 0)$:
+
+| $\tau$ | $P_\tau$ |
+| --- | --- |
+| 0.5 | $(0.867, 0.117, 0.016)$ |
+| 1 | $(0.665, 0.245, 0.090)$ |
+| 2 | $(0.506, 0.307, 0.186)$ |
+
+Temperature rescales *all* tokens, including the implausible tail, so high temperatures produce incoherent text as easily as varied text.
+
+### Truncated sampling: top-$k$ and top-$p$
+
+Sample, but only from the head of the distribution. **Top-$k$** keeps the $k$ most probable tokens and renormalizes; it is predictable and ignores how peaked the distribution is, so $k = 40$ is too many when one token has 95 % of the mass and too few when the distribution is flat. **Top-$p$** (nucleus sampling, [Holtzman et al., 2020](#references)) keeps the smallest set $S$ with $\sum_{w \in S} P(w) \ge p$; the set adapts to the shape of the distribution, which is why $p \approx 0.9$ is the usual default for open-ended generation. Both remove the long tail that temperature alone would sometimes sample.
+
+### Penalties and contrast
+
+A **repetition penalty** $\rho > 1$ divides the logit of every token already in the context by $\rho$ if positive and multiplies it if negative ([Keskar et al., 2019](#references)); OpenAI-style *frequency* and *presence* penalties instead subtract a term proportional to the token's count. Both suppress loops at the cost of sometimes suppressing a token that should repeat (a name).
+
+**Contrastive search** ([Su et al., 2022](#references)) scores candidates by $\lambda \log P(w) - (1 - \lambda)\max_{j<t}\cos(h_w, h_j)$: probability minus the similarity of the candidate's hidden state to earlier ones, so repetition of representation is penalized, not just of tokens. **Typical sampling** ([Meister et al., 2023](#references)) keeps tokens whose surprise $-\log P(w)$ is close to the entropy of the distribution, discarding both the predictable and the bizarre. **DoLa** ([Chuang et al., 2024](#references)) decodes from the difference between the logits of a late layer and an early layer, on the hypothesis that early layers carry generic predictions and late layers specific ones; in the notebook it degenerates into "Max is 11 and 1 and 1 and 1…" without a repetition penalty, which the method's documentation recommends.
+
+| Method | Knob | Deterministic | Typical use |
+| --- | --- | --- | --- |
+| Greedy | — | Yes | Short factual answers; loops on long text |
+| Beam | $B$, $\alpha$ | Yes | Translation, summarization with references |
+| Temperature | $\tau$ | No | Combined with truncation |
+| Top-$k$ | $k$ | No | Legacy default |
+| Top-$p$ | $p$ | No | Open-ended generation |
+| Repetition penalty | $\rho$ | — | Added to any of the above |
+| Contrastive search | $\lambda$ or $\alpha$, $k$ | Yes | Coherent long text without sampling |
+
+## Making generation faster
+
+Each generated token requires a forward pass over the prefix. Two mechanisms recover most of the waste.
+
+**KV caching.** Keys and values of earlier positions do not change when a token is appended; cache them and compute only the new position's query, key and value. Memory per token is $2 \times L \times d_{kv}$ numbers, which is why grouped-query attention, which shrinks $d_{kv}$, matters for serving.
+
+**Speculative decoding** ([Leviathan, Kalman and Matias, 2023](#references)). A small *draft* model proposes $k$ tokens; the large *target* model verifies them in one forward pass over the extended prefix; accepted tokens are kept and the first rejected one is replaced by the target's own choice. With greedy decoding the output is identical to the target model's; with sampling, an acceptance rule makes the output distribution identical. In the notebook, a 1.7 B target with a 135 M draft generates 128 tokens in 45 s instead of 103 s on the same hardware, with the same text when both are greedy. Serving engines add **continuous batching** (requests join and leave a running batch), **paged KV memory** and **prefix caching** (a shared long prompt is encoded once), which raise throughput further without changing the model.
+
+## What changed
+
+| | Recurrent LM | Decoder-only Transformer |
+| --- | --- | --- |
+| Context | Whole prefix, through a forgetting state | Whole prefix, by attention |
+| Training over a sequence | $T$ sequential steps | One parallel pass with a causal mask |
+| Scale reached | Tens of millions of parameters | $10^8$ to $10^{12}$ |
+| Use of the pretrained model | Perplexity, sampling | Completion, few-shot prompting, then tuning |
+
+## Limitations
+
+- **Left to right only.** The representation of token $t$ never sees $t + 1$; for understanding tasks an encoder's bidirectional vector is a better feature. The [model-families note](/notes/nlp/model-families) compares.
+- **Fluent is not correct.** The objective rewards plausible continuations, so a base model fabricates with the same confidence it states facts.
+- **A continuer, not an assistant.** Without further training the model does not follow instructions, stop, or refuse.
+- **Generation is sequential** and memory-bound at inference even though training is parallel.
+- **Decoding choices are part of the system.** The same model gives different text under different samplers; evaluations must fix them.
+
+## What you should remember
+
+- Objective: $-\frac1T\sum_t \log P(w_t \mid w_{<t})$ over every token; the causal mask trains all positions in one pass.
+- GPT-2 small: 12 blocks, $d = 768$, 124 M, tied embeddings. Llama 3.2 1B: 16 blocks, $d = 2{,}048$, GQA, RoPE, gated FFN, ≈ 1.24 B.
+- A base model continues text; prompting it as a completion works better than asking it a question.
+- Decoding: greedy loops, beam search is for reference-matched tasks, temperature rescales, top-$p$ truncates adaptively, penalties and contrastive search target repetition.
+- KV caching and speculative decoding speed generation without changing the output.
+
+## Notebook
+
+Three notebooks. Cell numbers count every cell, markdown included, from 1.
+
+[`week08_modern_LLM.ipynb`](https://github.com/glkuzi/nlp_dsba/blob/4130e09940ddd363cee9fa3bd51b149466cfc6fb/seminars/week08_modern_LLM.ipynb): cells 5–10 load the Llama 3.2 1B base checkpoint in a `text-generation` pipeline with up to 512 new tokens and run the equation prompt as a question and as a completion; cells 17–19 print the module trees of the base and instruction-tuned checkpoints and confirm they are string-identical.
+
+[`week10_PEFT.ipynb`](https://github.com/glkuzi/nlp_dsba/blob/4130e09940ddd363cee9fa3bd51b149466cfc6fb/seminars/week10_PEFT.ipynb): cells 10–13 load GPT-2 small, add a `[PAD]` token, print the module tree and the parameter count 124,442,112.
+
+[`week11_pt0_Decoding_and_Sampling.ipynb`](https://github.com/glkuzi/nlp_dsba/blob/4130e09940ddd363cee9fa3bd51b149466cfc6fb/seminars/week11_pt0_Decoding_and_Sampling.ipynb):
+
+- Cells 5–8 state the temperature formula and define `generate_once` with `max_new_tokens`, `temperature`, `top_k`, `top_p`, `typical_p` and `repetition_penalty` passed to `generate`.
+- Cells 10–13 run greedy (the Mrs. Jenkins loop), $\tau = 0.7$, top-$k$ = 40 and top-$p$ = 0.9 on "Continue the story: Once upon a time" with a 135 M instruction-tuned model and print the texts.
+- Cells 14–16 explain and run typical sampling ($p = 0.2$) and top-$p$ with repetition penalty 1.2.
+- Cells 17–20 run contrastive search (`penalty_alpha=0.6, top_k=4`) and DoLa (`dola_layers="low"`), both through custom-generation repositories.
+- Cells 21–24 pair a 1.7 B target with a 135 M draft via `assistant_model` and time 128 greedy tokens: 103.05 s and 101.38 s without the draft, 45.45 s and 40.79 s with it. The two runs with the draft produce different texts from each other and from the base run because a later cell changed the global seed and the prompt tokenizer between runs; with identical settings the outputs would coincide.
+- Cells 25–33 describe vLLM (paged attention, continuous batching, prefix caching) and run a 360 M model with and without a shared long prompt; timings for those cells are not in the saved outputs.
+
+## Next
+
+Encoders fill in, decoders continue, and the translation model of the previous section did both with an encoder–decoder. The [next note](/notes/nlp/model-families) puts the three arrangements side by side with their objectives, asks which to pick for which task, and explains why decoder-only models came to dominate.
+
+## References
+
+- A. Radford, K. Narasimhan, T. Salimans, I. Sutskever. [Improving Language Understanding by Generative Pre-Training](https://cdn.openai.com/research-covers/language-unsupervised/language_understanding_paper.pdf). OpenAI, 2018. GPT-1.
+- A. Radford, J. Wu, R. Child, D. Luan, D. Amodei, I. Sutskever. [Language Models are Unsupervised Multitask Learners](https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf). OpenAI, 2019. GPT-2.
+- T. B. Brown et al. [Language Models are Few-Shot Learners](https://arxiv.org/abs/2005.14165). NeurIPS, 2020. GPT-3 and in-context learning.
+- A. Holtzman, J. Buys, L. Du, M. Forbes, Y. Choi. [The Curious Case of Neural Text Degeneration](https://arxiv.org/abs/1904.09751). ICLR, 2020. Nucleus sampling and the failure of likelihood maximization.
+- N. S. Keskar, B. McCann, L. R. Varshney, C. Xiong, R. Socher. [CTRL: A Conditional Transformer Language Model for Controllable Generation](https://arxiv.org/abs/1909.05858). arXiv, 2019. The repetition penalty.
+- Y. Su, T. Lan, Y. Wang, D. Yogatama, L. Kong, N. Collier. [A Contrastive Framework for Neural Text Generation](https://arxiv.org/abs/2202.06417). NeurIPS, 2022. Contrastive search.
+- C. Meister, T. Pimentel, G. Wiher, R. Cotterell. [Locally Typical Sampling](https://doi.org/10.1162/tacl_a_00536). TACL, 11, 2023.
+- Y.-S. Chuang, Y. Xie, H. Luo, Y. Kim, J. Glass, P. He. [DoLa: Decoding by Contrasting Layers Improves Factuality in Large Language Models](https://arxiv.org/abs/2309.03883). ICLR, 2024.
+- Y. Leviathan, M. Kalman, Y. Matias. [Fast Inference from Transformers via Speculative Decoding](https://arxiv.org/abs/2211.17192). ICML, 2023.
+- W. Kwon et al. [Efficient Memory Management for Large Language Model Serving with PagedAttention](https://arxiv.org/abs/2309.06180). SOSP, 2023. vLLM.
+- J. Ainslie et al. [GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints](https://arxiv.org/abs/2305.13245). EMNLP, 2023. Grouped-query attention.

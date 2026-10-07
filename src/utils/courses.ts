@@ -92,7 +92,7 @@ export const courses: Record<CourseKey, Course> = {
         noteTopic('Named entity recognition', 'nlp/named-entity-recognition'),
         noteTopic('Question answering', 'nlp/question-answering'),
         noteTopic('Summarization', 'nlp/summarization'),
-        noteTopic('Machine translation', 'nlp/transformer-machine-translation'),
+        noteTopic('Machine translation', 'nlp/transformer-machine-translation', 'results'),
       ] },
       { title: 'Modern LLM Systems', summary: 'Systems built around a language model, and how to evaluate the whole system.', topics: [
         noteTopic('Embeddings and semantic search', 'nlp/semantic-search'),

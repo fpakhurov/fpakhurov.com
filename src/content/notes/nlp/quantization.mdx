@@ -1,0 +1,182 @@
+---
+title: Quantization
+description: "Store weights (and sometimes activations) as 8- or 4-bit integers with a scale and a zero point instead of 32-bit floats. The note derives the affine map and the integer matrix product, measures memory, accuracy and speed on a 67 M-parameter classifier through three implementations, explains GPTQ's calibration-based weight quantization, and places distillation and pruning next to it."
+course: nlp
+section: Adaptation and Efficient Models
+order: 24
+status: published
+tags: [quantization, int8, int4, gptq, nf4, distillation, inference]
+prerequisites: [Instruction tuning and alignment, Transformer Architecture, Linear algebra]
+---
+
+import AffineMap from '../../../components/figures/quantization/AffineMap.astro';
+
+A trained model is a set of matrices of 32-bit floats, and serving it means holding them in memory and multiplying by them for every token. A 7 B-parameter model is 28 GB in 32-bit and 14 GB in 16-bit; at generation time the cost is dominated by reading those bytes, once per token. Quantization stores the numbers in fewer bits. This note derives what that does to a matrix product, measures it on a small model, and explains how the method scales to large language models.
+
+**Notation.** A real value $x$ in a known range $[a, b]$; its integer code $x_q \in [a_q, b_q]$ (for int8, $[-128, 127]$); scale $s$ and zero point $z$. For a linear layer, $Y = XW + b$ with $X \in \mathbb R^{n \times d}$.
+
+## Baseline: 32-bit floats everywhere
+
+Every weight is a float32: 4 bytes, about 7 significant digits, a range of $10^{\pm 38}$. Nothing in a trained network uses that precision; weights of a layer typically lie in a range of a few units and are not distinguishable at the third decimal. Half precision (float16 or bfloat16) halves the memory with no visible loss and is the default for serving. Going below 16 bits needs integers, because hardware has no 8-bit float arithmetic in general use, and integers need a map.
+
+## The affine map
+
+<aside class="callout"><strong>Key idea.</strong> Pick the range $[a, b]$ that the values occupy, spread the $2^k$ integer codes evenly over it, and remember two numbers per tensor (or per row, or per group of 128 weights): the width of one step $s$ and which code corresponds to zero.</aside>
+
+$$
+x_q = \operatorname{round}\!\Big(\frac{x}{s} + z\Big), \qquad x \approx s\,(x_q - z), \qquad
+s = \frac{b - a}{b_q - a_q}, \quad z = \operatorname{round}\!\Big(\frac{b\,a_q - a\,b_q}{b - a}\Big).
+$$
+
+The scale is the real width of one integer step; the zero point is the integer that represents $0.0$, chosen so that $a \mapsto a_q$ and $b \mapsto b_q$. Codes are clipped to $[a_q, b_q]$. The round-trip error $|x - s(x_q - z)|$ is at most $s/2$ for $x$ inside the range, and unbounded outside it, so the choice of $[a, b]$ is the whole art: a range that is too wide wastes codes, a range that is too narrow clips the outliers that matter most.
+
+### Worked example
+
+Range $[a, b] = [-2, 3]$, int8. Then $s = 5/255 = 0.0196$ and $z = \operatorname{round}((3 \cdot (-128) - (-2) \cdot 127)/5) = \operatorname{round}(-26.0) = -26$.
+
+| $x$ | $x/s + z$ | $x_q$ | $s(x_q - z)$ | error |
+| --- | --- | --- | --- | --- |
+| $-2$ | $-128.0$ | $-128$ | $-2.000$ | 0 |
+| $0.37$ | $-7.13$ | $-7$ | $0.3725$ | $0.0025$ |
+| $1$ | $25.0$ | $25$ | $1.000$ | 0 |
+| $3$ | $127.0$ | $127$ | $3.000$ | 0 |
+
+<AffineMap />
+
+## What happens to a matrix product
+
+Quantize the input $X$ (scale $s_X$, zero $z_X$), the weight $W$ ($s_W, z_W$) and the bias. Substituting $X = s_X(X_q - z_X)$ and $W = s_W(W_q - z_W)$ into $Y_{ij} = b_j + \sum_k X_{ik} W_{kj}$ and expanding the product of two differences:
+
+$$
+Y_{ij} = s_b (b_{q,j} - z_b) + s_X s_W \Big[\sum_k X_{q,ik} W_{q,kj} - z_W \sum_k X_{q,ik} - z_X \sum_k W_{q,kj} + d\, z_X z_W\Big].
+$$
+
+Everything inside the bracket is integer arithmetic: an int8 × int8 matrix product accumulated in int32, two row and column sums, and a constant. The floats appear only in the final rescaling by $s_X s_W$ and the bias. The output can be re-quantized to $(s_Y, z_Y)$ by applying the map once more. This is the identity that makes quantization a speed-up rather than only a memory saving: when the hardware has fast int8 matrix units (modern GPUs and CPUs do), the bracket runs several times faster than the float product, and the weights read from memory are a quarter the size.
+
+Two things are required for the speed-up to appear. The kernel must exist for the hardware, and the activation ranges must be known. **Dynamic** quantization measures the range of $X$ at run time, per batch, and quantizes weights ahead of time; it needs no calibration data and pays a small cost per batch. **Static** quantization fixes the activation ranges in advance from a calibration set of a few hundred inputs, so that the whole graph runs in integers; it is faster and more fragile. **Quantization-aware training** simulates the rounding during fine-tuning so that the weights adapt to it; it recovers accuracy at the lowest bit widths at the cost of a training run.
+
+## Measurements on a small classifier
+
+The model is DistilBERT (66.96 M parameters), fine-tuned on IMDb sentiment; the test set is 25,000 reviews. Baseline: **0.249 GB** in float32, accuracy **0.9313**.
+
+| Implementation | What is quantized | Memory | Accuracy | Time, one batch of 64 |
+| --- | --- | --- | --- | --- |
+| float32 | nothing | 0.249 GB | 0.9313 | 24.5 s (CPU) |
+| Hand-written int8 linear layers (the formula above) | linear weights and inputs | 0.129 GB | — | slower than float (no int kernel) |
+| `torch.ao.quantization.quantize_dynamic` | linear layers, int8 | 0.089 GB | — | 20.4 s (CPU) |
+| `bitsandbytes` 8-bit (`load_in_8bit=True`) | linear layers, int8 on GPU | 0.085 GB | 0.9266 | 3.6 s (GPU) |
+
+Reading the table:
+
+- **Memory** halves with the hand-written layers (the embedding tables are left in float32 and are 23 % of the model), and drops to about a third with the library implementations, which also pack scales efficiently. Quantizing the embeddings as well would go further.
+- **Accuracy** drops by half a point at 8 bits with no retraining; this is typical for post-training int8 on encoders.
+- **Speed** is where implementations differ. The hand-written int8 layer is 24× *slower* than float32 (1.23 ms against 51 μs for a $256 \times 128$ input on a $128 \times 128$ layer), because PyTorch has no optimized int8 matmul on that CPU path and the sums are done in generic int32 ops; the arithmetic is right (mean absolute error 0.0011 against the float output) and the kernel is missing. The built-in dynamic quantization is 17 % faster than float on CPU. The 8-bit GPU run is 7× faster, but it is a different device: the comparison is with the same model on a GPU in 16-bit, which the notebook does not run. Quantization pays off only with a kernel written for the target hardware; without one it is a memory tool.
+
+The `torch.ao` path also does not run on GPU at all (the dynamic int8 linear op is CPU-only), which is one reason practitioners use the `bitsandbytes`, GPTQ and AWQ ecosystems for Transformers rather than the framework's own quantization.
+
+## Weight-only quantization for large language models
+
+Generation with a large decoder is memory-bound: each token needs every weight read once and does little arithmetic per byte. Reducing the bytes is the lever, so LLM quantization is usually **weight-only**: weights in 4 or 8 bits, activations kept in 16-bit, with kernels that dequantize weights on the fly inside the matrix product. Two schemes dominate:
+
+**LLM.int8()** ([Dettmers et al., 2022](#references)) quantizes weights and activations to int8 per row and column, except that a few activation columns with outliers (large magnitudes that appear in models above a few billion parameters) are kept in 16-bit and multiplied separately. Without the outlier path, 8-bit accuracy collapses above 6 B parameters; with it, it matches 16-bit.
+
+**NF4** ([Dettmers et al., 2023](#references)) is a 4-bit format whose 16 levels are placed at the quantiles of a standard normal rather than evenly, because trained weights are approximately normal and evenly spaced levels waste codes in the tails. Combined with *double quantization* (quantizing the per-block scales themselves to 8 bits) it stores a 7 B model in about 3.5 GB and is the base of QLoRA in the [PEFT note](/notes/nlp/peft#fine-tuning-a-quantized-model-qlora).
+
+## GPTQ: quantizing weights with calibration data
+
+Rounding every weight to its nearest level ignores that the weights of a layer act together: a rounding error in one weight can be compensated by adjusting the others. **GPTQ** ([Frantar et al., 2023](#references)) does this compensation layer by layer:
+
+1. Run a small calibration set (128 sequences is the usual recommendation) through the model and collect the layer's inputs $X$. The layer's output error for a weight change $\delta W$ is $\|\delta W^\top X\|^2$, a quadratic form with Hessian $H = 2 X X^\top$.
+2. Quantize the weight matrix one column at a time. After rounding a column, update all not-yet-quantized columns by the optimal correction $\delta = -\frac{w_q - w}{H^{-1}_{qq}}\, H^{-1}_{:,q}$, which is the Optimal Brain Surgeon step ([Hassibi and Stork, 1993](#references)) applied with the pre-computed inverse Hessian.
+3. Proceed through the columns in a fixed order, with a lazy batched update and a small dampening of $H$ for numerical stability.
+
+The result is a 4-bit (or 3-bit) model whose layer outputs are as close as possible, in the least-squares sense on the calibration data, to the original's. Scales are stored per **group** of 128 weights along a row (`group_size=128`), a compromise between per-tensor (coarse) and per-weight (no saving). The quantized weights are packed eight 4-bit codes per int32 (`qweight`), with the zero points packed likewise (`qzeros`), and specialized kernels (ExLlama) read them.
+
+Calibration data matters. The notebook quantizes a 125 M-parameter model to 4 bits twice: with a few hundred WikiText-2 sequences it generates fluent text ("Hello my name is Alex and I'm a 25 year old male…"); with a single sentence as calibration set it generates `My name is "M""""""""`. The Hessian estimated from one sentence is nearly rank-one, and the compensation step then pushes the remaining weights in meaningless directions. A pre-quantized 7 B chat model from the Hub loads into 4-bit `QuantLinear` layers and generates normally.
+
+## Distillation and pruning
+
+Quantization keeps the architecture and shrinks the numbers. Two other compression routes change the architecture:
+
+**Knowledge distillation** ([Hinton, Vinyals and Dean, 2015](#references)) trains a smaller *student* to match a larger *teacher*'s output distribution, not only the hard labels:
+
+$$
+\mathcal L = \alpha\, \mathcal L_{\text{CE}}(y, p_s) + (1 - \alpha)\, T^2\, D_{\mathrm{KL}}\big(\operatorname{softmax}(z_t / T)\,\|\,\operatorname{softmax}(z_s / T)\big),
+$$
+
+where $z_t, z_s$ are teacher and student logits and the temperature $T > 1$ softens both distributions so that the student also learns which wrong classes the teacher considers close. The $T^2$ factor keeps the gradient magnitude comparable across temperatures. DistilBERT itself, the model measured above, is BERT-base distilled to 6 layers with 40 % fewer parameters and 97 % of the GLUE score ([Sanh et al., 2019](#references)). For language models, distillation also takes the form of training on a large model's generated text (the Alpaca route of the [instruction tuning note](/notes/nlp/instruction-tuning#supervised-fine-tuning)).
+
+**Pruning** removes weights (unstructured) or whole heads, neurons or layers (structured). Unstructured sparsity saves memory only with sparse kernels; structured pruning gives a smaller dense model and needs retraining to recover.
+
+## Trade-offs
+
+| Bits | Memory vs fp16 | Typical quality change | Needs |
+| --- | --- | --- | --- |
+| 16 | 1× | none | nothing |
+| 8 (weights + activations) | ½ | small (< 1 point here) | int8 kernel; outlier handling above ~6 B |
+| 4 (weights only, GPTQ / NF4 / AWQ) | ¼ | small to moderate; grows for small models | calibration data (GPTQ) or none (NF4); dequantizing kernel |
+| 3 and below | < ¼ | noticeable; task-dependent | careful calibration, often QAT |
+
+Throughput follows memory only when the kernel exists, and accuracy results on one benchmark do not transfer to another: a model quantized with perplexity as the criterion can lose more on reasoning or long generation than the perplexity suggests. Any specific number for a current model is a snapshot; the mechanism and the trade-off shape are what to keep.
+
+## What changed
+
+| | Float model | Quantized model |
+| --- | --- | --- |
+| Storage per weight | 32 or 16 bits | 8 or 4 bits + a scale per group |
+| Matrix product | float | integer bracket + one float rescale |
+| Accuracy | reference | small loss at 8 bits, more at 4 |
+| Speed | reference | faster only with a hardware kernel |
+| Training | normal | frozen (PTQ) or simulated rounding (QAT); LoRA on top (QLoRA) |
+
+## Limitations
+
+- **Range and outliers.** A few large activations can force a wide range that wastes most codes; mixed precision for outlier columns is the standard patch.
+- **Kernels.** The memory saving is universal; the speed-up is not. Without a matching kernel, quantized layers can be slower than float.
+- **Small models suffer more.** Fewer parameters leave less redundancy to absorb rounding; 4-bit is routine at 7 B and risky at 100 M.
+- **Benchmark drift.** Quantization is evaluated on a metric; losses elsewhere are easy to miss.
+- **Not reversible.** The original precision is gone; keep the float checkpoint.
+
+## What you should remember
+
+- Affine map: $x_q = \operatorname{round}(x/s + z)$, $x \approx s(x_q - z)$, with $s = (b - a)/(b_q - a_q)$; error $\le s/2$ inside the range, clipping outside.
+- A quantized linear layer is an integer matrix product plus row/column sums, rescaled once by $s_X s_W$.
+- DistilBERT on IMDb: 0.249 → 0.085 GB and 0.9313 → 0.9266 at 8 bits; speed depends entirely on the kernel.
+- LLMs are quantized weight-only (int8 with outlier columns, NF4, GPTQ 4-bit with group size 128); GPTQ compensates rounding errors column by column using a Hessian from calibration data, and a bad calibration set ruins the model.
+- Distillation trains a small model on a large model's soft outputs; pruning removes parameters; both change the architecture, quantization does not.
+
+## Notebook
+
+Two notebooks. Cell numbers count every cell, markdown included, from 1.
+
+[`week12_pt0_Torch_and_ONNX_Quantization_+_PEFT.ipynb`](https://github.com/glkuzi/nlp_dsba/blob/4130e09940ddd363cee9fa3bd51b149466cfc6fb/seminars/week12_pt0_Torch_and_ONNX_Quantization_+_PEFT.ipynb):
+
+- Cell 3 states the distillation loss; cells 5–17 load IMDb, a DistilBERT checkpoint fine-tuned on it, build batches of 64, print 66,955,010 parameters, 0.249 GB, and accuracy 0.9313.
+- Cell 18 derives the integer matrix product reproduced above; cells 19–21 implement `QuantizedTensor` (per-tensor min–max range with a $10^{-6}$ margin) and `QuantizedLinear`; cells 23–28 time a $128 \to 128$ layer (51 μs float, 1.23 ms quantized) and measure the mean absolute error 0.0011; cells 30–31 replace every linear layer and print 0.129 GB.
+- Cells 35–43 apply `quantize_dynamic` (0.089 GB, 20.4 s against 24.5 s per batch on CPU); cell 45 shows the GPU failure of the dynamic int8 op.
+- Cells 49–56 load the model with `BitsAndBytesConfig(load_in_8bit=True)`: 0.085 GB, 3.6 s per batch on GPU, accuracy 0.9266.
+- Cells 58–67 sketch static quantization with ONNX Runtime and a 1,000-example calibration set; the cells are marked as not fully working and are not executed to completion.
+- Cells 69–74 are the QLoRA template described in the [PEFT note](/notes/nlp/peft#notebook).
+
+[`week12_pt1_Distillation_and_GPTQ_Quantization.ipynb`](https://github.com/glkuzi/nlp_dsba/blob/4130e09940ddd363cee9fa3bd51b149466cfc6fb/seminars/week12_pt1_Distillation_and_GPTQ_Quantization.ipynb):
+
+- Cells 20–24 quantize `facebook/opt-125m` to 4 bits with `GPTQConfig(bits=4, group_size=128, dataset="wikitext2", desc_act=False)`, inspect the packed `qweight` and `qzeros` int32 buffers, and generate the fluent sentence quoted above.
+- Cells 27–29 repeat with a one-sentence calibration set and generate the degenerate output.
+- Cells 33–39 load a pre-quantized Llama-2-7B chat model, print the `QuantLinear` layers and the quantization config (4-bit, group size 128, ExLlama kernel), and generate 50 tokens.
+- Cells 42–52 fine-tune it with LoRA, as described in the PEFT note.
+
+## Next
+
+The course has now built, pretrained, adapted and compressed models. The next section turns to the tasks those models are used for and asks, for each, what the input and output are, which metric measures it, what the classical baseline was, and what the Transformer-era approach changed. The [text classification note](/notes/nlp/text-classification) opens it with the task that has run through the whole course, and collects every AG News result in one table.
+
+## References
+
+- B. Jacob et al. [Quantization and Training of Neural Networks for Efficient Integer-Arithmetic-Only Inference](https://arxiv.org/abs/1712.05877). CVPR, 2018. The affine scheme and the integer matrix product.
+- T. Dettmers, M. Lewis, Y. Belkada, L. Zettlemoyer. [LLM.int8(): 8-bit Matrix Multiplication for Transformers at Scale](https://arxiv.org/abs/2208.07339). NeurIPS, 2022.
+- T. Dettmers, A. Pagnoni, A. Holtzman, L. Zettlemoyer. [QLoRA: Efficient Finetuning of Quantized LLMs](https://arxiv.org/abs/2305.14314). NeurIPS, 2023. NF4 and double quantization.
+- E. Frantar, S. Ashkboos, T. Hoefler, D. Alistarh. [GPTQ: Accurate Post-Training Quantization for Generative Pre-trained Transformers](https://arxiv.org/abs/2210.17323). ICLR, 2023.
+- B. Hassibi, D. G. Stork. [Second order derivatives for network pruning: Optimal Brain Surgeon](https://proceedings.neurips.cc/paper/1992/hash/303ed4c69846ab36c2904d3ba8573050-Abstract.html). NeurIPS, 1993.
+- J. Lin et al. [AWQ: Activation-aware Weight Quantization for LLM Compression and Acceleration](https://arxiv.org/abs/2306.00978). MLSys, 2024.
+- G. Hinton, O. Vinyals, J. Dean. [Distilling the Knowledge in a Neural Network](https://arxiv.org/abs/1503.02531). NeurIPS Deep Learning Workshop, 2015.
+- V. Sanh, L. Debut, J. Chaumond, T. Wolf. [DistilBERT, a distilled version of BERT: smaller, faster, cheaper and lighter](https://arxiv.org/abs/1910.01108). arXiv, 2019.
+- Hugging Face. [Quantization overview](https://huggingface.co/docs/transformers/main/en/quantization/overview). Which backend supports which device and bit width.

@@ -1,0 +1,125 @@
+---
+title: Transformer for machine translation
+description: "The German–English task with the full architecture: an encoder–decoder Transformer with the same parameter budget as the LSTM doubles its BLEU, an ablation isolates what cross-attention is worth, four layers add a little more, beam search replaces greedy decoding, and the attention maps are read."
+course: nlp
+section: Transformers
+order: 16
+status: published
+tags: [transformers, machine-translation, bleu, beam-search, cross-attention, multi30k]
+prerequisites: [Positional representations, Sequence-to-sequence models]
+---
+
+The [seq2seq note](/notes/nlp/seq2seq) left the German–English task at BLEU 0.152 with an LSTM encoder–decoder whose single hand-over vector lost most of the source. This note trains the encoder–decoder Transformer of the [architecture note](/notes/nlp/transformers#three-arrangements) on the same data with the same tokenizers and a matched parameter count, so that the comparison isolates the architecture. It then takes the model apart: what cross-attention contributes, what depth contributes, what decoding contributes.
+
+**Notation.** As before: source $x_{1:S}$ (German), target $y_{1:T}$ (English), test BLEU computed with one fixed implementation on the 1,000 test pairs, outputs cut at the end symbol.
+
+## The model
+
+PyTorch's `nn.Transformer` with $d = 128$, 8 heads ($d_k = 16$), $d_{\text{ff}} = 512$, one encoder block and one decoder block, dropout at the library default. A learned positional table of 32 rows is added to the token embeddings on both sides. Three masks are built per batch:
+
+- a **source padding mask**, so that encoder self-attention and decoder cross-attention ignore `[PAD]` keys in the German sentence;
+- a **causal mask** of shape $T \times T$ for decoder self-attention, so that target position $t$ sees only $\le t$;
+- a **target padding mask** for the decoder's own padding.
+
+Training is teacher forcing with the one-position shift and cross-entropy ignoring padding, exactly as for the LSTM; the whole target is processed in one pass thanks to the causal mask. Greedy generation runs the decoder once per output token on the growing prefix and stops when every sequence in the batch has produced `[SEP]`.
+
+Parameter counts: 8,385,850 in total against 8,380,474 for the LSTM, 497,978 outside the shared embedding and output matrices against 492,602. The two models are the same size to within 0.1 %.
+
+## Results
+
+| Model | Blocks | Test BLEU |
+| --- | --- | --- |
+| LSTM encoder–decoder | 1 (bidirectional) | 0.152 |
+| Transformer | 1 + 1 | 0.320 |
+| Transformer, decoder sees only the first encoder state | 1 + 1 | 0.190 |
+| Transformer | 4 + 4 | 0.342 |
+
+Same data, same tokenizers, same budget, same 10 epochs: the Transformer doubles the BLEU of the recurrent model. The example sentences show what changed:
+
+| Source | Reference | LSTM | Transformer (1 + 1) | Transformer (4 + 4) |
+| --- | --- | --- | --- | --- |
+| Ein Mann mit einem orangefarbenen Hut, der etwas anstarrt. | A man in an orange hat starring at something. | a man in a red shirt is standing on a street. | a man in an orange hat is working on the ground. | a man with an orange hat is talking to something. |
+| Fünf Leute in Winterjacken und mit Helmen stehen im Schnee mit Schneemobilen im Hintergrund. | Five people wearing winter jackets and helmets stand in the snow, with snowmobiles in the background. | three people in a red shirt and a red shirt is sitting on a street. | five people in winter clothing in red and blue snow with snow in the background. | five people in winter hats and wearing a helmet are standing in the snow with snow in the snow. |
+| Leute Reparieren das Dach eines Hauses. | People are fixing the roof of a house. | people are sitting on a street. | people are working on a window of a store. | people are enjoying a window of a train. |
+
+The Transformer transfers the count (*five*), the colour (*orange*), the setting (*snow*, *winter*) and the structure of the sentence. It still confuses objects and actions on sentences that need world knowledge the 29,000-pair corpus does not contain. The errors are now about content the model has not seen, not about content it had and lost.
+
+### What cross-attention is worth
+
+The third row is the ablation described in the [attention note](/notes/nlp/attention-before-transformers#evidence-removing-the-bottleneck-from-a-transformer): the same model with the decoder's cross-attention restricted to the encoder's first output vector, which recreates the LSTM's bottleneck inside a Transformer. BLEU drops from 0.320 to 0.190. Everything else in the two models is identical, so 0.13 of the 0.17 improvement over the LSTM is attributable to the decoder reading all source positions, and the remaining 0.04 to the rest of the architecture (self-attention in both stacks, the feed-forward layers, the training dynamics).
+
+### What depth is worth
+
+Four blocks on each side raise BLEU from 0.320 to 0.342 with 9.77 M parameters (1.89 M outside the embeddings, almost four times the one-block model). The gain is real but small on captions of 10–15 tokens; depth pays for long-range structure that this corpus barely has. The run trains without any special care, which is the residual connections doing their job.
+
+### What the cross-attention learned
+
+Extracting the one-block decoder's cross-attention weights gives a $[B, T, S]$ tensor; each row sums to 1. Plotted for short test pairs with English tokens as rows and German tokens as columns, the matrices are close to diagonal, shifted by one: the row for English token $t$ attends to the German token aligned with English token $t + 1$. The model is predicting the next token, so the source word it needs is the one that translates the *next* output, and that is what it looks at. A soft word alignment was learned from sentence pairs alone, with no alignment supervision.
+
+## Beam search
+
+Greedy decoding takes the most probable token at each step. The sequence it produces is not in general the most probable sequence: a slightly less likely first word can lead to a much more likely continuation. Exhaustive search over all $|V|^T$ sequences is impossible; **beam search** keeps the $B$ best partial sequences at every step.
+
+At step $t$, each of the $B$ hypotheses is extended by its top-$B$ next tokens, giving $B^2$ candidates scored by the sum of log-probabilities $\sum_{s \le t} \log P(y_s \mid y_{<s}, x)$; the best $B$ survive. A hypothesis that emits `[SEP]` is finished and compared with the current best finished one using a **length-normalized** score,
+
+$$
+\text{score}(y) = \frac{1}{|y|^{\alpha}} \sum_{s=1}^{|y|} \log P(y_s \mid y_{<s}, x), \qquad \alpha = 0.6,
+$$
+
+because raw log-probabilities are always more negative for longer outputs and would favour stopping early. The search ends when no hypotheses remain or the maximum length is reached. Cost: $B$ decoder passes per output step instead of one, and the passes cannot be merged across hypotheses as simply as across a batch.
+
+| Beam width $B$ | Test BLEU (4 + 4 model) |
+| --- | --- |
+| 1 (greedy) | 0.253 |
+| 3 | 0.265 |
+| 5 | 0.263 |
+
+Width 3 gains about one point over greedy; width 5 gains nothing more. This is typical: beam search helps, saturates quickly, and wider beams can even hurt because the length normalization is only approximate ([Stahlberg and Byrne, 2019](#references)). Note that the greedy number in this table, 0.253, is not the 0.342 reported for the same model above. The two come from different evaluation paths in the notebook: the batched evaluation generates with padding masks for the whole batch, the beam-search evaluation encodes each sentence on its own without padding and runs a separate decoding loop with its own stopping rule. Numbers are comparable only within one table, which is the point made in the [evaluation note](/notes/nlp/corpora-and-evaluation#pitfalls-that-survive-a-correct-split).
+
+## What changed
+
+| | LSTM encoder–decoder | Transformer encoder–decoder |
+| --- | --- | --- |
+| Source access during decoding | One vector | All $S$ encoder outputs, per step, per head |
+| Sequential steps in training | $S + T$ | 0 (masks) |
+| Parameters | 8.38 M | 8.39 M |
+| Test BLEU, Multi30k | 0.152 | 0.320 (1 + 1), 0.342 (4 + 4) |
+| Alignment | None | Readable from cross-attention |
+
+## Limitations
+
+- **Small data.** 29,000 caption pairs is tiny for translation; the model has no knowledge beyond them. The strong systems in this task family are pretrained on hundreds of millions of sentence pairs or on monolingual text first (next section).
+- **BLEU.** The numbers rank these models and nothing more; implementation and evaluation path change them by several points, as the beam-search table shows.
+- **Inference is still sequential.** Training parallelizes over $T$; generation does not, and each new token re-reads the whole prefix unless keys and values are cached.
+- **Exposure bias and greedy/beam gaps** are inherited from the seq2seq setting.
+
+## What you should remember
+
+- With matched parameters and data, the encoder–decoder Transformer scores 0.320 BLEU against the LSTM's 0.152; most of the gain (0.13) is the decoder's access to all source positions.
+- Four blocks per side add 0.02 BLEU on this corpus; residuals make the deeper model train as easily.
+- One-block cross-attention learns a one-ahead diagonal alignment without supervision.
+- Beam search keeps $B$ hypotheses with length-normalized log-probability; it helps by about a point here and saturates at $B = 3$.
+- Compare BLEU only within one implementation and one evaluation path.
+
+## Notebook
+
+[`week04_lstm_attention_transformer.ipynb`](https://github.com/glkuzi/nlp_dsba/blob/4130e09940ddd363cee9fa3bd51b149466cfc6fb/seminars/week04_lstm_attention_transformer.ipynb). Cell numbers count every cell, markdown included, from 1.
+
+- Cell 57 defines `Seq2SeqTransformer`: a shared embedding, a learned positional table of 32 rows, `nn.Transformer(d_model=128, nhead=8, dim_feedforward=512, batch_first=True)` with configurable block counts, `encode` with the source key-padding mask, `decode` with the causal mask and both padding masks, and a greedy `generate` that stops once every sequence has emitted `[SEP]`.
+- Cells 59–63: one block per side, 8,385,850 parameters, 10 epochs, test BLEU 0.32; cells 64–69 print the first five translations.
+- Cells 71–78 register a forward hook on the decoder's `multihead_attn` after monkey-patching its wrapper to return weights, confirm the `[32, 31, 32]` shape with rows summing to 1, and plot six alignment matrices.
+- Cells 80–85: the no-cross-attention variant, test BLEU 0.19.
+- Cells 87–97: four blocks per side, 9,774,394 parameters, test BLEU 0.342, and the five translations.
+- Cell 99 implements `beam_search` for one encoded sentence (beam width, maximum length and $\alpha = 0.6$ as arguments); the candidate list is pruned inside the loop over hypotheses rather than after it, so fewer than $B^2$ candidates compete at each step. Cells 107–110 evaluate it over the test set for $B = 1, 3, 5$ and report 0.253, 0.265 and 0.263.
+
+## Next
+
+Every model so far was trained from scratch on the task's own data, and the best of them, the Transformer, is the one that benefits most from more text. The next section of the course trains Transformers on unlabelled text with a self-supervised objective and reuses them. The [BERT note](/notes/nlp/bert) starts with the encoder: mask tokens, predict them, and get a model whose per-token vectors depend on context.
+
+## References
+
+- A. Vaswani, N. Shazeer, N. Parmar, J. Uszkoreit, L. Jones, A. N. Gomez, Ł. Kaiser, I. Polosukhin. [Attention Is All You Need](https://arxiv.org/abs/1706.03762). NeurIPS, 2017. The encoder–decoder Transformer for translation; §6.1 (beam search with length penalty $\alpha = 0.6$).
+- Y. Wu et al. [Google's Neural Machine Translation System](https://arxiv.org/abs/1609.08144). arXiv, 2016. §7 (length normalization in beam search).
+- F. Stahlberg, B. Byrne. [On NMT Search Errors and Model Errors: Cat Got Your Tongue?](https://aclanthology.org/D19-1331/). EMNLP, 2019. Why wider beams do not keep helping.
+- D. Elliott, S. Frank, K. Sima'an, L. Specia. [Multi30K: Multilingual English-German Image Descriptions](https://aclanthology.org/W16-3210/). VL, 2016.
+- PyTorch. [`torch.nn.Transformer`](https://pytorch.org/docs/stable/generated/torch.nn.Transformer.html). The module used in the notebook; the docs state the mask conventions.

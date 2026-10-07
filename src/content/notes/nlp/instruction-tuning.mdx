@@ -1,0 +1,158 @@
+---
+title: Instruction tuning and alignment
+description: "A pretrained decoder continues text; an assistant answers and stops. The note follows the two training stages that make the difference, supervised fine-tuning on instruction–response dialogues and optimization against human preferences (reward model with PPO, or DPO without one), and shows with a chat template that the architecture does not change at all."
+course: nlp
+section: Adaptation and Efficient Models
+order: 23
+status: published
+tags: [instruction-tuning, sft, rlhf, dpo, alignment, chat-template, reward-model]
+prerequisites: [Parameter-efficient fine-tuning, GPT and autoregressive language modeling]
+---
+
+The [GPT note](/notes/nlp/gpt#what-a-base-model-does) showed a base model given "Find the value of n in the equation n + 2 = 6." It solved the equation and then kept producing more equations, because that is what follows such text on the web. The same model, after two further training stages, answers in three lines and stops. This note describes those stages. They do not touch the architecture; they change the weights and the format of the input.
+
+**Notation.** A prompt $x$ and a response $y$; the policy $\pi_\theta(y \mid x)$ is the language model being trained; $\pi_{\text{ref}}$ is a frozen copy it started from; a reward model $r_\phi(x, y)$ scores responses; $y_w \succ y_l$ means a human preferred $y_w$ to $y_l$.
+
+## Baseline: the base model and the chat template
+
+Before any training, compare the base checkpoint with its instruction-tuned sibling. Their printed module trees are identical, string for string: same 16 blocks, same attention, same vocabulary. What differs is the weights, and one more thing: the tuned model expects its input wrapped in a **chat template**. For a one-turn conversation the tokenizer produces
+
+```
+<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+
+Cutting Knowledge Date: December 2023
+Today Date: 13 Nov 2025
+
+<|eot_id|><|start_header_id|>user<|end_header_id|>
+
+Find the value of n in the equation n + 2 = 6.<|eot_id|>
+```
+
+and the model continues with an assistant header and its answer, ending with `<|eot_id|>`. The special tokens mark roles and turn boundaries; the model has learned to stop at `<|eot_id|>` and the serving code stops decoding there. Its answer to the equation: "Subtract 2 from both sides … n = 4. So, the value of n is 4." Then it stops. The template is part of the model's contract; sending the tuned model raw text without it gives base-model behaviour.
+
+## Supervised fine-tuning
+
+<aside class="callout"><strong>Key idea.</strong> Show the model what an answer looks like. Collect dialogues in which a user asks and an assistant responds well, format them with the template, and train the model with the ordinary next-token loss on the assistant's tokens.</aside>
+
+**Supervised fine-tuning** (SFT) is the fine-tuning of the [previous notes](/notes/nlp/fine-tuning) with a different dataset and no new head: the objective is the pretraining objective,
+
+$$
+\mathcal L_{\text{SFT}} = -\sum_{t \in \text{response}} \log \pi_\theta(y_t \mid x, y_{<t}),
+$$
+
+usually with the loss masked to the response tokens so that the model is not trained to reproduce the prompts. The data is the whole method. The InstructGPT work ([Ouyang et al., 2022](#references)) had contractors write demonstrations; open datasets such as UltraChat, No Robots and MathInstruct supply tens of thousands to millions of dialogues. Writing them by hand is expensive, and two shortcuts are standard:
+
+- **Self-instruct / Alpaca** ([Wang et al., 2023](#references); [Taori et al., 2023](#references)): start from 175 human-written seed instructions, prompt a strong model to generate more instructions and their answers (52,000 for Alpaca), and fine-tune on the result. The student model inherits the generator's behaviour, which is a form of distillation.
+- **Instruction pretraining** ([Cheng et al., 2024](#references)): generate instruction–response pairs from the pretraining documents themselves, so that the instruction data is as broad as the corpus.
+
+SFT with LoRA or QLoRA on a 7 B model fits on one GPU; the whole pipeline of this note is routinely run that way.
+
+After SFT the model answers. What SFT cannot do is make it answer *better than its demonstrations*, or make it avoid answers that are fluent, confident and wrong, because the loss only raises the probability of the shown responses and never lowers the probability of bad ones.
+
+## Preference optimization
+
+### With a reward model: RLHF
+
+[Ouyang et al. (2022)](#references), following [Christiano et al. (2017)](#references) and [Stiennon et al. (2020)](#references), add a stage that uses comparisons rather than demonstrations:
+
+1. For each prompt, sample several responses from the SFT model (different seeds, temperatures).
+2. Humans rank them. A ranking of $k$ responses yields $\binom{k}{2}$ pairs $(y_w, y_l)$.
+3. Train a **reward model** $r_\phi$, usually the SFT model with a scalar head, to agree with the comparisons under the Bradley–Terry model:
+   $$
+   P(y_w \succ y_l \mid x) = \sigma\big(r_\phi(x, y_w) - r_\phi(x, y_l)\big), \qquad
+   \mathcal L_{\text{RM}} = -\log \sigma\big(r_\phi(x, y_w) - r_\phi(x, y_l)\big).
+   $$
+   The reward is defined only up to a constant and only on the distribution of responses it was trained on.
+4. Optimize the policy with reinforcement learning (PPO) to maximize the reward while staying near the SFT model:
+   $$
+   \max_\theta\; \mathbb E_{x,\, y \sim \pi_\theta}\big[r_\phi(x, y)\big] - \beta\, D_{\mathrm{KL}}\big(\pi_\theta(\cdot \mid x)\,\|\,\pi_{\text{ref}}(\cdot \mid x)\big).
+   $$
+
+The KL term is what keeps the method honest: without it the policy finds responses that score high on $r_\phi$ and are nonsense, because the reward model is accurate only near the data it saw (**reward hacking**). $\beta$ sets how far the policy may move.
+
+The empirical result that made the method standard: human raters preferred the outputs of a 1.3 B-parameter RLHF model to those of the 175 B-parameter SFT and base models ([Ouyang et al., 2022](#references), Figure 1). Preference training changed what the model does more than a hundredfold increase in size did.
+
+### Without a reward model: DPO
+
+PPO is expensive (four models in memory: policy, reference, reward, value) and fragile to tune. [Rafailov et al. (2023)](#references) showed that the KL-regularized objective above has a closed-form optimum,
+
+$$
+\pi^*(y \mid x) \propto \pi_{\text{ref}}(y \mid x)\, \exp\!\big(r(x, y)/\beta\big),
+$$
+
+which can be inverted: the reward is a function of the policy, $r(x, y) = \beta \log \frac{\pi^*(y \mid x)}{\pi_{\text{ref}}(y \mid x)} + \text{const}$. Substituting into the Bradley–Terry likelihood eliminates $r$ and gives a loss on the policy alone:
+
+$$
+\mathcal L_{\text{DPO}} = -\log \sigma\!\Big(\beta \log \frac{\pi_\theta(y_w \mid x)}{\pi_{\text{ref}}(y_w \mid x)} - \beta \log \frac{\pi_\theta(y_l \mid x)}{\pi_{\text{ref}}(y_l \mid x)}\Big).
+$$
+
+**Direct preference optimization** trains the policy on preference pairs with a classification-style loss: raise the log-ratio of the preferred response, lower that of the rejected one, each relative to the reference. No reward model, no sampling during training, two models in memory. The derivation is exact for the objective; whether DPO or PPO yields the better model in practice depends on the data and is still argued, and both are implemented in the TRL library the notebook points to.
+
+## Evaluating an assistant
+
+Perplexity says nothing about helpfulness, and a single reference answer does not exist. The usual instruments, developed further in the [LLM evaluation note](/notes/nlp/llm-evaluation):
+
+- **Pairwise human preference at scale.** Chatbot Arena shows users two anonymous responses and asks which is better; an Elo-style rating is computed from many such votes.
+- **Model-judged benchmarks.** MT-Bench scores multi-turn answers with a strong model as the judge; AlpacaEval compares a model's answers with a reference model's and reports a win rate.
+- **Capability benchmarks** of the base model (reasoning, knowledge) still apply and can drop after alignment, the **alignment tax**.
+
+## Choosing a model to adapt
+
+Three practical rules, all empirical and time-dependent:
+
+- Prefer a checkpoint that has been through SFT and preference optimization unless the task is pure completion; its behaviour is the one the template and the serving stack assume.
+- Do not pretrain. Continued pretraining on a domain is sometimes worth it; starting from scratch almost never is outside a few organizations.
+- A recent small model (around 1–10 B parameters) usually beats an older large one on general tasks, and a large aligned model often needs no fine-tuning for classification or summarization, only a well-written prompt with the expected output format.
+
+## What changed
+
+| | Pretrained base | After SFT | After preference optimization |
+| --- | --- | --- | --- |
+| Trained on | Web text, next token | Instruction–response dialogues | Preference pairs |
+| Behaviour | Continues text | Answers and stops | Answers in ways people prefer |
+| Can lower bad outputs | No | No | Yes |
+| Architecture | Same | Same | Same |
+| Input format | Raw text | Chat template | Chat template |
+
+## Limitations
+
+- **The data defines the behaviour**, including its errors and biases; demonstrations written for one audience train a model for that audience.
+- **Reward hacking and sycophancy.** A reward learned from human ratings rewards what raters like, which includes confident tone and agreement.
+- **Alignment tax.** Some capabilities of the base model regress.
+- **No new knowledge.** Neither stage teaches facts; they shape how existing knowledge is expressed.
+- **Evaluation is the hard part.** Preferences are noisy and judges are models; the next notes return to this.
+
+## What you should remember
+
+- An instruction-tuned model is the base architecture with different weights and a chat template of special role tokens; sending text without the template gives base behaviour.
+- SFT: next-token loss on assistant responses in formatted dialogues; data from humans, or generated by a stronger model (self-instruct, Alpaca).
+- RLHF: rank samples, fit a Bradley–Terry reward model, optimize reward minus $\beta$ KL to the SFT model with PPO. A 1.3 B RLHF model was preferred to a 175 B SFT model.
+- DPO: the same objective's optimum written as a loss on the policy, $-\log\sigma(\beta\Delta\log\text{-ratio})$, with no reward model.
+- Evaluate assistants by pairwise preference and judged benchmarks, and watch for the alignment tax.
+
+## Notebook
+
+[`week08_modern_LLM.ipynb`](https://github.com/glkuzi/nlp_dsba/blob/4130e09940ddd363cee9fa3bd51b149466cfc6fb/seminars/week08_modern_LLM.ipynb). Cell numbers count every cell, markdown included, from 1.
+
+- Cells 5–10 run the Llama 3.2 1B base checkpoint on the equation prompt as a question and as a completion; the saved outputs are the continuations described in the [GPT note](/notes/nlp/gpt#what-a-base-model-does).
+- Cells 12–15 run the instruction-tuned checkpoint on the same prompt in `messages` format and print the three-line answer that stops at $n = 4$.
+- Cells 17–19 print both module trees and confirm `str(pipe_pretrained.model) == str(pipe.model)`.
+- Cell 21 applies the tokenizer's chat template with `tokenize=False` and prints the string quoted above.
+- Cells 24–31 describe SFT, Alpaca, RLHF and DPO with pointers to the TRL trainers; cells 32–36 list MT-Bench, AlpacaEval and the arenas and give the model-choice advice summarized above.
+
+## Next
+
+Adapted or not, a model has to be served, and the models that answer well are large. The [next note](/notes/nlp/quantization) reduces the memory and the latency of a trained model by storing its weights in fewer bits, derives what happens to a matrix multiplication when its operands are integers, and measures accuracy, memory and speed before and after.
+
+## References
+
+- L. Ouyang et al. [Training language models to follow instructions with human feedback](https://arxiv.org/abs/2203.02155). NeurIPS, 2022. InstructGPT: SFT, reward modelling, PPO, and the 1.3 B versus 175 B comparison.
+- P. F. Christiano, J. Leike, T. B. Brown, M. Martic, S. Legg, D. Amodei. [Deep Reinforcement Learning from Human Preferences](https://arxiv.org/abs/1706.03741). NeurIPS, 2017.
+- N. Stiennon et al. [Learning to summarize from human feedback](https://arxiv.org/abs/2009.01325). NeurIPS, 2020.
+- R. Rafailov, A. Sharma, E. Mitchell, S. Ermon, C. D. Manning, C. Finn. [Direct Preference Optimization: Your Language Model is Secretly a Reward Model](https://arxiv.org/abs/2305.18290). NeurIPS, 2023.
+- Y. Wang et al. [Self-Instruct: Aligning Language Models with Self-Generated Instructions](https://aclanthology.org/2023.acl-long.754/). ACL, 2023.
+- R. Taori et al. [Alpaca: A Strong, Replicable Instruction-Following Model](https://crfm.stanford.edu/2023/03/13/alpaca.html). Stanford CRFM, 2023.
+- D. Cheng, Y. Gu, S. Huang, J. Bi, M. Huang, F. Wei. [Instruction Pre-Training: Language Models are Supervised Multitask Learners](https://arxiv.org/abs/2406.14491). EMNLP, 2024.
+- R. A. Bradley, M. E. Terry. [Rank Analysis of Incomplete Block Designs: I. The Method of Paired Comparisons](https://doi.org/10.2307/2334029). *Biometrika*, 39, 1952.
+- L. Zheng et al. [Judging LLM-as-a-Judge with MT-Bench and Chatbot Arena](https://arxiv.org/abs/2306.05685). NeurIPS, 2023.
+- Hugging Face. [TRL documentation](https://huggingface.co/docs/trl/index). SFT, reward, PPO and DPO trainers.

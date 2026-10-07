@@ -1,0 +1,124 @@
+---
+title: Named entity recognition
+description: "Label every token with the entity it belongs to: the BIO scheme that turns spans into per-token classes, the alignment between labelled words and subword tokens, a linear head on a pretrained encoder, entity-level precision, recall and F1, and the baselines and pitfalls of sequence labelling."
+course: nlp
+section: NLP Tasks
+order: 26
+status: published
+tags: [ner, sequence-labelling, bio-tags, token-classification, seqeval, conll-2003]
+prerequisites: [Text classification, BERT and masked language modeling, Tokenization]
+---
+
+Classification gives one label per document. Many questions need a label per *piece* of the document: which words name a person, an organization, a place, a date. Named entity recognition (NER) is the standard instance of **sequence labelling**, and it is where the gap between the words a dataset labels and the subword tokens a Transformer reads has to be bridged explicitly.
+
+**Notation.** A sentence is a sequence of words $w_1, \dots, w_n$ with gold tags $y_1, \dots, y_n$; the tokenizer turns it into subword tokens $t_1, \dots, t_m$ with $m \ge n$; the encoder gives a vector $h_j$ per token; a head gives logits over the tag set at every position.
+
+## Task formulation
+
+Input: a sentence. Output: the set of entity spans in it, each with a type. The standard types in the CoNLL-2003 benchmark ([Tjong Kim Sang and De Meulder, 2003](#references)) are `PER`, `ORG`, `LOC` and `MISC`; the training split has 14,041 sentences, validation 3,250, test 3,453. Spans are converted into per-word tags with the **BIO scheme**: `B-X` begins an entity of type `X`, `I-X` continues it, `O` is outside any entity. With four types that is $4 \times 2 + 1 = 9$ classes.
+
+| Token | Barack | Obama | was | born | in | Honolulu |
+| --- | --- | --- | --- | --- | --- | --- |
+| Tag | `B-PER` | `I-PER` | `O` | `O` | `O` | `B-LOC` |
+
+The `B`/`I` distinction is what lets two adjacent entities of the same type be told apart: `B-PER I-PER B-PER` is two people, `B-PER I-PER I-PER` is one.
+
+## Baseline: features and a sequence model
+
+Before neural models, NER was a conditional random field over hand-built features: capitalization, word shape, suffixes, gazetteer membership, the previous and next words ([Lafferty, McCallum and Pereira, 2001](#references)). A CRF models the *sequence* of tags jointly, so it learns that `I-PER` cannot follow `O`. The first neural systems kept the CRF on top of a bidirectional LSTM over word and character embeddings ([Lample et al., 2016](#references); [Huang, Xu and Yu, 2015](#references)) and reached about 90–91 $F_1$ on CoNLL-2003; capitalization and character shape were still the most useful signals, now learned.
+
+## Token classification with a pretrained encoder
+
+<aside class="callout"><strong>Key idea.</strong> Each token's contextual vector already encodes whether it is part of a name and of what kind. Put a linear layer with 9 outputs on every position, train it with cross-entropy against the tag of that position, and read the tags off with an argmax.</aside>
+
+$$
+\text{logits}_j = W h_j + b \in \mathbb R^{9}, \qquad
+\mathcal L = -\frac{1}{|J|}\sum_{j \in J} \log \operatorname{softmax}(\text{logits}_j)_{y_j},
+$$
+
+where $J$ is the set of token positions that carry a label. Shapes: ids `[B, m]` → vectors `[B, m, 768]` → logits `[B, m, 9]`, flattened to `[B·m, 9]` against `[B·m]` targets for the loss. No CRF: the encoder's context is strong enough that independent per-token decisions work, and the few invalid transitions can be fixed in post-processing.
+
+The model is *cased*: capital letters are the strongest cue for names, and the uncased tokenizer of earlier notes would throw them away.
+
+### Aligning words and tokens
+
+The dataset labels words; the model reads WordPiece tokens. `Hendrix penned on a piece of London hotel stationery in late 1966` becomes `Hendrix penned on a piece of London hotel station ##ery in late 1966`, and `10,925` becomes four tokens. The tokenizer's `word_ids()` gives, for each token, the index of the word it came from (`None` for `[CLS]` and `[SEP]`), and labels are assigned by rule:
+
+- special tokens get the label $-100$, which the cross-entropy ignores;
+- the first token of a word gets the word's tag;
+- continuation tokens (`##ery`) get either the same tag (`label_all_tokens=True`, the notebook's choice) or $-100$, so that only the first piece is trained and evaluated.
+
+Both conventions appear in practice; what matters is to use the same one at evaluation time, and to map predictions back to words by taking the first token of each word.
+
+### A frozen encoder is not enough
+
+The notebook freezes all 108.3 M parameters of BERT-base-cased and trains the 6,921-parameter head alone (0.01 % of the model) for two epochs at a learning rate of $5 \times 10^{-3}$. The training loss ends at 0.26, and a test sentence shows the result:
+
+| | SOCCER | - | JAPAN | GET | LUCKY | WIN | , | CHINA | IN | SURPRISE | DEFEAT | . |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| gold | O | O | B-LOC | O | O | O | O | B-PER | O | O | O | O |
+| frozen + head | O | O | O | O | O | B-PER | B-PER | B-PER | O | O | O | O |
+
+The head misses `JAPAN`, tags `WIN` and the comma as persons, and gets `CHINA` right by the standard of a gold tag that is itself a famous annotation error in this corpus (`CHINA` is a country). A linear read-out of frozen features can separate names from non-names roughly and cannot place boundaries; this is the linear-probing result of the [fine-tuning note](/notes/nlp/fine-tuning#linear-probing-train-only-the-head) in another task. Fine-tuning the whole encoder on CoNLL-2003 gives 92.4 $F_1$ for BERT-base ([Devlin et al., 2019](#references), Table 7); the recipe is the one from the earlier notes (learning rate $2$ to $5 \times 10^{-5}$, two to four epochs), and the notebook's setup becomes it by removing the lines that set `requires_grad = False`.
+
+## Evaluation: entities, not tokens
+
+Token accuracy is misleading twice over: most tokens are `O`, and a half-tagged entity is useless. The standard is entity-level precision, recall and $F_1$ from the [evaluation note](/notes/nlp/corpora-and-evaluation#spans-rather-than-tokens), as implemented by `seqeval`: a predicted span counts as correct only if its start, end and type all match a gold span. Predicted `B-PER I-PER` over `Barack Obama` is one true positive; `B-PER` over `Barack` alone is one false positive and one false negative. The $-100$ positions are dropped before scoring, and the tag ids are mapped back to strings because the scorer reads the `B-`/`I-` prefixes.
+
+A per-type breakdown (PER, ORG, LOC, MISC) is standard and depends on the id-to-label mapping being the dataset's. The notebook defines its own mapping with `B-LOC` at index 3 and `B-ORG` at 5, while the dataset's feature list has `B-ORG` at 3 and `B-LOC` at 5; the overall $F_1$ is unaffected by a consistent swap, but the per-type numbers and the printed tags are exchanged between the two types. Read label mappings from the dataset's `features`, not by hand.
+
+## Why extract entities
+
+Three uses recur. **Monitoring and analytics**: count mentions of organizations, people and places across a stream of news and link them to a knowledge base. **Slot filling** in assistants: `book a flight to Tokyo next Friday` needs `Tokyo` as a destination and `next Friday` as a date before any booking logic runs; NER is the first stage, followed by linking and normalization. **De-identification**: replace names, addresses, phone numbers and dates in text by placeholders (`[CLIENT_1]`) before the text leaves a controlled environment, for example to be sent to an external model. The last use shows the task's failure modes most sharply: a missed entity is a leak, a wrong boundary leaks half a name, the same person must get the same placeholder across a document (coreference), and the placeholders must be reversible for the authorized reader while not reconstructible from context by anyone else, which NER alone does not guarantee.
+
+## What changed
+
+| | Feature CRF / BiLSTM-CRF | Encoder + linear head, fine-tuned |
+| --- | --- | --- |
+| Features | hand-built or learned per word and character | contextual subword vectors |
+| Sequence model | CRF over tags | none; context inside the encoder |
+| Casing, shape | explicit features | learned, needs a cased model |
+| CoNLL-2003 test $F_1$ | ≈ 90–91 | ≈ 92–93 |
+| Tokens | words | subwords, aligned by `word_ids` |
+
+## Limitations
+
+- **Spans are flat.** BIO cannot express nested entities (`[Bank of [America]]`) or discontinuous ones; nested NER needs span-based models.
+- **Types are fixed by the data.** A model trained on four coarse types cannot find drug names or product codes without new labels; zero-shot NER with prompted language models trades accuracy for flexibility.
+- **Domain shift** is severe: news-trained models degrade on tweets, legal text and clinical notes, where casing and formatting differ.
+- **Boundaries are fragile** at punctuation, hyphens and subword splits, and the metric is unforgiving of one-token errors.
+- **The benchmark has errors** (`CHINA` as a person), so the top scores partly measure agreement with the annotators.
+
+## What you should remember
+
+- NER is per-token classification with BIO tags; four types give nine classes.
+- Align word labels to subword tokens with `word_ids`: special tokens $-100$, first piece gets the tag, continuation pieces get the tag or $-100$, consistently.
+- A linear head on a frozen encoder roughly finds names and fails at boundaries; fine-tune the encoder (92.4 $F_1$ for BERT-base on CoNLL-2003).
+- Score at the entity level (`seqeval`), per type, with label mappings taken from the dataset.
+- Use a cased model; casing is the strongest cue.
+
+## Notebook
+
+[`week07_nlp_tasks.ipynb`](https://github.com/glkuzi/nlp_dsba/blob/4130e09940ddd363cee9fa3bd51b149466cfc6fb/seminars/week07_nlp_tasks.ipynb). Cell numbers count every cell, markdown included, from 1.
+
+- Cells 3–9 load CoNLL-2003 and print its features, including the `ner_tags` label list in the dataset's own order.
+- Cells 11–15 tokenize a training sentence with `bert-base-cased` and show the subword splits and `word_ids()`.
+- Cell 17 defines `tokenize_and_align_labels` with the $-100$ convention and `label_all_tokens=True`; cell 18 maps it over the dataset.
+- Cells 23–27 build `BERTforNER` (frozen `AutoModel`, dropout, `nn.Linear(768, 9)`, cross-entropy on flattened logits) and print 6,921 trainable of 108,317,193 parameters.
+- Cells 30–31 define the hand-written `id2label` and the `seqeval` metric function; cell 32 trains for two epochs with `Trainer` (learning rate $5\times10^{-3}$, batch 32, `DataCollatorForTokenClassification`) and reports a final training loss of 0.262; the evaluation metrics computed each epoch are not in the saved output.
+- Cells 34–35 print the gold tags and the model's predictions for the first test sentence, reproduced above.
+- Cells 36–37 list the uses of NER and pose the de-identification question.
+
+## Next
+
+Tagging finds entities that are already there. The [next note](/notes/nlp/question-answering) asks for a span that answers a question, which is the same encoder reading a question and a passage together and predicting two positions, a start and an end, instead of a tag per token.
+
+## References
+
+- E. F. Tjong Kim Sang, F. De Meulder. [Introduction to the CoNLL-2003 Shared Task: Language-Independent Named Entity Recognition](https://aclanthology.org/W03-0419/). CoNLL, 2003.
+- J. Lafferty, A. McCallum, F. Pereira. [Conditional Random Fields: Probabilistic Models for Segmenting and Labeling Sequence Data](https://repository.upenn.edu/cis_papers/159/). ICML, 2001.
+- Z. Huang, W. Xu, K. Yu. [Bidirectional LSTM-CRF Models for Sequence Tagging](https://arxiv.org/abs/1508.01991). arXiv, 2015.
+- G. Lample, M. Ballesteros, S. Subramanian, K. Kawakami, C. Dyer. [Neural Architectures for Named Entity Recognition](https://aclanthology.org/N16-1030/). NAACL, 2016.
+- J. Devlin, M.-W. Chang, K. Lee, K. Toutanova. [BERT: Pre-training of Deep Bidirectional Transformers for Language Understanding](https://aclanthology.org/N19-1423/). NAACL, 2019. §5.3 and Table 7 (CoNLL-2003 results).
+- N. Nakayama. [seqeval](https://github.com/chakki-works/seqeval). Entity-level evaluation for sequence labelling.
+- Hugging Face. [Token classification](https://huggingface.co/docs/transformers/tasks/token_classification). The alignment recipe used in the notebook.
