@@ -1,6 +1,6 @@
 ---
 title: Self-Attention
-description: "A sequence attends to itself: every token builds queries, keys and values by three linear maps, scores every other token, and takes a weighted average of the values. The note gives the matrix form, the reason for the √d scaling, masks, multi-head attention, the shapes at every step, and the quadratic cost."
+description: "A sequence attends to itself: every token builds a query, a key and a value by three linear maps, scores every token, and takes a weighted average of the values. The note derives the matrix form with shapes, works a three-token example by hand, explains the √d_k scaling, masks and the loss of word order, and builds multi-head attention and its quadratic cost."
 course: nlp
 section: Transformers
 order: 13
@@ -9,38 +9,93 @@ tags: [attention, self-attention, transformers, multi-head, masking, language-mo
 prerequisites: [Attention before Transformers, Linear algebra]
 ---
 
+import SoftLookup from '../../../components/figures/attention/SoftLookup.astro';
 import AttentionShapes from '../../../components/figures/attention/AttentionShapes.astro';
+import ProjectionEffect from '../../../components/figures/attention/ProjectionEffect.astro';
+import ScaleSaturation from '../../../components/figures/attention/ScaleSaturation.astro';
+import AttentionMasks from '../../../components/figures/attention/AttentionMasks.astro';
+import OrderBlind from '../../../components/figures/attention/OrderBlind.astro';
+import MultiHead from '../../../components/figures/attention/MultiHead.astro';
+import PathCost from '../../../components/figures/attention/PathCost.astro';
 
-The [previous note](/notes/nlp/attention-before-transformers) let a decoder state read a weighted sum of encoder states. The two sides came from two recurrent networks, and the recurrence was still there: encoder states were computed one after another, and each carried its context only through the chain. This note removes the recurrence. A sequence attends to *itself*: every position scores every other position and aggregates their values, in one matrix product over the whole sequence, with nothing sequential left. This is the operation that the Transformer ([Vaswani et al., 2017](#references)) is built from.
+The [previous note](/notes/nlp/attention-before-transformers) gave the decoder of a recurrent translator a direct path to every encoder state: at each output step it scores all encoder states against its own state, turns the scores into weights with a softmax and reads a weighted average. The single fixed-size context vector is gone. Two problems remain inside the encoder. Its states are still produced one after another, so a sentence of $n$ tokens takes $n$ sequential steps. And whatever links two distant source words still travels through every recurrent step between them. This note applies the same lookup *inside* one sequence: every position scores every position, itself included, and reads a weighted average of all of them, in one matrix product with nothing sequential left. That operation is self-attention; with several heads in parallel it is the only operation that mixes positions in the Transformer ([Vaswani et al., 2017](#references)). Matrix pictures of the same computation are in [Alammar (2018)](#references) and the textbook chapter of [Jurafsky and Martin](#references).
 
-**Notation.** A sequence of $n$ tokens with $d$-dimensional vectors is the matrix $X \in \mathbb R^{n \times d}$ (one row per token). Projection matrices $W_Q, W_K \in \mathbb R^{d \times d_k}$ and $W_V \in \mathbb R^{d \times d_v}$. Softmax over a matrix is taken row by row.
+**Notation.** A sequence of $n$ tokens with $d$-dimensional vectors is the matrix $X \in \mathbb R^{n \times d}$; its row $x_i$ is the vector of token $i$ (an embedding, later embedding plus position, later the output of the previous layer). Vectors are rows, as in PyTorch. Learned matrices $W_Q, W_K \in \mathbb R^{d \times d_k}$ and $W_V \in \mathbb R^{d \times d_v}$ give the query $q_i = x_i W_Q$, the key $k_i = x_i W_K$ and the value $v_i = x_i W_V$. Scores are $s_{ij}$, attention weights $\alpha_{ij}$, outputs $y_i$; $h$ is the number of heads. A softmax over a matrix is taken row by row.
 
-## Baseline: attention between two sequences
+## The problem: a word's meaning depends on other words
 
-In the encoder–decoder, the *query* was a decoder state $s_t$, the things compared against it were the encoder states $h_i$, and the things summed were the same encoder states. Three roles, two sources, and the comparison vectors and the summed vectors were the same object.
+In "The trophy doesn't fit in the brown suitcase because *it* is too big", *it* is the trophy; replace *big* by *small* and *it* is the suitcase. This pair is a Winograd schema ([Levesque, Davis and Morgenstern, 2012](#references)), built so that the answer is obvious to a reader and cannot be read off the pronoun itself. A static embedding gives *it* the same vector in both sentences. What we want is a layer that rewrites each token's vector using the tokens it relates to, where the relevant tokens are chosen by their content and can be anywhere in the sentence.
 
-<aside class="callout"><strong>Key idea.</strong> Give every token three vectors computed by three learned linear maps from its own representation: a <em>query</em> (what it is looking for), a <em>key</em> (what it offers for matching) and a <em>value</em> (what it contributes when matched). Then every token attends to every token of the same sequence. The same three maps are shared by all positions, so the whole computation is three matrix products, one score matrix and one softmax.</aside>
+## Baseline: recurrence, with attention on top
+
+A recurrent encoder (the [LSTM note](/notes/nlp/lstm-and-gru)) mixes context by passing a state from left to right, and in a bidirectional encoder also from right to left. The previous note added attention between decoder and encoder, but the encoder itself is still recurrent, and in that attention the three roles came from two sources: the *query* was the decoder state $s_t$, and the encoder states $h_i$ were both the vectors compared against it and the vectors summed.
+
+Where it fails:
+
+- **Sequential computation.** Step $t$ needs the state of step $t-1$, so the $n$ steps of one sequence cannot run in parallel on a GPU, whatever the batch size.
+- **Long paths.** The signal, and the gradient, between positions $i$ and $j$ passes through $|i - j|$ non-linear updates and through one state vector of fixed width. Gates make the path trainable; they do not make it short.
+- **Mixing is not a comparison.** How much of token $j$ reaches token $i$ is decided by the gates as the state rolls forward, not by comparing $i$ with $j$ directly.
+
+<aside class="callout"><strong>Key idea.</strong> Give every token three vectors computed by three learned linear maps from its own representation: a <em>query</em> (what it is looking for), a <em>key</em> (what it offers for matching) and a <em>value</em> (what it contributes when matched). Then every token attends to every token of the same sequence, itself included. The same three maps are used at all positions, so the whole layer is a few matrix products, any two positions are one step apart, and nothing waits for a previous position.</aside>
+
+## Attention as a soft dictionary lookup
+
+A dictionary compares a query with stored keys and returns the value of the key that matches exactly. Attention keeps the three roles and makes the match soft: every key matches a little, the softmax turns the match scores into weights that sum to one, and the result is the weighted average of all values. A hard lookup is the limit of a very peaked softmax. Because the weights are a smooth function of the scores, gradients reach the queries, the keys and the values, so all three projections are learned by backpropagation together with the rest of the model.
+
+The previous note fits this pattern with the decoder state as the query and the encoder states as keys and values at once ([Bahdanau, Cho and Bengio, 2015](#references)). **Self-attention** takes queries, keys and values from the same sequence; attention within one sequence was used on top of recurrent readers before the Transformer ([Cheng, Dong and Lapata, 2016](#references)); the Transformer made it the only mixing operation. **Cross-attention** takes queries from one sequence (the decoder) and keys and values from another (the encoder output); it is the same operation with an $m \times n$ weight matrix for $m$ queries and $n$ keys, and the [Transformer note](/notes/nlp/transformers#three-arrangements) places it in the decoder.
 
 ## From embeddings to Q, K and V
 
+For one token $i$ the layer does four things (a step-by-step walk-through in this order is [Starmer, 2023](#references)):
+
+1. **Project.** $q_i = x_i W_Q$, and for every token $j$: $k_j = x_j W_K$, $v_j = x_j W_V$. Each coordinate of $q_i$ multiplies the coordinates of $x_i$ by a column of weights and adds them up: a linear layer without bias.
+2. **Score.** $s_{ij} = q_i \cdot k_j / \sqrt{d_k}$ for every $j$, including $j = i$.
+3. **Normalize.** $\alpha_{ij} = \exp(s_{ij}) / \sum_{l=1}^{n} \exp(s_{il})$. The weights are positive and $\sum_j \alpha_{ij} = 1$.
+4. **Mix.** $y_i = \sum_{j=1}^{n} \alpha_{ij} v_j$.
+
+The same $W_Q$, $W_K$ and $W_V$ are used at every position. This weight sharing is what lets one layer process sentences of any length, and it means the keys and values are computed once and reused by every query: moving from token $i$ to token $i + 1$ needs only the new query. The new vector $y_i$ contains input from every token in proportion to how well its key matched $q_i$: context has been added to the token. The rows of $Y$ are contextual embeddings: the same word gets different vectors in different sentences, which is what the [BERT note](/notes/nlp/bert#from-static-to-contextual-embeddings) builds on and what [semantic search](/notes/nlp/semantic-search) compares.
+
+### Why separate queries and keys
+
+Without projections we could score with $x_i \cdot x_j$. Two things go wrong. The score is symmetric, so "the pronoun looks for its antecedent" and "the antecedent looks for the pronoun" would be the same relation. And $x_i \cdot x_i = \lVert x_i \rVert^2$ tends to win its own row: by Cauchy–Schwarz $x_i \cdot x_j \le \lVert x_i \rVert \lVert x_j \rVert$, which is at most $\lVert x_i \rVert^2$ whenever $\lVert x_j \rVert \le \lVert x_i \rVert$, so when all vectors have the same norm the diagonal is the largest score of every row, and the softmax favours the token itself (in high dimensions by a wide margin). The raw dot product builds this preference in; the layer has no way to turn it off.
+
+With projections the score is
+
 $$
-Q = X W_Q \in \mathbb R^{n \times d_k}, \qquad K = X W_K \in \mathbb R^{n \times d_k}, \qquad V = X W_V \in \mathbb R^{n \times d_v}.
+s_{ij} = \frac{x_i\, W_Q W_K^\top\, x_j^\top}{\sqrt{d_k}},
 $$
 
-Row $i$ of $Q$ is the query of token $i$, built from token $i$'s vector alone; likewise for keys and values. Separating the three roles matters: the vector a token uses to *search* need not be the vector it *presents* to searchers, and neither need be the information it *hands over*. In the previous note all three were the recurrent state; here they are three different projections of it.
+a learned bilinear form. It need not be symmetric, so the layer can learn "a pronoun looks for nouns" without "nouns look for pronouns", and attending to oneself becomes a learned choice rather than a built-in bias: a head can still learn a large self-score where that helps. The matrix $W_Q W_K^\top$ has rank at most $d_k$: a head compares tokens along $d_k$ learned directions. A separate $W_V$ decouples *what is matched* from *what is passed on*: the features that make a token easy to find need not be the features it should hand over.
+
+### Why a dot product
+
+The [previous note](/notes/nlp/attention-before-transformers#scoring-functions) compared additive, bilinear and dot-product scores ([Luong, Pham and Manning, 2015](#references)) and explained why cosine similarity is not used. What is new here: with dot products the whole score matrix is one matrix multiplication, $QK^\top$, and the norms left in the score act as information: a query with a larger norm gives a sharper softmax, and a key with a larger norm draws more weight from every query aligned with it. What does need control is the typical size of the scores, which grows with $d_k$; the fixed factor $1/\sqrt{d_k}$ below handles that without normalizing each pair.
 
 ## Scaled dot-product attention
 
+Stacking the rows gives the matrix form:
+
 $$
-\operatorname{Attention}(Q, K, V) = \operatorname{softmax}\!\left(\frac{Q K^\top}{\sqrt{d_k}}\right) V .
+\begin{gathered}
+Q = X W_Q \in \mathbb R^{n \times d_k}, \\
+K = X W_K \in \mathbb R^{n \times d_k}, \\
+V = X W_V \in \mathbb R^{n \times d_v},
+\end{gathered}
+$$
+
+$$
+\begin{aligned}
+&\operatorname{Attention}(Q, K, V) \\
+&\qquad = \operatorname{softmax}\!\Big(\frac{Q K^\top}{\sqrt{d_k}}\Big) V .
+\end{aligned}
 $$
 
 Reading from the inside out:
 
-1. $QK^\top \in \mathbb R^{n \times n}$. Entry $(i, j)$ is $q_i \cdot k_j$, the match between token $i$'s query and token $j$'s key. Row $i$ holds the scores of token $i$ against the whole sequence, including itself.
-2. Dividing by $\sqrt{d_k}$ keeps the scores at a scale the softmax can work with (next subsection).
-3. The row-wise softmax turns row $i$ into weights $\alpha_{i,1}, \dots, \alpha_{i,n}$ that are positive and sum to one, exactly as in the previous note.
-4. Multiplying by $V$ makes row $i$ of the output $\sum_j \alpha_{i,j} v_j$, the weighted average of all value vectors from token $i$'s point of view.
+1. $QK^\top \in \mathbb R^{n \times n}$. Entry $(i, j)$ is $q_i \cdot k_j$. Row $i$ holds the scores of token $i$ against the whole sequence, itself included.
+2. Dividing by $\sqrt{d_k}$ keeps the scores at a scale the softmax can work with ([below](#why-divide-by-dksqrtd_kdk)).
+3. The row-wise softmax turns row $i$ into the weights $\alpha_{i1}, \dots, \alpha_{in}$.
+4. Multiplying by $V$ makes row $i$ of the output $\sum_j \alpha_{ij} v_j = y_i$: the matrix form is the four steps above done for all tokens at once.
 
 | Matrix | Shape | Meaning |
 | --- | --- | --- |
@@ -48,112 +103,264 @@ Reading from the inside out:
 | $Q, K$ | $n \times d_k$ | queries, keys |
 | $V$ | $n \times d_v$ | values |
 | $QK^\top$ | $n \times n$ | token-to-token scores |
-| $\operatorname{softmax}(QK^\top/\sqrt{d_k})$ | $n \times n$ | attention weights, rows sum to 1 |
-| output | $n \times d_v$ | one context-aware vector per token |
-
-The output has one row per input token: self-attention is a sequence-to-sequence map of the same length, which is what lets it be stacked.
-
-### Worked example
-
-Three tokens in two dimensions, $X$ with rows $(1, 0)$, $(0, 1)$, $(1, 1)$, and identity projections so that $Q = K = V = X$ and $d_k = 2$. The scaled scores $QK^\top/\sqrt 2$ are
-
-$$
-\frac{1}{\sqrt 2}\begin{pmatrix} 1 & 0 & 1 \\ 0 & 1 & 1 \\ 1 & 1 & 2 \end{pmatrix}
-= \begin{pmatrix} .71 & 0 & .71 \\ 0 & .71 & .71 \\ .71 & .71 & 1.41 \end{pmatrix}.
-$$
-
-Row-wise softmax gives weights $(.40, .20, .40)$, $(.20, .40, .40)$, $(.25, .25, .50)$. The third token, whose query matches its own key best (score $1.41$), keeps half of its own value and takes a quarter from each neighbour; its output row is $.25\,(1,0) + .25\,(0,1) + .50\,(1,1) = (.75, .75)$. The first token's output is $(.80, .60)$: it started at $(1, 0)$ and moved towards the tokens it attended to. Every output row is a convex combination of the value rows.
+| $A = \operatorname{softmax}(QK^\top/\sqrt{d_k})$ | $n \times n$ | attention weights, rows sum to 1 |
+| $AV$ | $n \times d_v$ | one context-aware vector per token |
 
 <AttentionShapes />
 
+The output has one row per input token: self-attention maps a sequence to a sequence of the same length, which is what lets it be stacked. With a batch of $B$ sequences padded to length $n$ the tensors are $[B, n, d]$ and the scores $[B, n, n]$; `torch.bmm` does one product per sequence. For cross-attention with $m$ queries the scores are $[B, m, n]$.
+
+### Worked example
+
+Three tokens, "dogs chase cats", with $d = 4$ and $d_k = d_v = 2$. The input vectors and projections are toy numbers chosen to keep the arithmetic small:
+
+$$
+X = \begin{pmatrix} 1&0&1&0 \\ 0&1&0&1 \\ 1&0&0&1 \end{pmatrix},
+$$
+
+$$
+\begin{gathered}
+W_Q = \begin{pmatrix} 1&0 \\ 0&1 \\ 1&0 \\ 0&0 \end{pmatrix}, \qquad
+W_K = \begin{pmatrix} 0&1 \\ 1&0 \\ 0&0 \\ 1&1 \end{pmatrix}, \\[4pt]
+W_V = \begin{pmatrix} 1&0 \\ 0&2 \\ 1&1 \\ 0&1 \end{pmatrix}.
+\end{gathered}
+$$
+
+The projections are
+
+$$
+\begin{gathered}
+Q = \begin{pmatrix} 2&0 \\ 0&1 \\ 1&0 \end{pmatrix}, \qquad
+K = \begin{pmatrix} 0&1 \\ 2&1 \\ 1&2 \end{pmatrix}, \\[4pt]
+V = \begin{pmatrix} 2&1 \\ 0&3 \\ 1&1 \end{pmatrix}.
+\end{gathered}
+$$
+
+The scores and the scaled scores ($\sqrt 2 \approx 1.414$):
+
+$$
+\begin{gathered}
+QK^\top = \begin{pmatrix} 0&4&2 \\ 1&1&2 \\ 0&2&1 \end{pmatrix}, \\[4pt]
+\frac{QK^\top}{\sqrt 2} = \begin{pmatrix} 0&2.828&1.414 \\ 0.707&0.707&1.414 \\ 0&1.414&0.707 \end{pmatrix}.
+\end{gathered}
+$$
+
+The row-wise softmax and the output:
+
+$$
+\begin{gathered}
+A = \begin{pmatrix} 0.045&0.768&0.187 \\ 0.248&0.248&0.503 \\ 0.140&0.576&0.284 \end{pmatrix}, \\[4pt]
+Y = AV = \begin{pmatrix} 0.277&2.536 \\ 1.000&1.497 \\ 0.564&2.152 \end{pmatrix}.
+\end{gathered}
+$$
+
+Check row 2 by hand: $y_2 = 0.248\,(2, 1) + 0.248\,(0, 3) + 0.503\,(1, 1) = (1.000, 1.497)$ up to rounding. Reading the weights: *dogs* takes 77% of its new vector from *chase* and keeps only 4.5% of itself; *chase* draws half from *cats*. Every row sums to one; the columns need not. Every output row is a convex combination of the value rows, so it lies inside the triangle they span.
+
+<SoftLookup />
+
+The same inputs without projections make the point of the previous subsection concrete. Let $A_0 = \operatorname{softmax}(XX^\top/\sqrt 4)$ be the weights computed from raw dot products:
+
+$$
+\begin{gathered}
+XX^\top = \begin{pmatrix} 2&0&1 \\ 0&2&1 \\ 1&1&2 \end{pmatrix}, \\[4pt]
+A_0 = \begin{pmatrix} 0.506&0.186&0.307 \\ 0.186&0.506&0.307 \\ 0.274&0.274&0.452 \end{pmatrix}:
+\end{gathered}
+$$
+
+the scores are symmetric and the diagonal is the largest entry of every row. The learned $W_Q \ne W_K$ remove both.
+
+<ProjectionEffect />
+
 ### Why divide by $\sqrt{d_k}$
 
-If the components of $q$ and $k$ are independent with mean 0 and variance 1, the dot product $q \cdot k = \sum_{m=1}^{d_k} q_m k_m$ is a sum of $d_k$ independent terms each with variance 1, so it has variance $d_k$ and standard deviation $\sqrt{d_k}$. With $d_k = 64$ a typical score is of order $8$, and a softmax over inputs that differ by several units is nearly one-hot. Two scores of $11.7$ and $-2.6$ give weights $0.9999994$ and $6 \times 10^{-7}$: the second token is effectively invisible, and the gradient of the softmax with respect to either score is of order $10^{-6}$, so training stalls. Dividing by $\sqrt{d_k}$ brings the scores back to unit variance regardless of $d_k$. The variance claim is an identity under the independence assumption; that this assumption roughly holds at initialization, and that the scaling helps in practice, is empirical ([Vaswani et al., 2017](#references), §3.2.1).
+Assume the components of $q$ and $k$ are independent with mean 0 and variance 1, roughly what initialization and normalization give. Then $q \cdot k = \sum_{c=1}^{d_k} q_c k_c$ is a sum of $d_k$ independent terms, each with mean $\mathbb E[q_c]\,\mathbb E[k_c] = 0$ and variance $\mathbb E[q_c^2]\,\mathbb E[k_c^2] = 1$. Variances of independent terms add, so
+
+$$
+\operatorname{Var}(q \cdot k) = d_k, \qquad \operatorname{Var}\!\Big(\frac{q \cdot k}{\sqrt{d_k}}\Big) = 1 .
+$$
+
+This is the argument of [Vaswani et al. (2017)](#references), footnote 4 in §3.2.1. The divisor is the size $d_k$ of the query and key vectors of one head (64 in the base Transformer), not the model width $d$ (512); the two coincide only for a single head with $d_k = d$.
+
+Why the size matters: the softmax Jacobian is $\partial \alpha_j / \partial s_l = \alpha_j(\delta_{jl} - \alpha_l)$. When one score dominates, $\alpha$ is close to one-hot and every entry of the Jacobian is close to zero, so the scores, and through them $W_Q$ and $W_K$, stop receiving gradient. A one-number summary is the trace $\sum_j \alpha_j(1 - \alpha_j) = 1 - \sum_j \alpha_j^2$: it is $1 - 1/n$ for uniform weights and $0$ for one-hot weights.
+
+A toy simulation shows the effect: $n = 16$ keys, $q, k \sim \mathcal N(0, I_{d_k})$, 2000 draws per $d_k$, seed 0.
+
+| $d_k$ | std of $q \cdot k$ | largest weight, unscaled | largest weight, scaled | $1 - \sum \alpha_j^2$, unscaled | $1 - \sum \alpha_j^2$, scaled |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 0.99 | 0.21 | 0.21 | 0.87 | 0.87 |
+| 4 | 1.99 | 0.43 | 0.23 | 0.71 | 0.87 |
+| 16 | 4.01 | 0.69 | 0.25 | 0.43 | 0.87 |
+| 64 | 8.02 | 0.84 | 0.25 | 0.22 | 0.87 |
+| 512 | 22.49 | 0.94 | 0.25 | 0.08 | 0.87 |
+
+Unscaled, at $d_k = 64$ the softmax already puts most of its weight on one key at initialization and the gradient measure has dropped to a quarter. Scaled, both numbers barely move with $d_k$. The same effect is visible in the worked example: without the $\sqrt 2$, the first row would be $(0.016, 0.867, 0.117)$ instead of $(0.045, 0.768, 0.187)$. The scale fixes the starting point only; training can still make attention sharp where that helps, by growing the norms of queries and keys.
+
+<ScaleSaturation />
 
 ## Masks
 
-Some scores must be excluded before the softmax, and the standard way is to set them to $-\infty$ so that $\exp(-\infty) = 0$ removes them from the normalization.
+Some scores must be excluded before the softmax. The standard way is to set them to $-\infty$: since $e^{-\infty} = 0$, those weights are exactly zero, and the remaining weights of the row still sum to one.
 
-- **Padding mask.** Positions that are `[PAD]` should not receive attention: their keys are masked in every row. Shape $[B, 1, n]$, broadcast over queries.
-- **Causal mask.** A language model predicting token $t + 1$ from tokens $\le t$ must not let position $t$ attend to positions $> t$; otherwise the answer leaks in. An upper-triangular mask of $-\infty$ above the diagonal, shape $[n, n]$, enforces it for all positions at once, which is what makes training on a whole sequence in one pass possible. The [GPT note](/notes/nlp/gpt) relies on this.
+- **Padding mask.** Sequences in a batch are padded to a common length, and `[PAD]` positions must not receive weight. Their *columns* are masked: $s_{ij} = -\infty$ for every pad key $j$, in every row. The mask has shape $[B, 1, n]$ broadcast over the queries, or $[B, n, n]$ written out. Rows of pad queries still produce outputs; they are discarded later, for example by pooling only over real tokens.
+- **Causal mask.** A language model predicting token $t + 1$ from tokens $\le t$ must not let position $t$ see later positions, or the answer leaks in. Setting $s_{ij} = -\infty$ for $j > i$ (the upper triangle, shape $[n, n]$) enforces this for all positions at once, which is what lets a decoder train on a whole sequence in one pass. The [GPT note](/notes/nlp/gpt) relies on it.
+
+On the worked example, with *cats* treated as padding the rows become $(0.056, 0.944, 0)$, $(0.5, 0.5, 0)$ and $(0.196, 0.804, 0)$; with a causal mask they become $(1, 0, 0)$, $(0.5, 0.5, 0)$ and $(0.140, 0.576, 0.284)$.
+
+<AttentionMasks />
 
 ```python
-scores = (q @ k.transpose(-2, -1)) / sqrt(d_k)        # [B, n, n]
-scores = scores.masked_fill(~mask, float("-inf"))      # mask: True where allowed
-weights = scores.softmax(dim=-1)                       # rows over allowed keys sum to 1
-output = weights @ v                                   # [B, n, d_v]
+scores = q @ k.transpose(-2, -1) / math.sqrt(d_k)          # [B, n, n]
+scores = scores.masked_fill(mask, float("-inf"))           # mask: True where a key is not allowed
+weights = scores.softmax(dim=-1)                           # each row sums to 1 over allowed keys
+output = weights @ v                                       # [B, n, d_v]
+
+causal = torch.triu(torch.ones(n, n, dtype=torch.bool), diagonal=1)   # True above the diagonal
 ```
 
-A row with every key masked would be all $-\infty$ and produce NaN; padding masks must leave at least the token itself, or the row must be handled separately.
+[Phuong and Hutter (2022)](#references) give precise pseudocode for both masks. A row in which every key is masked would be $0/0$ and produce NaN. It cannot happen with a causal mask (the diagonal is always allowed), nor with a padding mask as long as every sequence has at least one real token, such as a leading `[CLS]`. With both masks and left padding, as in batched generation, rows of pad queries can be fully masked; implementations then use a large finite negative number instead of $-\infty$, or zero those rows after the softmax.
+
+## Self-attention does not see word order
+
+Swap *dogs* and *cats* and run the same layer on "cats chase dogs" without any position information. The rows of $X$ are swapped, so the rows of $Q$, $K$ and $V$ are swapped, the weight matrix has its rows and columns permuted in the same way, and the output rows are swapped. The vector computed for *dogs* is $(0.277, 2.536)$ in both sentences. In general $\operatorname{Attention}(\Pi X) = \Pi\,\operatorname{Attention}(X)$ for any permutation matrix $\Pi$: self-attention is permutation-equivariant, and the one-line proof is in the [positional representations note](/notes/nlp/positional-encoding#baseline-no-positions). The layer sees a bag of tokens. Order has to be supplied from outside: either added to $X$, so that the same word at a different position gets a different input vector (absolute positions), or built into the scores, as relative and rotary positions do ([positional representations note](/notes/nlp/positional-encoding#relative-and-rotary-positions)).
+
+<OrderBlind />
 
 ## Multi-head attention
 
-One softmax per token gives one set of weights, so a token can express only one pattern of "who to look at" per layer. **Multi-head attention** runs $h$ independent attentions with smaller projections and concatenates the results:
+One head gives each query one distribution over positions and one weighted average. A token often needs several relations at once: its syntactic head, its antecedent, the previous token. A single softmax can spread its weight over several tokens, but then their values are averaged into one vector and can no longer be told apart. **Multi-head attention** runs $h$ attentions in parallel, each with its own smaller projections, and combines their outputs:
 
 $$
-\operatorname{head}_m = \operatorname{Attention}(X W_Q^{(m)}, X W_K^{(m)}, X W_V^{(m)}), \qquad
-\operatorname{MultiHead}(X) = [\operatorname{head}_1; \dots; \operatorname{head}_h]\, W_O ,
+\begin{gathered}
+H_r = \operatorname{Attention}\big(Q^{(r)}, K^{(r)}, V^{(r)}\big), \\
+\operatorname{MultiHead}(X) = \big[H_1; \dots; H_h\big]\, W_O ,
+\end{gathered}
 $$
 
-with $W_Q^{(m)}, W_K^{(m)}, W_V^{(m)} \in \mathbb R^{d \times d/h}$ and $W_O \in \mathbb R^{d \times d}$. Each head has $d_k = d/h$, so the total cost in parameters and in floating-point operations is the same as one head of full width: $3 d^2$ for the projections plus $d^2$ for $W_O$, $4d^2$ per layer. For BERT-base, $d = 768$ and $h = 12$: $d_k = 64$ and $4 \times 768^2 = 2.36$ M attention parameters per layer. The small model trained in the notebook has $d = 32$, $h = 4$, $d_k = 8$.
+where $Q^{(r)} = X W_Q^{(r)}$, $K^{(r)} = X W_K^{(r)}$, $V^{(r)} = X W_V^{(r)}$ for $r = 1, \dots, h$, the output $H_r$ of head $r$ is in $\mathbb R^{n \times d_v}$, $[\,\cdot\,;\,\cdot\,]$ concatenates along the feature axis, and $W_O \in \mathbb R^{h d_v \times d}$.
 
-Different heads can learn different relations (previous token, syntactic head, same entity), and plotting the $n \times n$ weights of each head in each layer of a trained model shows a mix of sharp local patterns in early layers and diffuse ones later. An individual head is not guaranteed to be interpretable, and many heads can be removed after training with little loss ([Voita et al., 2019](#references)).
+With $d_k = d_v = d/h$ the cost is that of one head of full width. The $3h$ projection matrices hold $3h \cdot d \cdot d/h = 3d^2$ weights and $W_O$ another $d^2$, so $4d^2$ per layer for any $h$. In the classification model of the notebook ($d = 32$, $h = 4$, $d_k = 8$) that is $3 \cdot 4 \cdot 32 \cdot 8 + 32^2 = 4{,}096$ weights per layer. The base Transformer uses $d = 512$, $h = 8$, $d_k = d_v = 64$; BERT-base uses $d = 768$, $h = 12$, $d_k = 64$, so $4 \cdot 768^2 \approx 2.36$ M attention weights per layer, not counting biases.
+
+The concatenation followed by $W_O$ is a sum over heads. Split $W_O$ into $h$ blocks of $d_v$ rows, $W_O^{(r)}$; then, with $A^{(r)}$ the weight matrix of head $r$,
+
+$$
+\operatorname{MultiHead}(X) = \sum_{r=1}^{h} A^{(r)}\, X\, W_V^{(r)} W_O^{(r)} .
+$$
+
+Each head adds its own contribution, with its own attention pattern and its own map $W_V^{(r)} W_O^{(r)}$ of rank at most $d_v$ from what it reads to what it writes ([Elhage et al., 2021](#references)). In code the $h$ heads are one projection to $d$ columns, reshaped:
+
+```python
+# W_Q: [d, h*d_k], the h matrices W_Q^(r) side by side; same for W_K and W_V
+q = (x @ W_Q).view(B, n, h, d_k).transpose(1, 2)    # [B, h, n, d_k]; same for k and v
+out = attention(q, k, v, mask)                      # mask: [B, 1, n, n] or [B, 1, 1, n], broadcast over heads; out: [B, h, n, d_k]
+out = out.transpose(1, 2).reshape(B, n, h * d_k)    # concatenate the heads
+y = out @ W_O                                       # [B, n, d]
+```
+
+Looping over $h$ separate small heads, as the notebook does, gives the same result more slowly.
+
+<MultiHead />
+
+Heads and layers are different things. Heads run side by side on the same input and their outputs are summed through $W_O$; layers are stacked, so the queries of a layer come from vectors that already carry context from the layer below. The notebook model has 4 heads in each of 4 layers, 16 attention patterns per input.
+
+What heads learn is an empirical question. Analyses of trained models find heads that attend to the previous or the next token, heads that follow syntactic relations, heads for coreference, and many heads that put most of their weight on separator tokens or punctuation ([Clark et al., 2019](#references); [Voita et al., 2019](#references)). Many heads can be removed after training with little loss ([Michel, Levy and Neubig, 2019](#references); [Voita et al., 2019](#references)); having several heads seems to matter more for training than at inference.
 
 ## Complexity
 
-The score matrix has $n^2$ entries per head, computed with $d_k$ multiplications each, and the product with $V$ costs the same:
+The score matrix has $n^2$ entries per head, each computed with $d_k$ multiplications, and the product with $V$ costs the same:
 
-| Operation | Time | Memory |
-| --- | --- | --- |
-| Projections $XW_Q, XW_K, XW_V$ | $O(n d^2)$ | $O(nd)$ |
-| Scores $QK^\top$ and weights $\times V$ | $O(n^2 d)$ | $O(n^2)$ per head |
-| Recurrent layer, for comparison | $O(n d^2)$, sequential in $n$ | $O(nd)$ |
+| Operation | Time | Memory | Sequential steps | Longest path |
+| --- | --- | --- | --- | --- |
+| Projections $XW_Q, XW_K, XW_V$ | $O(n d^2)$ | $O(nd)$ | $O(1)$ | — |
+| Scores $QK^\top$ and weights $\times V$ | $O(n^2 d)$ | $O(n^2)$ per head | $O(1)$ | $O(1)$ |
+| Recurrent layer, for comparison | $O(n d^2)$ | $O(nd)$ | $O(n)$ | $O(n)$ |
 
-For $n = 128$ and $d = 32$ the score matrices are $16{,}384$ entries per head per example and the projections dominate. For $n = 4{,}096$ and $d = 1{,}024$ the scores are $1.7 \times 10^7$ per head and $n^2 d \approx 1.7 \times 10^{10}$ operations per layer, larger than the $n d^2 \approx 4.3 \times 10^9$ of the projections; attention is the quadratic term. In exchange, nothing depends on a previous position: all $n$ rows are computed by one matrix multiplication, which is why a Transformer trains in parallel over the sequence and a recurrent network does not. Long-context systems therefore spend their engineering on this term: caching keys and values during generation, exact kernels that avoid materializing the $n \times n$ matrix ([Dao et al., 2022](#references)), and sparse, windowed or linearized variants.
+The last two columns are those of Table 1 in [Vaswani et al. (2017)](#references). For $n = 128$ and $d = 32$, the classification model of the notebook, the score matrices hold $16{,}384$ entries per head per example, and because $n = 4d$ the attention products already cost more than the projections: $2n^2 d \approx 1.0 \times 10^6$ multiply-adds for $QK^\top$ and $AV$ against $4nd^2 \approx 5.2 \times 10^5$ for $W_Q$, $W_K$, $W_V$ and $W_O$. For $n = 4{,}096$ and $d = 1{,}024$ the scores are $1.7 \times 10^7$ per head, and $2n^2 d \approx 3.4 \times 10^{10}$ against $4nd^2 \approx 1.7 \times 10^{10}$. Up to constants attention is the $n^2 d$ term and the projections the $n d^2$ term, so attention takes over once $n$ is a small multiple of $d$: $n = 2d$ against the projections, about $6d$ against a whole block with a feed-forward width of $4d$. In exchange, nothing depends on a previous position: all $n$ rows come from one matrix multiplication, which is why a Transformer trains in parallel over the sequence and a recurrent network does not. Long-context systems therefore spend their engineering on this term: caching keys and values during generation, exact kernels that never store the $n \times n$ matrix ([Dao et al., 2022](#references)), and sparse, windowed or linearized variants.
+
+<PathCost />
+
+## What a trained model's heads look like
+
+The notebook trains the 4-layer, 4-head encoder of the [Transformer note](/notes/nlp/transformers#a-small-encoder-on-ag-news) on AG News and plots the $49 \times 49$ weight matrices of one 49-token training example (the first of a shuffled batch) for all 16 heads. The plots are saved only as images, so they are described here in words.
+
+- In layer 1 almost every row is close to one-hot, and most queries choose one of a few content tokens rather than themselves or their neighbours. In the single head plotted with token labels (layer 1, head 4), most rows put nearly all their weight on one of four words: *injured*, *travel*, *southern* and *baghdad*.
+- In layer 2 the weights are spread more evenly over many keys.
+- From layer 3 on, vertical stripes appear: nearly every query puts its weight on the same few keys. In layer 3 this holds for some heads, in layer 4 for all of them.
+
+This is the pattern the head analyses above describe (many queries reading a few shared keys), and the notebook itself warns that such maps are hard to read. They show where a head reads from, not what the classifier relies on.
 
 ## What changed
 
 | | Encoder–decoder attention | Self-attention |
 | --- | --- | --- |
 | Queries from | Decoder state | Every token of the sequence |
-| Keys and values from | Encoder states (same vector) | Every token, by separate projections |
-| Sequential dependency | Through both recurrences | None |
-| Computation | One softmax per decoder step | One $n \times n$ softmax per layer |
-| Cost | $O(n)$ per step | $O(n^2 d)$ per layer |
+| Keys and values from | Encoder states (one vector for both) | Every token, by separate projections |
+| Path between two positions | Through the recurrence, $O(n)$ | One step |
+| Sequential dependency | Through both recurrences | None across positions within a layer (generation still emits one token at a time) |
+| Computation | One softmax per decoder step | One $n \times n$ softmax per head and layer |
+| Cost | $O(nd)$ per decoder step | $O(n^2 d)$ per layer |
+| Word order | From the recurrence | Lost; must be supplied (in the input or in the scores) |
 | Heads | One | $h$ in parallel |
 
 ## Limitations
 
-- **No notion of order.** Permuting the input rows permutes the output rows identically; nothing in $QK^\top V$ knows that token 2 came before token 3. Order has to be injected separately, which the [positional representations note](/notes/nlp/positional-encoding) does.
-- **Quadratic in $n$.** Doubling the context quadruples the score computation and memory.
-- **Linear in the values.** The output is a weighted average of value vectors: there is no non-linearity per position yet, and a single attention layer cannot compute arbitrary functions of a token. The [Transformer note](/notes/nlp/transformers) adds the feed-forward layer for that reason.
-- **Weights are not explanations.** Attention maps are a useful diagnostic and a poor proof of what the model relies on.
+- **No notion of order.** Permuting the input rows permutes the output rows; positions must be supplied, in the input or in the scores, which the [positional representations note](/notes/nlp/positional-encoding) does.
+- **Quadratic in $n$.** Doubling the context quadruples the score computation and memory. At $n = 128$ and $h = 4$, as in the notebook, that is $65{,}536$ weights per sequence per layer; at $n = 32{,}000$ it is about $10^9$ per head. Exact kernels avoid storing the matrix but the work stays quadratic; sparse and linear approximations trade exactness for length.
+- **Weights must sum to one.** A head with nothing useful to read still has to put its weight somewhere; trained models park it on separators, punctuation or the first token ([Clark et al., 2019](#references); [Xiao et al., 2024](#references)).
+- **Only weighted averages.** Each head's output is a convex combination of value vectors, and the layer only maps these linearly through $W_O$: the softmax is the only non-linearity, and there is no per-token transformation yet. The [Transformer note](/notes/nlp/transformers) adds the feed-forward layer, residual connections and normalization.
+- **Weights are not explanations.** Different weight patterns can give the same prediction ([Jain and Wallace, 2019](#references); a more careful view in [Wiegreffe and Pinter, 2019](#references)), and the weights ignore how large the transformed values are that they multiply ([Kobayashi et al., 2020](#references)). Attention maps are a diagnostic, not a proof of what the model relies on.
 
 ## What you should remember
 
-- $Q = XW_Q$, $K = XW_K$, $V = XW_V$; $\operatorname{Attention}(Q, K, V) = \operatorname{softmax}(QK^\top/\sqrt{d_k})\,V$; output row $i$ is a convex combination of value rows weighted by how well query $i$ matches each key.
-- $\sqrt{d_k}$ restores unit variance to the scores so the softmax does not saturate.
-- Masks set forbidden scores to $-\infty$: padding keys always, future keys in a decoder.
-- $h$ heads with $d_k = d/h$ cost the same as one wide head and give $h$ weight patterns per layer; $4d^2$ parameters per layer.
-- Time $O(n^2 d)$, memory $O(n^2)$ per head, and no sequential dependency.
+- $Q = XW_Q$, $K = XW_K$, $V = XW_V$; $\operatorname{Attention}(Q, K, V) = \operatorname{softmax}(QK^\top/\sqrt{d_k})\,V$; output row $i$ is a weighted average of the value rows, with weights from how well query $i$ matches each key.
+- Shapes: $X$ is $n \times d$, scores $n \times n$, output $n \times d_v$; cross-attention gives $m \times n$.
+- Separate $W_Q$ and $W_K$ make the score asymmetric and stop self-matching from dominating; $W_V$ separates what is matched from what is passed on.
+- Divide by $\sqrt{d_k}$, the per-head key size, because $\operatorname{Var}(q \cdot k) = d_k$; otherwise the softmax saturates and its gradient vanishes.
+- Masks set scores to $-\infty$: padding masks key columns, a causal mask the upper triangle.
+- Self-attention is permutation-equivariant; positions must be supplied, in the input or in the scores.
+- $h$ heads of size $d/h$, concatenated and mixed by $W_O$: $4d^2$ weights per layer for any $h$, equivalent to a sum of per-head contributions.
+- Time $O(n^2 d)$, memory $O(n^2)$ per head, one step between any two positions, no sequential dependency.
 
 ## Notebook
 
-[`week05_transformer.ipynb`](https://github.com/glkuzi/nlp_dsba/blob/4130e09940ddd363cee9fa3bd51b149466cfc6fb/seminars/week05_transformer.ipynb). Cell numbers count every cell, markdown included, from 1.
+[`week05_transformer.ipynb`](https://github.com/glkuzi/nlp_dsba/blob/4130e09940ddd363cee9fa3bd51b149466cfc6fb/seminars/week05_transformer.ipynb). Cell numbers count every cell, markdown included, from 1. The repository is private at the time of writing.
 
-- Cell 38 states the scaled dot-product formula and the query/key/value reading used above.
-- Cell 39 implements `Attention` (one head: three bias-free `nn.Linear(embed_dim, embed_dim // num_heads)` projections, `bmm` scores divided by $\sqrt{d_k}$, `masked_fill` with $-\infty$, softmax, dropout on the weights, `bmm` with $V$; it returns the weights as well) and `MultiHeadAttention` (a `ModuleList` of heads, concatenation along the last axis, a final `nn.Linear(embed_dim, embed_dim)`). The comments in the cell record the shape at every step.
-- Cell 40 builds the padding mask: `tokens == pad_idx`, expanded to `[B, n, n]` so that padded keys are masked in every row.
-- Cells 49–62 run a trained 4-layer, 4-head model on one 49-token headline and plot the $49 \times 49$ weight matrix of every head in every layer, then one head with the tokens as axis labels.
+- Cell 38 states the scaled dot-product formula, the query, key and value reading used above, and the reason for $\sqrt{d_k}$.
+- Cell 39 implements `Attention`, one head: three bias-free `nn.Linear(embed_dim, embed_dim // num_heads)` projections, `torch.bmm` scores divided by $\sqrt{d_k}$, `masked_fill` with $-\infty$, a softmax over the keys, dropout on the weights and `bmm` with $V$; it returns the weights as well. `MultiHeadAttention` keeps the heads in an `nn.ModuleList`, concatenates their outputs along the last axis and applies a bias-free `nn.Linear(embed_dim, embed_dim)` as $W_O$, returning the weights stacked to $[B, n, n, h]$.
+- Cell 40 builds the padding mask `tokens == pad_idx`, repeated over the query rows to $[B, n, n]$, so pad keys are masked in every row.
+- Cell 42 uses `MultiHeadAttention` inside `TransformerLayer` and stacks four layers in `Transformer`, which also returns all attention weights; the [Transformer note](/notes/nlp/transformers#notebook) describes the block.
+- Cell 45 (saved output) prints the model: every head has `Linear(32 → 8)` projections and $W_O$ is `Linear(32 → 32)`, so each layer has $4{,}096$ attention weights, as computed above.
+- Cells 51–57 take the first example of a shuffled training batch, crop it to its 49 real tokens and run the trained model on it; cell 59 plots the 16 weight matrices (rows are heads, columns are layers) and cell 62 plots layer 1, head 4 with the tokens as axis labels. Both are saved images, described above.
+
+Implementation remarks for readers who run the notebook:
+
+- Cell 29 sets `PAD_ID = tokenizer_fast.pad_token_type_id`, the token-*type* id, where `pad_token_id` is meant. It works only because both are 0 for this tokenizer.
+- In cell 39 the shape comments of the projections are an exercise, and the one for $W_V$, `(embed_dim, embed_dim)`, is wrong: as applied, each of $W_Q$, $W_K$, $W_V$ maps `embed_dim` to `embed_dim // num_heads` (32 to 8). PyTorch stores `nn.Linear.weight` transposed, as `(out, in)`.
+- In cell 42 the comment on `attention_scores` gives `(batch_size, length, embed_dim, num_heads, num_layers)`; the tensor is $[B, n, n, h, L]$.
+- In cell 59 each panel gets its own colour scale (`imshow` without `vmin`/`vmax`), so brightness is comparable within a panel but not between panels.
+
+The cross-attention weights of a one-layer translation Transformer are extracted and plotted in [`week04_lstm_attention_transformer.ipynb`](https://github.com/glkuzi/nlp_dsba/blob/4130e09940ddd363cee9fa3bd51b149466cfc6fb/seminars/week04_lstm_attention_transformer.ipynb), cells 70–78: a saved tensor of shape $[32, 31, 32]$ (batch, target, source) whose rows sum to 1. `nn.MultiheadAttention` returns the average over its 8 heads by default, so these are averaged weights. The [previous note](/notes/nlp/attention-before-transformers#notebook) discusses them.
 
 ## Next
 
-Self-attention mixes information across positions, with one weighted average per head. To build a deep model from it three more pieces are needed: a non-linear transformation applied to each position, a way to stack many layers without the gradient problems of the [RNN note](/notes/nlp/recurrent-networks#gradients-through-time), and the encoder, decoder and encoder–decoder arrangements that turn the block into a classifier, a language model or a translator. The [next note](/notes/nlp/transformers) assembles the Transformer block and its three configurations.
+Self-attention mixes information across positions and does nothing else: each output is an average of linear maps of the inputs, it has no idea of order, and a deep stack of bare attention layers is hard to train. The [Transformer note](/notes/nlp/transformers) wraps multi-head attention with residual connections and layer normalization, adds a position-wise feed-forward network, and arranges the block as an encoder, a decoder with causal self-attention, or an encoder–decoder with cross-attention.
 
 ## References
 
-- A. Vaswani, N. Shazeer, N. Parmar, J. Uszkoreit, L. Jones, A. N. Gomez, Ł. Kaiser, I. Polosukhin. [Attention Is All You Need](https://arxiv.org/abs/1706.03762). NeurIPS, 2017. §3.2 (scaled dot-product and multi-head attention).
+- A. Vaswani, N. Shazeer, N. Parmar, J. Uszkoreit, L. Jones, A. N. Gomez, Ł. Kaiser, I. Polosukhin. [Attention Is All You Need](https://arxiv.org/abs/1706.03762). NeurIPS, 2017. §3.2.1 (scaled dot-product attention and the variance footnote), §3.2.2 (multi-head attention), Table 1 (complexity, sequential operations, path length).
+- H. J. Levesque, E. Davis, L. Morgenstern. [The Winograd Schema Challenge](https://cs.nyu.edu/~ed1/papers/WSKR2012.pdf). KR, 2012. The trophy and suitcase example.
+- D. Bahdanau, K. Cho, Y. Bengio. [Neural Machine Translation by Jointly Learning to Align and Translate](https://arxiv.org/abs/1409.0473). ICLR, 2015.
+- M.-T. Luong, H. Pham, C. D. Manning. [Effective Approaches to Attention-based Neural Machine Translation](https://arxiv.org/abs/1508.04025). EMNLP, 2015.
+- J. Cheng, L. Dong, M. Lapata. [Long Short-Term Memory-Networks for Machine Reading](https://arxiv.org/abs/1601.06733). EMNLP, 2016. Attention within one sequence before the Transformer.
+- N. Elhage, N. Nanda, C. Olsson, et al. [A Mathematical Framework for Transformer Circuits](https://transformer-circuits.pub/2021/framework/index.html). Transformer Circuits Thread, 2021. Multi-head attention as a sum of per-head terms.
+- M. Phuong, M. Hutter. [Formal Algorithms for Transformers](https://arxiv.org/abs/2207.09238). arXiv, 2022. Precise pseudocode for attention and masking.
+- K. Clark, U. Khandelwal, O. Levy, C. D. Manning. [What Does BERT Look At? An Analysis of BERT's Attention](https://arxiv.org/abs/1906.04341). BlackboxNLP, 2019.
 - E. Voita, D. Talbot, F. Moiseev, R. Sennrich, I. Titov. [Analyzing Multi-Head Self-Attention: Specialized Heads Do the Heavy Lifting, the Rest Can Be Pruned](https://aclanthology.org/P19-1580/). ACL, 2019.
+- P. Michel, O. Levy, G. Neubig. [Are Sixteen Heads Really Better than One?](https://arxiv.org/abs/1905.10650) NeurIPS, 2019.
+- S. Jain, B. C. Wallace. [Attention is not Explanation](https://arxiv.org/abs/1902.10186). NAACL, 2019.
+- S. Wiegreffe, Y. Pinter. [Attention is not not Explanation](https://arxiv.org/abs/1908.04626). EMNLP, 2019.
+- G. Kobayashi, T. Kuribayashi, S. Yokoi, K. Inui. [Attention is Not Only a Weight: Analyzing Transformers with Vector Norms](https://arxiv.org/abs/2004.10102). EMNLP, 2020.
+- G. Xiao, Y. Tian, B. Chen, S. Han, M. Lewis. [Efficient Streaming Language Models with Attention Sinks](https://arxiv.org/abs/2309.17453). ICLR, 2024.
 - T. Dao, D. Y. Fu, S. Ermon, A. Rudra, C. Ré. [FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness](https://arxiv.org/abs/2205.14135). NeurIPS, 2022.
-- J. Alammar. [The Illustrated Transformer](https://jalammar.github.io/illustrated-transformer/). 2018. The matrix pictures that the figure follows.
-- D. Jurafsky, J. H. Martin. [*Speech and Language Processing*](https://web.stanford.edu/~jurafsky/slp3/), 3rd ed. draft. Chapter 9 (the Transformer; attention heads, masking).
+- J. Starmer (StatQuest). [Transformer Neural Networks, ChatGPT's foundation, Clearly Explained!!!](https://www.youtube.com/watch?v=zxQyTK8quyY) Video, 2023. A step-by-step walk through queries, keys, values and the weighted sum for one word, the order this note follows.
+- J. Alammar. [The Illustrated Transformer](https://jalammar.github.io/illustrated-transformer/). 2018. Matrix pictures of self-attention.
+- D. Jurafsky, J. H. Martin. [*Speech and Language Processing*](https://web.stanford.edu/~jurafsky/slp3/), 3rd ed. draft of 19 August 2026. Chapter 7, Transformers and Pretraining (self-attention, multi-head attention, masking).
