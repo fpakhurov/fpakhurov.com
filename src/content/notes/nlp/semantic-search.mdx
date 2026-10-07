@@ -1,0 +1,153 @@
+---
+title: Embeddings and semantic search
+description: "Find the passages that answer a query among thousands: lexical matching with BM25, dense retrieval with contrastively trained sentence embeddings, how documents are cut into chunks, cross-encoder reranking and hybrid retrieval, and the metrics (hit rate at k, mean reciprocal rank) that measure a retriever on a golden set before any generation is involved."
+course: nlp
+section: Modern LLM Systems
+order: 29
+status: published
+tags: [retrieval, embeddings, bm25, dense-retrieval, chunking, reranking, mrr]
+prerequisites: [BERT and masked language modeling, Bag of words and TF-IDF, Word embeddings]
+---
+
+The [embeddings note](/notes/nlp/word-embeddings#from-words-to-sentences-for-now) ended with a nearest-neighbour search over averaged word vectors: embed a question, compare with every stored question by cosine, return the closest. That is the whole idea of semantic search; what has changed since is the encoder, the index, and the engineering around what to embed. This note builds a retriever over a corpus of Russian-language posts about machine learning, measures it, and improves it twice. Generation does not appear until the [next note](/notes/nlp/rag); a retriever has to be right on its own first.
+
+**Notation.** A query $q$ and a corpus of passages $d_1, \dots, d_N$; an embedding model $e(\cdot) \in \mathbb R^{m}$; a similarity $\mathrm{sim}(q, d)$; the retriever returns the top-$k$ passages by similarity. For a query with a known relevant passage, $\mathrm{rank}(q)$ is the position of that passage in the returned list (or $\infty$ if absent).
+
+## The task
+
+Input: a query, typically short. Output: a ranked list of passages from a fixed corpus. The corpus here is a dump of a Telegram channel: a few thousand posts, up to several hundred words each, in Russian with English technical terms. A **golden set** of (question, relevant post) pairs, written by hand, is the test set; the question is phrased as a reader would ask it, and the post contains the answer.
+
+## Baseline: lexical matching
+
+Score a passage by the query terms it contains, weighted as in the [TF-IDF note](/notes/nlp/bag-of-words-and-tf-idf#tf-idf-reweighting-the-counts). The standard refinement is **BM25** ([Robertson and Zaragoza, 2009](#references)):
+
+$$
+\mathrm{BM25}(q, d) = \sum_{t \in q} \mathrm{idf}(t)\cdot \frac{f(t, d)\,(k_1 + 1)}{f(t, d) + k_1\big(1 - b + b\,\frac{|d|}{\overline{|d|}}\big)},
+$$
+
+with $f(t, d)$ the count of term $t$ in $d$, $|d|$ the passage length, $\overline{|d|}$ the average length, and $k_1 \approx 1.2$, $b \approx 0.75$. Relative to raw TF-IDF, the count saturates (the 10th occurrence of a term adds little) and long passages are penalized. BM25 is fast (an inverted index), needs no training, is exact on rare terms and identifiers (`Log-Linear Attention`, an error code, a product name), and fails on **vocabulary mismatch**: a query about *speeding up attention for long sequences* does not share a term with a passage about *sub-quadratic complexity*.
+
+## Dense retrieval
+
+<aside class="callout"><strong>Key idea.</strong> Embed the query and every passage with an encoder trained so that a question and the passage that answers it have a high cosine, and search by vector similarity. Paraphrases and synonyms land near each other because the encoder learned that from pairs, not from shared terms.</aside>
+
+### The embedding model
+
+A **bi-encoder**: one Transformer encoder applied separately to the query and to each passage, pooled (mean of token vectors or the `[CLS]` vector) and normalized to unit length so that cosine is a dot product. It is trained contrastively on (query, positive passage) pairs with in-batch negatives: for a batch of $B$ pairs, the loss pushes each query's similarity to its own passage above its similarity to the other $B - 1$ passages,
+
+$$
+\mathcal L = -\frac1B\sum_{i=1}^B \log \frac{\exp(\mathrm{sim}(q_i, d_i)/\tau)}{\sum_{j=1}^B \exp(\mathrm{sim}(q_i, d_j)/\tau)},
+$$
+
+the InfoNCE objective ([Karpukhin et al., 2020](#references); [Reimers and Gurevych, 2019](#references)). The frozen `[CLS]` of a masked-language model is a poor sentence vector, as the [transfer learning note](/notes/nlp/transfer-learning#frozen-features-and-a-linear-model) found; contrastive training is what makes the vectors comparable across texts.
+
+Two conventions matter when using one. A **symmetric** model embeds queries and passages the same way (`BAAI/bge-m3`, 1,024 dimensions, multilingual). An **asymmetric** model expects a prefix that says which side a text is on (`intfloat/multilingual-e5-large`: `query: ` and `passage: `), because questions and answers are different kinds of text and the model was trained to map them with different heads. Omitting the prefix silently degrades an asymmetric model.
+
+### The index
+
+Passages are embedded once and stored with their vectors in a vector store (the notebook uses an in-memory Qdrant collection). A query costs one encoder pass plus a nearest-neighbour search; for corpora of millions of vectors the search is approximate (HNSW graphs, product quantization), trading a little recall for sub-millisecond lookups. At this corpus size, exact search is fine.
+
+### Chunking
+
+An encoder reads a few hundred tokens, and a long post contains several ideas; embedding the whole post averages them into one vector that matches none of the questions well. Documents are therefore cut into **chunks**, and the choice of unit shapes everything downstream:
+
+| Chunker | Unit | Keeps | Loses | Use |
+| --- | --- | --- | --- | --- |
+| Fixed token window (256 tokens, overlap 64) | tokens | exact size, predictable cost | sentence and word boundaries | billing-sensitive pipelines |
+| Sentence | sentences up to a size | whole thoughts | uniform size; ideas spanning sentences | texts with self-contained sentences |
+| Semantic (adjacent sentences merged while cosine ≥ 0.5) | topically coherent groups | one idea per chunk | predictable size | multi-topic documents |
+| Recursive (headings → paragraphs → sentences → tokens) | document structure | hierarchy | needs format-specific rules | Markdown, HTML, documentation |
+
+A second trick decouples what is *matched* from what is *returned*: **parent-document retrieval** indexes small child chunks (120 characters here) for precise matching, and returns the parent chunk they came from, so the generator gets enough context. Overlap between chunks guards against an answer split across a boundary, at the cost of index size.
+
+## Measuring a retriever
+
+For each golden question, run the retriever, find the position of the known-relevant post in the returned list, and aggregate:
+
+- **Hit rate at $k$** (the notebook calls it P@k): the fraction of questions whose relevant post is within the top $k$.
+- **Mean reciprocal rank**: $\mathrm{MRR} = \frac{1}{|Q|}\sum_{q} \frac{1}{\mathrm{rank}(q)}$, with $1/\infty = 0$. It rewards putting the right passage first and discounts lower ranks harmonically.
+
+Because the index holds chunks and the golden set holds whole posts, "is this chunk the relevant post" is decided by fuzzy string matching (a partial-ratio similarity of at least 80 %), which is itself a source of error: a chunk from a different post that quotes the same sentence counts as a hit.
+
+### Worked example
+
+Three questions; the relevant post is found at rank 1, rank 3, and not at all within the top 10:
+
+| Question | Rank | $1/\mathrm{rank}$ | Hit@1 | Hit@3 | Hit@10 |
+| --- | --- | --- | --- | --- | --- |
+| A | 1 | 1.000 | 1 | 1 | 1 |
+| B | 3 | 0.333 | 0 | 1 | 1 |
+| C | — | 0 | 0 | 0 | 0 |
+| **mean** | | **0.444** | **0.33** | **0.67** | **0.67** |
+
+Hit@$k$ answers "how often is the answer somewhere in what we hand to the next stage"; MRR answers "how high is it". A generator that reads the top 5 cares about Hit@5; one that reads only the top passage cares about MRR.
+
+The notebook runs this evaluation for the dense retriever, the parent-document retriever, BM25, the hybrid and the reranked variants; the numeric outputs of those cells were not saved, so no values are quoted here. The procedure is the point: every retrieval change is measured on the golden set before it goes near a generator.
+
+## Two improvements
+
+### Reranking with a cross-encoder
+
+A bi-encoder scores a pair from two independent vectors; it never sees query and passage together. A **cross-encoder** reads `[CLS] q [SEP] d [SEP]` and outputs one relevance score, with full attention between the two texts, which is more accurate and $N$ times more expensive, because it cannot pre-compute anything. The standard pipeline uses both: retrieve the top 20–100 cheaply, then re-score only those with the cross-encoder (`BAAI/bge-reranker-v2-m3` here) and re-order. The cost is $k$ encoder passes per query; the gain is in precision at the top, where the generator reads.
+
+### Hybrid retrieval
+
+BM25 and dense retrieval fail on different queries: exact identifiers versus paraphrases. Running both and merging the lists (weighted score fusion with weights 0.4 and 0.6 in the notebook, or reciprocal rank fusion, $\sum_r 1/(60 + \mathrm{rank}_r)$) covers both failure modes with no training. On technical corpora full of names and codes, hybrid retrieval is usually the right default.
+
+### Query expansion
+
+Users write *чё делать если в промптах нерелевантная инфа?* and the corpus says *нерелевантная информация в контексте*. A small instruction-tuned model can rewrite the query into the register of the corpus, or generate several paraphrases that are all searched. It costs a generation per query and helps most when queries are short and informal.
+
+## What changed
+
+| | BM25 | Dense bi-encoder | + reranker | Hybrid |
+| --- | --- | --- | --- | --- |
+| Matches on | terms | meaning (trained pairs) | meaning, jointly read | both |
+| Training | none | contrastive, large pair sets | contrastive, pairs | none extra |
+| Query cost | inverted index lookup | 1 encoder pass + ANN | + $k$ encoder passes | both lookups |
+| Rare identifiers | exact | often missed | depends on candidates | exact |
+| Paraphrase | missed | found | found | found |
+
+## Limitations
+
+- **The encoder's training distribution.** Embeddings trained on web Q&A pairs degrade on legal, medical or code corpora; a golden set is the only way to know.
+- **Chunk boundaries** cut answers; overlap and parent retrieval mitigate, not remove.
+- **Long and multi-topic passages** embed to a blurred vector; the fix is chunking, which creates the previous problem.
+- **Freshness.** Changing a document means re-embedding it; the index is a snapshot.
+- **The golden set is small and hand-made**, and the fuzzy-match criterion adds noise; differences of a few points between retrievers are not conclusions.
+- **Similarity is not relevance.** A passage about the same topic that does not contain the answer scores high; reranking helps, generation evaluation (next notes) catches the rest.
+
+## What you should remember
+
+- BM25: saturated term counts with length normalization; exact on rare terms, blind to paraphrase.
+- Dense retrieval: a contrastively trained bi-encoder, cosine on normalized vectors, a vector index; respect symmetric vs asymmetric conventions.
+- Chunk by a unit that holds one idea; index small, return large (parent retrieval); overlap guards boundaries.
+- Measure on a golden set with Hit@$k$ and MRR before touching generation.
+- Rerank the top candidates with a cross-encoder; fuse BM25 and dense lists for both failure modes.
+
+## Notebook
+
+[`week09_RAG.ipynb`](https://github.com/glkuzi/nlp_dsba/blob/4130e09940ddd363cee9fa3bd51b149466cfc6fb/seminars/week09_RAG.ipynb). Cell numbers count every cell, markdown included, from 1.
+
+- Cells 6–14 load the post dump, plot post lengths, print five long posts, and load the golden set of question–post pairs.
+- Cells 20–25 wrap posts as documents; cells 28–46 try the token, sentence, semantic and recursive chunkers on five long posts and print the chunks and their token counts.
+- Cells 48–50 configure the symmetric `bge-m3` embedder (normalized vectors) with the asymmetric `e5` alternative in a comment; cell 52 builds the in-memory Qdrant index (the saved run shows a library version error at this cell, after which the remaining retrieval cells have no saved outputs).
+- Cells 58–63 set up parent-document retrieval with 120-character child chunks.
+- Cells 65–71 implement the golden-set evaluation (Hit@k for $k \in \{1, 3, 5, 10\}$ and MRR), first with exact substring matching, then with an 80 % fuzzy threshold.
+- Cells 74–77 build BM25, the 0.4 / 0.6 hybrid, and evaluate each; cells 87–92 load the `bge-reranker-v2-m3` cross-encoder and rerank the top 20.
+- Cells 83–84 paraphrase an informal query with a 3 B instruction-tuned model.
+
+## Next
+
+A retriever hands over passages; something has to turn them into an answer. The [next note](/notes/nlp/rag) puts a language model after the retriever, decides how to build its context, lists the ways the combination fails, and separates the evaluation of the retrieval from the evaluation of the answer.
+
+## References
+
+- S. Robertson, H. Zaragoza. [The Probabilistic Relevance Framework: BM25 and Beyond](https://doi.org/10.1561/1500000019). *Foundations and Trends in Information Retrieval*, 3(4), 2009.
+- V. Karpukhin et al. [Dense Passage Retrieval for Open-Domain Question Answering](https://aclanthology.org/2020.emnlp-main.550/). EMNLP, 2020.
+- N. Reimers, I. Gurevych. [Sentence-BERT: Sentence Embeddings using Siamese BERT-Networks](https://aclanthology.org/D19-1410/). EMNLP, 2019.
+- R. Nogueira, K. Cho. [Passage Re-ranking with BERT](https://arxiv.org/abs/1901.04085). arXiv, 2019. Cross-encoder reranking.
+- G. V. Cormack, C. L. A. Clarke, S. Büttcher. [Reciprocal Rank Fusion outperforms Condorcet and individual Rank Learning Methods](https://doi.org/10.1145/1571941.1572114). SIGIR, 2009.
+- J. Chen, S. Xiao, P. Zhang, K. Luo, D. Lian, Z. Liu. [BGE M3-Embedding: Multi-Lingual, Multi-Functionality, Multi-Granularity Text Embeddings](https://arxiv.org/abs/2402.03216). arXiv, 2024. The embedder used in the notebook.
+- L. Wang et al. [Multilingual E5 Text Embeddings: A Technical Report](https://arxiv.org/abs/2402.05672). arXiv, 2024. The asymmetric prefix convention.
+- Yu. A. Malkov, D. A. Yashunin. [Efficient and robust approximate nearest neighbor search using Hierarchical Navigable Small World graphs](https://arxiv.org/abs/1603.09320). *IEEE TPAMI*, 42(4), 2020. HNSW.

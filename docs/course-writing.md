@@ -16,7 +16,11 @@ How the Generative Models notes were written and reviewed, as a guide for the ne
 
 ## 3. Storyline
 
-- The course is one story. The order lives in two places that must agree: the `order` field of each note and the section map in `src/utils/courses.ts`. Current story: Gaussians → entropy and KL → fitting with KL → training background → autoencoders → VAE → GAN → WGAN → IS → FID → LPIPS → flows → flow architectures → DDPM forward → DDPM objective.
+- The course is one story. The order lives in two places that must agree: the `order` field of each note and the section map in `src/utils/courses.ts`. The build checks that every published note is listed, that every listed note exists, that a note's `section` matches the section it is listed under (anchored cross-references are exempt), and that every anchor named in the map exists on the built page.
+  - Generative Models: Gaussians → entropy and KL → fitting with KL → training background → autoencoders → VAE → GAN → WGAN → IS → FID → LPIPS → flows → flow architectures → DDPM forward → DDPM objective.
+  - NLP: text as data → tokenization → corpora and evaluation → bag of words and TF-IDF → n-gram LMs → word embeddings → Word2Vec → CNNs → RNNs → LSTM/GRU → seq2seq → attention → self-attention → Transformer → positions → Transformer MT → BERT → GPT → model families → transfer learning → fine-tuning → PEFT → instruction tuning → quantization → classification → NER → QA → summarization → semantic search → RAG → tools and agents → LLM evaluation → text diffusion. Planned topics (GloVe, FastText, sentence-pair similarity) stay as plain strings in the map until they have source material.
+- Each NLP note follows one storyline: problem → baseline → where it fails → key idea → mechanism and formulas (with shapes) → worked example → results → what changed against the baseline → limitations → what to remember → next. Blocks used: `Key idea` callout, **Worked example**, **What changed**, **Limitations**, **What you should remember**, **Notebook**, **Next**. No quizzes.
+- Every number quoted from a notebook is a saved output of that notebook; when a run was interrupted or an output was not saved, the note says so instead of quoting a number. Numbers that only illustrate a formula are labelled as toy examples.
 - Each note opens from where the previous one ended (one paragraph: what problem is left, what this note does about it) and closes with a **Next** section that names the problem the next note solves.
 - Every topic has exactly one home. Theory and practice can be split (entropy note: the quantities; fitting note: what they do in training), but the same derivation is never written twice. Cross-link instead, with anchors: `/notes/generative-models/vae#where-the-elbo-comes-from`.
 - Heading slugs are part of the interface: the course map and other notes link to them. Changing a heading means updating every link to it; the link check below catches misses.
@@ -49,7 +53,7 @@ How the Generative Models notes were written and reviewed, as a guide for the ne
 
 ## 7. Notebooks
 
-- Link notebooks at a pinned commit, never at a branch: `https://github.com/HSE-LAMBDA/DeepGenerativeModels/blob/<sha>/seminars/...`. State the convention once per Notebook section: cell numbers count every cell, markdown included, from 1.
+- Link notebooks at a pinned commit, never at a branch: `https://github.com/HSE-LAMBDA/DeepGenerativeModels/blob/<sha>/seminars/...` for Generative Models and `https://github.com/glkuzi/nlp_dsba/blob/4130e09940ddd363cee9fa3bd51b149466cfc6fb/seminars/...` for NLP. State the convention once per Notebook section: cell numbers count every cell, markdown included, from 1. The NLP repository is private at the time of writing; the links resolve for its collaborators and 404 for others until it is made public.
 - Describe what the cells do and which choices they make (datasets, hyperparameters, loss reductions, sampling details), in the note's notation.
 - Separate procedure from results. Quote numbers only from saved outputs and say so; if a notebook has no saved outputs, say that it documents procedures.
 - Report implementation issues plainly and briefly (a reused tensor, a missing `eval()`, a mislabelled plot). They are useful to readers who run the notebook.
@@ -75,8 +79,9 @@ Run after every change set:
 
 1. `npm run build` with 0 errors.
 2. On every built note page: no `katex-error`, no duplicate `id`, no broken internal link or anchor (including links from the course map and between notes).
-3. A text search for banned source words (`scan`, `seminar`, `slide`, `page \d`, `handwrit`, `editorial`, `transcri`) in notes and figure captions.
-4. Visual check of changed figures in light, dark and narrow layouts.
+3. A text search for banned source words (`scan`, `seminar`, `slide`, `page \d`, `handwrit`, `editorial`, `transcri`) in notes and figure captions, with notebook URLs excluded (their paths contain `seminars/`). Author names such as Pascanu are false positives.
+4. `COURSE_LENIENT=1 npm run build` builds a course whose map lists notes that do not exist yet (useful while drafting); the plain `npm run build` is strict and is what is published.
+5. Visual check of changed figures in light, dark and narrow layouts.
 
 ## 11. Review process
 
