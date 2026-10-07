@@ -67,7 +67,7 @@ export const courses = {
         'Flow architectures': 'Архитектуры потоков',
         'Diffusion Models': 'Диффузионные модели',
         'DDPM: the forward process': 'DDPM: прямой процесс',
-        'DDPM: reverse process and training objective': 'DDPM: обратный процесс и функция потерь',
+        'DDPM: reverse process and training objective': 'DDPM: обратный процесс и целевая функция обучения',
         'Sampling': 'Сэмплирование',
         'Score matching': 'Score matching',
         'Latent diffusion': 'Латентная диффузия',
