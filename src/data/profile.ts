@@ -4,63 +4,32 @@
 export type Lang = 'en' | 'ru';
 type Text = Record<Lang, string>;
 
-// Production figures shown on the homepage. System and client names stay out.
-export const impact: { value: Text; label: Text }[] = [
-  { value: { en: '5,000+', ru: '5 000+' }, label: { en: 'operational actions per month', ru: 'операционных действий в месяц' } },
-  { value: { en: '> ₽48M', ru: '> 48 млн ₽' }, label: { en: 'estimated annual business effect', ru: 'оценка годового бизнес-эффекта' } },
-  { value: { en: '4 min → 5 sec', ru: '4 мин → 5 с' }, label: { en: 'retrieval / RAG workflow latency', ru: 'задержка сценария поиска / RAG' } },
-  { value: { en: '2 min → 3 sec', ru: '2 мин → 3 с' }, label: { en: 'model inference after optimization', ru: 'инференс модели после оптимизации' } },
-];
-
-export const principles: { title: Text; text: Text }[] = [
+// Three examples from production work for the homepage, with each figure in its context.
+// <strong> marks the figures. System, employer and client names stay out.
+export const examples: { label: Text; text: Text; href: string }[] = [
   {
-    title: { en: 'Baseline first', ru: 'Сначала базовая линия' },
+    label: { en: 'Retrieval', ru: 'Поиск' },
     text: {
-      en: 'Measure how the process works today, in time, errors or cost, before a model touches it.',
-      ru: 'Измерить, как процесс работает сейчас — по времени, ошибкам или стоимости, — до того как к нему прикоснётся модель.',
+      en: 'In the main retrieval workflow, getting a usable answer took about <strong>4 minutes</strong> per request. After we rebuilt retrieval around the decision people actually had to make and tuned inference for latency, it took about <strong>5 seconds</strong>.',
+      ru: 'В основном сценарии поиска полезный ответ на один запрос занимал около <strong>4 минут</strong>. После того как мы перестроили поиск вокруг решения, которое людям на самом деле нужно было принять, и оптимизировали инференс по задержке, — около <strong>5 секунд</strong>.',
     },
+    href: '/work#llm-ecommerce',
   },
   {
-    title: { en: 'Outcomes over prototypes', ru: 'Результат важнее прототипов' },
+    label: { en: 'Local inference', ru: 'Локальный инференс' },
     text: {
-      en: 'A system counts when it moves a metric in production. The number of proofs of concept says little.',
-      ru: 'Система засчитывается, когда двигает метрику в продакшене. Количество PoC говорит мало.',
+      en: 'A Text-to-SQL assistant had to move inside the company perimeter onto one A100, with a target of under 10 seconds per question. On transformers it needed <strong>2 minutes</strong>; on vLLM with FP8 quantization, <strong>3 seconds</strong>.',
+      ru: 'Ассистент Text-to-SQL нужно было перенести внутрь контура компании на одну A100 с целью меньше 10 секунд на вопрос. На transformers генерация занимала <strong>2 минуты</strong>, на vLLM с квантизацией FP8 — <strong>3 секунды</strong>.',
     },
+    href: '/work#local-text-to-sql',
   },
   {
-    title: { en: 'Cheap tests', ru: 'Дешёвые проверки' },
+    label: { en: 'Agents', ru: 'Агенты' },
     text: {
-      en: 'Check a hypothesis on a small labelled set or a manual run before building infrastructure for it.',
-      ru: 'Проверить гипотезу на небольшом размеченном наборе или ручном прогоне, прежде чем строить под неё инфраструктуру.',
+      en: 'Supply, transit and export agents under one coordinator, with a person confirming every critical operation. The platform handles <strong>5,000+</strong> operational actions a month, with an estimated annual effect above <strong>₽48M</strong>.',
+      ru: 'Агенты снабжения, транзита и экспорта под общим координатором; каждую критическую операцию подтверждает человек. Через платформу проходит <strong>5 000+</strong> операционных действий в месяц, оценка годового эффекта — более <strong>48 млн ₽</strong>.',
     },
-  },
-  {
-    title: { en: 'Reusable patterns', ru: 'Повторно используемые паттерны' },
-    text: {
-      en: 'Retrieval, tool access, evaluation and confirmation steps are built once and reused across products.',
-      ru: 'Поиск, доступ к инструментам, оценка и шаги подтверждения строятся один раз и переиспользуются в разных продуктах.',
-    },
-  },
-  {
-    title: { en: 'People own consequential actions', ru: 'Значимые действия — за человеком' },
-    text: {
-      en: 'The model proposes. A person confirms anything that changes money, stock or a customer’s experience.',
-      ru: 'Модель предлагает. Человек подтверждает всё, что меняет деньги, запасы или опыт клиента.',
-    },
-  },
-  {
-    title: { en: 'Rules, ML or agents', ru: 'Правила, ML или агенты' },
-    text: {
-      en: 'Deterministic automation where the logic is known, ML where it has to be learned from data, agents where the path cannot be fixed in advance.',
-      ru: 'Детерминированная автоматизация, где логика известна; ML, где её нужно выучить из данных; агенты, где путь нельзя зафиксировать заранее.',
-    },
-  },
-  {
-    title: { en: 'Infrastructure as a chain', ru: 'Инфраструктура как цепочка' },
-    text: {
-      en: 'Agents depend on LLMs, LLMs on infrastructure and data, data on recorded decisions. A missing link cannot be skipped.',
-      ru: 'Агенты зависят от LLM, LLM — от инфраструктуры и данных, данные — от зафиксированных решений. Недостающее звено нельзя пропустить.',
-    },
+    href: '/work#multi-agent',
   },
 ];
 
