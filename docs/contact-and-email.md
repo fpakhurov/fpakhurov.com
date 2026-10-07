@@ -4,7 +4,7 @@ How the site publishes contact channels without handing a personal address to sp
 
 ## 1. One source of truth
 
-- Every public profile and contact channel lives in `src/config/profile.ts`: `github`, `linkedin`, `orcid`, `habr`, `email`, `telegram`. The header, footer, homepages, CV, `/contact`, `/ru/contact` and the Person JSON-LD read from it. Never write a profile URL or handle directly into a component.
+- Every public profile and contact channel lives in `src/config/profile.ts`: `github`, `linkedin`, `orcid`, `habr`, `hse`, `email`, `telegram`. The header, footer, homepage, About, CV, `/contact`, `/ru/contact` and the Person JSON-LD read from it. Other profile content (impact figures, principles, writing) stays in `src/data/profile.ts`. Never write a profile URL or handle directly into a component.
 - `null` means not configured: the channel is hidden everywhere and left out of structured data.
 - The build validates every value. A malformed URL or a placeholder (`example`, `your`, `todo`, …) fails the build instead of being published.
 - To add a channel, add the field to `Profile`, a rule to `profileRules`, a definition to `linkDefinitions`, and the id to the lists that should show it (`contactChannels`, `footerProfiles`, `cvProfiles`, `sameAs`).
