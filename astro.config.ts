@@ -4,6 +4,7 @@ import sitemap from '@astrojs/sitemap';
 import { unified, rehypeHeadingIds } from '@astrojs/markdown-remark';
 import remarkMath from 'remark-math';
 import rehypeKatex from 'rehype-katex';
+import remarkHeadingIds from './src/plugins/remark-heading-ids.mjs';
 
 interface HastNode {
   type: string;
@@ -17,6 +18,7 @@ interface HastNode {
  * section headings are linkable without an extra dependency.
  */
 function rehypeHeadingAnchors() {
+  let label = 'Link to this section';
   const walk = (node: HastNode) => {
     if (!node.children) return;
     for (const child of node.children) {
@@ -29,7 +31,7 @@ function rehypeHeadingAnchors() {
             {
               type: 'element',
               tagName: 'a',
-              properties: { href: `#${id}`, className: ['heading-anchor'], ariaLabel: 'Link to this section' },
+              properties: { href: `#${id}`, className: ['heading-anchor'], ariaLabel: label },
               children: [{ type: 'text', value: '#' } as HastNode],
             },
           ];
@@ -38,7 +40,10 @@ function rehypeHeadingAnchors() {
       walk(child);
     }
   };
-  return (tree: HastNode) => walk(tree);
+  return (tree: HastNode, file: { path?: string }) => {
+    label = file.path?.includes('/notes-ru/') ? 'Ссылка на этот раздел' : 'Link to this section';
+    walk(tree);
+  };
 }
 
 export default defineConfig({
@@ -47,7 +52,7 @@ export default defineConfig({
   integrations: [mdx(), sitemap()],
   markdown: {
     processor: unified({
-      remarkPlugins: [remarkMath],
+      remarkPlugins: [remarkMath, remarkHeadingIds],
       rehypePlugins: [rehypeKatex, rehypeHeadingIds, rehypeHeadingAnchors],
     }),
     shikiConfig: { theme: 'github-dark-default' },

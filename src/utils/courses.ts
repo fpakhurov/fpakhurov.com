@@ -18,6 +18,15 @@ export interface Course {
   /** The course storyline as a sequence of stages. */
   progression: string[];
   sections: CourseSection[];
+  /** Russian texts for the course page. `labels` maps English section titles, summaries and topic titles to Russian. */
+  ru: {
+    title: string;
+    shortTitle: string;
+    description: string;
+    tagline?: string;
+    progression?: string[];
+    labels: Record<string, string>;
+  };
 }
 
 // A string is a planned topic. Published topics explicitly name their note and,
@@ -33,6 +42,12 @@ export const courses: Record<CourseKey, Course> = {
     description: 'One path from raw text to modern LLM systems: each method is introduced by the problem the previous one could not solve.',
     tagline: 'Stable URLs · equations · examples · prerequisites',
     progression: ['Text', 'Representations', 'Sequences', 'Transformers', 'Pretraining', 'Adaptation', 'Tasks', 'LLM Systems'],
+    ru: {
+      title: 'Обработка естественного языка',
+      shortTitle: 'NLP',
+      description: 'Путь от основ работы с текстом к современным LLM-системам и их оценке.',
+      labels: {},
+    },
     sections: [
       { title: 'Text Foundations', summary: 'How text becomes model input, and how a result is measured.', topics: [
         noteTopic('Text as data', 'nlp/text-as-data'),
@@ -112,6 +127,52 @@ export const courses: Record<CourseKey, Course> = {
     description: 'Probability, latent variables and the main families of modern generative models.',
     tagline: 'Stable URLs · equations · examples · prerequisites',
     progression: ['Probability', 'Divergences', 'Autoencoders', 'VAEs', 'GANs', 'Evaluation', 'Flows', 'Diffusion'],
+    // Russian labels for the course map, keyed by the English titles below.
+    ru: {
+      title: 'Генеративные модели',
+      shortTitle: 'Генеративные модели',
+      description: 'Вероятность, латентные переменные и основные семейства современных генеративных моделей.',
+      tagline: 'Постоянные адреса · формулы · примеры · пререквизиты',
+      progression: ['Вероятность', 'Дивергенции', 'Автоэнкодеры', 'VAE', 'GAN', 'Оценка', 'Потоки', 'Диффузия'],
+      labels: {
+        'Foundations': 'Основы',
+        'Multivariate Gaussian distributions': 'Многомерные гауссовские распределения',
+        'Entropy, cross-entropy and KL divergence': 'Энтропия, кросс-энтропия и KL-дивергенция',
+        'Fitting distributions with KL': 'Подгонка распределений с помощью KL',
+        'Maximum likelihood': 'Метод максимального правдоподобия',
+        'Batch normalization, gradients and convolutions': 'Батч-нормализация, градиенты и свёртки',
+        'Autoencoders': 'Автоэнкодеры',
+        'Variational Autoencoders': 'Вариационные автоэнкодеры',
+        'Variational autoencoders': 'Вариационные автоэнкодеры (VAE)',
+        'ELBO': 'ELBO',
+        'Reparameterization trick': 'Трюк репараметризации',
+        'VAE variants': 'Варианты VAE',
+        'GANs': 'GAN',
+        'Generative adversarial networks': 'Генеративно-состязательные сети (GAN)',
+        'Conditional GAN': 'Условный GAN',
+        'f-GAN': 'f-GAN',
+        'Wasserstein GANs and Lipschitz constraints': 'GAN Вассерштейна и ограничение Липшица',
+        'Evaluation': 'Оценка качества',
+        'Inception Score': 'Inception Score (IS)',
+        'Fréchet Inception Distance': 'Fréchet Inception Distance (FID)',
+        'LPIPS': 'LPIPS',
+        'Precision / Recall': 'Precision / Recall',
+        'Human evaluation': 'Оценка людьми',
+        'Normalizing Flows': 'Нормализующие потоки',
+        'Normalizing flows: change of variables': 'Нормализующие потоки: замена переменных',
+        'Flow architectures': 'Архитектуры потоков',
+        'Diffusion Models': 'Диффузионные модели',
+        'DDPM: the forward process': 'DDPM: прямой процесс',
+        'DDPM: reverse process and training objective': 'DDPM: обратный процесс и целевая функция обучения',
+        'Sampling': 'Сэмплирование',
+        'Score matching': 'Score matching',
+        'Latent diffusion': 'Латентная диффузия',
+        'Autoregressive Models': 'Авторегрессионные модели',
+        'Factorization': 'Факторизация',
+        'PixelRNN / PixelCNN': 'PixelRNN / PixelCNN',
+        'Autoregressive transformers': 'Авторегрессионные трансформеры',
+      },
+    },
     sections: [
       { title: 'Foundations', topics: [
         noteTopic('Multivariate Gaussian distributions', 'generative-models/gaussian-distributions'),
