@@ -8,8 +8,8 @@ export default function remarkHeadingIds() {
       const last = node.children[node.children.length - 1];
       if (!last || last.type !== 'text') return;
       // Smartypants may already have turned a `--` in the id into a dash.
-      // Lower-case Greek letters occur in English slugs (`in-practice-a-\u03b2-schedule`).
-      const match = last.value.match(/\s*\{#([a-z0-9\u03b1-\u03c9\u2013\u2014-]+)\}\s*$/);
+      // English slugs can contain Greek letters (`in-practice-a-β-schedule`) and underscores from math (`d_k`).
+      const match = last.value.match(/\s*\{#([^\s{}]+)\}\s*$/);
       if (!match) return;
       last.value = last.value.slice(0, match.index);
       const id = match[1].replace(/[\u2013\u2014]/g, '--');

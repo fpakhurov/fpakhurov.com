@@ -1,0 +1,112 @@
+---
+title: Transfer learning in NLP
+description: "Three ways to use one pretrained encoder on one task, measured on AG News: a cloze prompt with no training (46 % and then 61 % after fixing a label name), frozen [CLS] vectors under logistic regression (90 %), and full fine-tuning (95 %). The note explains what each transfers and what each costs."
+course: nlp
+section: Pretrained Language Models
+order: 20
+status: published
+tags: [transfer-learning, zero-shot, feature-extraction, fine-tuning, bert, ag-news]
+prerequisites: [BERT and masked language modeling, Encoder, decoder and encoder–decoder models, Corpora and evaluation]
+---
+
+The course has one running benchmark: four-way topic classification of AG News, where TF-IDF scored 0.918 and every model trained from scratch scored lower. A pretrained encoder changes the question from "which architecture" to "how to use what was learned on 3 billion words". This note tries the three standard answers on the same model and data, in increasing order of cost, and gets the first result that clearly beats the baseline.
+
+**Notation.** A pretrained encoder $f_\theta$ maps a token sequence to vectors $h_1, \dots, h_n$; $h_{\text{CLS}}$ is the vector at the first position. A task head $g_\phi$ maps a vector to logits. "Frozen" means $\theta$ is not updated.
+
+## Baseline: the pretrained model as a black box
+
+The checkpoint is a set of weights and a tokenizer. Three things can be done with it without training it from scratch: ask it questions in its own language (prompting), read its outputs as features for another model, or continue training it on the task. Each transfers a different part of what pretraining learned.
+
+## Zero-shot classification with the MLM head
+
+**What transfers:** the model's ability to fill a blank with a plausible word, shown in the [BERT note](/notes/nlp/bert#what-the-pretrained-head-can-do).
+
+Append a template to each article, `This news is about [MASK].`, and read the MLM distribution at the mask restricted to four candidate words, one per class: `world`, `sports`, `business`, `technology`. The prediction is the candidate with the highest probability. No parameter is trained; the "training" is choosing the template and the words.
+
+| Setting | Accuracy |
+| --- | --- |
+| Labels `world / sports / business / technology` | 0.456 |
+| per class: World 0.03, Sports 0.51, Business 0.96, Sci/Tech 0.32 | |
+| Labels `politics / sports / business / technology` | 0.613 |
+
+The first result looks like a weak classifier; the per-class numbers say it is a broken one. Nearly every World article is labelled something else, because `world` is not a word that completes "This news is about ___" for an article about an election. Counting the model's top-100 fillers over the World articles ranks `us`, `america`, `politics`, `news`, `china`, `war` highest; replacing `world` by `politics` raises accuracy from 0.456 to 0.613 with no other change. The method works to the extent that the class name is the word the model would naturally use, and that is a property of the template and the vocabulary, not of the articles.
+
+Zero-shot is the cheapest route and the weakest: 0.613 is far below TF-IDF. Its value is in having no labelled data at all, and in tasks whose labels are ordinary words. For a decoder-only model the same idea becomes prompting with a few examples (the [GPT note](/notes/nlp/gpt)), which is stronger but still a prediction from the pretrained distribution rather than from the task's data.
+
+## Frozen features and a linear model
+
+**What transfers:** the contextual vectors.
+
+Run every article through the frozen encoder, take $h_{\text{CLS}}$ (768 numbers), and train multinomial logistic regression on the 120,000 vectors. This is the [TF-IDF pipeline](/notes/nlp/bag-of-words-and-tf-idf#a-linear-classifier-on-counts) with the 29,350-dimensional sparse count vector replaced by a 768-dimensional dense one.
+
+| Features | Linear model test accuracy |
+| --- | --- |
+| TF-IDF, 29,350-dim | 0.918 |
+| Frozen BERT `[CLS]`, 768-dim | 0.902 |
+
+The encoder's vector carries the topic without ever having been trained to: a linear read-out recovers 90 % of the labels. It does not beat the count baseline, for a reason the [CNN note](/notes/nlp/cnn-text-classification#results-on-ag-news) already met: a feature set tuned to the task (every word, with a weight) is hard to beat with a general-purpose feature set, and `[CLS]` was pretrained to predict sentence adjacency, not topic. Mean-pooling the token vectors usually does better than `[CLS]` for a frozen encoder; the notebook does not run it.
+
+Cost: one forward pass per document, once, then a model that trains in seconds and runs without the encoder at inference if the vectors are cached. This is the route when the encoder must stay fixed (shared between tasks, or served once for many consumers), and it is the route that sentence-embedding retrieval in the [semantic search note](/notes/nlp/semantic-search) takes.
+
+## Fine-tuning the whole encoder
+
+**What transfers:** the weights themselves, as an initialization.
+
+Put a new linear head on `[CLS]`, and train *all* parameters, encoder and head, on the labelled data with a small learning rate. The pretrained weights are the starting point and the task loss moves them.
+
+| Model | Trainable parameters | Validation accuracy |
+| --- | --- | --- |
+| BERT-base + linear head, 3 epochs, lr $2 \times 10^{-5}$, batch 16 | 110 M | **0.949** |
+
+Held out: 10 % of the training set (12,000 articles), since AG News has no validation split. Three passes over 108,000 articles at a learning rate 50× smaller than from-scratch training push the model past the baseline by three points and past every from-scratch model by four. The small learning rate is the point: the goal is to adjust the pretrained representation, not to overwrite it, and larger rates erase it (catastrophic forgetting) before the head has learned anything.
+
+| Route | Trains | Data needed | AG News |
+| --- | --- | --- | --- |
+| Zero-shot cloze | nothing | a template | 0.613 |
+| Frozen features + linear | 768 × 4 weights | labels | 0.902 |
+| Full fine-tuning | 110 M | labels | 0.949 |
+| TF-IDF + linear (no pretraining) | 29,350 × 4 | labels | 0.918 |
+
+## What is being transferred
+
+The three routes transfer, respectively, the pretrained *output distribution*, the pretrained *representation*, and the pretrained *weights as initialization*. Fine-tuning wins because it uses the most: every layer can adapt, and the gradient of the task loss flows into the attention patterns and feed-forward features that pretraining built. The frozen route cannot change what `[CLS]` encodes; the zero-shot route cannot change anything.
+
+The gain is empirical, and it has been measured many times since [Howard and Ruder (2018)](#references) and [Devlin et al. (2019)](#references): fine-tuned encoders beat from-scratch models by a margin that grows as the labelled set shrinks. With 120,000 labels the margin on AG News is three points; with 1,000 labels, from-scratch models collapse and fine-tuned ones hold up.
+
+## Limitations
+
+- **Full fine-tuning produces a full copy.** Every task gets its own 110 M (or 7 B) parameters. The [PEFT note](/notes/nlp/peft) addresses the cost.
+- **Instability.** Fine-tuning runs vary with the seed, especially on small datasets; the practice is several runs and a validation-based choice ([Dodge et al., 2020](#references)).
+- **Forgetting.** A fine-tuned model is worse at everything except its task; the pretrained generality is spent.
+- **Zero-shot depends on wording.** Template and label-word choice changed accuracy by 16 points here; that sensitivity does not go away with larger models, it moves to the prompt.
+- **Frozen `[CLS]` is a weak sentence vector.** Models meant to produce embeddings are trained for it, with a contrastive objective, not read off a masked-language model.
+
+## What you should remember
+
+- Zero-shot via the MLM head: rephrase the task as a cloze, restrict the vocabulary to label words; accuracy depends on the label words (0.456 → 0.613 by renaming one class).
+- Frozen features: `[CLS]` + logistic regression gives 0.902, below TF-IDF's 0.918; the pretrained vector carries the topic but was not trained for it.
+- Full fine-tuning at a small learning rate gives 0.949, the first result above the baseline; the gain is the pretrained initialization.
+- Report per-class metrics: the 0.456 hid a class at 3 %.
+- Each fine-tuned task costs a full copy of the model, which the next section reduces.
+
+## Notebook
+
+[`week06_BERT.ipynb`](https://github.com/glkuzi/nlp_dsba/blob/4130e09940ddd363cee9fa3bd51b149466cfc6fb/seminars/week06_BERT.ipynb). Cell numbers count every cell, markdown included, from 1.
+
+- Cells 32–37 build the prompted test set (`text + " This news is about [MASK]."`), run the `fill-mask` pipeline with `targets` set to the four label words, and report 0.456.
+- Cells 39–40 compute per-class accuracy; cells 42–45 filter the World articles and count the pipeline's top-100 fillers; cells 47–50 rename the class to `politics` and report 0.613.
+- Cells 53–58 switch to the `feature-extraction` pipeline, take the first output vector (`out[0, 0]`) of each article as $h_{\text{CLS}}$, fit `LogisticRegression` on the training vectors (the solver stops at its iteration limit, which the warning records) and report 0.902 on the test set.
+- Cell 61 fine-tunes `AutoModelForSequenceClassification` with 4 labels through `Trainer`: 90/10 split of the training set with seed 42, truncation at 128 tokens, 3 epochs, learning rate $2\times10^{-5}$, weight decay 0.01, batch 16; evaluation accuracy 0.9486 on the held-out 10 %. The `compute_metrics` argument in the cell refers to a method that does not exist on the metric object; the saved output nevertheless includes the evaluation accuracy, so the cell as saved was run with a working version of that line.
+
+## Next
+
+Fine-tuning is the best of the three routes and the most expensive: a full set of weights per task, trained with care. The next section of the course is about doing it cheaper and doing it better. The [fine-tuning note](/notes/nlp/fine-tuning) takes the question to a decoder-only model and compares training everything, training only the head, and training the head first and everything second.
+
+## References
+
+- J. Howard, S. Ruder. [Universal Language Model Fine-tuning for Text Classification](https://aclanthology.org/P18-1031/). ACL, 2018. ULMFiT: fine-tuning a pretrained language model for classification.
+- J. Devlin, M.-W. Chang, K. Lee, K. Toutanova. [BERT: Pre-training of Deep Bidirectional Transformers for Language Understanding](https://aclanthology.org/N19-1423/). NAACL, 2019. §4 (fine-tuning procedure and results).
+- T. Schick, H. Schütze. [Exploiting Cloze Questions for Few Shot Text Classification and Natural Language Inference](https://aclanthology.org/2021.eacl-main.20/). EACL, 2021. Pattern-exploiting training: the cloze formulation of classification used above.
+- J. Dodge, G. Ilharco, R. Schwartz, A. Farhadi, H. Hajishirzi, N. Smith. [Fine-Tuning Pretrained Language Models: Weight Initializations, Data Orders, and Early Stopping](https://arxiv.org/abs/2002.06305). arXiv, 2020.
+- N. Reimers, I. Gurevych. [Sentence-BERT: Sentence Embeddings using Siamese BERT-Networks](https://aclanthology.org/D19-1410/). EMNLP, 2019. Why frozen `[CLS]` is a poor sentence vector and what to train instead.
+- M. E. Peters, S. Ruder, N. A. Smith. [To Tune or Not to Tune? Adapting Pretrained Representations to Diverse Tasks](https://aclanthology.org/W19-4302/). RepL4NLP, 2019. Feature extraction versus fine-tuning.

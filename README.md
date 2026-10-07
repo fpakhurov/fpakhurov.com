@@ -26,7 +26,7 @@ Work and project entries keep English fields at the root of the frontmatter and 
 - Original handwritten material: `source-material/` (never copied to the built site)
 - Contacts and profiles: `src/config/profile.ts` (see `docs/contact-and-email.md`)
 
-Note URLs are permanent and never include dates. Each note declares its course, section, order, review status, tags and prerequisites in frontmatter.
+Note URLs are permanent and never include dates. Each note declares its course, section, order, review status, tags and prerequisites in frontmatter. The course pages (`/notes/nlp`, `/notes/generative-models`) are generated from the section maps in `src/utils/courses.ts` and the published notes; counts, progress and previous/next links are computed, not hard-coded. Writing standards are in [docs/course-writing.md](docs/course-writing.md).
 
 ## Deployment
 
