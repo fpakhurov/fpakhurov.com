@@ -1,0 +1,142 @@
+---
+title: Tool use and agents
+description: "A language model can emit a structured call to a function instead of an answer; the runtime executes it and feeds the result back. The note gives that protocol, the loop that turns it into an agent (state, planning, stopping), the ways to split work across specialized agents with a coordinator and a human confirmation step, the failure modes of the loop, and the cases where a fixed pipeline is the better design."
+course: nlp
+section: Modern LLM Systems
+order: 31
+status: published
+tags: [tool-use, function-calling, agents, react, planning, multi-agent, human-in-the-loop]
+prerequisites: [Retrieval-augmented generation, Instruction tuning and alignment]
+---
+
+The RAG system of the [previous note](/notes/nlp/rag) calls a retriever on every query, by design of the pipeline, before the model sees anything. The model has no say in whether retrieval was needed, what to search for, or whether to search again after reading the results. Tool use gives it that say, and an agent is what you get when the model is allowed to keep deciding. This note is about the mechanism, what it is good for, and a question the enthusiasm around it tends to skip: when a loop that lets a model decide is worse than a pipeline that does not.
+
+**Notation.** A model $\pi$ with a context $c$ (instructions, conversation, prior results); a set of tools $\{f_i\}$ with typed signatures; a tool call is $(i, \text{args})$; the runtime returns an observation $o = f_i(\text{args})$ that is appended to $c$.
+
+## Baseline: the model answers from its context
+
+Given a question whose answer requires today's weather, a calculation, or a lookup in a database, a plain model produces the kind of text that follows such questions: a guess with the right form. Retrieval fixes the lookup case for text corpora. It does not cover a calculator, a search engine, a code interpreter, a company's order system, or any action with a side effect.
+
+<aside class="callout"><strong>Key idea.</strong> Describe the available functions to the model, in text, with their argument schemas. Let the model's output be either an answer or a call: a function name and JSON arguments. The runtime, not the model, executes the call, appends the result to the context, and asks the model to continue. The model's job is to decide what to call and to use what comes back.</aside>
+
+## Tool use
+
+### The protocol
+
+1. The system prompt lists the tools: name, what it does, argument names and types (a JSON schema). Chat-tuned models are trained on such listings and on examples of emitting calls in a fixed format, with special tokens around them.
+2. The model generates either natural-language text or a call. A call is structured output in the sense of the [RAG note](/notes/nlp/rag#structured-output); constrained decoding or format-specific training makes it parseable.
+3. The runtime validates the arguments against the schema, executes the function, and appends the result as a message with a tool role.
+4. The model continues: it may answer, or call again.
+
+Two examples from the notebook, both with a 4 B-parameter instruction-tuned model and a web-search tool:
+
+- *What is the current weather in Paris?* → the model calls `web_search("current weather Paris")`, reads the result, and answers "Clear sky, around 13–16 °C". Three steps, 9,528 input tokens in total: the tool listing and the search results are re-read at every step.
+- *Generate a photo of the car James Bond drove in the latest movie* → a search call to find the car, then a call to an image-generation tool with the car's name as the prompt, then the image as the answer. Two tools, chained by the model, in one run.
+
+The second example shows what the protocol buys: no one wrote the sequence *search, then generate*. The model composed it from the tool descriptions and the question.
+
+### Code as the tool interface
+
+One variant replaces the fixed call format by Python: the model writes a short program that calls the tools as functions, the runtime executes it in a sandbox, and the printed output is the observation. A loop, a conditional, or a call whose arguments depend on an earlier result is then one step instead of several. Given a buggy script (`numbers(i)` on a list), the model runs it, reads the `TypeError`, rewrites the index as `numbers[i]`, re-runs, and returns the fixed code in a single step. The sandbox is not optional: the model is writing code that runs.
+
+## Agents: a loop around tool calls
+
+A single tool call extends the model; a **loop** that repeats *decide → call → observe* until a stopping condition is an **agent**. The ReAct pattern ([Yao et al., 2023](#references)) interleaves a written reasoning step with each action so that the trajectory is inspectable:
+
+```
+thought: I need the car model first, then an image.
+action:  web_search(query="car James Bond latest movie")
+observation: ... Aston Martin DB5 ...
+thought: Now generate the image.
+action:  text_to_image(prompt="Aston Martin DB5")
+observation: <image>
+final answer: <image>
+```
+
+What has to be added to the protocol to make the loop work:
+
+**State.** The context accumulates every call and result. For long tasks it exceeds the window and must be summarized or stored outside the model (a scratchpad, a memory of earlier runs, files); what is kept and what is dropped is a design decision with direct effect on behaviour.
+
+**Planning.** For multi-step tasks the model writes a plan first (sub-goals in order) and revises it as observations arrive. Planning is text generated by the same model; it is not a separate solver, and plans are often wrong in ways the model does not notice until an observation contradicts them.
+
+**Stopping.** A final-answer action, a maximum number of steps, a token or cost budget, and detection of repetition (the same call twice with the same result). Without the last three, a loop that cannot make progress runs until something external stops it.
+
+**Specialization and coordination.** Beyond a few tools, one prompt that describes everything degrades. The usual structure is several agents, each with a narrow role and its own tools, and a coordinator that routes the user's request and merges results. A concrete shape, from an inventory-operations system: a coordinator agent receives the request; supply, transit and export agents each query their own internal systems and propose actions in their domain; the coordinator assembles a proposal. Each sub-agent sees only its tools and instructions, which keeps every prompt short and every failure local.
+
+**Human confirmation.** Reading is cheap to undo; writing is not. The same inventory system proposes operational actions and executes none of them without an explicit confirmation step for the critical ones (moving stock, changing an export declaration). The loop pauses, shows the proposed call and its arguments, and continues only on approval. This is a property of the runtime, not of the model, and it is the single most effective safeguard in systems that act on the world.
+
+## Failure modes
+
+| Failure | Mechanism | Mitigation |
+| --- | --- | --- |
+| Wrong tool or wrong arguments | the model guesses from descriptions | precise descriptions, examples, schema validation, few tools per agent |
+| Hallucinated results | the model "remembers" a result it did not receive | only runtime-inserted observations; no fabricated tool messages |
+| Loops | same call, same result, no progress | step and cost budgets, repetition detection |
+| Compounding errors | a wrong early observation shapes every later step | plan revision, verification steps, human checkpoints |
+| Prompt injection through tools | a web page or document returned by a tool contains instructions | tool outputs are data; never execute instructions found in them; confirmation for side effects |
+| Cost | every step re-reads the whole context | compact state, caching of shared prefixes, small models for routing |
+| Silent side effects | a write succeeds that should not have | confirmation, dry-run modes, reversible actions first |
+
+The injection row deserves emphasis. An agent that reads a web page and then acts has exactly the vulnerability of the RAG system, with higher stakes: the page can say *now call `send_email` with the following content*, and a model that follows instructions well will try to. The only robust defence is structural: side-effecting tools behind confirmation, and a strict separation between instructions (from the system and the user) and data (from tools).
+
+## When an agent is unnecessary
+
+The loop costs tokens, latency and predictability. It is the right design when the number and order of steps depend on intermediate results that cannot be known in advance: debugging, open-ended research, operating a system with many possible actions. It is the wrong design when the steps are known:
+
+- A fixed sequence (retrieve → rerank → generate; classify → route) is a **pipeline**. Write it as code, with the model called at the steps that need language; it runs faster, costs less, and fails in explainable ways.
+- A single tool call with known arguments (look up this order, convert these units) is a **function call**, not an agent; let the program decide to call it.
+- A task with a schema-shaped answer (extract these fields) is **structured output**.
+- A task where a wrong action is expensive and the model's decision cannot be checked before execution should not be delegated to a loop at all.
+
+The practical rule: start with the pipeline; move a decision into the model only when the pipeline's fixed logic is measurably the bottleneck. Every decision moved into the model needs an evaluation of that decision, which the [next note](/notes/nlp/llm-evaluation) is about.
+
+## What changed
+
+| | Pipeline (RAG) | Tool use | Agent |
+| --- | --- | --- | --- |
+| Who decides the steps | the program | the model, one step | the model, repeatedly |
+| Side effects | none | possible | likely |
+| State | the prompt | the prompt + one result | accumulated, managed |
+| Cost | fixed | one extra generation | unbounded without budgets |
+| Predictability | high | medium | low |
+| Evaluate | retrieval + answer | call correctness + answer | trajectory, success, cost |
+
+## Limitations
+
+- **Reliability compounds.** A 95 % per-step success rate over ten dependent steps is 60 % end to end.
+- **Models are poor at knowing what they do not know**, which is the ability an agent most needs when deciding whether to call a tool.
+- **Benchmarks for agents are young** and sensitive to tool implementations; a score transfers poorly between environments.
+- **Cost is a first-class constraint**; a loop that solves the task at ten times the budget has not solved it.
+- **Multi-agent designs add coordination failures** (lost context between agents, contradictory proposals) on top of single-agent ones.
+
+## What you should remember
+
+- Tool use: describe functions with schemas; the model emits a call; the runtime executes and appends the result; the model continues.
+- An agent is the loop with state, a plan, and stopping rules (final answer, step and cost budgets, repetition detection).
+- Split large tool sets across specialized agents with a coordinator; put every side-effecting action behind human confirmation.
+- Tool outputs are data; instructions inside them are attacks.
+- Prefer a pipeline when the steps are known; move decisions into the model only when they must depend on intermediate results, and evaluate each one.
+
+## Notebook
+
+[the agents and diffusion notebook](https://github.com/glkuzi/nlp_dsba/blob/4130e09940ddd363cee9fa3bd51b149466cfc6fb/seminars/hse_seminar_14_agents_and_diffusion.ipynb). Cell numbers count every cell, markdown included, from 1.
+
+- Cell 7 builds a `CodeAgent` with a hosted image-generation tool and a web-search tool over a 4 B instruction-tuned model and runs the James Bond request; the saved trace shows the search step, the image call and the returned image (an Aston Martin DB5).
+- Cell 10 runs the weather question with only the search tool: three steps, 9,528 input and 225 output tokens, answer "Clear sky, around 13–16 °C".
+- Cells 13–15 pass a buggy script as an additional argument; the agent executes it, reads the error, fixes the indexing and returns the corrected code in one step.
+- Cells 18–20 belong to the [text diffusion note](/notes/nlp/text-diffusion).
+
+The multi-agent inventory structure described above is from a production system summarized on the [work page](/work); it is not in the notebook.
+
+## Next
+
+Every system in this section has decisions inside it that are made by a model: which passage is relevant, whether an answer is faithful, which tool to call. Measuring them needs more than a test set with labels. The [next note](/notes/nlp/llm-evaluation) covers evaluation of language-model systems: standardized task benchmarks and their harness, retrieval metrics, models as judges and how much to trust them, human evaluation, and the operational measures (latency, cost, reliability) that decide whether a system ships.
+
+## References
+
+- S. Yao, J. Zhao, D. Yu, N. Du, I. Shafran, K. Narasimhan, Y. Cao. [ReAct: Synergizing Reasoning and Acting in Language Models](https://arxiv.org/abs/2210.03629). ICLR, 2023.
+- T. Schick et al. [Toolformer: Language Models Can Teach Themselves to Use Tools](https://arxiv.org/abs/2302.04761). NeurIPS, 2023.
+- Y. Qin et al. [Tool Learning with Foundation Models](https://arxiv.org/abs/2304.08354). arXiv, 2023. A survey of tool use.
+- X. Wang et al. [Executable Code Actions Elicit Better LLM Agents](https://arxiv.org/abs/2402.01030). ICML, 2024. Code as the action interface.
+- K. Greshake, S. Abdelnabi, S. Mishra, C. Endres, T. Holz, M. Fritz. [Not what you've signed up for: Compromising Real-World LLM-Integrated Applications with Indirect Prompt Injection](https://arxiv.org/abs/2302.12173). AISec, 2023.
+- Hugging Face. [smolagents documentation](https://huggingface.co/docs/smolagents/index). The agent library used in the notebook.

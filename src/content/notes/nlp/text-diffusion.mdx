@@ -1,0 +1,128 @@
+---
+title: Non-autoregressive generation and text diffusion
+description: "Generate every position at once with a bidirectional model, keep the confident predictions, mask the rest and repeat: the masked discrete diffusion view of that loop, its training objective, the generation procedure with blocks, steps, confidence-based remasking and classifier-free guidance, and a comparison with left-to-right decoding on what each buys."
+course: nlp
+section: Advanced Generation
+order: 33
+status: published
+tags: [diffusion, non-autoregressive, masked-diffusion, llada, parallel-decoding, cfg]
+prerequisites: [GPT and autoregressive language modeling, BERT and masked language modeling, LLM evaluation]
+---
+
+import Unmasking from '../../../components/figures/text-diffusion/Unmasking.astro';
+
+Every generator in this course produced text left to right: one token per model call, each conditioned on all the previous ones, $T$ calls for $T$ tokens, no way to revise a token once written. The [BERT note](/notes/nlp/bert) trained a model that does something different, fill in masked positions from both sides, and could not generate with it because it had no procedure for going from nothing to a full sequence. This note supplies the procedure. It turns the masked-token predictor into a generator by iterating it, and the result is a discrete analogue of the diffusion models of the [Generative Models course](/notes/generative-models/ddpm-forward-process).
+
+**Notation.** A sequence $x_0 = (x_0^1, \dots, x_0^L)$ of tokens; a mask token $\mathrm{M}$; a noise level $t \in [0, 1]$; the partially masked sequence $x_t$; a model $p_\theta(x_0^i \mid x_t)$ that predicts the clean token at position $i$ from the whole masked sequence. The prompt occupies the first positions and is never masked.
+
+## Baseline: autoregressive decoding
+
+$P(x) = \prod_i P(x^i \mid x^{<i})$, sampled one factor at a time. Its properties, from the [GPT note](/notes/nlp/gpt): training is parallel thanks to the causal mask; generation is sequential; each step reads the cache of the previous ones; the representation of position $i$ never sees $i + 1$. The cost of generating $T$ tokens is $T$ model calls, and a mistake at step 10 conditions every later step.
+
+The first attempt at parallelism predicted all target tokens of a translation independently in one pass ([Gu et al., 2018](#references)). It is fast and the outputs are incoherent: each position samples its own plausible token without knowing what the neighbours chose (*a man* at position 2 and *are* at position 3), the **multimodality problem**. The fix was to iterate: predict everything, keep part of it, re-predict the rest conditioned on what was kept ([Ghazvininejad et al., 2019](#references)). Masked diffusion is that idea with a probabilistic training objective.
+
+<aside class="callout"><strong>Key idea.</strong> Define a forward process that masks tokens at random until nothing is left, and train a bidirectional model to reverse one step of it: given a sequence with some positions masked, predict the masked tokens. Generation starts from an all-masked sequence and applies the model repeatedly, unmasking a few positions per step, until none remain.</aside>
+
+## The forward and reverse processes
+
+**Forward.** At noise level $t$, each token of $x_0$ is replaced by $\mathrm{M}$ independently with probability $t$:
+
+$$
+q(x_t^i \mid x_0^i) = \begin{cases} x_0^i & \text{with probability } 1 - t, \\ \mathrm{M} & \text{with probability } t. \end{cases}
+$$
+
+At $t = 0$ the sequence is clean; at $t = 1$ it is all masks. Unlike the Gaussian forward process of the image case, a masked token carries no residual information and is never un-masked by the forward process; the state space is the vocabulary plus one absorbing symbol.
+
+**Reverse.** The model receives $x_t$ and outputs, for every masked position, a distribution over the vocabulary. Training samples $t$ uniformly, masks $x_0$ accordingly, and minimizes the cross-entropy on the masked positions, weighted by $1/t$:
+
+$$
+\mathcal L(\theta) = -\,\mathbb E_{t,\, x_0,\, x_t}\Big[\frac{1}{t}\sum_{i=1}^L \mathbb 1[x_t^i = \mathrm{M}]\,\log p_\theta(x_0^i \mid x_t)\Big].
+$$
+
+This is BERT's masked-language-model loss with a random masking rate instead of a fixed 15 % and a $1/t$ weight. The weight is what makes the objective a likelihood bound: [Ou et al. (2024)](#references) and [Nie et al. (2025)](#references) show that $\mathcal L$ is an upper bound on the negative log-likelihood $-\log p_\theta(x_0)$, analogous to the variational bound of the [DDPM training note](/notes/generative-models/ddpm-training-objective), so that lowering it raises a bound on the likelihood of the data. With the weight, masking rates near $t = 1$ (almost everything hidden) count for more; without it the model would be trained mostly on easy, lightly masked inputs. The architecture is a Transformer with full (non-causal) attention, the encoder arrangement of the [model-families note](/notes/nlp/model-families); LLaDA trains one at 8 B parameters from scratch on this objective.
+
+## Generation
+
+The sampler of the notebook, reduced to its steps, for a prompt of length $p$ and a generation length $G$:
+
+1. Build $x = [\text{prompt}, \mathrm{M}, \dots, \mathrm{M}]$ of length $p + G$.
+2. Split the $G$ positions into **blocks** of length $b$ (32 here) and process the blocks left to right; within the current block, positions are generated in parallel, and later blocks stay masked. This is a semi-autoregressive compromise: fully parallel over $G$ positions is possible but degrades quality on long outputs.
+3. Each block gets $S_b = S / (G / b)$ steps (128 steps for $G = 128$ and $b = 32$ gives 32 steps per block). At each step:
+   - run the model once over the whole sequence and take, at every masked position, the predicted token $\hat x^i = \arg\max p_\theta(\cdot \mid x_t)$ (with Gumbel noise added to the logits when sampling at a temperature above 0);
+   - compute a **confidence** per masked position, the probability $p_\theta(\hat x^i \mid x_t)$ of the chosen token (low-confidence remasking), or a random number (random remasking);
+   - **unmask** the $k$ most confident positions of the current block, where $k$ is the block's masked count divided by its remaining steps, so that the block empties on schedule; leave the others masked;
+4. Stop when every position is filled. Positions after the model's end-of-text token are padding to the fixed length.
+
+<Unmasking />
+
+Confidence-based unmasking is a heuristic with a clear rationale: the model is asked to commit first where it is surest, and each commitment conditions the next pass, so the hard positions are decided last with the most context. Random remasking is the version analysed in the papers; the confidence version is what works better empirically.
+
+**Classifier-free guidance** carries over from image diffusion. Run the model twice, once with the prompt and once with the prompt masked out (an unconditional prediction), and extrapolate: $\ell = \ell_{\text{uncond}} + (w + 1)(\ell_{\text{cond}} - \ell_{\text{uncond}})$ on the logits, with $w$ the guidance scale ($w = 0$ is the plain model). It sharpens adherence to the prompt at twice the compute per step. The notebook runs with $w = 0$.
+
+### Worked example
+
+Prompt: *Lily can run 12 kilometers per hour for 4 hours. After that, she runs 6 kilometers per hour. How many kilometers can she run in 8 hours?*, in a chat template. $G = 128$, $b = 32$, $S = 128$, temperature 0, low-confidence remasking, no guidance. Output:
+
+> Lily runs 12 kilometers per hour for 4 hours, so she runs a total of 12 \* 4 = 48 kilometers in the first 4 hours. After that, she runs 6 kilometers per hour for 4 hours, so she runs a total of 6 \* 4 = 24 kilometers in the next 4 hours. Therefore, in 8 hours, Lily can run a total of 48 + 24 = 72 kilometers. The answer is: 72
+
+followed by an end-of-turn token and padding. Correct, and produced by a model that never saw its own left context as "past". Note the arithmetic of the schedule: with $S = 128$ steps for 128 positions, each pass unmasks exactly one token per block, so this run made 128 full forward passes, the same count as left-to-right decoding and each pass over the full sequence rather than one cached token. The parallel speed-up exists only when $S < G$: 32 steps would unmask 4 tokens per pass per block and cut the model calls by four, at some cost in quality that the papers quantify on benchmarks and that this one example cannot.
+
+## Autoregressive versus diffusion generation
+
+| | Autoregressive | Masked diffusion |
+| --- | --- | --- |
+| Order | left to right, fixed | any; confidence-chosen, blocks optional |
+| Model calls for $G$ tokens | $G$ | $S$, chosen; $S \ll G$ for speed |
+| Context per prediction | left only | both sides of the sequence so far |
+| Revising a token | impossible | masked positions are re-predicted at every step; committed ones are not (in the basic sampler) |
+| Per-call cost | one new position with a KV cache | the whole sequence, no cache |
+| Output length | open-ended, stops at end token | fixed budget $G$, padded |
+| Infilling and editing | needs special training | native: mask the span to rewrite |
+| Likelihood | exact, by the chain rule | a bound |
+| Decoding knobs | temperature, top-$p$, beam | steps, block size, remasking rule, guidance |
+| Maturity | the production default | research and early deployment |
+
+What diffusion buys: a controllable trade between calls and quality, bidirectional conditioning, and editing by masking. What it costs: a full-sequence pass per step with no cache, a fixed length that must be guessed, and an output that is a bound-optimized sample rather than a chain-rule probability. Whether the trade is favourable depends on the lengths, the hardware and the quality bar; the papers report competitive benchmark scores at matched scale, and the field is moving.
+
+## What changed
+
+| | BERT (MLM) | Masked diffusion LM |
+| --- | --- | --- |
+| Masking rate | fixed 15 % | $t \sim U[0, 1]$ |
+| Loss weight | none | $1/t$ |
+| Objective's meaning | representation learning | likelihood bound |
+| Can generate | no | yes, by iterated unmasking |
+| Architecture | encoder | encoder (same arrangement), scaled up |
+
+## Limitations
+
+- **No cache.** Every step re-encodes the whole sequence; the per-step cost is $O((p + G)^2 d)$, and long prompts make steps expensive.
+- **Fixed length.** $G$ is a hyperparameter; too short truncates, too long pads and wastes steps.
+- **Committed tokens are final** in the basic sampler, so an early confident mistake persists; samplers that re-mask committed tokens exist and cost more steps.
+- **Quality versus steps is a curve**, measured on benchmarks, not a guarantee; one correct example says nothing about it.
+- **Tooling.** Constrained decoding, speculative tricks, serving engines and the ecosystem around autoregressive models mostly do not transfer yet.
+
+## What you should remember
+
+- Masked diffusion: forward process masks each token with probability $t$; the model predicts masked tokens from the whole sequence; the loss is masked cross-entropy weighted by $1/t$, which bounds the negative log-likelihood.
+- Generation: all-masked start, repeated full passes, unmask the most confident $k$ positions per pass, optionally in left-to-right blocks, with optional classifier-free guidance.
+- Speed-up requires steps $<$ generated tokens; with equal counts the method makes as many calls as left-to-right decoding and each is more expensive.
+- Compared with autoregression: bidirectional context, editing by masking, a chosen number of steps; against it, no KV cache, fixed length, a likelihood bound.
+
+## Notebook
+
+[the agents and diffusion notebook](https://github.com/glkuzi/nlp_dsba/blob/4130e09940ddd363cee9fa3bd51b149466cfc6fb/seminars/hse_seminar_14_agents_and_diffusion.ipynb), cell 20. Cell numbers count every cell, markdown included, from 1. The cell defines `add_gumbel_noise` (temperature sampling on the logits), `get_num_transfer_tokens` (the per-step unmasking counts that empty a block on schedule), and `generate` (blocks, steps, the optional guidance branch that concatenates the conditional and unconditional inputs, the `low_confidence` and `random` remasking rules, and the top-$k$ transfer per block); loads an instruction-tuned mixture-of-experts masked-diffusion model with its tokenizer and chat template; and runs the Lily prompt with `steps=128, gen_length=128, block_length=32, temperature=0., cfg_scale=0.`. The printed output is the one quoted above, ending in the model's end-of-turn token followed by end-of-text padding.
+
+## Next
+
+This is the last note of the course. The path ran from bytes to tokens, from counts to vectors, from recurrence to attention, from pretraining to adaptation, and from single models to systems around them; the final note gave up the one assumption that every generator before it shared. The topics still marked *Planned* on the [course page](/notes/nlp) (GloVe, FastText, sentence-pair similarity) will be written when their source material is ready.
+
+## References
+
+- S. Nie, F. Zhu, Z. You, X. Zhang, J. Ou, J. Hu, J. Zhou, Y. Lin, J.-R. Wen, C. Li. [Large Language Diffusion Models](https://arxiv.org/abs/2502.09992). arXiv, 2025. LLaDA: the objective, the sampler with low-confidence remasking, and the benchmark comparison with autoregressive models.
+- J. Ou, S. Nie, K. Xue, F. Zhu, J. Sun, Z. Li, C. Li. [Your Absorbing Discrete Diffusion Secretly Models the Conditional Distributions of Clean Data](https://arxiv.org/abs/2406.03736). ICLR, 2025. The likelihood bound for masked diffusion.
+- J. Austin, D. D. Johnson, J. Ho, D. Tarlow, R. van den Berg. [Structured Denoising Diffusion Models in Discrete State-Spaces](https://arxiv.org/abs/2107.03006). NeurIPS, 2021. D3PM, including the absorbing (mask) process.
+- A. Lou, C. Meng, S. Ermon. [Discrete Diffusion Modeling by Estimating the Ratios of the Data Distribution](https://arxiv.org/abs/2310.16834). ICML, 2024.
+- J. Gu, J. Bradbury, C. Xiong, V. O. K. Li, R. Socher. [Non-Autoregressive Neural Machine Translation](https://arxiv.org/abs/1711.02281). ICLR, 2018.
+- M. Ghazvininejad, O. Levy, Y. Liu, L. Zettlemoyer. [Mask-Predict: Parallel Decoding of Conditional Masked Language Models](https://aclanthology.org/D19-1633/). EMNLP, 2019.
+- J. Ho, T. Salimans. [Classifier-Free Diffusion Guidance](https://arxiv.org/abs/2207.12598). NeurIPS Workshop, 2021.
