@@ -24,6 +24,7 @@ npm run build
 
 Work and project entries keep English fields at the root of the frontmatter and the Russian text under `ru:`. The schema requires both, so the English and Russian pages stay in step. Home, Work, Projects and About render both languages from the shared views in `src/views/`; the remaining Russian pages come from `src/utils/ru-pages.ts`. External actions (`Paper`, `Code`, `PDF`, `BibTeX`, `Article`) are listed only when the material is public.
 - Original handwritten material: `source-material/` (never copied to the built site)
+- Contacts and profiles: `src/config/profile.ts` (see `docs/contact-and-email.md`)
 
 Note URLs are permanent and never include dates. Each note declares its course, section, order, review status, tags and prerequisites in frontmatter.
 

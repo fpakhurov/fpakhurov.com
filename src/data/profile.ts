@@ -103,9 +103,3 @@ export const writing: { year: number; title: Text; type: Text; links: { label: T
     links: [{ label: { en: 'PDF', ru: 'PDF' }, href: 'https://github.com/fpakhurov/diffusion-hallucinations/blob/main/arXiv_diploma_report/template.pdf' }],
   },
 ];
-
-export const profiles = {
-  github: 'https://github.com/fpakhurov',
-  habr: 'https://habr.com/ru/users/fpakhurov/',
-  hse: 'https://www.hse.ru/staff/f',
-};
