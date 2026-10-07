@@ -1,0 +1,131 @@
+---
+title: Question answering
+description: "Extractive QA reads a question and a passage together and predicts where the answer starts and ends: the input format, the sliding window for long passages, the character-to-token mapping, the two-head model and its loss, exact-match and F1, and the step from a passage given to a passage retrieved."
+course: nlp
+section: NLP Tasks
+order: 27
+status: published
+tags: [question-answering, squad, extractive-qa, span-prediction, exact-match, f1]
+prerequisites: [Named entity recognition, BERT and masked language modeling]
+---
+
+NER labels tokens that are there to be labelled. Question answering asks the model to *find* something: given a question and a passage, return the part of the passage that answers it. The Transformer-era formulation makes this a prediction of two positions, and almost all of the engineering is in getting the data into and out of that form.
+
+**Notation.** Question $q$, context passage $c$; the answer is a span $c[a_s : a_e]$ given as a character offset and a text; after tokenization the span is a pair of token indices $(s, e)$; the encoder gives a vector $h_j$ per token.
+
+## Task formulation
+
+**Extractive QA**: the answer is a contiguous span of the given passage. The SQuAD 1.1 benchmark ([Rajpurkar et al., 2016](#references)) has 87,599 training and 10,570 validation question–passage–answer triples drawn from Wikipedia, with the answer stored as text plus its start character:
+
+```json
+{"context": "Barack Obama was born in Honolulu and ...",
+ "question": "Where was Barack Obama born?",
+ "answers": {"text": ["Honolulu"], "answer_start": [25]}}
+```
+
+The end offset is implied by the text's length. Every answer is guaranteed to exist in the passage; SQuAD 2.0 ([Rajpurkar, Jia and Liang, 2018](#references)) adds unanswerable questions, for which the model must abstain.
+
+**Open-domain QA** drops the given passage: the system must find candidate passages in a corpus first, then extract or generate the answer. **Generative QA** lets a decoder write the answer in its own words. The extractive setting isolates the reading step and is where the mechanics are clearest.
+
+## Baseline: match the question against the passage
+
+Early neural readers encoded the question and the passage separately and built an attention matrix between them, so that each passage token knew which question tokens it resembled; BiDAF ([Seo et al., 2017](#references)) reached about 77 $F_1$ on SQuAD 1.1 with that design over LSTMs. The Transformer formulation removes the separate encoders: feed both texts into one encoder and let self-attention do the matching.
+
+<aside class="callout"><strong>Key idea.</strong> Concatenate question and passage into one sequence. Every passage token then attends to every question token through the encoder. Train two scorers over positions, one for "the answer starts here" and one for "the answer ends here", and read the answer off as the best start–end pair.</aside>
+
+## The input
+
+`[CLS] question [SEP] passage [SEP]`, with `token_type_ids` marking the two segments. Three complications are handled at preprocessing time:
+
+**Long passages.** The encoder reads at most 384 tokens here (512 is the model's limit). The question is never truncated (`truncation="only_second"`); a long passage is cut into overlapping **windows** of the remaining length with a stride of 128 tokens, each window paired with the full question, so that an answer near a cut is wholly inside at least one window. One example may become several; `overflow_to_sample_mapping` records which original example each window came from. A 128-token window with stride 32 turns one SQuAD example into three.
+
+**Characters to tokens.** The answer is a character offset; the model needs token indices. `return_offsets_mapping=True` gives each token's `(start_char, end_char)` in the original text:
+
+| token | `[CLS]` | Barack | Obama | was | born | in | Hawaii | . | `[SEP]` |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| offsets | (0, 0) | (0, 6) | (7, 12) | (13, 16) | (17, 21) | (22, 24) | (25, 31) | (31, 32) | (0, 0) |
+
+The start token is the last one whose start character $\le$ `answer_start`, and the end token the first one whose end character $\ge$ `answer_start + len(text)`, searched only within the passage segment (`sequence_ids` tells which tokens belong to the question, the passage, or neither).
+
+**Windows without the answer.** If the answer is not fully inside a window, both targets are set to position 0, the `[CLS]` token. The model thus learns a "no answer in this window" output, which is also how SQuAD 2.0 abstention is represented.
+
+## The model and its loss
+
+Two linear scorers on top of the encoder, implemented as one `nn.Linear(768, 2)` whose two outputs are split:
+
+$$
+s_j = w_s \cdot h_j, \qquad e_j = w_e \cdot h_j, \qquad
+P_{\text{start}}(j) = \operatorname{softmax}_j(s), \quad P_{\text{end}}(j) = \operatorname{softmax}_j(e).
+$$
+
+Each softmax runs *over positions*, not over classes: "which of the $m$ tokens is the start" is one $m$-way classification and "which is the end" another. This is not the three-class token tagging (start / end / neither) it might look like: that formulation would allow several starts in one passage and has no way to prefer one; the position softmax yields exactly one of each and a joint score for any pair. The loss is the mean of the two cross-entropies,
+
+$$
+\mathcal L = \tfrac12\big(-\log P_{\text{start}}(s^*) - \log P_{\text{end}}(e^*)\big),
+$$
+
+and the prediction is the pair $(j, k)$ maximizing $s_j + e_k$ subject to $j \le k$ and $k - j$ below a maximum answer length, scored across all windows of the example; the plain argmax of each head separately, which the notebook uses, can return an end before the start.
+
+### What a frozen encoder gives
+
+The notebook freezes BERT-base-cased, trains only the 1,538-parameter head on 2,000 training windows for three epochs, and then asks *Where was Barack Obama born?* over *Barack Obama was born in Hawaii. He was elected president in 2008.* The answer returned is `Barack Obama born? [SEP] Barack Obama`: the independent argmaxes land in the question segment, the end precedes the start, and the decoded span runs across the separator. Nothing in frozen MLM features says "this token is where an answer starts"; span extraction is the task where the encoder most needs to be fine-tuned. Fine-tuned BERT-base reaches 88.5 $F_1$ and 80.8 exact match on SQuAD 1.1 ([Devlin et al., 2019](#references), Table 2); the published recipe is three epochs over the full training set at learning rate $3 \times 10^{-5}$ with all parameters trained.
+
+## Metrics
+
+**Exact match** (EM): 1 if the predicted text equals one of the gold answers after normalization (lowercase, strip punctuation and articles), else 0. **F1**: token-level overlap between prediction and gold, with the maximum taken over the gold answers when there are several, averaged over questions. EM punishes `in Honolulu` against `Honolulu`; F1 gives it $2 \cdot 1 \cdot 0.5 / 1.5 = 0.67$. Both are computed on *text*, so the character-to-token round trip must be inverted exactly: decode the predicted token span back to the original characters with the offsets, not to a re-tokenized string.
+
+## From a given passage to a retrieved one
+
+Extractive QA assumes someone handed the model the right passage. In an open-domain system the passage comes from a retriever: embed the question, find the nearest passages in an index of a corpus, and run the reader on the top few ([Chen et al., 2017](#references); [Karpukhin et al., 2020](#references)). The reader's accuracy is then bounded by the retriever's recall, and the two have to be evaluated separately, which is the structure of the [semantic search](/notes/nlp/semantic-search) and [RAG](/notes/nlp/rag) notes. Generative readers (a decoder given the question and passages) replace span extraction by free text and inherit its advantages (paraphrase, synthesis across passages) and its risk (answers not in the passages).
+
+## What changed
+
+| | BiDAF-style reader | Pretrained encoder, two heads |
+| --- | --- | --- |
+| Question–passage matching | explicit attention layer | self-attention over the concatenation |
+| Encoders | separate, from scratch | one, pretrained |
+| Output | start/end over positions | start/end over positions |
+| SQuAD 1.1 F1 | ≈ 77 | 88.5 (base), 90.9 (large) |
+| Long passages | truncated | sliding windows |
+
+## Limitations
+
+- **Only spans.** Answers that need counting, combining or rephrasing cannot be extracted.
+- **Abstention is hard.** Without unanswerable training data the model always finds a span; with it, the `[CLS]` score must be calibrated against the best span score.
+- **Windows can split evidence.** An answer whose justification lies outside its window is guessed from local cues.
+- **EM and F1 measure overlap**, not correctness; a wrong span with the right words scores well, and a correct paraphrase scores zero on EM.
+- **Memorization.** Wikipedia-based benchmarks overlap pretraining corpora; a model may answer from memory rather than from the passage, which the retrieved-passage setting exposes.
+
+## What you should remember
+
+- Extractive QA: `[CLS] q [SEP] c [SEP]` → two softmaxes over positions (start, end) → best pair with $j \le k$.
+- Preprocessing does the work: sliding windows with stride for long passages, offset mapping from characters to tokens, position 0 for windows without the answer.
+- A frozen encoder cannot do span extraction; fine-tune (BERT-base: 88.5 F1 on SQuAD 1.1).
+- EM and token F1 on normalized text; decode spans via offsets.
+- Open-domain QA = retriever + reader; the reader is bounded by retrieval recall.
+
+## Notebook
+
+[`week07_nlp_tasks.ipynb`](https://github.com/glkuzi/nlp_dsba/blob/4130e09940ddd363cee9fa3bd51b149466cfc6fb/seminars/week07_nlp_tasks.ipynb). Cell numbers count every cell, markdown included, from 1.
+
+- Cells 40–44 describe the format and load SQuAD 1.1 (87,599 / 10,570).
+- Cells 49–53 tokenize one question–context pair with `max_length=128, stride=32, return_overflowing_tokens=True` and show the three resulting windows and `overflow_to_sample_mapping`.
+- Cells 54–56 show `return_offsets_mapping` on a short sentence (the table above).
+- Cell 57 is the full `preprocess_function` (384 tokens, stride 128, `sequence_ids`, the start/end search, position 0 for windows without the answer); cell 58 maps it over the dataset.
+- Cell 62 defines `BERTforQA` with a frozen encoder and `nn.Linear(768, 2)`, splitting the outputs into start and end logits and averaging the two cross-entropies.
+- Cells 65–68 load the SQuAD metric, define a `compute_metrics` that decodes the predicted span from `label_ids` rather than from the input ids (a bug: the labels hold start and end positions, not tokens), and train on 2,000 windows for three epochs; the evaluation returns no F1 or EM in the saved output.
+- Cell 70 runs the frozen model on the Obama example and prints the broken answer quoted above.
+
+## Next
+
+Extracting a span is one way to produce an answer; condensing a document is another. The [next note](/notes/nlp/summarization) compares two formulations of summarization, selecting parts of the input and writing new text, fine-tunes an encoder–decoder for the second, and shows why the metric used to score it rewards copying.
+
+## References
+
+- P. Rajpurkar, J. Zhang, K. Lopyrev, P. Liang. [SQuAD: 100,000+ Questions for Machine Comprehension of Text](https://aclanthology.org/D16-1264/). EMNLP, 2016.
+- P. Rajpurkar, R. Jia, P. Liang. [Know What You Don't Know: Unanswerable Questions for SQuAD](https://aclanthology.org/P18-2124/). ACL, 2018.
+- M. Seo, A. Kembhavi, A. Farhadi, H. Hajishirzi. [Bidirectional Attention Flow for Machine Comprehension](https://arxiv.org/abs/1611.01603). ICLR, 2017.
+- J. Devlin, M.-W. Chang, K. Lee, K. Toutanova. [BERT: Pre-training of Deep Bidirectional Transformers for Language Understanding](https://aclanthology.org/N19-1423/). NAACL, 2019. §4.2 and Table 2 (SQuAD).
+- D. Chen, A. Fisch, J. Weston, A. Bordes. [Reading Wikipedia to Answer Open-Domain Questions](https://aclanthology.org/P17-1171/). ACL, 2017.
+- V. Karpukhin et al. [Dense Passage Retrieval for Open-Domain Question Answering](https://aclanthology.org/2020.emnlp-main.550/). EMNLP, 2020.
+- Hugging Face. [Question answering](https://huggingface.co/docs/transformers/tasks/question_answering). The sliding-window preprocessing used in the notebook.

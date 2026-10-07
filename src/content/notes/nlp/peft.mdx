@@ -1,0 +1,142 @@
+---
+title: Parameter-efficient fine-tuning
+description: "Freeze the pretrained weights and train a small set of new parameters in the right place: adapters inserted between layers, LoRA's low-rank correction to the weight matrices, or a learned prompt. On the same sentiment task LoRA matches full fine-tuning while training 0.24 % of the parameters; prompt tuning does not, and the note says why."
+course: nlp
+section: Adaptation and Efficient Models
+order: 22
+status: published
+tags: [peft, lora, adapters, prompt-tuning, qlora, low-rank]
+prerequisites: [Fine-tuning, Linear algebra]
+---
+
+import LoraUpdate from '../../../components/figures/peft/LoraUpdate.astro';
+
+Full fine-tuning in the [previous note](/notes/nlp/fine-tuning) reached 0.890 on SST-2 and paid for it with gradients and optimizer states for all 124 million parameters and a full copy of the model per task. Linear probing paid almost nothing and reached 0.737. The question is whether there is a way to train a few parameters and still get the fine-tuning number. There is, and the main method turns on one observation about what fine-tuning actually changes.
+
+**Notation.** A pretrained weight matrix $W \in \mathbb R^{d_{\text{out}} \times d_{\text{in}}}$ (frozen); its fine-tuned version $W + \Delta W$; a layer input $x$ and output $h$. $r$ is a rank; $\sigma$ a sigmoid.
+
+## Baseline: all or nothing
+
+Two regimes exist so far. Train everything ($\Delta W$ is free, $d_{\text{out}} d_{\text{in}}$ parameters per matrix, hundreds of matrices) or train only a head ($\Delta W = 0$ everywhere). The first is expensive, the second underfits. The methods below sit between them by restricting the *form* of $\Delta W$ or by adding a small module whose parameters are the only ones trained.
+
+## Adapters
+
+[Houlsby et al. (2019)](#references) insert a small bottleneck module after each sub-layer of every block: project the $d$-dimensional activation down to $m \ll d$, apply a non-linearity, project back up, and add the result to the activation (a residual). Only the adapter weights ($2dm$ per adapter plus biases) and the layer norms are trained. With $d = 768$ and $m = 64$ an adapter has about 100 K parameters, and a 12-block model with two adapters per block adds 2.4 M, 2 % of BERT-base, for accuracy within a point of full fine-tuning on the GLUE tasks of the paper. The cost is at inference: the adapters are extra layers that run on every forward pass and cannot be removed.
+
+## LoRA: a low-rank update
+
+<aside class="callout"><strong>Key idea.</strong> Do not add layers; constrain the change to existing layers. Write the fine-tuning update of a weight matrix as a product of two thin matrices, $\Delta W = BA$ with $B \in \mathbb R^{d_{\text{out}} \times r}$, $A \in \mathbb R^{r \times d_{\text{in}}}$ and $r$ small, train only $A$ and $B$, and keep $W$ frozen. After training, $BA$ can be added into $W$ once, so inference costs nothing extra.</aside>
+
+[Hu et al. (2022)](#references) built LoRA on the observation, empirical and made earlier by [Aghajanyan, Zettlemoyer and Gupta (2021)](#references), that the update a pretrained model needs for a downstream task has low *intrinsic rank*: most of the directions in $\Delta W$ do not matter. The layer computes
+
+$$
+h = W x + \Delta W x = W x + B A x = W x + B\,(A x),
+$$
+
+evaluated right to left: $Ax$ is $r$ numbers, $B(Ax)$ is back in $d_{\text{out}}$ dimensions. $A$ is initialized with small Gaussian values and $B$ with zeros, so $\Delta W = 0$ at the first step and training starts from exactly the pretrained model. A scale $\alpha / r$ multiplies the correction so that changing $r$ does not change the effective learning rate.
+
+<LoraUpdate />
+
+### Worked example
+
+$d_{\text{in}} = d_{\text{out}} = 4$, $r = 1$. A full update is 16 numbers; LoRA trains $A = (1, 0, -1, 0)$ (4 numbers) and $B = (2, 0, 0, 1)^\top$ (4 numbers). Their product is
+
+$$
+BA = \begin{pmatrix} 2 \\ 0 \\ 0 \\ 1 \end{pmatrix}\begin{pmatrix} 1 & 0 & -1 & 0 \end{pmatrix}
+= \begin{pmatrix} 2 & 0 & -2 & 0 \\ 0 & 0 & 0 & 0 \\ 0 & 0 & 0 & 0 \\ 1 & 0 & -1 & 0 \end{pmatrix},
+$$
+
+a $4 \times 4$ matrix of rank 1: every row is a multiple of $A$. For $x = (1, 1, 0, 1)$, $Ax = 1$ and $BAx = (2, 0, 0, 1)$: the correction adds the direction $B$ scaled by how much $x$ aligns with $A$. Eight trained numbers specify a 16-entry matrix, at the price that the matrix can only point in one direction. With $r$ directions it can point in $r$.
+
+### Parameter count
+
+Per matrix: $r(d_{\text{in}} + d_{\text{out}})$ against $d_{\text{in}} d_{\text{out}}$. For the fused attention projection of GPT-2 ($768 \to 2{,}304$, producing $Q, K, V$ at once) with $r = 8$: $8 \times (768 + 2{,}304) = 24{,}576$ per block, 294,912 over 12 blocks, plus the 1,536-parameter head: **296,448 trainable parameters, 0.24 % of the model**. The original paper applies LoRA to the query and value projections only; the notebook targets the fused `c_attn`, which covers query, key and value because GPT-2 computes them in one matrix.
+
+### Result
+
+| Regime | Trainable | Val. accuracy | Val. loss |
+| --- | --- | --- | --- |
+| Full fine-tuning | 124 M (100 %) | 0.890 | 0.277 |
+| Linear probing | 1,536 (0.001 %) | 0.737 | 0.541 |
+| **LoRA, $r = 8$ on attention** | **296 K (0.24 %)** | **0.899** | **0.271** |
+| Prompt tuning, 12 tokens | 10.8 K (0.009 %) | 0.663 | 0.656 |
+| LP-FT | 124 M | 0.900 | 0.258 |
+
+LoRA matches full fine-tuning (the one-point difference is noise on 872 examples) with 400 times fewer trained parameters, a learning rate of $10^{-4}$ (the new matrices start from scratch, so the small-step caution of full fine-tuning does not apply), and no optimizer state for the frozen body. The adapter for a task is a file of 296 K numbers that can be swapped in and out of one shared base model.
+
+## Prompt tuning
+
+[Lester, Al-Rfou and Constant (2021)](#references) train nothing inside the model. A sequence of $k$ *virtual tokens*, free vectors of dimension $d$, is prepended to every input's embeddings; the model is frozen; only those $k \times d$ numbers (and here the head) are trained. The method rests on the observation that large language models can be steered by a prompt, and replaces hand-written prompts by learned ones. Initializing the virtual tokens from the embeddings of a natural sentence (`Predict if sentiment of this review is positive or negative`, 11 tokens, padded to 12) gives the optimizer a sensible start.
+
+Result: **0.663** with 10,752 trainable parameters, below linear probing. The paper's finding is that prompt tuning matches fine-tuning only for models above about 10 B parameters and lags badly below ([Lester et al., 2021](#references), Figure 1); a 124 M model is far on the wrong side of that curve. The method is also tied to the decoder-only, prompt-driven way of using a model, and does little for an encoder. Its appeal is size: a task is a few thousand numbers.
+
+Prefix tuning ([Li and Liang, 2021](#references)) is the stronger relative: learned vectors are injected as extra keys and values into every attention layer rather than only at the input.
+
+## Fine-tuning a quantized model: QLoRA
+
+LoRA keeps the frozen body in memory, and for a 7 B model that is 14 GB in 16-bit. [Dettmers et al. (2023)](#references) store the frozen body in 4 bits (the NF4 format of the [quantization note](/notes/nlp/quantization), 3.5 GB for 7 B), dequantize each matrix on the fly for the forward pass, keep the LoRA matrices in 16-bit, and apply a second quantization to the quantization constants themselves. The gradients flow through the dequantized weights into $A$ and $B$ only. The notebook's GPTQ example does the same with a 4-bit Llama-2-7B: LoRA with $r = 8$ on the four attention projections adds 8.4 M trainable parameters, and ten training steps on a quotes dataset run on a single consumer GPU. The quality of QLoRA fine-tunes is close to 16-bit LoRA in the paper's experiments; the mechanism that makes it possible is that the frozen weights never need gradients, so their storage format is free to be anything the forward pass can read.
+
+## Trade-offs
+
+| Method | Trained | Inference cost | Where it applies | Quality (this task) |
+| --- | --- | --- | --- | --- |
+| Full fine-tuning | 100 % | none | any | 0.890 |
+| Adapters | ~2 % | extra layers | any | ≈ full (literature) |
+| LoRA | 0.1–1 % | none after merging | linear layers | 0.899 |
+| Prompt tuning | < 0.01 % | $k$ extra tokens per input | large decoders | 0.663 |
+| QLoRA | LoRA on a 4-bit body | 4-bit body | large decoders | ≈ LoRA (literature) |
+
+Practical choices: $r$ between 4 and 64 (the paper found $r = 1$ to $8$ sufficient for GPT-3 on its tasks, and quality flat beyond); apply to attention projections first, and to the feed-forward matrices as well when the budget allows (`target_modules="all-linear"` in the QLoRA example); learning rate around $10^{-4}$ to $3 \times 10^{-4}$; dropout on the LoRA path.
+
+## What changed
+
+| | Full fine-tuning | LoRA |
+| --- | --- | --- |
+| $\Delta W$ | Free | Rank $\le r$ |
+| Parameters per task | All | $r(d_{\text{in}} + d_{\text{out}})$ per matrix |
+| Optimizer memory | 2 states per weight | 2 states per LoRA weight |
+| Artefact per task | Full model | Adapter file |
+| Inference | Same | Same, after merging |
+| Learning rate | Small | Larger (new weights) |
+
+## Limitations
+
+- **Rank is a bet.** Tasks that require large, high-rank changes (new languages, long continued pretraining) are not well served by small $r$; LoRA is for adaptation, not for teaching the model a new domain from scratch.
+- **Frozen body, frozen capacity.** Nothing new can be stored except through $\Delta W$; LoRA does not add knowledge the way continued pretraining does.
+- **Scale dependence.** Prompt tuning's usefulness depends on model size; LoRA's hyperparameters ($r$, target modules, $\alpha$) depend on the model and task and are chosen empirically.
+- **Adapters add latency**, LoRA does not; QLoRA trades dequantization compute for memory.
+- **Noise.** The comparisons above rest on one run each on 872 examples; differences of a point are not conclusions.
+
+## What you should remember
+
+- LoRA: $h = Wx + BAx$ with $W$ frozen, $A$ random, $B = 0$ at start; $r(d_{\text{in}} + d_{\text{out}})$ trained parameters per matrix; merge $BA$ into $W$ for inference.
+- On SST-2 with GPT-2 small, LoRA ($r = 8$, attention) gives 0.899 against 0.890 for full fine-tuning with 0.24 % of the parameters trained.
+- Adapters add small bottleneck layers (extra inference cost); prompt tuning learns input vectors and needs a very large model to compete (0.663 here).
+- QLoRA puts the frozen body in 4 bits and trains LoRA on top, which fits 7 B-parameter fine-tuning on one GPU.
+- The rank is a hypothesis about how much the task needs to change the model; it is right for adaptation and wrong for new knowledge.
+
+## Notebook
+
+[`week10_PEFT.ipynb`](https://github.com/glkuzi/nlp_dsba/blob/4130e09940ddd363cee9fa3bd51b149466cfc6fb/seminars/week10_PEFT.ipynb). Cell numbers count every cell, markdown included, from 1.
+
+- Cells 35–38 configure `LoraConfig(task_type=SEQ_CLS, r=8, lora_dropout=0.1, target_modules=['c_attn'])`, wrap the model with `get_peft_model` and print `trainable params: 296,448 || all params: 124,738,560 || trainable%: 0.2377` (the "all" count includes the LoRA matrices themselves).
+- Cells 40–43 train with AdamW at $10^{-4}$ for 1,000 steps and report validation loss 0.2708 and accuracy 0.8991.
+- Cells 45–49 configure `PromptTuningConfig` with 12 virtual tokens initialized from the sentence quoted above (`num_virtual_tokens=12`, `token_dim=768`), print 10,752 trainable parameters, and cells 52–54 train and report 0.6560 loss and 0.6628 accuracy.
+
+[`week12_pt1_Distillation_and_GPTQ_Quantization.ipynb`](https://github.com/glkuzi/nlp_dsba/blob/4130e09940ddd363cee9fa3bd51b149466cfc6fb/seminars/week12_pt1_Distillation_and_GPTQ_Quantization.ipynb), cells 42–52: a 4-bit GPTQ Llama-2-7B is prepared with `prepare_model_for_kbit_training`, wrapped with `LoraConfig(r=8, lora_alpha=32, target_modules=["k_proj","o_proj","q_proj","v_proj"], lora_dropout=0.05)`, which prints 8,388,608 trainable parameters, and trained for 10 steps with `Trainer`; the "all params" figure printed there (270 M) counts packed 4-bit weights as single int32 parameters and is not the model's true size.
+
+[`week12_pt0_Torch_and_ONNX_Quantization_+_PEFT.ipynb`](https://github.com/glkuzi/nlp_dsba/blob/4130e09940ddd363cee9fa3bd51b149466cfc6fb/seminars/week12_pt0_Torch_and_ONNX_Quantization_+_PEFT.ipynb), cells 69–74: the QLoRA configuration (`load_in_4bit`, `nf4`, double quantization, bfloat16 compute) and `LoraConfig(r=16, target_modules="all-linear")` for a Mistral-7B base; the cells are a template and are not run to completion.
+
+## Next
+
+Adaptation so far has meant a labelled task: sentiment, topic. The models people actually interact with were adapted to something broader, the behaviour of answering an instruction, and the [next note](/notes/nlp/instruction-tuning) describes that process: supervised fine-tuning on instruction–response pairs, then optimization against human preferences, with LoRA and QLoRA as the usual way to afford it.
+
+## References
+
+- E. J. Hu, Y. Shen, P. Wallis, Z. Allen-Zhu, Y. Li, S. Wang, L. Wang, W. Chen. [LoRA: Low-Rank Adaptation of Large Language Models](https://arxiv.org/abs/2106.09685). ICLR, 2022.
+- A. Aghajanyan, L. Zettlemoyer, S. Gupta. [Intrinsic Dimensionality Explains the Effectiveness of Language Model Fine-Tuning](https://aclanthology.org/2021.acl-long.568/). ACL, 2021.
+- N. Houlsby et al. [Parameter-Efficient Transfer Learning for NLP](https://proceedings.mlr.press/v97/houlsby19a.html). ICML, 2019. Adapters.
+- B. Lester, R. Al-Rfou, N. Constant. [The Power of Scale for Parameter-Efficient Prompt Tuning](https://aclanthology.org/2021.emnlp-main.243/). EMNLP, 2021.
+- X. L. Li, P. Liang. [Prefix-Tuning: Optimizing Continuous Prompts for Generation](https://aclanthology.org/2021.acl-long.353/). ACL, 2021.
+- T. Dettmers, A. Pagnoni, A. Holtzman, L. Zettlemoyer. [QLoRA: Efficient Finetuning of Quantized LLMs](https://arxiv.org/abs/2305.14314). NeurIPS, 2023.
+- Hugging Face. [PEFT documentation](https://huggingface.co/docs/peft/index). The library used in the notebooks.
