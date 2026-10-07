@@ -13,6 +13,8 @@ export interface Profile {
   linkedin: string | null;
   orcid: string | null;
   habr: string | null;
+  /** University staff page. */
+  hse: string | null;
   /**
    * Public email, kept as separate parts so the address never appears whole in the
    * repository or the built HTML. The contact page assembles it only when a visitor asks.
@@ -27,6 +29,7 @@ export const profile: Profile = {
   linkedin: 'https://www.linkedin.com/in/fpakhurov/',
   orcid: 'https://orcid.org/0009-0006-6977-7573',
   habr: 'https://habr.com/ru/users/fpakhurov/',
+  hse: 'https://www.hse.ru/staff/f',
   email: { user: 'fedor', domain: 'fpakhurov.com' },
   telegram: 'fpakhurov',
 };
@@ -37,6 +40,7 @@ const profileRules: Record<Exclude<keyof Profile, 'email'>, RegExp> = {
   linkedin: /^https:\/\/www\.linkedin\.com\/in\/[A-Za-z0-9-]+\/$/,
   orcid: /^https:\/\/orcid\.org\/\d{4}-\d{4}-\d{4}-\d{3}[\dX]$/,
   habr: /^https:\/\/habr\.com\/ru\/users\/[A-Za-z0-9_-]+\/$/,
+  hse: /^https:\/\/www\.hse\.ru\/staff\/[A-Za-z0-9_-]+$/,
   telegram: /^[A-Za-z][A-Za-z0-9_]{4,31}$/,
 };
 const placeholder = /example|placeholder|your|todo|xxx|changeme/i;
@@ -80,6 +84,7 @@ const linkDefinitions: Record<LinkChannel['id'], { name: string; value: (field: 
   github: { name: 'GitHub', value: (url) => url.replace('https://', ''), href: (url) => url },
   orcid: { name: 'ORCID', value: (url) => url.replace('https://orcid.org/', ''), href: (url) => url },
   habr: { name: 'Habr', value: (url) => `@${url.split('/').filter(Boolean).pop()}`, href: (url) => url },
+  hse: { name: 'HSE', value: (url) => url.replace('https://www.', ''), href: (url) => url },
   telegram: { name: 'Telegram', value: (username) => `@${username}`, href: (username) => `https://t.me/${username}` },
 };
 
@@ -103,13 +108,14 @@ export const contactChannels: ContactChannel[] = [
 export const footerProfiles = links(['github', 'linkedin', 'orcid']);
 
 /** Profiles shown on the CV. */
-export const cvProfiles = links(['github', 'linkedin', 'orcid']);
+export const cvProfiles = links(['github', 'linkedin', 'orcid', 'habr', 'hse']);
 
 export const github = link('github');
+export const hse = link('hse');
 
 /** Accessible name for an external profile link: name, optionally the value, and the new-tab note. */
 export const channelLabel = (item: LinkChannel, lang: Lang, withValue = true) =>
   `${withValue ? `${item.name}: ${item.value}` : item.name} (${newTab[lang]})`;
 
 /** Linked profiles for Person.sameAs. The email stays out of structured data, which harvesters read first. */
-export const sameAs = links(['github', 'linkedin', 'orcid', 'habr']).map((item) => item.href);
+export const sameAs = links(['github', 'linkedin', 'orcid', 'habr', 'hse']).map((item) => item.href);

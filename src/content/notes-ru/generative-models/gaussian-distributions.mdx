@@ -1,0 +1,245 @@
+---
+title: Многомерные гауссовские распределения
+description: Вектор средних, ковариационная матрица, двумерная плотность и сэмплирование любой гауссианы из стандартного шума с помощью квадратного корня из матрицы, а также параметризация в PyTorch, которая используется в первых экспериментах по подгонке распределений.
+course: generative-models
+section: Основы
+order: 1
+status: published
+tags: [gaussian, covariance, sampling, cholesky, pytorch]
+prerequisites: [Линейная алгебра, Теория вероятностей]
+---
+
+import NotebookScatter from '../../../components/figures/gaussian-distributions/NotebookScatter.astro';
+import CovarianceClouds from '../../../components/figures/gaussian-distributions/CovarianceClouds.astro';
+import Standardization1D from '../../../components/figures/gaussian-distributions/Standardization1D.astro';
+import SamplingPipeline from '../../../components/figures/gaussian-distributions/SamplingPipeline.astro';
+
+Генеративная модель — это распределение, из которого можно сэмплировать и, в идеале, вычислять его плотность. Пока нейронные сети не появились, курс работает с простейшим распределением, которое остаётся интересным в нескольких измерениях: многомерным гауссовским (multivariate Gaussian). Оно служит сквозным примером первых заметок и выступает там в двух ролях: это и **цель**, из которой мы берём данные, и **модель**, которую мы под эти данные подгоняем. Оно же возвращается почти в каждой следующей модели: априорное распределение VAE, шум диффузионной модели, базовое распределение нормализующего потока (normalizing flow) и статистики признаков, на которых построен FID.
+
+Вводный блок курса состоит из трёх шагов:
+
+1. **сгенерировать данные** из известного распределения (эта заметка);
+2. измерить, насколько далеки друг от друга два распределения ([Энтропия, кросс-энтропия и KL-дивергенция](/ru/notes/generative-models/entropy-and-divergences));
+3. **подогнать** параметризованное двумерное распределение к данным градиентным спуском по такому расстоянию ([Подгонка распределений с помощью KL](/ru/notes/generative-models/fitting-distributions-with-kl)).
+
+**Обозначения.** Заглавные буквы, например $X$ и $Z$, обозначают случайные векторы; полужирные строчные, например $\mathbf x$ и $\mathbf z$, — точки плоскости, то есть значения, которые эти векторы принимают. Полужирные заглавные, например $\boldsymbol\Sigma$, $\mathbf A$ и $\mathbf L$, — матрицы, $\mathbf I$ — единичная матрица, $\mathbf A^{\top}$ — транспонированная матрица, $|\boldsymbol\Sigma|$ — определитель. Запись $X \sim \mathcal N(\mu, \sigma^2)$ означает одномерное нормальное распределение со средним $\mu$ и дисперсией $\sigma^2$, а $X \sim \mathcal N(\boldsymbol\mu, \boldsymbol\Sigma)$ — многомерное нормальное распределение с вектором средних $\boldsymbol\mu$ и ковариационной матрицей $\boldsymbol\Sigma$: второй аргумент — всегда дисперсия или ковариация, а не стандартное отклонение. Плотности обозначаются $p$ и $q$; начиная с раздела про PyTorch, $P$ — фиксированное целевое распределение с плотностью $p$, а $Q$ — обучаемая модель с плотностью $q$.
+
+## Ковариационная матрица \{#the-covariance-matrix\}
+
+Возьмём случайный вектор-столбец в двух измерениях и его среднее:
+
+$$
+X = \begin{pmatrix} X_1 \\ X_2 \end{pmatrix}, \qquad
+\boldsymbol{\mu} = \mathbb E[X] = \begin{pmatrix} \mu_{1} \\ \mu_{2} \end{pmatrix}.
+$$
+
+Его разброс описывает матрица дисперсий и ковариаций размера $2 \times 2$, $\boldsymbol\Sigma = \mathbb E\bigl[(X-\boldsymbol\mu)(X-\boldsymbol\mu)^{\top}\bigr]$:
+
+$$
+\begin{aligned}
+\boldsymbol{\Sigma}
+&= \begin{pmatrix} \operatorname{Var}(X_1) & \operatorname{Cov}(X_1, X_2) \\ \operatorname{Cov}(X_1, X_2) & \operatorname{Var}(X_2) \end{pmatrix} \\[4pt]
+&= \begin{pmatrix} \sigma_{1}^2 & \rho\,\sigma_{1}\sigma_{2} \\ \rho\,\sigma_{1}\sigma_{2} & \sigma_{2}^2 \end{pmatrix},
+\end{aligned}
+$$
+
+где $\rho$ — коэффициент корреляции между $X_1$ и $X_2$. Матрица симметрична, потому что $\operatorname{Cov}(X_1, X_2) = \operatorname{Cov}(X_2, X_1)$. Кроме того, она положительно полуопределённая (positive semidefinite): для любого фиксированного вектора $\mathbf a$ дисперсия $\operatorname{Var}(\mathbf a^{\top}X) = \mathbf a^{\top}\boldsymbol\Sigma\,\mathbf a$ не может быть отрицательной. Все дисперсии и ковариации вектора умещаются в три свободных числа.
+
+Пример, который проходит через всю заметку, — гауссиана с центром в начале координат и
+
+$$
+\boldsymbol{\mu} = \begin{pmatrix} 0 \\ 0 \end{pmatrix}, \qquad
+\boldsymbol{\Sigma} = \begin{pmatrix} 1 & 0.5 \\ 0.5 & 1 \end{pmatrix}:
+$$
+
+единичные дисперсии и корреляция $\rho = 0.5$, поэтому облако точек вытянуто вдоль диагонали $x_1 = x_2$.
+
+### Почему нужна полная матрица, а не две дисперсии? \{#why-a-full-matrix-and-not-just-two-variances\}
+
+Две дисперсии говорят, насколько облако разбросано вдоль каждой координатной оси. Этого достаточно, только когда координаты некоррелированы, и тогда облако вытянуто вдоль осей. Внедиагональный элемент хранит то, чего дисперсии передать не могут: как координаты меняются **совместно**. Именно он наклоняет облако.
+
+На рисунке 1 правое облако — это левое, повёрнутое на 45°. У двух облаков одинаковые собственные значения (1.5 и 0.5), но обе дисперсии правого облака вдоль осей равны 1. Ровно такие же дисперсии вдоль осей у круглого облака $\mathcal N(\mathbf 0, \mathbf I)$, так что по одним двум дисперсиям наклонённое облако нельзя отличить от круга. Наклон фиксирует только $\operatorname{Cov}(X_1, X_2) = 0.5$.
+
+<CovarianceClouds />
+
+## Двумерная плотность \{#the-bivariate-density\}
+
+Когда $\boldsymbol\Sigma$ обратима (положительно определена, а не только полуопределена), совместная плотность на всей плоскости $\mathbb R^2$ равна
+
+$$
+\begin{aligned}
+p(\mathbf x) &= \frac{1}{2\pi\sqrt{|\boldsymbol\Sigma|}} \\[4pt]
+&\times \exp\!\left(-\tfrac12\, (\mathbf{x}-\boldsymbol\mu)^{\top}\,\boldsymbol\Sigma^{-1}\,(\mathbf{x}-\boldsymbol\mu)\right),
+\end{aligned}
+$$
+
+где $\mathbf x = (x_1, x_2)^{\top}$, $\boldsymbol\Sigma^{-1}$ — обратная матрица, а $|\boldsymbol\Sigma|$ — определитель ковариационной матрицы. Размеры сомножителей в квадратичной форме таковы:
+
+$$
+\underbrace{(\mathbf{x}-\boldsymbol\mu)^{\top}}_{1\times 2}\;
+\underbrace{\boldsymbol\Sigma^{-1}}_{2\times 2}\;
+\underbrace{(\mathbf{x}-\boldsymbol\mu)}_{2\times 1},
+$$
+
+поэтому показатель экспоненты — скаляр. В $d$ измерениях нормирующая константа становится равной $(2\pi)^{-d/2}|\boldsymbol\Sigma|^{-1/2}$, и при $d = 2$ получается выражение выше ([Bishop, 2006](#references), §2.3).
+
+Линии уровня плотности, на которых квадрат **расстояния Махаланобиса** (Mahalanobis distance) $(\mathbf{x}-\boldsymbol\mu)^{\top}\boldsymbol\Sigma^{-1}(\mathbf{x}-\boldsymbol\mu)$ равен $k^2$, — эллипсы ([Murphy, 2022](#references), §3.2). Рисунки 1 и 3 показывают их как линии уровня $1\sigma$ ($k = 1$) и $2\sigma$ ($k = 2$). Вероятность попасть внутрь такого эллипса следует из преобразования, описанного ниже в [разделе о сэмплировании](#sampling-from-standard-noise-to-any-gaussian). Запишем $X = \boldsymbol\mu + \boldsymbol\Sigma^{1/2} Z$, где $Z \sim \mathcal N(\mathbf 0, \mathbf I)$. Поскольку $\boldsymbol\Sigma^{1/2}$ симметрична и $\boldsymbol\Sigma^{1/2}\boldsymbol\Sigma^{-1}\boldsymbol\Sigma^{1/2} = \mathbf I$, квадрат расстояния превращается в $Z^{\top}Z = Z_1^2 + Z_2^2$ — квадрат длины стандартного шума. Стандартная плотность $\frac{1}{2\pi}e^{-r^2/2}$ зависит только от радиуса $r$, поэтому в полярных координатах
+
+$$
+\begin{aligned}
+\Pr\bigl(Z_1^2 + Z_2^2 \le k^2\bigr) &= \int_0^{k} r\,e^{-r^2/2}\,dr \\[4pt]
+&= 1 - e^{-k^2/2}.
+\end{aligned}
+$$
+
+Это функция распределения $\chi^2$ с двумя степенями свободы в точке $k^2$. Значит, эллипс $1\sigma$ содержит $1 - e^{-1/2} \approx 39\%$ вероятности, а эллипс $2\sigma$ — $1 - e^{-2} \approx 86\%$, а не 68% и 95%, как одномерные интервалы.
+
+Для сквозного примера
+
+$$
+\begin{aligned}
+|\boldsymbol\Sigma| &= 1 - 0.5^2 = 0.75, \\[4pt]
+\boldsymbol\Sigma^{-1} &= \frac{1}{0.75}\begin{pmatrix} 1 & -0.5 \\ -0.5 & 1 \end{pmatrix} \\[4pt]
+&= \begin{pmatrix} 4/3 & -2/3 \\ -2/3 & 4/3 \end{pmatrix},
+\end{aligned}
+$$
+
+а максимальное значение плотности равно $p(\boldsymbol\mu) = 1/(2\pi\sqrt{0.75}) \approx 0.184$.
+
+## Сэмплирование: от стандартного шума к любой гауссиане \{#sampling-from-standard-noise-to-any-gaussian\}
+
+В одномерном случае стандартизация и обратное к ней преобразование имеют вид
+
+$$
+\begin{aligned}
+Z &= \frac{X - \mu}{\sigma} \sim \mathcal N(0, 1) \quad \text{для } X \sim \mathcal N(\mu, \sigma^2),\\[4pt]
+X &= \mu + \sigma Z \sim \mathcal N(\mu, \sigma^2) \quad \text{для } Z \sim \mathcal N(0, 1).
+\end{aligned}
+$$
+
+Поэтому, чтобы сэмплировать любое нормальное распределение, достаточно сэмплировать стандартное, растянуть результат в $\sigma$ раз и сдвинуть на $\mu.$
+
+<Standardization1D />
+
+В двумерном случае нужна матрица, которая играет роль $\sigma$.
+
+**Спектральное разложение.** По спектральной теореме любую вещественную симметричную матрицу, в частности любую ковариационную матрицу, можно записать как
+
+$$
+\boldsymbol\Sigma = \mathbf U\,\boldsymbol\Lambda\,\mathbf U^{\top},
+$$
+
+где $\boldsymbol\Lambda$ — диагональная матрица из собственных значений $\boldsymbol\Sigma$, а столбцы ортогональной матрицы $\mathbf U$ — соответствующие нормированные собственные векторы. Собственные значения неотрицательны, потому что $\boldsymbol\Sigma$ положительно полуопределена, и можно определить квадратный корень из матрицы
+
+$$
+\boldsymbol\Sigma^{1/2} = \mathbf U\,\boldsymbol\Lambda^{1/2}\,\mathbf U^{\top},
+$$
+
+где $\boldsymbol\Lambda^{1/2}$ содержит квадратные корни из собственных значений. Корень сам симметричен, потому что $(\mathbf U\boldsymbol\Lambda^{1/2}\mathbf U^{\top})^{\top} = \mathbf U\boldsymbol\Lambda^{1/2}\mathbf U^{\top}$. Так как $\mathbf U^{\top}\mathbf U = \mathbf I$, получаем $\boldsymbol\Sigma^{1/2}\boldsymbol\Sigma^{1/2} = \mathbf U\boldsymbol\Lambda\mathbf U^{\top} = \boldsymbol\Sigma$.
+
+**Преобразование.** Если $Z \sim \mathcal N(\mathbf 0, \mathbf I)$, то
+
+$$
+X = \boldsymbol\mu + \boldsymbol\Sigma^{1/2} Z \sim \mathcal N(\boldsymbol\mu, \boldsymbol\Sigma).
+$$
+
+В общем случае подходит любая квадратная матрица $\mathbf A$ с $\mathbf A\mathbf A^{\top} = \boldsymbol\Sigma$; $\boldsymbol\Sigma^{1/2}$ — одна из них, потому что она симметрична и в квадрате даёт $\boldsymbol\Sigma$. Для положительно определённой $\boldsymbol\Sigma$ такая $\mathbf A$ обратима, поскольку $(\det\mathbf A)^2 = |\boldsymbol\Sigma| > 0$, и формула замены переменных (change of variables) даёт плотность $X = \boldsymbol\mu + \mathbf A Z$ ([Murphy, 2022](#references), §2.8). Подставим $\mathbf z = \mathbf A^{-1}(\mathbf x - \boldsymbol\mu)$ в стандартную плотность $\frac{1}{2\pi}e^{-\mathbf z^{\top}\mathbf z/2}$ и разделим на $|\det\mathbf A| = |\boldsymbol\Sigma|^{1/2}$:
+
+$$
+\begin{aligned}
+p(\mathbf x) &= \frac{1}{2\pi\,|\det\mathbf A|}\exp\!\left(-\tfrac12\,\mathbf z^{\top}\mathbf z\right) \\[4pt]
+&= \frac{1}{2\pi\sqrt{|\boldsymbol\Sigma|}} \\[4pt]
+&\times \exp\!\left(-\tfrac12\, (\mathbf{x}-\boldsymbol\mu)^{\top}\,\boldsymbol\Sigma^{-1}\,(\mathbf{x}-\boldsymbol\mu)\right),
+\end{aligned}
+$$
+
+потому что $\mathbf z^{\top}\mathbf z = (\mathbf x-\boldsymbol\mu)^{\top}(\mathbf A^{-1})^{\top}\mathbf A^{-1}(\mathbf x-\boldsymbol\mu)$ и $(\mathbf A^{-1})^{\top}\mathbf A^{-1} = (\mathbf A\mathbf A^{\top})^{-1} = \boldsymbol\Sigma^{-1}$. Это плотность $\mathcal N(\boldsymbol\mu, \boldsymbol\Sigma)$ из предыдущего раздела. (Для вырожденной $\boldsymbol\Sigma$ то же преобразование задаёт вырожденную гауссиану, сосредоточенную на прямой; плотности на плоскости у неё нет.) Первые два момента дают быструю проверку. Среднее равно $\boldsymbol\mu + \mathbf A\,\mathbb E[Z] = \boldsymbol\mu$, а ковариация —
+
+$$
+\begin{aligned}
+\operatorname{Cov}(\boldsymbol\mu + \mathbf A Z) &= \mathbf A\,\operatorname{Cov}(Z)\,\mathbf A^{\top} \\
+&= \mathbf A\,\mathbf I\,\mathbf A^{\top} = \boldsymbol\Sigma .
+\end{aligned}
+$$
+
+Симметричный корень $\boldsymbol\Sigma^{1/2}$ — лишь один из вариантов. Для положительно определённой $\boldsymbol\Sigma$ существует ровно одна нижнетреугольная матрица $\mathbf L$ с положительной диагональю и $\mathbf L\mathbf L^{\top} = \boldsymbol\Sigma$ — **множитель Холецкого** (Cholesky factor) ([Golub and Van Loan, 2013](#references), §4.2). В коде обычно выбирают именно его: конечный алгоритм вычисляет его примерно за $d^3/3$ операций с плавающей точкой для матрицы $d \times d$, тогда как спектральному разложению нужен итерационный метод. В отличие от симметричного корня, он требует положительной определённости: `torch.linalg.cholesky` завершается ошибкой на вырожденной ковариации, а `MultivariateNormal` принимает только положительно определённую `covariance_matrix`. `MultivariateNormal` в PyTorch сэмплирует ровно так: хранит множитель Холецкого переданной ковариации и возвращает $\boldsymbol\mu + \mathbf L Z$, где $Z \sim \mathcal N(\mathbf 0, \mathbf I)$ ([документация и исходный код PyTorch](#references)). Та же схема — на входе шум, на выходе детерминированное преобразование — лежит в основе [трюка репараметризации](/ru/notes/generative-models/vae#the-reparameterization-trick) (reparameterization trick) в VAE и [формулы зашумления за один шаг](/ru/notes/generative-models/ddpm-forward-process#the-objective-and-the-rescaled-step) в DDPM.
+
+<SamplingPipeline />
+
+### Разобранный пример \{#worked-example\}
+
+Для $\boldsymbol\Sigma = \begin{pmatrix} 1 & 0.5 \\ 0.5 & 1\end{pmatrix}$ характеристическое уравнение имеет вид $(1 - \lambda)^2 = 0.25$, поэтому собственные значения равны $\lambda_1 = 1.5$ и $\lambda_2 = 0.5$. Собственные векторы — $\tfrac{1}{\sqrt2}(1, 1)^{\top}$ и $\tfrac{1}{\sqrt2}(1, -1)^{\top}$. Дисперсия максимальна вдоль диагонали $x_1 = x_2$: полуоси эллипса $1\sigma$ равны $\sqrt{1.5} \approx 1.225$ вдоль неё и $\sqrt{0.5} \approx 0.707$ поперёк. Два допустимых квадратных корня:
+
+$$
+\begin{aligned}
+\boldsymbol\Sigma^{1/2} &= \frac12\begin{pmatrix} \sqrt{1.5}+\sqrt{0.5} & \sqrt{1.5}-\sqrt{0.5} \\ \sqrt{1.5}-\sqrt{0.5} & \sqrt{1.5}+\sqrt{0.5} \end{pmatrix} \\[4pt]
+&\approx \begin{pmatrix} 0.966 & 0.259 \\ 0.259 & 0.966 \end{pmatrix},
+\end{aligned}
+$$
+
+$$
+\mathbf L = \begin{pmatrix} 1 & 0 \\ 0.5 & \sqrt{0.75} \end{pmatrix} \approx \begin{pmatrix} 1 & 0 \\ 0.5 & 0.866 \end{pmatrix}.
+$$
+
+Проверка: $0.966^2 + 0.259^2 \approx 1$ и $2 \cdot 0.966 \cdot 0.259 \approx 0.5$. Для множителя Холецкого $\mathbf L\mathbf L^{\top} = \begin{pmatrix} 1 & 0.5 \\ 0.5 & 0.25 + 0.75 \end{pmatrix} = \boldsymbol\Sigma$. Обе матрицы превращают независимый стандартный шум в сэмплы одного и того же коррелированного облака.
+
+## Гауссианы в PyTorch \{#gaussians-in-pytorch\}
+
+`torch.distributions` содержит параметризуемые распределения с методами для вычисления (логарифма) плотности и для сэмплирования. Двумерная гауссиана — это `MultivariateNormal`. Экспериментам по подгонке в заметке [Подгонка распределений с помощью KL](/ru/notes/generative-models/fitting-distributions-with-kl) нужна гауссиана, параметры которой оптимизатор может менять свободно. Мешает ковариация: произвольная матрица $2\times 2$, вообще говоря, не является допустимой ковариационной матрицей.
+
+Выход — обучать не $\boldsymbol\Sigma$, а множитель Холецкого. При
+
+$$
+\begin{gathered}
+\mathbf L = \begin{pmatrix} e^{a} & 0 \\ b & e^{c} \end{pmatrix}, \\[4pt]
+\mathbf L\mathbf L^{\top} = \begin{pmatrix} e^{2a} & b\,e^{a} \\ b\,e^{a} & b^2 + e^{2c} \end{pmatrix},
+\end{gathered}
+$$
+
+три исходных числа $a, b, c$ могут принимать любые вещественные значения. Диагональ $\mathbf L$ хранится через логарифм, поэтому остаётся положительной, и треугольная матрица $\mathbf L$ обратима. Тогда $\mathbf L\mathbf L^{\top}$ симметрична и положительно определена: для $\mathbf v \ne \mathbf 0$ имеем $\mathbf v^{\top}\mathbf L\mathbf L^{\top}\mathbf v = \|\mathbf L^{\top}\mathbf v\|^2 > 0$, поскольку $\mathbf L^{\top}$ обратима. Сквозной пример получается при $a = 0$, $b = 0.5$ и $c = \ln\sqrt{0.75} \approx -0.144$; инициализация $a = b = c = 0$ даёт $\boldsymbol\Sigma = \mathbf I$.
+
+Обучаемые параметры создаются с `requires_grad=True`: это говорит механизму автоматического дифференцирования PyTorch (autograd) записывать операции над ними и вычислять их градиенты. У модельного распределения $Q$ обучаются среднее и исходные элементы $\mathbf L$. Целевое распределение $P$ создаётся с `requires_grad=False`, потому что оно фиксировано. Рисунок 4 показывает начальную точку первого эксперимента по подгонке; каждое облако окрашено по своей собственной плотности.
+
+<NotebookScatter />
+
+Минимальный пример обоих способов сэмплировать из распределения сквозного примера:
+
+```python
+import torch
+from torch import distributions as distrs
+
+mu = torch.zeros(2)
+cov = torch.tensor([[1.0, 0.5], [0.5, 1.0]])
+target = distrs.MultivariateNormal(
+    mu, covariance_matrix=cov)
+
+# 1000 сэмплов, форма (1000, 2)
+x = target.sample(torch.Size([1000]))
+# L = [[1, 0], [0.5, 0.866]]
+L = torch.linalg.cholesky(cov)
+# то же распределение вручную
+x_manual = mu + torch.randn(1000, 2) @ L.T
+```
+
+Каждая строка `torch.randn(1000, 2)` — один сэмпл $\mathbf z^{\top}$, поэтому `@ L.T` построчно вычисляет $(\mathbf L\mathbf z)^{\top}$.
+
+## Ноутбук \{#notebook\}
+
+Практическая часть заметки следует ноутбуку [Distances between distributions](https://github.com/HSE-LAMBDA/DeepGenerativeModels/blob/42dd64b535f5bedf1d2b3db28f2f21ce96c9f09f/seminars/01_metrics-and-distances/distances.ipynb) из репозитория курса HSE-LAMBDA *Deep Generative Models*. Ссылка закреплена на конкретном коммите; ячейки нумеруются с 1, считая все ячейки подряд.
+
+- **Ячейка 2** готовит окружение: импортирует Matplotlib со стилем `fivethirtyeight`, NumPy, PyTorch с `torch.distributions` под именем `distrs` и `clear_output` из IPython, с помощью которой циклы обучения потом перерисовывают графики.
+- **Ячейка 4** определяет `plot_2d_dots` — диаграмму рассеяния массива $N \times 2$ в пределах $(-10, 10)$ по умолчанию для обеих осей (аргументы `xlim` и `ylim`), по одной маленькой точке на сэмпл; точки можно окрасить по необязательному массиву значений через цветовую карту `cmap` (по умолчанию `viridis`).
+- **Ячейка 5** определяет три вспомогательные функции для описанной выше параметризации. `get_parameters(mu, sigma, requires_grad)` создаёт среднее $(\mu, \mu)$ и исходные элементы $a = c = \ln\sigma$, $b = 0$. `create_distr` собирает $\mathbf L$ и возвращает `MultivariateNormal(mu, L @ L.T)`, передавая $\mathbf L\mathbf L^{\top}$ как `covariance_matrix`. `sample(distr, n)` возвращает тензор $n \times 2$. Поскольку $\mathbf L$ уже является корректным множителем Холецкого, `MultivariateNormal(mu, scale_tril=L)` задаёт то же распределение и обходится без повторного разложения, которое PyTorch выполняет для `L @ L.T`; по этой причине документация PyTorch рекомендует `scale_tril`.
+- **Ячейки 8–11** создают фиксированное целевое распределение $\mathcal N((-5,-5), \mathbf I)$ и обучаемую модель $Q$, инициализированную как $\mathcal N(\mathbf 0, \mathbf I)$, и рисуют оба облака, окрашенные по $p(\mathbf x)$ и $q(\mathbf x)$ (рисунок 4). Ячейки 8 и 11 берут по 1000 сэмплов из каждого распределения, а графики используют цветовые карты `viridis` и `plasma`; на рисунке 4 по 400 сэмплов на облако, а плотность передана насыщенностью цвета. Сама подгонка — тема заметки [Подгонка распределений с помощью KL](/ru/notes/generative-models/fitting-distributions-with-kl).
+
+## Дальше \{#next\}
+
+Когда есть целевое распределение и обучаемая модель, остаётся понять, что значит «подогнать»: нужно число, которое говорит, насколько $Q$ далеко от $P$. Первый кандидат — KL-дивергенция, и чтобы понять её, мы начнём с энтропии в заметке [Энтропия, кросс-энтропия и KL-дивергенция](/ru/notes/generative-models/entropy-and-divergences).
+
+## Литература \{#references\}
+
+- C. M. Bishop. [*Pattern Recognition and Machine Learning*](https://www.microsoft.com/en-us/research/publication/pattern-recognition-machine-learning/). Springer, 2006. §2.3: гауссовское распределение и его моменты.
+- K. P. Murphy. [*Probabilistic Machine Learning: An Introduction*](https://probml.github.io/pml-book/book1.html). MIT Press, 2022. §2.8: преобразования случайных величин, включая формулу замены переменных; §3.2: многомерное гауссовское распределение и расстояние Махаланобиса.
+- G. H. Golub, C. F. Van Loan. [*Matrix Computations*](https://doi.org/10.56021/9781421407944), 4th ed. Johns Hopkins University Press, 2013. §4.2: положительно определённые системы и разложение Холецкого.
+- Документация PyTorch: [`torch.distributions.MultivariateNormal`](https://docs.pytorch.org/docs/stable/distributions.html#multivariatenormal); исходный код метода сэмплирования — [`multivariate_normal.py`](https://github.com/pytorch/pytorch/blob/v2.5.0/torch/distributions/multivariate_normal.py) (PyTorch 2.5.0).
+- HSE-LAMBDA, репозиторий курса *Deep Generative Models*: [`distances.ipynb`](https://github.com/HSE-LAMBDA/DeepGenerativeModels/blob/42dd64b535f5bedf1d2b3db28f2f21ce96c9f09f/seminars/01_metrics-and-distances/distances.ipynb).
