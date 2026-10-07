@@ -1,13 +1,13 @@
 ---
 title: Telemetron
 label: Systems · Streaming · ML infrastructure
-description: Streaming telemetry for a fleet of AI agents. Every processed request is an event; a Flink job aggregates the events per agent type in event time. Built as the capstone project of a Big Data course.
+description: "Capstone for a Big Data course. A fleet of AI agents reports every processed request as an event. The question: how do you get per-minute latency and tool-call statistics for each agent type when events arrive late and out of order?"
 highlights:
-  - Event-driven pipeline with Kafka topics on both ends and a PyFlink DataStream job in between.
-  - Event-time windows with watermarks; the generator emits late and out-of-order events, up to 90 seconds late, and they still land in the correct minute.
-  - A PostgreSQL dimension loaded once into the operator for enrichment, with no lookup per event.
-  - Per-minute average latency and median tool calls for each agent type, monitored on a live dashboard.
-  - The whole stack starts from one docker-compose file and one script.
+  - Kafka topics on both ends, a PyFlink DataStream job in between.
+  - Event-time windows with watermarks. The generator sends events up to 90 seconds late and out of order, and they still land in the correct minute.
+  - Enrichment from a PostgreSQL dimension loaded into the operator once, instead of a lookup per event.
+  - Average latency and median tool calls per agent type per minute, on a live dashboard.
+  - One docker-compose file and one script start the whole stack.
 tags: [Kafka, Flink, PostgreSQL, Event time, Docker]
 year: 2026
 status: completed
@@ -17,12 +17,12 @@ order: 4
 ru:
   title: Telemetron
   label: Системы · Стриминг · ML-инфраструктура
-  description: Потоковая телеметрия для парка AI-агентов. Каждый обработанный запрос — событие; задача Flink агрегирует события по типам агентов во времени событий. Итоговый проект курса по Big Data.
+  description: "Итоговый проект курса по Big Data. Парк AI-агентов отправляет каждый обработанный запрос как событие. Вопрос: как получить поминутную задержку и статистику вызовов инструментов по каждому типу агента, если события приходят с опозданием и не по порядку?"
   highlights:
-    - Событийный конвейер — топики Kafka на входе и выходе и задача PyFlink DataStream между ними.
-    - Окна по времени событий с водяными знаками; генератор выдаёт опоздавшие и перемешанные события с задержкой до 90 секунд, и они всё равно попадают в свою минуту.
-    - Справочник PostgreSQL загружается в оператор один раз для обогащения, без запроса на каждое событие.
-    - Поминутная средняя задержка и медиана вызовов инструментов по каждому типу агента на живом дашборде.
+    - Топики Kafka на входе и выходе, задача PyFlink DataStream между ними.
+    - Окна по времени событий с водяными знаками. Генератор отправляет события с опозданием до 90 секунд и не по порядку, и они всё равно попадают в свою минуту.
+    - Обогащение из справочника PostgreSQL, загруженного в оператор один раз, вместо запроса на каждое событие.
+    - Средняя задержка и медиана вызовов инструментов по каждому типу агента за минуту на живом дашборде.
     - Весь стек поднимается из одного docker-compose и одного скрипта.
   tags: [Kafka, Flink, PostgreSQL, Event time, Docker]
 ---

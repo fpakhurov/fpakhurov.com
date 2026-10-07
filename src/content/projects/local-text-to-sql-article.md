@@ -1,7 +1,7 @@
 ---
 title: Generating SQL queries with local models
 label: Article · Habr
-description: Engineering write-up of the local Text-to-SQL work, covering model selection, execution-based evaluation on real questions, vLLM serving and FP8 quantization on a single A100. Co-authored, in Russian.
+description: "How we moved a Text-to-SQL assistant onto local models: choosing the models, scoring them by executing queries for real questions, and fitting everything on one A100 with vLLM and FP8 quantization. Co-authored, in Russian."
 pathLabel: Case study →
 tags: [Text-to-SQL, Local LLM, Quantization]
 year: 2026
@@ -14,7 +14,7 @@ order: 3
 ru:
   title: Генерируем SQL-запросы на локальных моделях
   label: Статья · Хабр
-  description: Инженерный разбор локального Text-to-SQL — выбор моделей, оценка по исполнению на реальных вопросах, инференс на vLLM и квантизация FP8 на одной A100. В соавторстве.
+  description: "Как мы перенесли ассистента Text-to-SQL на локальные модели: выбор моделей, оценка по исполнению запросов на реальных вопросах и запуск на одной A100 с vLLM и квантизацией FP8. В соавторстве."
   pathLabel: Кейс →
   tags: [Text-to-SQL, Локальные LLM, Квантизация]
 ---
