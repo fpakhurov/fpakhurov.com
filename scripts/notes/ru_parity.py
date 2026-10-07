@@ -14,7 +14,8 @@ def math(s):
     rest = re.sub(r'\$\$.*?\$\$', '', s, flags=re.S)
     return display + re.findall(r'(?<!\\)\$(.+?)(?<!\\)\$', rest)
 
-norm = lambda m: re.sub(r'\\(text|mathrm|operatorname)\{[^{}]*\}', r'\\\1{}', m).strip()
+# Words inside \text{} may be translated; Russian uses a thin space instead of {,} between thousands.
+norm = lambda m: re.sub(r'(?<=\d)(\{,\}|\\,)(?=\d)', ',', re.sub(r'\\(text|mathrm|operatorname)\{[^{}]*\}', r'\\\1{}', m)).strip()
 a, b = collections.Counter(map(norm, math(en))), collections.Counter(map(norm, math(ru)))
 print('math equal (ignoring words in \\text{}):', a == b)
 if a != b:
