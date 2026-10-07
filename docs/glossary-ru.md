@@ -322,6 +322,75 @@ How the course notes are translated into Russian. The Russian notes live in `src
 | push a grid backward through a flow | пропустить сетку через поток в обратном направлении (not «проталкивать назад») |
 | weight decay | затухание весов (weight decay) † |
 
+### Natural language processing
+
+| English | Russian |
+| --- | --- |
+| token, tokenization, tokenizer | токен, токенизация, токенизатор |
+| vocabulary, out-of-vocabulary (OOV) | словарь, слово вне словаря (OOV) |
+| subword | подслово (subword) † |
+| byte-pair encoding (BPE), merge | byte-pair encoding (BPE), слияние (merge) |
+| pre-tokenization | предварительная токенизация (pre-tokenization) † |
+| normalization (of text) | нормализация текста |
+| stemming, lemmatization, lemma | стемминг, лемматизация, лемма |
+| stop words | стоп-слова |
+| corpus, corpora | корпус, корпусы |
+| bag of words | мешок слов (bag of words) † |
+| term frequency, inverse document frequency | частота термина, обратная документная частота (TF-IDF) |
+| n-gram, bigram | n-грамма, биграмма |
+| language model | языковая модель |
+| perplexity | перплексия |
+| smoothing, add-k smoothing, backoff | сглаживание, сглаживание add-k, откат (backoff) † |
+| one-hot encoding | one-hot кодирование |
+| word embedding | векторное представление слова, эмбеддинг (word embedding) † |
+| distributional hypothesis | дистрибутивная гипотеза |
+| context window | контекстное окно |
+| skip-gram, CBOW | skip-gram, CBOW (continuous bag of words) |
+| negative sampling | негативное сэмплирование (negative sampling) † |
+| padding, padding token, mask | паддинг, токен заполнения (padding), маска |
+| sequence length, batch size | длина последовательности, размер батча |
+| recurrent neural network (RNN), hidden state | рекуррентная нейронная сеть (RNN), скрытое состояние |
+| cell state, gate | состояние ячейки (cell state), вентиль (gate) † |
+| sequence-to-sequence (seq2seq) | sequence-to-sequence (seq2seq) |
+| encoder, decoder, encoder–decoder | энкодер, декодер, энкодер–декодер |
+| context vector | вектор контекста |
+| teacher forcing | teacher forcing † |
+| attention, attention weights, attention score | внимание (attention), веса внимания, оценка внимания (attention score) † |
+| self-attention, cross-attention | self-attention, cross-attention (внимание к выходам энкодера) † |
+| query, key, value | запрос, ключ, значение (query, key, value) † |
+| scaled dot-product attention | внимание на основе масштабированного скалярного произведения (scaled dot-product attention) † |
+| multi-head attention, head | многоголовое внимание (multi-head attention), голова † |
+| causal mask | каузальная маска (causal mask) † |
+| positional encoding | позиционное кодирование (positional encoding) † |
+| residual connection, layer normalization | остаточная связь, нормализация слоя (layer normalization) |
+| feed-forward block | полносвязный блок (feed-forward) |
+| pretraining, fine-tuning | предобучение, дообучение (fine-tuning) † |
+| masked language modeling (MLM) | маскированное языковое моделирование (MLM) † |
+| next-token prediction, autoregressive | предсказание следующего токена, авторегрессионный |
+| greedy decoding, beam search | жадное декодирование, лучевой поиск (beam search) † |
+| temperature, top-k, top-p (nucleus) sampling | температура, top-k, top-p (nucleus) сэмплирование |
+| transfer learning | перенос обучения (transfer learning) † |
+| zero-shot, few-shot | zero-shot, few-shot |
+| linear probing | линейное зондирование (linear probing) † |
+| parameter-efficient fine-tuning (PEFT), adapter | параметрически эффективное дообучение (PEFT), адаптер |
+| low-rank adaptation (LoRA), rank | низкоранговая адаптация (LoRA), ранг |
+| prompt, prompt tuning | промпт, настройка промпта (prompt tuning) † |
+| instruction tuning, alignment | обучение на инструкциях (instruction tuning), выравнивание (alignment) † |
+| reward model, RLHF, DPO | модель вознаграждения, RLHF, DPO |
+| quantization, calibration | квантизация, калибровка |
+| knowledge distillation | дистилляция знаний |
+| named entity recognition (NER) | распознавание именованных сущностей (NER) |
+| question answering (QA), extractive / abstractive | ответы на вопросы (QA), экстрактивный / абстрактивный |
+| summarization | суммаризация |
+| BLEU, ROUGE, exact match, F1 | BLEU, ROUGE, точное совпадение (exact match), F1 |
+| semantic search, dense retrieval, reranker | семантический поиск, плотный поиск (dense retrieval), реранкер † |
+| retrieval-augmented generation (RAG), chunk | генерация с извлечением (RAG), фрагмент (chunk) † |
+| vector store, index | векторное хранилище, индекс |
+| tool use, function calling, agent | использование инструментов, вызов функций (function calling), агент |
+| LLM-as-a-judge | LLM в роли судьи (LLM-as-a-judge) † |
+| hallucination | галлюцинация |
+| text diffusion, masked diffusion | текстовая диффузия, маскированная диффузия |
+
 ### Evaluation
 
 | English | Russian |
