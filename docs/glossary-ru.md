@@ -24,7 +24,7 @@ How the course notes are translated into Russian. The Russian notes live in `src
 
 - Neutral scientific register, first person plural («мы получаем», «рассмотрим»), as in the English notes. No «вы».
 - Russian typography: «ёлочки» for quotes, an em dash with spaces — between clauses, the letter «ё» where it is pronounced.
-- Decimal numbers keep the decimal point (0.5, 1.225), so that prose, formulas, figures and code use one notation. Percentages: «39 %» is not needed, write «39%».
+- Decimal numbers keep the decimal point (0.5, 1.225), so that prose, formulas, figures and code use one notation. Thousands are separated by a thin space, never a comma: `$50\,000$` in math (the English `$50{,}000$` would read as a decimal comma), «50 000» with a no-break space in prose; four-digit numbers stay unseparated (4096). Percentages: «39 %» is not needed, write «39%».
 - Keep sentences short and declarative, like the original. Do not add or drop content; if the English is ambiguous, translate the meaning that the mathematics supports.
 - **English terms in parentheses.** On the first use of a key term in each note, give the English term in parentheses: «нормализующий поток (normalizing flow)». Do this for every term in the glossary marked †, for any term whose Russian translation is not established or varies between textbooks, and whenever the English name is what a reader will search for. Later uses in the same note are Russian only.
 
@@ -356,7 +356,7 @@ How the course notes are translated into Russian. The Russian notes live in `src
 | context vector | вектор контекста |
 | teacher forcing | teacher forcing † |
 | attention, attention weights, attention score | внимание (attention), веса внимания, оценка внимания (attention score) † |
-| self-attention, cross-attention | self-attention, cross-attention (внимание к выходам энкодера) † |
+| self-attention, cross-attention | self-attention (внимание последовательности к самой себе; masculine agreement: «слой self-attention»), cross-attention (внимание к выходам энкодера) † |
 | query, key, value | запрос, ключ, значение (query, key, value) † |
 | scaled dot-product attention | внимание на основе масштабированного скалярного произведения (scaled dot-product attention) † |
 | multi-head attention, head | многоголовое внимание (multi-head attention), голова † |
@@ -390,6 +390,46 @@ How the course notes are translated into Russian. The Russian notes live in `src
 | LLM-as-a-judge | LLM в роли судьи (LLM-as-a-judge) † |
 | hallucination | галлюцинация |
 | text diffusion, masked diffusion | текстовая диффузия, маскированная диффузия |
+| centre word / context word | центральное слово / контекстное слово |
+| input / output vector (word2vec) | входной / выходной вектор |
+| score (dot product, logit) | оценка (score) †; «в оптимуме оценка равна…» where it could read as an estimate |
+| negative samples, noise distribution, noise words | негативные примеры (negative samples) †, шумовое распределение, шумовые слова |
+| unigram distribution | униграммное распределение (unigram distribution) † |
+| subsampling of frequent words | прореживание частых слов (subsampling) † |
+| hierarchical softmax | иерархический softmax (hierarchical softmax) † |
+| noise-contrastive estimation (NCE) | шумоконтрастное оценивание (noise-contrastive estimation, NCE) † |
+| pointwise mutual information (PMI), shifted / smoothed PMI | поточечная взаимная информация (PMI) †, сдвинутая / сглаженная PMI |
+| context distribution smoothing | сглаживание распределения контекстов (context distribution smoothing) † |
+| skip-gram negative sampling (SGNS) | skip-gram с негативным сэмплированием (SGNS) † |
+| self-supervised learning | обучение с самоконтролем (self-supervision) †; not «самообучение» |
+| counts / frequency | число вхождений / частота |
+| word type / running words | тип слова (word type) † / словоупотребления |
+| held-out text | отложенный текст (held-out) † |
+| greedy longest match | жадный поиск самого длинного совпадения (greedy longest match) † |
+| merge rule, end-of-word marker | правило слияния, маркер конца слова |
+| ties, tie-break rule | равенство счётчиков, правило разрешения равенств |
+| byte-level BPE | байтовый BPE (byte-level BPE) † |
+| unigram language model (tokenizer), lattice, Viterbi algorithm | униграммная языковая модель (unigram language model) †, решётка (lattice) †, алгоритм Витерби |
+| subword regularization | регуляризация подслов (subword regularization) † |
+| WordPiece score | критерий слияния WordPiece; not «оценка» |
+| trainer (tokenizers library) | процедура обучения; not «тренер» |
+| re-estimate (EM) | повторно оценивать; not «переоценивать» |
+| unseen word | слово, не встречавшееся при обучении, новое слово; not «невиданное» |
+| weight tying, weight sharing | связывание весов (weight tying) †, разделение весов (weight sharing) † |
+| cased / uncased tokenizer | токенизатор с учётом регистра (cased) / без учёта регистра (uncased) |
+| detokenization, special tokens | детокенизация, специальные токены |
+| soft dictionary lookup | мягкий поиск по словарю (the data structure, not the vocabulary) |
+| contextual / static embedding | контекстный / статический эмбеддинг |
+| padding mask, pad key / pad query | маска паддинга (padding mask) †, ключ-паддинг / запрос-паддинг |
+| permutation-equivariant | эквивариантный относительно перестановок (permutation-equivariant) † |
+| rotary position embedding | ротационные позиционные эмбеддинги (rotary, RoPE) † |
+| Winograd schema, coreference | схема Винограда (Winograd schema) †, кореференция |
+| attention pattern / attention map | шаблон внимания / карта внимания |
+| GPU kernel (FlashAttention) | GPU-ядро (kernel) †; not bare «ядро» |
+| position-wise feed-forward network | полносвязная сеть, применяемая к каждой позиции отдельно (position-wise feed-forward) † |
+| Cauchy–Schwarz inequality | неравенство Коши–Буняковского |
+| random seed | начальное значение генератора (seed) |
+| stacked (tensors) | собранные (stack) в тензор; not «сложенные», which reads as summed |
 
 ### Evaluation
 
