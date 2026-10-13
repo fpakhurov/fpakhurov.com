@@ -27,6 +27,7 @@ const background: Record<string, PrerequisiteTarget> = {
   'Determinants': { href: MML },
   'Теория вероятностей': { href: MML },
   'Математическое ожидание': { href: MML },
+  'Условная вероятность': { href: MML },
   'Линейная алгебра': { href: MML },
   'Математический анализ': { href: MML },
   'Определители': { href: MML },
