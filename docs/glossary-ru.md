@@ -394,6 +394,7 @@ How the course notes are translated into Russian. The Russian notes live in `src
 | retrieval-augmented generation (RAG), chunk | генерация с извлечением (RAG), фрагмент (chunk) † |
 | vector store, index | векторное хранилище, индекс |
 | tool use, function calling, agent | использование инструментов, вызов функций (function calling), агент |
+| runtime, sandbox, trace / trajectory | среда выполнения (runtime) †, песочница (sandbox) †, трасса (trace) †, траектория |
 | LLM-as-a-judge | LLM в роли судьи (LLM-as-a-judge) † |
 | hallucination | галлюцинация |
 | text diffusion, masked diffusion | текстовая диффузия, маскированная диффузия |
