@@ -350,7 +350,7 @@ How the course notes are translated into Russian. The Russian notes live in `src
 | padding, padding token, mask | паддинг, токен заполнения (padding), маска |
 | sequence length, batch size | длина последовательности, размер батча |
 | recurrent neural network (RNN), hidden state | рекуррентная нейронная сеть (RNN), скрытое состояние |
-| cell state, gate | состояние ячейки (cell state), вентиль (gate) † |
+| cell state, gate; input / output / reset gate | состояние ячейки (cell state), гейт (gate) †; входной / выходной гейт, гейт сброса (reset gate) † |
 | sequence-to-sequence (seq2seq) | sequence-to-sequence (seq2seq) |
 | encoder, decoder, encoder–decoder | энкодер, декодер, энкодер–декодер |
 | context vector | вектор контекста |
