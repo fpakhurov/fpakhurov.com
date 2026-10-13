@@ -51,6 +51,8 @@ export const courses: Record<CourseKey, Course> = {
       progression: ['Текст', 'Представления', 'Последовательности', 'Трансформеры', 'Предобучение', 'Адаптация', 'Задачи', 'LLM-системы'],
       labels: {
         'Text Foundations': 'Основы работы с текстом',
+        'What natural language processing is': 'Что такое обработка естественного языка',
+        'Why language is hard for a computer': 'Почему язык труден для компьютера',
         'Classical NLP': 'Классический NLP',
         'Distributed Representations': 'Распределённые представления',
         'Neural Sequence Models': 'Нейросетевые модели последовательностей',
@@ -124,6 +126,8 @@ export const courses: Record<CourseKey, Course> = {
     },
     sections: [
       { title: 'Text Foundations', summary: 'How text becomes model input, and how a result is measured.', topics: [
+        noteTopic('What natural language processing is', 'nlp/natural-language-processing'),
+        noteTopic('Why language is hard for a computer', 'nlp/natural-language-processing', 'why-language-is-hard-for-a-computer'),
         noteTopic('Text as data', 'nlp/text-as-data'),
         noteTopic('Tokenization', 'nlp/tokenization'),
         noteTopic('Byte-pair encoding', 'nlp/tokenization', 'byte-pair-encoding'),
