@@ -210,6 +210,8 @@ export const courses: Record<CourseKey, Course> = {
       progression: ['Вероятность', 'Дивергенции', 'Автоэнкодеры', 'VAE', 'GAN', 'Оценка', 'Потоки', 'Диффузия'],
       labels: {
         'Foundations': 'Основы',
+        'What generative modeling is': 'Что такое генеративное моделирование',
+        'Sampling from simple noise': 'Сэмплирование из простого шума',
         'Multivariate Gaussian distributions': 'Многомерные гауссовские распределения',
         'Entropy, cross-entropy and KL divergence': 'Энтропия, кросс-энтропия и KL-дивергенция',
         'Fitting distributions with KL': 'Подгонка распределений с помощью KL',
@@ -249,6 +251,8 @@ export const courses: Record<CourseKey, Course> = {
     },
     sections: [
       { title: 'Foundations', topics: [
+        noteTopic('What generative modeling is', 'generative-models/generative-modeling'),
+        noteTopic('Sampling from simple noise', 'generative-models/generative-modeling', 'how-a-computer-samples-at-all'),
         noteTopic('Multivariate Gaussian distributions', 'generative-models/gaussian-distributions'),
         noteTopic('Entropy, cross-entropy and KL divergence', 'generative-models/entropy-and-divergences'),
         noteTopic('Fitting distributions with KL', 'generative-models/fitting-distributions-with-kl'),
