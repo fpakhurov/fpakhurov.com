@@ -5,7 +5,7 @@ import { z } from 'astro/zod';
 const noteSchema = z.object({
     title: z.string(),
     description: z.string(),
-    course: z.enum(['nlp', 'generative-models']),
+    course: z.enum(['probability', 'ml', 'generative-models', 'nlp']),
     section: z.string(),
     order: z.number(),
     status: z.enum(['draft', 'published', 'needs-review']),

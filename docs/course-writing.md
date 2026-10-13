@@ -16,6 +16,7 @@ How the Generative Models notes were written and reviewed, as a guide for the ne
 
 ## 3. Storyline
 
+- The courses form a graph: each course in `src/utils/courses.ts` lists the courses to take first in `requires`, and `/notes` draws the graph from it (Probability Theory → Machine Learning → NLP; Probability Theory and Machine Learning → Generative Models). The design of the two newer courses is in `docs/course-design-probability-ml.md`.
 - The course is one story. The order lives in two places that must agree: the `order` field of each note and the section map in `src/utils/courses.ts`. The build checks that every published note is listed, that every listed note exists, that a note's `section` matches the section it is listed under (anchored cross-references are exempt), and that every anchor named in the map exists on the built page.
   - Generative Models: Gaussians → entropy and KL → fitting with KL → training background → autoencoders → VAE → GAN → WGAN → IS → FID → LPIPS → flows → flow architectures → DDPM forward → DDPM objective.
   - NLP: text as data → tokenization → corpora and evaluation → bag of words and TF-IDF → n-gram LMs → word embeddings → Word2Vec → CNNs → RNNs → LSTM/GRU → seq2seq → attention → self-attention → Transformer → positions → Transformer MT → BERT → GPT → model families → transfer learning → fine-tuning → PEFT → instruction tuning → quantization → classification → NER → QA → summarization → semantic search → RAG → tools and agents → LLM evaluation → text diffusion. Planned topics (GloVe, FastText, sentence-pair similarity) stay as plain strings in the map until they have source material.
@@ -27,7 +28,7 @@ How the Generative Models notes were written and reviewed, as a guide for the ne
 
 ## 4. Structure of a note
 
-1. Frontmatter: `title`, `description` (one sentence, what the note covers), `course`, `section` (must match a section in `courses.ts`), `order`, `status`, `tags`, `prerequisites`.
+1. Frontmatter: `title`, `description` (one sentence, what the note covers), `course`, `section` (must match a section in `courses.ts`), `order`, `status`, `tags`, `prerequisites`. Every prerequisite becomes a link: the title of a note of the same course links to that note; anything else (a background topic, a note of another course) needs an entry in `src/utils/prerequisites.ts`, or the build fails. Quote a prerequisite that contains a comma (`"Encoder, decoder and encoder–decoder models"`), or YAML splits it in two.
 2. Opening paragraph that connects to the previous note.
 3. **Notation** paragraph when the note introduces symbols.
 4. Body sections, each built around one question. Prefer "Why not just …?" or "Where the bound comes from" over generic headings.
@@ -53,7 +54,7 @@ How the Generative Models notes were written and reviewed, as a guide for the ne
 
 ## 7. Notebooks
 
-- Link Generative Models notebooks at a pinned commit, never at a branch: `https://github.com/HSE-LAMBDA/DeepGenerativeModels/blob/<sha>/seminars/...`. Link NLP notebooks at the maintained branch of the public copy, `https://github.com/xufana/dsba_nlp/blob/autumn-2025/seminars/...`, which holds the notebooks with pinned environments; the original course repository (`glkuzi/nlp_dsba`) is private, so do not link it. State the convention once per Notebook section: cell numbers count every cell, markdown included, from 1, and quoted numbers come from the run saved with the course (cells changed since then have no saved output). When a notebook on the branch changes, recheck the cell numbers the notes cite and the descriptions of the cells that changed.
+- Link notebooks at the maintained branch of their repository, so readers land on the version that runs today. Generative Models: the default branch of HSE-LAMBDA, `https://github.com/HSE-LAMBDA/DeepGenerativeModels/blob/spring-2025-long/seminars/...` (the newer `spring-2026-long` has only the first seminars so far). NLP: the public copy, `https://github.com/xufana/dsba_nlp/blob/autumn-2025/seminars/...`, which holds the notebooks with pinned environments; the original course repository (`glkuzi/nlp_dsba`) is private, so do not link it. State the convention once per Notebook section: cell numbers count every cell, markdown included, from 1, and quoted numbers come from the run saved with the course (cells changed since then have no saved output). When a notebook on the branch changes, recheck the cell numbers the notes cite and the descriptions of the cells that changed.
 - Describe what the cells do and which choices they make (datasets, hyperparameters, loss reductions, sampling details), in the note's notation.
 - Separate procedure from results. Quote numbers only from saved outputs and say so; if a notebook has no saved outputs, say that it documents procedures.
 - Report implementation issues plainly and briefly (a reused tensor, a missing `eval()`, a mislabelled plot). They are useful to readers who run the notebook.
