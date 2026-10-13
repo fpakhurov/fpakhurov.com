@@ -13,6 +13,7 @@ export type PrerequisiteTarget = { note: string; anchor?: string } | { href: str
 const MML = 'https://mml-book.github.io/';
 const D2L_MLP = 'https://d2l.ai/chapter_multilayer-perceptrons/index.html';
 const D2L_BACKPROP = 'https://d2l.ai/chapter_multilayer-perceptrons/backprop.html';
+const D2L_LINEAR = 'https://d2l.ai/chapter_linear-classification/index.html';
 
 const background: Record<string, PrerequisiteTarget> = {
   // Probability and mathematics: Deisenroth, Faisal and Ong, "Mathematics for Machine Learning".
@@ -58,7 +59,8 @@ const background: Record<string, PrerequisiteTarget> = {
   'Свёртки': { note: 'generative-models/training-background', anchor: 'a-convolution-layer' },
   'Wasserstein GANs': { note: 'generative-models/wgan' },
   'GAN Вассерштейна': { note: 'generative-models/wgan' },
-  'Linear models': { note: 'nlp/bag-of-words-and-tf-idf', anchor: 'a-linear-classifier-on-counts' },
+  'Linear models': { href: D2L_LINEAR },
+  'Линейные модели': { href: D2L_LINEAR },
   'Logistic regression': { note: 'nlp/bag-of-words-and-tf-idf', anchor: 'a-linear-classifier-on-counts' },
   'Логистическая регрессия': { note: 'nlp/bag-of-words-and-tf-idf', anchor: 'a-linear-classifier-on-counts' },
 };
