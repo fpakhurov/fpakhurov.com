@@ -9,21 +9,22 @@ export interface CourseSection {
   topics: CourseTopic[];
 }
 
+/** A stage of the course storyline: its label and the section (or note) it opens. */
+export interface ProgressionStage { label: string; section?: string; note?: string }
+
 export interface Course {
   title: string;
   shortTitle: string;
   description: string;
-  /** Short list of what every note provides. */
-  tagline: string;
-  /** The course storyline as a sequence of stages. */
-  progression: string[];
+  /** The course storyline as a sequence of stages; each stage links to a section of the course page (or to a note). */
+  progression: ProgressionStage[];
   sections: CourseSection[];
   /** Russian texts for the course page. `labels` maps English section titles, summaries and topic titles to Russian. */
   ru: {
     title: string;
     shortTitle: string;
     description: string;
-    tagline?: string;
+    /** Russian stage labels, in the order of `progression`. */
     progression?: string[];
     labels: Record<string, string>;
   };
@@ -40,14 +41,21 @@ export const courses: Record<CourseKey, Course> = {
     title: 'Natural Language Processing',
     shortTitle: 'NLP',
     description: 'One path from raw text to modern LLM systems: each method is introduced by the problem the previous one could not solve.',
-    tagline: 'Stable URLs · equations · examples · prerequisites',
-    progression: ['Text', 'Representations', 'Sequences', 'Transformers', 'Pretraining', 'Adaptation', 'Tasks', 'LLM Systems'],
+    progression: [
+      { label: 'Text', section: 'Text Foundations' },
+      { label: 'Representations', section: 'Distributed Representations' },
+      { label: 'Sequences', section: 'Neural Sequence Models' },
+      { label: 'Transformers', section: 'Transformers' },
+      { label: 'Pretraining', section: 'Pretrained Language Models' },
+      { label: 'Adaptation', section: 'Adaptation and Efficient Models' },
+      { label: 'Tasks', section: 'NLP Tasks' },
+      { label: 'LLM Systems', section: 'Modern LLM Systems' },
+    ],
     // Russian labels for the course map, keyed by the English titles and summaries below.
     ru: {
       title: 'Обработка естественного языка',
       shortTitle: 'NLP',
       description: 'Один путь от сырого текста к современным LLM-системам: каждый метод появляется как ответ на задачу, которую не решил предыдущий.',
-      tagline: 'Постоянные адреса · формулы · примеры · пререквизиты',
       progression: ['Текст', 'Представления', 'Последовательности', 'Трансформеры', 'Предобучение', 'Адаптация', 'Задачи', 'LLM-системы'],
       labels: {
         'Text Foundations': 'Основы работы с текстом',
@@ -203,14 +211,21 @@ export const courses: Record<CourseKey, Course> = {
     title: 'Generative Models',
     shortTitle: 'Generative Models',
     description: 'Probability, latent variables and the main families of modern generative models.',
-    tagline: 'Stable URLs · equations · examples · prerequisites',
-    progression: ['Probability', 'Divergences', 'Autoencoders', 'VAEs', 'GANs', 'Evaluation', 'Flows', 'Diffusion'],
+    progression: [
+      { label: 'Probability', note: 'generative-models/gaussian-distributions' },
+      { label: 'Divergences', note: 'generative-models/entropy-and-divergences' },
+      { label: 'Autoencoders', note: 'generative-models/autoencoders' },
+      { label: 'VAEs', section: 'Variational Autoencoders' },
+      { label: 'GANs', section: 'GANs' },
+      { label: 'Evaluation', section: 'Evaluation' },
+      { label: 'Flows', section: 'Normalizing Flows' },
+      { label: 'Diffusion', section: 'Diffusion Models' },
+    ],
     // Russian labels for the course map, keyed by the English titles below.
     ru: {
       title: 'Генеративные модели',
       shortTitle: 'Генеративные модели',
       description: 'Вероятность, латентные переменные и основные семейства современных генеративных моделей.',
-      tagline: 'Постоянные адреса · формулы · примеры · пререквизиты',
       progression: ['Вероятность', 'Дивергенции', 'Автоэнкодеры', 'VAE', 'GAN', 'Оценка', 'Потоки', 'Диффузия'],
       labels: {
         'Foundations': 'Основы',
