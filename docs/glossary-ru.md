@@ -384,6 +384,13 @@ How the course notes are translated into Russian. The Russian notes live in `src
 | summarization | суммаризация |
 | BLEU, ROUGE, exact match, F1 | BLEU, ROUGE, точное совпадение (exact match), F1 |
 | semantic search, dense retrieval, reranker | семантический поиск, плотный поиск (dense retrieval), реранкер † |
+| retriever | поисковая модель (retriever) † |
+| bi-encoder / cross-encoder | биэнкодер / кросс-энкодер (bi-encoder / cross-encoder) † |
+| golden set | эталонная выборка (golden set) † |
+| hit rate at k, mean reciprocal rank (MRR) | доля попаданий в топ-k (Hit@k), средний обратный ранг (MRR) |
+| reciprocal rank fusion (RRF) | слияние по обратным рангам (reciprocal rank fusion, RRF) † |
+| parent-document retrieval | поиск по родительским документам (parent-document retrieval) † |
+| inverted index, vocabulary mismatch, query expansion | обратный индекс, несовпадение словаря (vocabulary mismatch) †, расширение запроса |
 | retrieval-augmented generation (RAG), chunk | генерация с извлечением (RAG), фрагмент (chunk) † |
 | vector store, index | векторное хранилище, индекс |
 | tool use, function calling, agent | использование инструментов, вызов функций (function calling), агент |
