@@ -33,7 +33,7 @@ How the Generative Models notes were written and reviewed, as a guide for the ne
 3. **Notation** paragraph when the note introduces symbols.
 4. Body sections, each built around one question. Prefer "Why not just …?" or "Where the bound comes from" over generic headings.
 5. Callouts (`<aside class="callout"><strong>Title.</strong> …</aside>`) for side derivations, caveats and takeaways. Give each a real title; never "Editorial note".
-6. **Notebook**: what the accompanying notebook does, cell by cell (see section 7).
+6. **Notebook**: what the accompanying notebook does, cell by cell (see section 7). This is the only place in a note that mentions the notebook.
 7. **Next**: one paragraph that hands over to the next note.
 8. **References**: full entries with links.
 
@@ -54,6 +54,7 @@ How the Generative Models notes were written and reviewed, as a guide for the ne
 
 ## 7. Notebooks
 
+- A note works on its own. Links to notebooks, cell numbers, what a notebook prints or plots, its variable names and its implementation issues belong only in the Notebook section; the body never sends the reader to the notebook, not even with "see the Notebook section". Numbers from saved runs are welcome in the body as self-contained results: state the setup (data, model, size) in the body's own words, then the number. Figure captions follow the same rule.
 - Link notebooks at the maintained branch of their repository, so readers land on the version that runs today. Generative Models: the default branch of HSE-LAMBDA, `https://github.com/HSE-LAMBDA/DeepGenerativeModels/blob/spring-2025-long/seminars/...` (the newer `spring-2026-long` has only the first seminars so far). NLP: the public copy, `https://github.com/xufana/dsba_nlp/blob/autumn-2025/seminars/...`, which holds the notebooks with pinned environments; the original course repository (`glkuzi/nlp_dsba`) is private, so do not link it. State the convention once per Notebook section: cell numbers count every cell, markdown included, from 1, and quoted numbers come from the run saved with the course (cells changed since then have no saved output). When a notebook on the branch changes, recheck the cell numbers the notes cite and the descriptions of the cells that changed.
 - Describe what the cells do and which choices they make (datasets, hyperparameters, loss reductions, sampling details), in the note's notation.
 - Separate procedure from results. Quote numbers only from saved outputs and say so; if a notebook has no saved outputs, say that it documents procedures.
@@ -67,6 +68,7 @@ How the Generative Models notes were written and reviewed, as a guide for the ne
 - Every SVG has `<title>` and `<desc>` that describe what the figure shows in words.
 - The caption explains how to read the figure and states the parameters used; it never describes where the drawing came from. Caption, figure and text must use the same numbers.
 - Check each figure in light mode, dark mode and at narrow width: no overlapping labels, no clipped text, arrows pointing at what they label.
+- Mechanism figures ("what goes where") use the kit in `src/components/figures/seqflow/`: `Vec` (a vector as a column or row of cells with its values), `Op` (an operation: `+`, `×`, `tanh`, `softmax`), `Box`, `Arrow`, `Badge` (a numbered step) and `NewMark` (an amber outline for what a model adds to the previous one), with one colour per role: inputs green, states blue, weights and gates amber, outputs red (`Legend` draws the key). The numbered badges match a numbered list in the text right after the figure. Mark each part of the drawing with `data-s="n"` for the step it belongs to and add `<Stepper steps={...} />` under the SVGs: readers can then step through the figure one step at a time; without JavaScript the whole figure is shown. Give the narrow layout the class `seq-narrow`, which enlarges its text. The sequence-model notes (RNN, LSTM, seq2seq, attention, self-attention, Transformer) share this vocabulary so that each figure reads as a refinement of the previous one.
 
 ## 9. Formatting details
 
