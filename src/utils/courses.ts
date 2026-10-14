@@ -395,6 +395,7 @@ export const courses: Record<CourseKey, Course> = {
         'GloVe': 'GloVe',
         'FastText': 'FastText',
         'Semantic similarity and sentence pairs': 'Семантическая близость и пары предложений',
+        'Cross-encoders and bi-encoders': 'Кросс-энкодеры и би-энкодеры',
         'How text becomes model input, and how a result is measured.': 'Как текст становится входом модели и как измерить результат.',
         'Counting words is a strong baseline; counting sequences gives the first language model.': 'Подсчёт слов — сильный baseline; подсчёт последовательностей даёт первую языковую модель.',
         'From one-hot vectors to dense vectors that carry meaning.': 'От one-hot векторов к плотным векторам, которые несут смысл.',
@@ -429,8 +430,8 @@ export const courses: Record<CourseKey, Course> = {
         noteTopic('Word2Vec', 'nlp/word2vec'),
         noteTopic('CBOW and skip-gram', 'nlp/word2vec', 'two-prediction-tasks-cbow-and-skip-gram'),
         noteTopic('Negative sampling', 'nlp/word2vec', 'negative-sampling'),
-        'GloVe',
-        'FastText',
+        noteTopic('GloVe', 'nlp/glove'),
+        noteTopic('FastText', 'nlp/fasttext'),
         noteTopic('From static to contextual embeddings', 'nlp/bert', 'from-static-to-contextual-embeddings'),
       ] },
       { title: 'Neural Sequence Models', summary: 'Models that read a sequence, and the bottleneck that attention removes.', topics: [
@@ -464,7 +465,8 @@ export const courses: Record<CourseKey, Course> = {
       ] },
       { title: 'NLP Tasks', summary: 'The same pretrained encoder, a different head for each task.', topics: [
         noteTopic('Text classification', 'nlp/text-classification'),
-        'Semantic similarity and sentence pairs',
+        noteTopic('Semantic similarity and sentence pairs', 'nlp/sentence-similarity'),
+        noteTopic('Cross-encoders and bi-encoders', 'nlp/sentence-similarity', 'bi-encoder-embed-each-text-once'),
         noteTopic('Named entity recognition', 'nlp/named-entity-recognition'),
         noteTopic('Question answering', 'nlp/question-answering'),
         noteTopic('Summarization', 'nlp/summarization'),
