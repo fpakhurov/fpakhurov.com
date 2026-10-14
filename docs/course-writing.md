@@ -79,7 +79,7 @@ How the Generative Models notes were written and reviewed, as a guide for the ne
 Run after every change set:
 
 1. `npm run build` with 0 errors.
-2. On every built note page: no `katex-error`, no duplicate `id`, no broken internal link or anchor (including links from the course map and between notes).
+2. On every built note page: no `katex-error`, no duplicate `id`, no broken internal link or anchor (including links from the course map and between notes), and no link to `glkuzi/nlp_dsba`: it is private, and every NLP notebook link goes to `xufana/dsba_nlp` on `autumn-2025`.
 3. A text search for banned source words (`scan`, `seminar`, `slide`, `page \d`, `handwrit`, `editorial`, `transcri`) in notes and figure captions, with notebook URLs excluded (their paths contain `seminars/`). Author names such as Pascanu are false positives.
 4. `COURSE_LENIENT=1 npm run build` builds a course whose map lists notes that do not exist yet (useful while drafting); the plain `npm run build` is strict and is what is published.
 5. Visual check of changed figures in light, dark and narrow layouts.
