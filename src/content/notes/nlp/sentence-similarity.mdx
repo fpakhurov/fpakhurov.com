@@ -1,0 +1,156 @@
+---
+title: Semantic similarity and sentence pairs
+description: "Tasks whose input is two texts: semantic textual similarity, paraphrase detection and natural language inference; why averaged word vectors fail on pairs, how similarity is evaluated with rank correlation, and the two ways to use a Transformer: a cross-encoder that reads both texts together and a bi-encoder (Sentence-BERT) that embeds them separately, with the accuracy and the cost of each."
+course: nlp
+section: NLP Tasks
+order: 28
+status: published
+tags: [semantic-similarity, sts, paraphrase, nli, cross-encoder, bi-encoder, sentence-bert, spearman]
+prerequisites: [Text classification, BERT and masked language modeling]
+---
+
+import PairEncoders from '../../../components/figures/sentence-similarity/PairEncoders.astro';
+
+[Text classification](/notes/nlp/text-classification) gives one label to one text. Many questions are about two texts at once: are these two Quora questions duplicates, does this sentence follow from that one, how close in meaning are a query and a passage? The model now needs a function of a *pair*, and the way it reads the pair decides both its accuracy and its cost. This note covers the pair tasks, a baseline that looks reasonable and fails, how similarity is measured, and the two Transformer architectures that every later system, [semantic search](/notes/nlp/semantic-search) included, is built from.
+
+**Notation.** A pair of texts $(a, b)$ with a label $y$: a class, or a similarity score. An encoder $f$ maps a text to token vectors; pooled sentence vectors are $u = f(a)$ and $v = f(b)$. $\cos(u, v) = u \cdot v / (\lVert u \rVert \lVert v \rVert)$.
+
+## Three pair tasks
+
+- **Semantic textual similarity (STS).** A score from 0 (unrelated) to 5 (equivalent), averaged over several annotators. The STS benchmark has 8,628 pairs from captions, news and forums, split into 5,749 for training, 1,500 for development and 1,379 for testing.
+- **Paraphrase and duplicate detection.** A binary label: do the two texts say the same thing? Quora's question pairs (QQP in the GLUE benchmark) ask whether two questions are duplicates, which is what a question-answering site needs to merge threads.
+- **Natural language inference (NLI).** Three classes for a premise and a hypothesis: the hypothesis follows (entailment), contradicts it (contradiction) or neither (neutral). SNLI has 570,000 labelled pairs and MultiNLI 430,000 from more genres.
+
+The order of the texts matters for NLI and for retrieval (a short query against a long passage) and does not for STS and paraphrase. All three are measured on held-out pairs: accuracy or $F_1$ for the classification tasks, rank correlation with the gold scores for STS.
+
+## Baseline: average the word vectors, compare by cosine
+
+The [embeddings note](/notes/nlp/word-embeddings#from-words-to-sentences-for-now) already turned a question into one vector by averaging its word vectors. Doing this for both texts and taking the cosine gives a similarity with no training at all. With the 32-dimensional CBOW vectors trained on Quora questions in the [GloVe note](/notes/nlp/glove#a-run-on-quora-questions) (stopwords removed, as in training), five toy pairs, with similarity scores assigned by hand on the STS scale, come out as follows:
+
+| Pair | Hand score | Cosine |
+| --- | --- | --- |
+| How do I learn Python? / What is the best way to learn Python? | 5 | 0.891 |
+| How can I make money online? / How can I earn money from the internet? | 4 | 0.938 |
+| Who is the best football player? / Who is the best cricket player? | 2 | 0.969 |
+| How do I lose weight? / How do I gain weight? | 1 | 0.964 |
+| Why is the sky blue? / How can I make money online? | 0 | 0.023 |
+
+The unrelated pair is separated cleanly; everything else is ranked wrongly. *Lose weight* and *gain weight* are opposite requests, and after stopword removal they are `lose weight ?` and `gain weight ?`: two of three tokens shared, and *lose* and *gain* themselves occur in the same contexts, so their vectors are close. *Football player* and *cricket player* share the topic and the structure. An average keeps the topic and discards what distinguishes the two texts: which word differs, its role, negation, direction.
+
+The same holds at scale. On the STS benchmark, averaged GloVe vectors reach a Spearman correlation of 58.02 (reported, by convention, $\times 100$), and pretrained BERT used the same way does worse: 46.35 for averaged token vectors and 16.50 for the `[CLS]` vector ([Reimers and Gurevych, 2019](#references)). A masked language model is not trained to make distances meaningful.
+
+## Measuring similarity: rank correlation
+
+A model's similarity scores and the human scores live on different scales (cosines between 0.6 and 1, gold between 0 and 5), and for search or deduplication only the order matters. STS is therefore scored with **Spearman's rank correlation**: replace each list by the ranks of its values and compute the correlation of the ranks. Without ties,
+
+$$
+\rho = 1 - \frac{6 \sum_i d_i^2}{n (n^2 - 1)},
+$$
+
+where $d_i$ is the difference between the two ranks of pair $i$.
+
+**Worked example.** Five pairs with gold scores $(4.8, 3.6, 2.5, 1.2, 0.2)$ and model scores $(0.91, 0.62, 0.70, 0.35, 0.10)$. The gold ranks are $(5, 4, 3, 2, 1)$, the model ranks $(5, 3, 4, 2, 1)$: the model swaps the second and third pairs. The rank differences are $(0, 1, -1, 0, 0)$, $\sum d_i^2 = 2$, and $\rho = 1 - 6 \cdot 2 / (5 \cdot 24) = 0.9$. (Pearson's correlation of the raw values is 0.948; it would also reward getting the spacing right, which a cosine has no reason to.) For the five question pairs above, $\rho = 0.10$.
+
+## Cross-encoder: read the pair together
+
+A pretrained encoder can read both texts in one input, `[CLS] a [SEP] b [SEP]`, with segment embeddings marking which text each token belongs to (the [BERT input](/notes/nlp/bert#the-input)). In every layer, every token of $a$ attends to every token of $b$: *lose* can be compared with *gain* directly. A head on the `[CLS]` position outputs the class (NLI, paraphrase) or a score (STS, trained by regression), and the whole model is [fine-tuned](/notes/nlp/fine-tuning) on labelled pairs. This is a **cross-encoder**.
+
+It is the accurate option. BERT-base fine-tuned on the STS benchmark training pairs reaches a Spearman correlation of 84.30 on the test set, and 88.33 when it is first fine-tuned on NLI ([Reimers and Gurevych, 2019](#references)). The price is that nothing is computed per text: every pair is a new forward pass. Finding the most similar pair among $n = 10{,}000$ sentences takes $n(n-1)/2 = 49{,}995{,}000$ passes, about 65 hours on one V100 GPU in the same paper's measurement.
+
+## Bi-encoder: embed each text once
+
+A **bi-encoder** encodes $a$ and $b$ separately with the same encoder and compares the two vectors. Sentence-BERT ([Reimers and Gurevych, 2019](#references)) is the standard recipe:
+
+1. **Encode.** $a$ and $b$ go through the same BERT, each on its own; the token vectors of each text are averaged into $u$ and $v$.
+2. **Train on NLI.** A softmax classifier on the concatenation $(u, v, |u - v|)$, with $W_t \in \mathbb R^{3 \times 3d}$, predicts entailment, contradiction or neutral; the gradient trains the encoder through both copies.
+3. **Use by cosine.** After training the classifier is thrown away, and $\cos(u, v)$ is the similarity. For STS the encoder can be trained further with a regression loss, the squared difference between $\cos(u, v)$ and the gold score.
+
+The concatenation matters more than the pooling. With NLI training, measured on the STS development set, $(u, v)$ alone gives 66.04, $|u - v|$ alone 69.78, and $(u, v, |u - v|)$ 80.78, while mean, `[CLS]` and max pooling give 80.78, 79.80 and 79.07. The element-wise difference tells the classifier, and through it the encoder, in which dimensions two sentences disagree.
+
+<PairEncoders />
+
+The result is a usable sentence vector. Without any STS training, Sentence-BERT-base trained on NLI reaches 77.03 on the STS benchmark, against 58.02 for averaged GloVe and 16.50 for BERT's `[CLS]`. Trained on NLI and then STS, it reaches 85.35, three points below the cross-encoder's 88.33. In exchange, 10,000 sentences need 10,000 passes, about 5 seconds, and comparing them is a matrix of dot products.
+
+## Which one to use
+
+The two architectures trade accuracy for cost, and systems combine them. To compare a few pairs carefully (deduplicating a short list, checking whether an answer entails a claim), use a cross-encoder. To search, cluster or deduplicate many texts, embed every text once with a bi-encoder, store the vectors and compare them by cosine, then rerank the top candidates with a cross-encoder: the [retrieve-and-rerank pipeline](/notes/nlp/semantic-search#reranking-with-a-cross-encoder) of the semantic-search note. Modern embedding models are bi-encoders trained contrastively on many more pairs than NLI, as described in [the embedding model](/notes/nlp/semantic-search#the-embedding-model) section there.
+
+## What changed
+
+| | Averaged word vectors | Cross-encoder | Bi-encoder (Sentence-BERT) |
+| --- | --- | --- | --- |
+| Input | each text separately | the pair in one sequence | each text separately |
+| Interaction between texts | none | in every attention layer | only through $\cos(u, v)$ |
+| Training | none | fine-tuning on labelled pairs | NLI classification, then optionally STS |
+| STS benchmark, Spearman | 58.02 (GloVe) | 88.33 | 85.35 |
+| 10,000 sentences | 10,000 averages | 49,995,000 passes | 10,000 passes |
+
+## Limitations
+
+- **Labels are graded opinions.** STS scores average a few annotators' judgements of a vague notion; paraphrase labels depend on the dataset's guidelines (are two questions duplicates if one adds a detail?).
+- **Bi-encoders compress.** One vector per text cannot represent every way a text can relate to another; negation and small but decisive differences (*lose* or *gain*) remain the hardest cases even after training.
+- **Domain shift.** A model trained on NLI captions and news can rank pairs from medical or legal text badly; similarity is learned, not universal.
+- **Symmetric versus asymmetric.** STS is symmetric; question–passage relevance is not, and models trained for one transfer imperfectly to the other.
+
+## What you should remember
+
+- Pair tasks: STS (graded score, Spearman), paraphrase (binary), NLI (three classes).
+- Averaging word vectors keeps the topic and loses the difference; it ranks *lose weight* and *gain weight* as near duplicates.
+- Spearman's $\rho$ compares rankings, because only the order of similarities is meaningful: $\rho = 1 - 6\sum d_i^2 / (n(n^2-1))$.
+- A cross-encoder reads `[CLS] a [SEP] b [SEP]` and is the most accurate, at one pass per pair.
+- A bi-encoder (Sentence-BERT) embeds each text once, is trained on NLI with $(u, v, |u - v|)$, compares by cosine, and is three points behind on STS at a tiny fraction of the cost. Retrieve with a bi-encoder, rerank with a cross-encoder.
+
+## Notebook
+
+[`week01_word_embeddings.ipynb`](https://github.com/xufana/dsba_nlp/blob/autumn-2025/seminars/week01_word_embeddings.ipynb) builds the averaging baseline of this note (cell numbers count every cell, markdown included, from 1). The saved notebook has no outputs for these cells, so no numbers are quoted from it.
+
+- **Cell 81** defines `get_phrase_embedding`: lower-case, tokenize, keep the words the model knows and average their vectors, with a zero vector when none is known.
+- **Cells 82–85** embed about a thousand questions and plot them in two dimensions with t-SNE.
+- **Cells 86–91** embed the first 1,000 questions and define `find_nearest`, which ranks them by cosine to a query; cells 89–91 run it on three queries.
+- **Cells 92–93** use the same averages as features for a logistic-regression classifier on AG News.
+
+The numbers in this note come from the Code section and from the Sentence-BERT paper.
+
+## Code
+
+The averaging baseline and Spearman's $\rho$, with the CBOW vectors of the [FastText note](/notes/nlp/fasttext#code):
+
+```python
+import re, numpy as np
+from scipy.stats import spearmanr
+from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
+
+wv = w2v.wv                                       # Word2Vec(sents, vector_size=32, window=5, min_count=5, workers=1, seed=0)
+tok = re.compile(r"\w+|[^\w\s]+")
+
+def embed(text):
+    words = [t for t in tok.findall(text.lower()) if t not in ENGLISH_STOP_WORDS and t in wv.key_to_index]
+    return np.mean([wv[w] for w in words], axis=0)
+
+pairs = [
+    ("How do I learn Python?", "What is the best way to learn Python?", 5),
+    ("How can I make money online?", "How can I earn money from the internet?", 4),
+    ("Who is the best football player?", "Who is the best cricket player?", 2),
+    ("How do I lose weight?", "How do I gain weight?", 1),
+    ("Why is the sky blue?", "How can I make money online?", 0),
+]
+cos = []
+for a, b, score in pairs:
+    u, v = embed(a), embed(b)
+    cos.append(u @ v / np.linalg.norm(u) / np.linalg.norm(v))
+print(np.round(cos, 3))                                    # [0.891 0.938 0.969 0.964 0.023]
+print(spearmanr([p[2] for p in pairs], cos).correlation)   # 0.1
+print(spearmanr([4.8, 3.6, 2.5, 1.2, 0.2], [0.91, 0.62, 0.70, 0.35, 0.10]).correlation)  # 0.9
+```
+
+## Next
+
+A label per document, or per pair, is still a label for the whole input. The [next note](/notes/nlp/named-entity-recognition) asks for a label per *token*, which is the same encoder with a head applied at every position, and runs into the mismatch between the words that carry labels and the subword tokens the model reads.
+
+## References
+
+- N. Reimers, I. Gurevych. [Sentence-BERT: Sentence Embeddings using Siamese BERT-Networks](https://aclanthology.org/D19-1410/). EMNLP, 2019. Table 1 (STS without STS training), Table 2 (STS benchmark), Table 6 (pooling and concatenation), §1 (65 hours against 5 seconds).
+- D. Cer, M. Diab, E. Agirre, I. Lopez-Gazpio, L. Specia. [SemEval-2017 Task 1: Semantic Textual Similarity](https://aclanthology.org/S17-2001/). SemEval, 2017. The STS benchmark.
+- S. R. Bowman, G. Angeli, C. Potts, C. D. Manning. [A large annotated corpus for learning natural language inference](https://aclanthology.org/D15-1075/). EMNLP, 2015. SNLI.
+- A. Williams, N. Nangia, S. Bowman. [A Broad-Coverage Challenge Corpus for Sentence Understanding through Inference](https://aclanthology.org/N18-1101/). NAACL, 2018. MultiNLI.
+- A. Wang, A. Singh, J. Michael, F. Hill, O. Levy, S. R. Bowman. [GLUE: A Multi-Task Benchmark and Analysis Platform for Natural Language Understanding](https://aclanthology.org/W18-5446/). BlackboxNLP, 2018. Includes QQP.

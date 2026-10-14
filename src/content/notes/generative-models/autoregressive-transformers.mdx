@@ -1,0 +1,200 @@
+---
+title: "Autoregressive transformers: ImageGPT, VQGAN, DALL·E and Parti"
+description: "Replace masked convolutions with causal self-attention and pixels with learned tokens: the cost of attention and the KV cache, ImageGPT on a palette of 512 colours, the two-stage recipe of VQGAN, text-to-image with DALL·E and Parti, the sampling knobs that trade diversity for quality, and how this family compares with diffusion."
+course: generative-models
+section: Autoregressive Models
+order: 22
+status: published
+tags: [autoregressive, transformer, imagegpt, vqgan, dall-e, parti, text-to-image, kv-cache]
+prerequisites: ["Autoregressive models: PixelRNN and PixelCNN", "VAE variants: β-VAE and VQ-VAE"]
+---
+
+import TwoStage from '../../../components/figures/autoregressive-transformers/TwoStage.astro';
+import SequenceLengths from '../../../components/figures/autoregressive-transformers/SequenceLengths.astro';
+
+The [previous note](/notes/generative-models/autoregressive-models) built image models from the chain rule and masked convolutions. Two limits remained: a convolution sees a fixed neighbourhood, and an image of $256 \times 256$ pixels is a sequence of almost 200,000 values. Transformers remove the first limit, since causal self-attention reads the whole past at every layer, and make the second one worse, since attention compares every pair of positions. The models of this note answer by changing what a token is: a palette colour of a small image (ImageGPT), then a code of a learned discrete autoencoder (VQGAN, DALL·E, Parti). The second answer turns image generation into the problem language models already solve, and text-to-image into continuing a caption.
+
+**Notation.** A sequence of tokens $s = (s_1, \dots, s_N)$ from a vocabulary of size $K$, modelled as $p(s) = \prod_i p(s_i \mid s_{<i})$. A code grid of $h \times w$ tokens is read row by row, so $N = hw$. A condition $c$, such as a caption, is a second token sequence.
+
+## From convolutions to attention
+
+A transformer decoder computes, at every layer, attention from each position to the positions before it. The **causal mask** sets the score of every later position to $-\infty$ before the softmax, which is exactly the job the masks A and B did for PixelCNN: output $i$ depends only on $s_{<i}$. The [GPT note](/notes/nlp/gpt#the-objective) of the NLP course derives the consequences, which carry over unchanged. Training is one parallel pass with teacher forcing and a cross-entropy at every position. Sampling is sequential, one token per pass. There is no blind spot, because every layer can reach every earlier position.
+
+Every layer compares $N(N+1)/2$ pairs of positions, so the cost grows with the square of the sequence length, and this decides what the tokens of an image can be.
+
+<SequenceLengths />
+
+Sampling has a second quadratic cost. Rerunning the network on the whole prefix to produce each token compares $\sum_{t=1}^{N} t(t+1)/2 = N(N+1)(N+2)/6$ pairs per layer in total: 179,481,600 for $N = 1024$. The keys and values of earlier positions do not change when a token is appended, so a **KV cache** keeps them and computes attention only for the new query: $\sum_t t = N(N+1)/2 = 524{,}800$ pairs, $(N+2)/3 = 342$ times fewer. The price is memory: two vectors per layer and position. For Qwen2-0.5B, a small open language model with 24 layers and two key-value heads of 64 dimensions, stored in 16-bit numbers, that is $2 \cdot 24 \cdot 2 \cdot 64 \cdot 2 = 12{,}288$ bytes per token, 12 MiB for 1024 tokens and 384 MiB for its full context of 32,768. Without grouped-query attention, with 14 key-value heads, it would be seven times more. The Code section checks that the cache changes no output.
+
+The knobs that turn the predicted distribution into a sample, temperature, top-$k$ and top-$p$, are the same as for text and are described in the [GPT note](/notes/nlp/gpt#decoding-turning-probabilities-into-text). On images they act like the truncation trick of GANs: they trade diversity for typical samples, as the VQGAN results below show.
+
+## Pixels as tokens: ImageGPT
+
+ImageGPT ([Chen et al., 2020](#references)) applies GPT-2 to images with as little change as possible. A $224 \times 224 \times 3$ sequence would make the attention logits tens of thousands of times larger than in language models, so the image is first downsampled to $32 \times 32$ or $48 \times 48$, and the three channels of each pixel are replaced by the nearest of 512 colours found by k-means: a sequence of $32^2 = 1024$ or $48^2 = 2304$ tokens over a vocabulary of 512. The palette is the simplest tokenizer, a VQ-VAE with an identity encoder and decoder, as the paper notes. The largest model, iGPT-L, is GPT-2 with 48 layers and a width of 1536, 1.4 billion parameters.
+
+The paper's main interest is representation rather than sampling. A model trained only to predict the next pixel learns features that linearly separate the classes of CIFAR-10 with 96.3% accuracy and reach 99.0% after fine-tuning. The paper also shows completions of half-images, but at these small sizes: pixel tokens do not scale to the resolutions of the models below.
+
+## Learned tokens: the two-stage recipe
+
+The way out was already in the [VQ-VAE](/notes/generative-models/vae-variants#where-the-prior-went): train a discrete autoencoder first, then an autoregressive model over its codes. With a downsampling factor $f$ the grid has $(H/f) \times (W/f)$ positions, and the transformer never sees a pixel.
+
+<TwoStage />
+
+The two stages divide the work as in [latent diffusion](/notes/generative-models/latent-diffusion), which came later from the same group as VQGAN: the tokenizer handles textures and local detail, and the prior handles composition. The tokenizer must therefore compress hard and still reconstruct sharp images, which is what a plain VQ-VAE with a squared-error loss does not do.
+
+### VQGAN
+
+VQGAN ([Esser, Rombach and Ommer, 2021](#references)) keeps the vector quantizer and the codebook and commitment terms of the VQ-VAE and changes the reconstruction loss. The squared error is replaced by a perceptual loss, as in [LPIPS](/notes/generative-models/lpips), and a patch-based discriminator is added, which judges small patches of the reconstruction as real or not. The adversarial term gets an adaptive weight,
+
+$$
+\lambda = \frac{\lVert \nabla_{G_L} \mathcal L_{\text{rec}} \rVert}{\lVert \nabla_{G_L} \mathcal L_{\text{GAN}} \rVert + \delta},
+$$
+
+the ratio of the gradient norms of the two losses with respect to the last layer $G_L$ of the decoder, so that neither term overwhelms the other. With $f = 16$ a $256 \times 256$ image becomes a $16 \times 16$ grid, and the paper usually takes a codebook of $K = 1024$: 256 tokens of 10 bits, or 2560 bits, against 1,572,864 bits of raw pixels. The second stage is a GPT-2 medium transformer with 307 million parameters, whose 256-token sequence was the longest that fit on a 12 GB GPU. Conditions are prepended as tokens: a class label, or the codes of a segmentation map or depth map produced by a second VQGAN. Images in the megapixel range are generated with a sliding attention window, each token predicted from a $16 \times 16$ neighbourhood of codes.
+
+A tokenizer bounds what the second stage can reach. On ImageNet, reconstructions through a $16 \times 16$ grid have an [FID](/notes/generative-models/fid) of 7.94 to the validation images with 1024 codes and 4.98 with 16,384; the paper treats this number as an estimate of the best FID the second stage can reach.
+
+### Sampling knobs on images
+
+The class-conditional ImageNet model of VQGAN (codebook of 16,384) shows how much sampling settings matter. Its FID with plain top-$k$ sampling at $k = 973$ is 29.20; at $k = 250$ it is 15.98, and top-$p = 0.88$ on top of $k = 973$ gives 15.78. Keeping only the samples that a ResNet-101 classifier scores highly for their class, the best 5%, brings it to 5.88, below the 7.53 of BigGAN. Every one of these steps removes unlikely samples, and every one trades [recall for precision](/notes/generative-models/precision-recall#where-the-trade-off-appears): the FID improves because the remaining samples are more typical of their class; the model does not cover more of the data.
+
+## Text to image: DALL·E
+
+DALL·E ([Ramesh et al., 2021](#references)) applies the recipe at scale. The tokenizer is a discrete VAE trained with the Gumbel-softmax relaxation, which turns a $256 \times 256$ image into a $32 \times 32$ grid over 8192 codes, a 192-fold shorter sequence than the pixels. The caption is encoded into at most 256 BPE tokens from a vocabulary of 16,384, and the text and the 1024 image tokens are concatenated into one sequence of up to 1280 tokens. A single decoder-only transformer with 12 billion parameters, 64 layers of sparse attention, models the whole stream, trained on 250 million image-caption pairs. Text-to-image generation is then the continuation of a caption: feed the text tokens and sample the 1024 image tokens.
+
+Samples are drawn in batches and reranked: a contrastive image-text model (CLIP) scores each of 512 candidates against the caption, and the best are kept. In a human evaluation on MS-COCO captions against DF-GAN, a GAN trained on that dataset, the majority of five raters judged the DALL·E sample more realistic 90.0% of the time and better matching the caption 93.3% of the time, although DALL·E was never trained on the MS-COCO captions.
+
+## Parti: an encoder–decoder at scale \{#parti-an-encoder-decoder-at-scale\}
+
+Parti ([Yu et al., 2022](#references)) treats text-to-image as translation. An encoder reads the caption, at most 128 tokens from a SentencePiece vocabulary of 16,000, and a decoder generates the 1024 image tokens of a ViT-VQGAN, a VQGAN whose encoder and decoder are vision transformers, with 8192 codes. A super-resolution network of about 15 million parameters raises the decoded $256 \times 256$ images to $1024 \times 1024$. The paper trains four sizes, 350 million, 750 million, 3 billion and 20 billion parameters, and finds that quality and alignment with the text keep improving with size. The 20-billion model reaches a zero-shot FID of 7.23 on MS-COCO and 3.22 after fine-tuning on it.
+
+Two tools from other families improve the samples. [Classifier-free guidance](/notes/generative-models/latent-diffusion#classifier-free-guidance) works on logits as it works on scores: the model is trained with the caption sometimes dropped, and sampling combines the unconditional and conditional predictions with a weight above one. Contrastive reranking keeps the best of 16 samples per prompt instead of DALL·E's 512. Parti's paper also introduced PartiPrompts, the set of more than 1,600 prompts described in the [human evaluation note](/notes/generative-models/human-evaluation#how-good-and-does-it-match).
+
+## The models side by side
+
+| Model | Image tokens | Vocabulary | Transformer | Parameters |
+| --- | --- | --- | --- | --- |
+| ImageGPT (iGPT-L) | $32 \times 32$ palette pixels of a downsampled image | 512 colours | decoder | 1.4 B |
+| VQGAN | $16 \times 16$ codes of $256 \times 256$ | 1024 (16,384 on ImageNet) | decoder | 307 M |
+| DALL·E | $32 \times 32$ codes after up to 256 text tokens | 8192 | decoder, sparse attention | 12 B |
+| Parti | $32 \times 32$ codes, text in a separate encoder | 8192 | encoder–decoder | 20 B |
+
+## Autoregressive transformers and diffusion
+
+The two families share more than it seems. Both work in the latent space of a separately trained autoencoder, both are conditioned on text through attention, and both are steered by classifier-free guidance. They differ in how a sample is built. An autoregressive model fixes one token at a time, 1024 network passes for a $32 \times 32$ grid, and cannot revise a token once it is sampled. A diffusion model refines the whole latent at once over 20 to 50 steps. In return the autoregressive model gives the exact likelihood of the tokens and shares its architecture, training code and scaling behaviour with language models.
+
+## Summary
+
+- A causal transformer is a PixelCNN without a blind spot: every layer sees the whole past, at a cost quadratic in the sequence length.
+- The KV cache turns the cubic cost of naive sampling into a quadratic one, at a memory cost of two vectors per layer and token.
+- Pixels make sequences too long. ImageGPT shortens them with a colour palette and a small image; the two-stage recipe replaces them with the codes of a discrete autoencoder.
+- VQGAN makes the tokenizer good enough at high compression with perceptual and adversarial losses; its reconstruction FID bounds what the prior can reach.
+- DALL·E and Parti condition on text by putting it in the sequence or in an encoder, and improve samples with reranking and classifier-free guidance; top-$k$, top-$p$ and rejection trade diversity for typical samples.
+
+## Notebook
+
+The course has no notebook on image transformers. Its [LLM seminar](https://github.com/HSE-LAMBDA/DeepGenerativeModels/blob/spring-2025-long/seminars/13_LLM/Transformers-LangChain.ipynb) in the HSE-LAMBDA *Deep Generative Models* repository runs an autoregressive transformer over text with Hugging Face Transformers and LangChain (cell numbers count every cell from 1). Its outputs are saved.
+
+- **Cells 1–35**: a tour of `pipeline()` with encoder models: sentiment analysis with the default DistilBERT model, speech recognition with wav2vec 2.0 on MInDS-14, a multilingual BERT that rates a French sentence as 5 stars with probability 0.73, and the tokenizer and model classes behind a pipeline. The `Trainer` example is in markdown cells and is not run.
+- **Cells 39–41**: `Qwen/Qwen2-0.5B-Instruct`, the model of the KV-cache example above, as a text-generation pipeline with at most 100 new tokens, wrapped as a LangChain chat model. The model's generation settings sample with temperature 0.7, top-$k$ 20 and top-$p$ 0.8 and a repetition penalty of 1.1, so the answers vary between runs.
+- **Cells 43–46**: the model has no memory of its own. Asked "What's my name?" alone, it gives a general answer about names; with the earlier turns in the input it answers "Bob". A conversation is a prefix that is fed again on every turn.
+- **The saved answers contain the prompt.** Every AI message starts with the whole input in the model's chat template (`<|im_start|>system …`) and only then gives the answer, because the text-generation pipeline returns the prompt together with the continuation by default. When LangGraph stores these messages (cells 47–51) and sends them back on the next turn, the new prompt contains the old one nested inside an assistant turn. The short exchanges still get correct answers, but the context grows with each turn. Passing `return_full_text=False` to the pipeline keeps only the generated text.
+- **Cells 52–64**: prompt templates. With the system instruction to talk like a pirate (cells 55–58) the 0.5-billion-parameter model answers in plain English; with "answer in Spanish" stored in the conversation state (cells 59–64) it answers in Spanish, including the follow-up "Tu nombre es Bob."
+- **Cells 65–70**: `trim_messages` keeps the system message and the last messages that fit in 45 tokens, 7 of 11 in the example, and a graph that trims the history before every call. Trimming is how a chat stays inside a fixed context, 32,768 tokens for this model, and bounds the KV cache.
+
+## Code
+
+A small decoder-only transformer with causal attention, a KV cache and the sampling filters, in PyTorch. The check at the end compares cached and uncached logits and confirms that changing a later token does not change earlier predictions:
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class CausalSelfAttention(nn.Module):
+    def __init__(self, d, heads):
+        super().__init__()
+        self.h, self.qkv, self.out = heads, nn.Linear(d, 3 * d), nn.Linear(d, d)
+
+    def forward(self, x, cache=None):                 # x: [B, T, d], the new positions only
+        B, T, d = x.shape
+        q, k, v = self.qkv(x).view(B, T, 3, self.h, d // self.h).permute(2, 0, 3, 1, 4)
+        if cache is not None:                         # keys and values of earlier positions
+            if 'k' in cache:
+                k, v = torch.cat([cache['k'], k], 2), torch.cat([cache['v'], v], 2)
+            cache['k'], cache['v'] = k, v
+        S = k.shape[2]                                # positions visible so far
+        mask = torch.ones(T, S, dtype=torch.bool).tril(S - T)   # new query i sees keys up to its own position
+        y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+        return self.out(y.transpose(1, 2).reshape(B, T, d))
+
+class TinyGPT(nn.Module):
+    def __init__(self, vocab=16, d=32, heads=4, layers=2, max_len=64):
+        super().__init__()
+        self.tok, self.pos = nn.Embedding(vocab, d), nn.Embedding(max_len, d)
+        self.blocks = nn.ModuleList(CausalSelfAttention(d, heads) for _ in range(layers))
+        self.mlps = nn.ModuleList(nn.Sequential(nn.LayerNorm(d), nn.Linear(d, 4 * d), nn.GELU(), nn.Linear(4 * d, d)) for _ in range(layers))
+        self.norms = nn.ModuleList(nn.LayerNorm(d) for _ in range(layers))
+        self.head = nn.Linear(d, vocab)
+
+    def forward(self, idx, caches=None, start=0):     # idx: [B, T] tokens at positions start .. start+T-1
+        x = self.tok(idx) + self.pos(torch.arange(start, start + idx.shape[1]))
+        for l, (attn, mlp, norm) in enumerate(zip(self.blocks, self.mlps, self.norms)):
+            x = x + attn(norm(x), None if caches is None else caches[l])
+            x = x + mlp(x)
+        return self.head(x)                           # logits: [B, T, vocab]
+
+def filter_logits(logits, temperature=1.0, top_k=None, top_p=None):
+    logits = logits / temperature
+    if top_k is not None:                             # keep the k largest logits
+        kth = logits.topk(top_k, dim=-1).values[..., -1:]
+        logits = logits.masked_fill(logits < kth, float('-inf'))
+    if top_p is not None:                             # keep the smallest set with probability >= top_p
+        sorted_logits, order = logits.sort(dim=-1, descending=True)
+        cum = sorted_logits.softmax(-1).cumsum(-1)
+        drop = cum - sorted_logits.softmax(-1) >= top_p   # mass before this token already reaches top_p
+        logits = logits.masked_fill(drop.scatter(-1, order, drop), float('-inf'))
+    return logits
+
+@torch.no_grad()
+def generate(model, prompt, n_new, **kw):             # prompt: [B, T0]
+    caches = [{} for _ in model.blocks]
+    logits = model(prompt, caches)                    # one parallel pass over the prompt fills the cache
+    out = prompt
+    for _ in range(n_new):
+        probs = filter_logits(logits[:, -1], **kw).softmax(-1)
+        nxt = torch.multinomial(probs, 1)
+        out = torch.cat([out, nxt], 1)
+        logits = model(nxt, caches, start=out.shape[1] - 1)   # only the new token is processed
+    return out
+
+torch.manual_seed(0)
+model = TinyGPT().eval()
+seq = generate(model, torch.tensor([[1, 2, 3]]), 20, temperature=0.7, top_k=5)
+with torch.no_grad():
+    full = model(seq[:, :-1])                         # recompute every position from scratch
+    caches = [{} for _ in model.blocks]
+    step = torch.cat([model(seq[:, i:i + 1], caches, start=i) for i in range(seq.shape[1] - 1)], 1)
+    a = seq[:, :10].clone(); b = a.clone(); b[0, 7] = (b[0, 7] + 1) % 16
+    print('max |cached - full| =', (full - step).abs().max().item())
+    print('earlier logits unchanged:', torch.allclose(model(a)[:, :7], model(b)[:, :7]))
+
+z = torch.tensor([[2.0, 1.5, 1.0, 0.0, -1.0]])
+for kw in [{}, {'temperature': 0.7}, {'top_k': 3}, {'top_p': 0.7}]:
+    print(kw, filter_logits(z, **kw).softmax(-1).numpy().round(3))
+```
+
+The run prints a largest difference of $4.8 \cdot 10^{-7}$, the rounding error of 32-bit arithmetic, and `True`. For the logits $(2, 1.5, 1, 0, -1)$ the probabilities are 0.463, 0.281, 0.170, 0.063 and 0.023; temperature 0.7 sharpens them to 0.555, 0.272, 0.133, 0.032 and 0.008; top-$k$ with $k = 3$ keeps three tokens with 0.506, 0.307 and 0.186; and top-$p$ with $p = 0.7$ keeps two with 0.622 and 0.378, because the first token alone has less than 0.7 of the mass and the first two have 0.744.
+
+## The course in one paragraph
+
+The five families of the course answer the same question, how to train a generator when $p(x)$ is unknown, in five ways. [VAEs](/notes/generative-models/vae) bound the likelihood with an encoder. [GANs](/notes/generative-models/gans) avoid the likelihood and train against a discriminator. [Normalizing flows](/notes/generative-models/normalizing-flows) compute the likelihood exactly with invertible layers. [Diffusion models](/notes/generative-models/ddpm-forward-process) bound it again, with a fixed encoder, the noising chain, so that the bound becomes a regression on noise, equivalently on the [score](/notes/generative-models/score-matching). [Autoregressive models](/notes/generative-models/autoregressive-models) compute it exactly as a product of conditionals and pay at sampling time. The largest models combine the families: a discrete or continuous autoencoder compresses the image, and a diffusion model or an autoregressive transformer generates in its latent space. All of them are judged by the same metrics, from [Inception Score](/notes/generative-models/inception-score) to [precision and recall](/notes/generative-models/precision-recall) and [human judgement](/notes/generative-models/human-evaluation), and all rest on the [KL divergence](/notes/generative-models/entropy-and-divergences) and its relatives.
+
+## References
+
+- M. Chen, A. Radford, R. Child, J. Wu, H. Jun, D. Luan, I. Sutskever. [Generative Pretraining from Pixels](https://proceedings.mlr.press/v119/chen20s.html). ICML, 2020.
+- P. Esser, R. Rombach, B. Ommer. [Taming Transformers for High-Resolution Image Synthesis](https://arxiv.org/abs/2012.09841). CVPR, 2021.
+- A. Ramesh, M. Pavlov, G. Goh, S. Gray, C. Voss, A. Radford, M. Chen, I. Sutskever. [Zero-Shot Text-to-Image Generation](https://arxiv.org/abs/2102.12092). ICML, 2021.
+- J. Yu et al. [Scaling Autoregressive Models for Content-Rich Text-to-Image Generation](https://arxiv.org/abs/2206.10789). TMLR, 2022.
+- J. Yu, X. Li, J. Y. Koh, H. Zhang, R. Pang, J. Qin, A. Ku, Y. Xu, J. Baldridge, Y. Wu. [Vector-quantized Image Modeling with Improved VQGAN](https://arxiv.org/abs/2110.04627). ICLR, 2022. ViT-VQGAN.
+- A. van den Oord, O. Vinyals, K. Kavukcuoglu. [Neural Discrete Representation Learning](https://arxiv.org/abs/1711.00937). NeurIPS, 2017. VQ-VAE.
