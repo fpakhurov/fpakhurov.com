@@ -245,6 +245,7 @@ export const courses: Record<CourseKey, Course> = {
         'Latent diffusion': 'Латентная диффузия',
         'Classifier-free guidance': 'Classifier-free guidance',
         'Autoregressive Models': 'Авторегрессионные модели',
+        'Autoregressive models': 'Авторегрессионные модели',
         'Factorization': 'Факторизация',
         'PixelRNN / PixelCNN': 'PixelRNN / PixelCNN',
         'Autoregressive transformers': 'Авторегрессионные трансформеры',
@@ -298,7 +299,12 @@ export const courses: Record<CourseKey, Course> = {
         noteTopic('Latent diffusion', 'generative-models/latent-diffusion'),
         noteTopic('Classifier-free guidance', 'generative-models/latent-diffusion', 'classifier-free-guidance'),
       ] },
-      { title: 'Autoregressive Models', topics: ['Factorization', 'PixelRNN / PixelCNN', 'Autoregressive transformers'] },
+      { title: 'Autoregressive Models', topics: [
+        noteTopic('Autoregressive models', 'generative-models/autoregressive-models'),
+        noteTopic('Factorization', 'generative-models/autoregressive-models', 'the-chain-rule-as-a-model'),
+        noteTopic('PixelRNN / PixelCNN', 'generative-models/autoregressive-models', 'pixelrnn-and-pixelcnn'),
+        'Autoregressive transformers',
+      ] },
     ],
   },
   nlp: {
