@@ -1,0 +1,179 @@
+---
+title: Score matching and Langevin dynamics
+description: "Learn the gradient of the log-density instead of the density: the score, Hyvärinen's score matching, its sliced and denoising versions, sampling with Langevin dynamics, why one noise level is not enough, and how noise-conditional scores and annealing lead to the same model as DDPM."
+course: generative-models
+section: Diffusion Models
+order: 19
+status: published
+tags: [diffusion, score-matching, langevin, denoising-score-matching, ncsn, tweedie]
+prerequisites: ["DDPM: reverse process and training objective", Multivariate Gaussian distributions]
+---
+
+import NoisedDensities from '../../../components/figures/score-matching/NoisedDensities.astro';
+import LangevinShares from '../../../components/figures/score-matching/LangevinShares.astro';
+
+The [DDPM note](/notes/generative-models/ddpm-training-objective) arrived at a model by bounding the likelihood of a noising chain and simplifying the bound until it became a regression on noise. This note arrives at the same model from the other side. Instead of a density, learn its gradient, the **score**; instead of a decoder, sample by following the score with a little noise added, **Langevin dynamics**. The two routes meet: the network that predicts the noise in DDPM is, up to a known scale, the score of the noised data.
+
+**Notation.** $p(x)$ is the data density on $\mathbb R^d$ and $s(x) = \nabla_x \log p(x)$ its score; $s_\theta(x)$ is the model. $q_\sigma(\tilde x) = \int p(x)\,\mathcal N(\tilde x; x, \sigma^2 I)\,dx$ is the data after adding Gaussian noise of scale $\sigma$. $\nabla \cdot s$ is the trace of the Jacobian of $s$.
+
+## Why the score
+
+Many models define a density only up to a constant: $p_\theta(x) = e^{-E_\theta(x)} / Z_\theta$ with an energy $E_\theta$ and a normalizer $Z_\theta = \int e^{-E_\theta(x)}\,dx$ that cannot be computed in high dimension. Maximum likelihood needs $\log Z_\theta$ and its gradient. The score does not:
+
+$$
+\nabla_x \log p_\theta(x) = -\nabla_x E_\theta(x) - \underbrace{\nabla_x \log Z_\theta}_{=\,0} .
+$$
+
+$Z_\theta$ depends on $\theta$ but not on $x$, so it disappears. The score of a Gaussian $\mathcal N(\mu, \sigma^2 I)$ is $-(x - \mu)/\sigma^2$: a vector pointing back to the mean, longer the farther away. In general the score points toward higher density, and it carries all the information about $p$: two densities with the same score everywhere differ by a constant factor, which normalization fixes.
+
+## Fitting a score: Hyvärinen's trick
+
+The natural loss is the **Fisher divergence**, the mean squared distance between the two scores under the data:
+
+$$
+J(\theta) = \tfrac12\, \mathbb E_{p}\big\lVert s_\theta(x) - \nabla_x \log p(x)\big\rVert^2 .
+$$
+
+It needs the true score, which is unknown. [Hyvärinen (2005)](#references) removes it by integration by parts. In one dimension, expand the square; the cross term is
+
+$$
+\mathbb E_p\big[s_\theta(x)\, (\log p)'(x)\big] = \int s_\theta(x)\, p'(x)\,dx = \big[s_\theta\, p\big]_{-\infty}^{\infty} - \int s_\theta'(x)\, p(x)\,dx = -\mathbb E_p\big[s_\theta'(x)\big],
+$$
+
+using $p\,(\log p)' = p'$ and assuming $s_\theta(x)\,p(x) \to 0$ at infinity. The square of the true score does not depend on $\theta$. In $d$ dimensions the same step per coordinate gives
+
+$$
+J(\theta) = \mathbb E_p\Big[\nabla \cdot s_\theta(x) + \tfrac12 \lVert s_\theta(x)\rVert^2\Big] + \text{const},
+$$
+
+an expectation over data that involves only the model.
+
+**Worked example.** Fit a Gaussian score $s_\theta(x) = -a(x - \mu)$ with $a = 1/\sigma^2$ to the data $\{1, 2, 4, 5\}$. Then $s_\theta' = -a$ and the objective is $\mathbb E\big[\tfrac12 a^2 (x - \mu)^2 - a\big]$. Setting the derivative in $\mu$ to zero gives $\mu = \bar x = 3$; the derivative in $a$ gives $a\,\mathbb E(x - \mu)^2 = 1$, so $\sigma^2 = \frac14(4 + 1 + 1 + 4) = 2.5$. Score matching recovers the sample mean and variance, the maximum likelihood estimates for a Gaussian, without ever touching the normalizing constant.
+
+The cost is the trace term. For a network $s_\theta: \mathbb R^d \to \mathbb R^d$, $\nabla \cdot s_\theta$ needs $d$ backward passes, one per diagonal entry of the Jacobian: fine for $d = 2$, impossible for an image with $d = 3 \cdot 64 \cdot 64$.
+
+## Two cheaper objectives
+
+**Sliced score matching** ([Song et al., 2019](#references)) projects onto random directions $v$ with $\mathbb E[v v^\top] = I$:
+
+$$
+J_{\text{SSM}}(\theta) = \mathbb E_{p}\,\mathbb E_{v}\Big[v^\top \nabla s_\theta(x)\, v + \tfrac12 \big(v^\top s_\theta(x)\big)^2\Big] .
+$$
+
+In expectation over $v$ this is the objective above, because $\mathbb E[v^\top A v] = \mathrm{tr}(A)$ and $\mathbb E[(v^\top s)^2] = \lVert s\rVert^2$. One Jacobian–vector product replaces $d$ backward passes.
+
+**Denoising score matching** ([Vincent, 2011](#references)) avoids derivatives of the model altogether by fitting the score of the **noised** data $q_\sigma$. Perturb $\tilde x = x + \sigma\varepsilon$ with $\varepsilon \sim \mathcal N(0, I)$. The score of the perturbation kernel is known, $\nabla_{\tilde x} \log \mathcal N(\tilde x; x, \sigma^2 I) = -(\tilde x - x)/\sigma^2 = -\varepsilon/\sigma$, and
+
+$$
+J_{\text{DSM}}(\theta) = \tfrac12\, \mathbb E_{x,\,\varepsilon}\Big\lVert s_\theta(x + \sigma\varepsilon) + \frac{\varepsilon}{\sigma}\Big\rVert^2
+$$
+
+equals the Fisher divergence to $q_\sigma$ up to a constant. The reason is that a squared-error regression learns a conditional mean: the minimizer is $s^*(\tilde x) = \mathbb E[-\varepsilon/\sigma \mid \tilde x]$, and this conditional mean is exactly $\nabla \log q_\sigma(\tilde x)$, a fact known as Tweedie's formula.
+
+**Worked example.** Data $x \sim \mathcal N(0, 1)$ and $\sigma = 0.5$. Then $\tilde x \sim \mathcal N(0, 1.25)$, whose score is $-\tilde x / 1.25 = -0.8\,\tilde x$. Directly: $\varepsilon$ and $\tilde x$ are jointly Gaussian with $\mathrm{Cov}(\varepsilon, \tilde x) = \sigma = 0.5$, so $\mathbb E[\varepsilon \mid \tilde x] = 0.5\,\tilde x / 1.25 = 0.4\,\tilde x$ and $\mathbb E[-\varepsilon/\sigma \mid \tilde x] = -0.8\,\tilde x$: the regression target, averaged, is the score of the noised data.
+
+The price of denoising score matching is that it estimates the score of $q_\sigma$, not of $p$. Small $\sigma$ keeps them close but makes the targets $\varepsilon/\sigma$ large and noisy; large $\sigma$ blurs the data. The way out, below, is to use many values of $\sigma$ at once.
+
+## Sampling with Langevin dynamics
+
+Given a score, **Langevin dynamics** produces samples:
+
+$$
+x_{k+1} = x_k + \frac{\eta}{2}\, s(x_k) + \sqrt{\eta}\, z_k, \qquad z_k \sim \mathcal N(0, I) .
+$$
+
+The drift climbs the density, the noise keeps the chain from collapsing onto the modes. For small step sizes $\eta$ and many steps the distribution of $x_k$ approaches $p$. Without the noise term the update is gradient ascent on $\log p$ and ends at a mode, not at a sample.
+
+**Worked example.** For $p = \mathcal N(0, 1)$, $s(x) = -x$ and the update is $x_{k+1} = (1 - \eta/2)\, x_k + \sqrt\eta\, z_k$. Its stationary variance $v$ solves $v = (1 - \eta/2)^2 v + \eta$, so
+
+$$
+v = \frac{\eta}{1 - (1 - \eta/2)^2} = \frac{1}{1 - \eta/4} .
+$$
+
+With $\eta = 0.1$ the chain settles at variance 1.026 instead of 1; with $\eta = 0.5$ at 1.143. The discretization bias is of order $\eta$, and smaller steps buy accuracy with more steps; a Metropolis–Hastings correction would remove the bias, at the cost of evaluating the density, which is what the score was meant to avoid.
+
+## Why one noise level fails
+
+Two problems appear as soon as the data are more than a blob ([Song and Ermon, 2019](#references)).
+
+**The score is unknown where there are no data.** Score matching weights its error by $p(x)$, so in regions of low density the learned score is barely trained, and a chain started there, as every chain started from noise is, follows arbitrary arrows. When the data lie near a low-dimensional manifold, as images do, almost all of space is such a region, and the score of the data itself is not even defined off the manifold.
+
+**Langevin dynamics cannot balance separated modes.** Take $p = 0.8\,\mathcal N(-4, 1) + 0.2\,\mathcal N(4, 1)$. Near each mode the score is that of one Gaussian and does not depend on the weights; the weights show only in the gap, where the score at $x = 0$ is $4(1 - 2 \cdot 0.8) = -2.4$, but the density there is about $0.00013$ and chains rarely visit. A chain falls into the mode nearest to its start and stays. With the exact score, 4000 chains started uniformly on $[-8, 8]$ end with 0.52 of them in the left mode after 2000 steps of size 0.05, close to the share that started on the left, not the true 0.8.
+
+Noise solves both problems. The noised density $q_\sigma$ is positive everywhere, so its score is defined and can be trained everywhere; for large $\sigma$ it fills the gap between the modes and makes the weights visible to a chain anywhere.
+
+<NoisedDensities />
+
+## Noise-conditional scores and annealing
+
+[Song and Ermon (2019)](#references) train one network for many noise levels at once. Choose a geometric sequence $\sigma_1 > \sigma_2 > \dots > \sigma_L$, condition the network on the level, and minimize a weighted sum of denoising objectives:
+
+$$
+\mathcal L(\theta) = \sum_{i=1}^{L} \sigma_i^2\; \tfrac12\, \mathbb E_{x,\,\varepsilon}\Big\lVert s_\theta(x + \sigma_i\varepsilon, \sigma_i) + \frac{\varepsilon}{\sigma_i}\Big\rVert^2 .
+$$
+
+The weight $\sigma_i^2$ makes the terms comparable: the target $\varepsilon/\sigma_i$ has size $1/\sigma_i$, so each weighted term is of order one. Sampling, **annealed Langevin dynamics**, runs a few Langevin steps at the largest noise level, where the chain moves freely, then continues at the next level from where it stopped, down to the smallest, with step sizes $\alpha_i = \epsilon\, \sigma_i^2/\sigma_L^2$ that shrink with the noise. For images the paper uses $L = 10$ levels from $\sigma_1 = 1$ to $\sigma_{10} = 0.01$, 100 steps per level and $\epsilon = 2 \cdot 10^{-5}$.
+
+In the mixture example, annealing through ten levels from $\sigma = 5$ to $\sigma = 0.1$, 100 steps each, with the exact score of each $q_\sigma$, ends with 0.79 of the chains in the left mode, against the true 0.8.
+
+<LangevinShares />
+
+## The same model as DDPM
+
+DDPM trains a network $\varepsilon_\theta(x_t, t)$ to predict the noise in $x_t = \sqrt{\bar\alpha_t}\, x_0 + \sqrt{1 - \bar\alpha_t}\,\varepsilon$ ([forward process](/notes/generative-models/ddpm-forward-process)). The score of this perturbation kernel is
+
+$$
+\nabla_{x_t} \log q(x_t \mid x_0) = -\frac{x_t - \sqrt{\bar\alpha_t}\, x_0}{1 - \bar\alpha_t} = -\frac{\varepsilon}{\sqrt{1 - \bar\alpha_t}} ,
+$$
+
+so denoising score matching at level $t$ regresses $s_\theta(x_t, t)$ onto $-\varepsilon/\sqrt{1 - \bar\alpha_t}$. Writing $s_\theta(x_t, t) = -\varepsilon_\theta(x_t, t)/\sqrt{1 - \bar\alpha_t}$ turns the DSM loss into $\lVert\varepsilon_\theta - \varepsilon\rVert^2 / (1 - \bar\alpha_t)$, and the weight $1 - \bar\alpha_t$, the variance of the noise, is the $\sigma^2$ weighting above. The DDPM objective $L_{\text{simple}}$ is noise-conditional denoising score matching with the noise variance as weight, and the DDPM sampling step is a Langevin-like step with the learned score. [Song et al. (2021)](#references) make the correspondence exact in continuous time: both models discretize a stochastic differential equation that adds noise, and generation runs its time reversal, whose drift contains the score $\nabla_x \log p_t(x)$.
+
+## What changed
+
+| | Likelihood (VAE, flows) | Score matching |
+| --- | --- | --- |
+| What is learned | a density or a bound on it | the gradient of the log-density |
+| Normalizing constant | needed, or avoided by the architecture | never needed |
+| Training signal | log-likelihood or ELBO | Fisher divergence, via a trace, random projections, or denoising |
+| Sampling | one decoder pass | many Langevin steps |
+| Weak spot | the architecture restricts the model | regions without data; separated modes, fixed by noise levels |
+
+## Limitations
+
+- **Many sampling steps.** Annealed Langevin runs hundreds to thousands of network evaluations per sample; faster samplers are the subject of later work.
+- **Discretization bias.** Unadjusted Langevin with a finite step samples a slightly wrong distribution, as the variance 1.026 instead of 1 shows.
+- **The noise schedule is a design choice.** The largest level must cover the distances between modes, the smallest must be below the detail that matters, and the steps between levels must overlap.
+- **No likelihood for free.** A score model does not give $\log p(x)$ directly; it can be computed through the probability flow ODE of [Song et al. (2021)](#references), at the cost of solving it.
+
+## Summary
+
+- The score $\nabla_x \log p(x)$ does not depend on the normalizing constant and determines $p$ up to it.
+- Hyvärinen's integration by parts turns the Fisher divergence into $\mathbb E_p[\nabla\cdot s_\theta + \frac12 \lVert s_\theta\rVert^2]$; sliced score matching estimates the trace with random projections; denoising score matching regresses onto $-\varepsilon/\sigma$ and learns the score of the noised data.
+- Langevin dynamics samples with the score; its step size trades bias against the number of steps.
+- One noise level fails in empty regions and between modes; noise-conditional scores with annealing fix both.
+- DDPM's noise prediction is noise-conditional denoising score matching: $s_\theta = -\varepsilon_\theta / \sqrt{1 - \bar\alpha_t}$.
+
+## Notebook
+
+The [score matching notebook](https://github.com/HSE-LAMBDA/DeepGenerativeModels/blob/spring-2025-long/seminars/10_Diffusion-Models/01_DPM_Score-Matching.ipynb) of the HSE-LAMBDA *Deep Generative Models* repository works on a two-dimensional Swiss roll (cell numbers count every cell from 1). It has no saved outputs, so it documents the procedure rather than results.
+
+- **Cell 5**: 10,000 points of a Swiss roll with noise 0.5, the first and third coordinates divided by 10.
+- **Cells 7–12**: standard score matching with a two-layer Softplus network, the exact Jacobian built by one backward pass per output coordinate, and 2000 full-batch Adam steps.
+- **Cells 15–19**: gradient ascent with the score (20 steps of $10^{-3}$) against Langevin dynamics (10 steps from $\epsilon = 10^{-2}$, multiplied by 0.9 after each step), both from the fixed point $(1.5, -1.5)$; the text says the start is drawn from $\mathcal N(0, I)$.
+- **Cells 20–23**: sliced score matching on the first 1000 points. The random directions are normalized to unit length, and the second term is computed as the mean of $(v_i\, s_i)^2/2$ over coordinates rather than $(v^\top s)^2/2$; both have the same expectation over $v$, so the objective is unbiased, with lower variance than the squared projection.
+- **Cells 24–27**: denoising score matching with $\sigma = 0.01$ and 5000 steps. At this noise level the targets are of size $1/\sigma = 100$ and points off the roll get almost no training signal, which is the failure that motivates the next cells.
+- **Cells 28–33**: a noise-conditional network with four levels from 1 to 0.01 and the $\sigma^2$-weighted loss, and plots of its score field at each level. Annealed Langevin sampling is not implemented, and the last plot assigns a random noise level to every grid point, so its arrows mix four different fields.
+
+## Next
+
+Diffusion and score models work in pixel space: every step of the reverse chain processes the full image, and most of its bits describe details no one perceives. The [next note](/notes/generative-models/latent-diffusion) runs the same process in the latent space of an autoencoder and adds the conditioning that turns it into text-to-image generation.
+
+## References
+
+- A. Hyvärinen. [Estimation of Non-Normalized Statistical Models by Score Matching](https://jmlr.org/papers/v6/hyvarinen05a.html). *Journal of Machine Learning Research*, 6, 2005.
+- P. Vincent. [A Connection Between Score Matching and Denoising Autoencoders](https://doi.org/10.1162/NECO_a_00142). *Neural Computation*, 23(7), 2011.
+- Y. Song, S. Garg, J. Shi, S. Ermon. [Sliced Score Matching: A Scalable Approach to Density and Score Estimation](https://arxiv.org/abs/1905.07088). UAI, 2019.
+- Y. Song, S. Ermon. [Generative Modeling by Estimating Gradients of the Data Distribution](https://arxiv.org/abs/1907.05600). NeurIPS, 2019. Noise-conditional score networks and annealed Langevin dynamics.
+- Y. Song, J. Sohl-Dickstein, D. P. Kingma, A. Kumar, S. Ermon, B. Poole. [Score-Based Generative Modeling through Stochastic Differential Equations](https://arxiv.org/abs/2011.13456). ICLR, 2021.
+- B. Efron. [Tweedie's Formula and Selection Bias](https://doi.org/10.1198/jasa.2011.tm11181). *Journal of the American Statistical Association*, 106(496), 2011.
+- G. O. Roberts, R. L. Tweedie. [Exponential Convergence of Langevin Distributions and Their Discrete Approximations](https://doi.org/10.2307/3318418). *Bernoulli*, 2(4), 1996.

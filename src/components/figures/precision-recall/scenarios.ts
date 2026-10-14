@@ -3,14 +3,10 @@
  * models N(0, s² I) with s = 0.3, 1 and 1.7, 2000 samples each, scored by k-NN precision and recall
  * (k = 3) and by density and coverage (k = 5). Seeded, so the note, the figure and its caption agree.
  */
+import { mulberry32 } from '../random';
+
 type P2 = [number, number];
 
-const mulberry32 = (seed: number) => () => {
-  let a = (seed = (seed + 0x6d2b79f5) | 0);
-  a = Math.imul(a ^ (a >>> 15), 1 | a);
-  a = (a + Math.imul(a ^ (a >>> 7), 61 | a)) ^ a;
-  return ((a ^ (a >>> 14)) >>> 0) / 4294967296;
-};
 const gaussians = (seed: number, n: number, s: number): P2[] => {
   const rand = mulberry32(seed);
   return Array.from({ length: n }, () => {
