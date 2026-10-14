@@ -231,6 +231,7 @@ export const courses: Record<CourseKey, Course> = {
         'Precision / Recall': 'Точность и полнота',
         'Density and coverage': 'Плотность и покрытие',
         'Human evaluation': 'Оценка людьми',
+        'Pairwise preferences and Elo': 'Попарные предпочтения и Эло',
         'Normalizing Flows': 'Нормализующие потоки',
         'Normalizing flows: change of variables': 'Нормализующие потоки: замена переменных',
         'Flow architectures': 'Архитектуры потоков',
@@ -277,7 +278,8 @@ export const courses: Record<CourseKey, Course> = {
         noteTopic('LPIPS', 'generative-models/lpips'),
         noteTopic('Precision / Recall', 'generative-models/precision-recall'),
         noteTopic('Density and coverage', 'generative-models/precision-recall', 'density-and-coverage'),
-        'Human evaluation',
+        noteTopic('Human evaluation', 'generative-models/human-evaluation'),
+        noteTopic('Pairwise preferences and Elo', 'generative-models/human-evaluation', 'which-of-two-is-better'),
       ] },
       { title: 'Normalizing Flows', topics: [
         noteTopic('Normalizing flows: change of variables', 'generative-models/normalizing-flows'),
