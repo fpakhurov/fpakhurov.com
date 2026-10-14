@@ -99,7 +99,7 @@ export const courses: Record<CourseKey, Course> = {
       },
     },
     sections: [
-      { title: 'Foundations', summary: 'What probability is, how to count it, and how information changes it.', topics: [noteTopic('What probability is', 'probability/what-probability-is'), 'Outcomes, events and counting', 'Kolmogorov\'s axioms', 'Conditional probability and Bayes\' formula', 'Independence'] },
+      { title: 'Foundations', summary: 'What probability is, how to count it, and how information changes it.', topics: [noteTopic('What probability is', 'probability/what-probability-is'), noteTopic('Outcomes, events and counting', 'probability/outcomes-events-and-counting'), 'Kolmogorov\'s axioms', 'Conditional probability and Bayes\' formula', 'Independence'] },
       { title: 'Random Variables', summary: 'Numbers produced by chance, and how to summarize them.', topics: ['Discrete distributions', 'Continuous distributions', 'Functions of random variables', 'Expectation and variance', 'Moment and characteristic functions'] },
       { title: 'Several Random Variables', summary: 'How random quantities depend on each other.', topics: ['Joint distributions and independence', 'Covariance and correlation', 'The multivariate Gaussian', 'Conditional expectation'] },
       { title: 'Limit Theorems', summary: 'Why averages work, how fast, and why the Gaussian is everywhere.', topics: ['Inequalities and concentration', 'The law of large numbers', 'The central limit theorem', 'Modes of convergence'] },
