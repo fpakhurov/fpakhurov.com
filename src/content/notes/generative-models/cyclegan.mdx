@@ -1,0 +1,193 @@
+---
+title: "CycleGAN: unpaired image-to-image translation"
+description: "Translating images between two domains without paired examples: paired translation with pix2pix, why an adversarial loss alone does not tie an output to its input, the cycle-consistency and identity losses, what the cycle does and does not rule out, the ResNet generator and 70×70 PatchGAN, the training recipe, and the failure modes."
+course: generative-models
+section: GANs
+order: 11
+status: published
+tags: [cyclegan, image-to-image-translation, cycle-consistency, pix2pix, patchgan, lsgan, gan]
+prerequisites: [Generative adversarial networks, Autoencoders]
+---
+
+import CycleToy from '../../../components/figures/cyclegan/CycleToy.astro';
+import CycleFlow from '../../../components/figures/cyclegan/CycleFlow.astro';
+
+The [previous note](/notes/generative-models/alpha-gan) gave a GAN an encoder, so that an image can be mapped to a code and back. Many practical tasks start from an image rather than from noise: turn a photo into a painting, a summer landscape into a winter one, a map into an aerial photo, a horse into a zebra. This is **image-to-image translation**. When the training data come in pairs, a conditional GAN learns it directly. For most of these tasks pairs do not exist: nobody has a photo of the same horse as a zebra. **CycleGAN** ([Zhu et al., 2017](#references)) learns from two unpaired collections, one per domain. It needs one idea on top of the GAN: translating an image to the other domain and back should return the original.
+
+**Notation.** Two domains $X$ and $Y$ (horses and zebras) with data distributions $P_X$ and $P_Y$; images $x \sim P_X$, $y \sim P_Y$. Two generators, $G: X \to Y$ and $F: Y \to X$, and two discriminators: $D_Y$ tells real $y$ from translated $G(x)$, $D_X$ tells real $x$ from $F(y)$. $\|a - b\|_1$ is the sum of absolute pixel differences; implementations average it over pixels, which only rescales the weights.
+
+## Paired translation: pix2pix
+
+With aligned pairs $(x, y)$, such as an edge map and the photo it was drawn from, translation is supervised learning, and the question is only which loss to use. A pixel loss alone, $\mathbb E\,\|y - G(x)\|_1$, produces blur: where several outputs are plausible, the minimizer of an $L_1$ loss is their per-pixel median, and of an $L_2$ loss their mean, neither of which looks like any of them. **pix2pix** ([Isola et al., 2017](#references)) adds a [conditional](/notes/generative-models/gans#conditional-gan) adversarial loss, in which the discriminator sees the pair $(x, y)$ or $(x, G(x))$ and must say whether the output is a real photo *for this input*:
+
+$$
+G^* = \arg\min_G \max_D\; \mathcal L_{\text{cGAN}}(G, D) + \lambda\, \mathbb E_{x, y}\, \|y - G(x)\|_1 , \qquad \lambda = 100 .
+$$
+
+The adversarial term makes the output sharp, and the $L_1$ term keeps it close to the true target. The generator is a U-Net, an encoder–decoder with skip connections between mirrored layers, and the discriminator is a **PatchGAN**: instead of one verdict per image, it outputs a grid of verdicts, one per overlapping $70 \times 70$ patch, and the loss averages them. The PatchGAN carries over to CycleGAN unchanged; the U-Net is replaced by a residual generator (below).
+
+## Without pairs, the adversarial loss is not enough
+
+Without pairs there is no target $y$ for a given $x$. The only signal left is the adversarial one: $G(x)$ should look like a sample of $Y$. That loss depends on $G$ only through the distribution of its outputs, so every $G$ that pushes $P_X$ onto $P_Y$ is optimal, whatever it does to an individual image. With enough capacity a network can map the set of horse photos to any permutation of zebra photos. In practice, an adversarial loss alone also tends to collapse: all inputs map to the same few outputs ([Zhu et al., 2017](#references), Section 1).
+
+A one-dimensional model makes the problem concrete. Let "horses" be $x \sim \mathcal N(0, 1)$ and "zebras" $y \sim \mathcal N(3, 0.5^2)$. Three generators produce outputs with exactly the zebra distribution:
+
+<CycleToy />
+
+A discriminator cannot tell (a), (b) and (c) apart. Only (a) is the translation we want; (c) has thrown away everything about its input.
+
+## Cycle consistency
+
+If $G$ and $F$ translate in opposite directions, each should undo the other: $x \to G(x) \to F(G(x)) \approx x$ (**forward cycle**) and $y \to F(y) \to G(F(y)) \approx y$ (**backward cycle**). The **cycle-consistency loss** measures both:
+
+$$
+\begin{aligned}
+\mathcal L_{\text{cyc}}(G, F) = \;&\mathbb E_{x \sim P_X}\, \|F(G(x)) - x\|_1 \\
++\;&\mathbb E_{y \sim P_Y}\, \|G(F(y)) - y\|_1 .
+\end{aligned}
+$$
+
+**What it rules out.** A zero forward-cycle loss means $F(G(x)) = x$ for every $x$, so $G$ is injective: two different inputs never map to the same output, or $F$ could not recover both. A translation that forgets its input cannot be undone. In the toy, map (c) has no inverse at all: $G(x)$ is independent of $x$, so the best any $F$ can do is to return the median of $x$, and the cycle error is $\mathbb E|x| = \sqrt{2/\pi} \approx 0.80$. Maps (a) and (b) are invertible, with $F(y) = 2(y - 3)$ and $F(y) = -2(y - 3)$, and their cycle error is zero.
+
+**What it does not rule out.** Map (b) reverses the order of its inputs and is just as cycle-consistent as (a). The cycle requires that the translation keep enough information to be undone; it does not say which of the invertible correspondences is the right one. Among images, the choice is made by the architecture. A convolutional generator built from residual blocks (below) represents the identity map easily and changes images locally, so the solution it finds first is the one that keeps the layout and changes texture and colour: stripes on the horse rather than a different animal in a different pose. When two domains admit several such correspondences, the network can pick a wrong one: on the photo → segmentation-label task, CycleGAN sometimes swaps the labels of trees and buildings ([Zhu et al., 2017](#references), Section 6).
+
+<aside class="callout"><strong>Two autoencoders.</strong> The composition $F \circ G$ maps $X$ to $X$ through an intermediate representation, so CycleGAN trains two autoencoders whose codes are images of the other domain. The cycle loss is their reconstruction loss, and the adversarial loss on $G(x)$ makes the code distribution match $P_Y$, as the code discriminator of an <a href="/notes/generative-models/alpha-gan">adversarial autoencoder</a> matches a prior. Nothing forces that code to store the input visibly, which is the root of the steganography problem below.</aside>
+
+## Identity loss
+
+Painting-to-photo translation showed one more freedom: the generators changed the tint of an image when they had no need to. A daytime Monet often came out as a sunset photo, and both the adversarial and the cycle loss were satisfied. The **identity loss** ([Taigman et al., 2017](#references)) asks each generator to leave an image of its own target domain unchanged:
+
+$$
+\mathcal L_{\text{id}}(G, F) = \mathbb E_{y \sim P_Y}\, \|G(y) - y\|_1 + \mathbb E_{x \sim P_X}\, \|F(x) - x\|_1 .
+$$
+
+A zebra fed to the horse-to-zebra generator is already a zebra, so the generator should output it as it is. This removes changes of global colour that neither domain requires. The paper uses it for the painting and photo-enhancement tasks; common implementations use it everywhere.
+
+## The full objective
+
+<CycleFlow />
+
+The four kinds of loss in the figure combine into one objective:
+
+$$
+\begin{aligned}
+\mathcal L(G, F, D_X, D_Y) = \;&\mathcal L_{\text{GAN}}(G, D_Y) + \mathcal L_{\text{GAN}}(F, D_X) \\
++\;&\lambda_{\text{cyc}}\, \mathcal L_{\text{cyc}}(G, F) + \lambda_{\text{id}}\, \mathcal L_{\text{id}}(G, F),
+\end{aligned}
+$$
+
+minimized over the generators and maximized over the discriminators, with $\lambda_{\text{cyc}} = 10$ and $\lambda_{\text{id}} = 0.5\,\lambda_{\text{cyc}} = 5$.
+
+1. **Adversarial, $X \to Y$.** $G$ makes $G(x)$; $D_Y$ compares it with real zebras.
+2. **Forward cycle.** $F$ maps $G(x)$ back; $\|F(G(x)) - x\|_1$ is penalized.
+3. **Backward direction.** The same with the roles swapped: $D_X$ judges $F(y)$, and $G(F(y))$ must match $y$.
+4. **Identity.** $G(y) \approx y$ and $F(x) \approx x$.
+
+Both cycles are needed. With the adversarial loss and only one cycle, training was often unstable and collapsed in the direction whose cycle was removed ([Zhu et al., 2017](#references), Section 5.1.4).
+
+## The networks
+
+**Generator.** The generator follows the style-transfer network of [Johnson et al. (2016)](#references). For $256 \times 256$ images:
+
+- a $7 \times 7$ convolution to 64 channels;
+- two stride-2 convolutions to $128 \times 128 \times 128$ and $64 \times 64 \times 256$;
+- **nine residual blocks** at $64 \times 64 \times 256$;
+- two stride-$\tfrac12$ (transposed) convolutions back to $256 \times 256 \times 64$;
+- a $7 \times 7$ convolution to 3 channels with $\tanh$.
+
+Each residual block computes $h + r(h)$, where $r$ is two $3 \times 3$ convolutions, so a block whose $r$ is near zero passes its input through. That is the bias towards small, local changes described above. Every convolution except the output one is followed by **instance normalization** (statistics per image and channel; with one image per batch this is the natural choice, see [training background](/notes/generative-models/training-background#instance-normalization)), and every one except the output layer and the second convolution of each residual block by a ReLU. Reflection padding instead of zero padding avoids dark borders. The generator has 11.38 million parameters, 93% of them in the residual blocks. Smaller images ($128 \times 128$) use six blocks.
+
+**Discriminator: a $70 \times 70$ PatchGAN.** Four $4 \times 4$ convolutions with 64, 128, 256 and 512 channels (the first three with stride 2, the last with stride 1; instance normalization in all but the first; LeakyReLU with slope 0.2), then a $4 \times 4$ convolution to one channel. On a $256 \times 256$ image it outputs a $30 \times 30$ map of scores. Each score depends on a $70 \times 70$ window of the input, its receptive field:
+
+$$
+r = 1 + \sum_\ell (k_\ell - 1) \prod_{m < \ell} s_m = 1 + 3\,(1 + 2 + 4 + 8 + 8) = 70 ,
+$$
+
+with kernel sizes $k_\ell = 4$ and strides $s = (2, 2, 2, 1, 1)$. A patch discriminator judges local texture, which is what most translations change, has 2.76 million parameters and runs on images of any size. It treats pixels further apart than a patch as independent, so global structure is left to the generator and the cycle loss. With two generators and two discriminators the model has 28.3 million parameters.
+
+## Training
+
+- **Least-squares adversarial loss.** The negative log-likelihood of the standard GAN is replaced by the [least-squares loss](/notes/generative-models/gans#least-squares-gan): $D_Y$ minimizes $\mathbb E\,(D_Y(y) - 1)^2 + \mathbb E\,D_Y(G(x))^2$ and $G$ minimizes $\mathbb E\,(D_Y(G(x)) - 1)^2$. It gives the generator gradients even for outputs that the discriminator already classifies as real but that lie far from the real data, and it trains more stably. The discriminator objective is divided by 2, which slows the discriminator relative to the generators.
+- **A history of generated images.** Each discriminator is updated on fakes drawn from a buffer of 50 previously generated images, not only the newest one ([Shrivastava et al., 2017](#references)). Once the buffer is full, each new fake replaces a random stored one with probability $\frac12$, and the old image is used instead. A discriminator that sees only the current generator can chase it in circles; one that also remembers earlier generators damps the oscillation.
+- **Optimization.** Adam with learning rate $2\cdot10^{-4}$, batch size 1, 100 epochs at a constant rate and 100 more with the rate decaying linearly to zero. Weights are initialized from $\mathcal N(0, 0.02^2)$.
+
+## Results
+
+Two evaluations from the paper show what the method achieves and what it does not:
+
+- **Realism.** In a perceptual study on maps ↔ aerial photos at $256 \times 256$, raters took CycleGAN's outputs for real images in 26.8% of trials (map → photo) and 23.2% (photo → map). Earlier unpaired methods fooled them in at most 2.6%.
+- **Faithfulness.** On Cityscapes labels → photo, a pretrained segmentation network recovers the input labels from the generated photos. Per-pixel accuracy is 0.52 and class IoU 0.11 for CycleGAN, against 0.71 and 0.18 for pix2pix trained on pairs. The adversarial loss alone gives a class IoU of 0.08, the cycle loss alone 0.02.
+
+## What changed
+
+| | pix2pix | CycleGAN |
+| --- | --- | --- |
+| Training data | aligned pairs $(x, y)$ | two unpaired collections |
+| Networks | $G$; $D(x, y)$ sees the input | $G$, $F$, $D_X$, $D_Y$; each $D$ sees one domain |
+| What ties the output to the input | $L_1$ to the true target, $\lambda = 100$ | cycle loss, $\lambda_{\text{cyc}} = 10$; identity loss |
+| Adversarial loss | conditional, log-likelihood | unconditional per domain, least squares |
+| Generator | U-Net | ResNet with 9 residual blocks |
+| Discriminator | $70 \times 70$ PatchGAN | $70 \times 70$ PatchGAN, history buffer of 50 |
+
+## Limitations
+
+- **Geometry.** Changes of colour and texture work; changes of shape mostly do not. On dog → cat the learned translation degenerates into minimal changes of the input, which the authors tentatively attribute to a generator architecture tailored to appearance changes.
+- **Dataset bias.** Trained on ImageNet's wild horses and zebras, which include no riders, the horse → zebra model also paints stripes on the rider.
+- **A gap to paired training.** The faithfulness scores above stay well below pix2pix, and some ambiguities, such as the swapped tree and building labels, cannot be resolved without some supervision.
+- **Hidden information.** A generator can satisfy the cycle loss by hiding the information it needs in a near-invisible, high-frequency signal in its output, which the other generator decodes ([Chu, Zhmoginov and Sandler, 2017](#references)). Then the cycle is consistent although the visible translation has lost the content, and small perturbations of $G(x)$ can change $F(G(x))$ a lot.
+- **One output per input.** Both generators are deterministic, so a horse has exactly one zebra version, while many translations are one-to-many (a sketch has many colourings).
+- **One model per pair of domains.** For $k$ domains, all pairs need $k(k-1)/2$ CycleGANs with $k(k-1)$ generators, and no generator learns from the data of the other domains.
+
+## Summary
+
+- Without pairs, an adversarial loss constrains only the distribution of the outputs; any map onto the target distribution is optimal, including one that ignores its input.
+- The cycle loss $\|F(G(x)) - x\|_1 + \|G(F(y)) - y\|_1$ makes each translation invertible, so it keeps the information about its input; it does not choose among invertible correspondences, and the architecture's bias towards small local changes does that.
+- The identity loss keeps images of the target domain unchanged and prevents gratuitous colour shifts; $\lambda_{\text{cyc}} = 10$, $\lambda_{\text{id}} = 5$.
+- Networks: a ResNet generator with nine residual blocks and instance normalization; a $70 \times 70$ PatchGAN that scores a $30 \times 30$ grid of patches.
+- Training: least-squares GAN losses, a history buffer of 50 fakes, Adam $2\cdot10^{-4}$, batch 1, 200 epochs with linear decay over the last 100.
+- Failure modes: geometric changes, dataset bias, hidden information, deterministic one-to-one outputs, and one model per pair of domains.
+
+## Notebook
+
+The [CycleGAN notebook](https://github.com/HSE-LAMBDA/DeepGenerativeModels/blob/spring-2025-long/seminars/04_Image-to-Image/CycleGAN.ipynb) of the HSE-LAMBDA *Deep Generative Models* repository trains and runs CycleGAN on horse2zebra (cell numbers count every cell, markdown included, from 1). The networks, dataset, replay buffer and learning-rate schedule come from the [CycleGAN-PyTorch](https://github.com/Lornatang/CycleGAN-PyTorch) package by Lornatang, pinned to one commit.
+
+- **Cells 1–2: the method.** Unpaired translation, the adversarial, cycle and identity losses and the full objective. The markdown writes the adversarial loss with $\log D$ and a discriminator with outputs in $\{0, 1\}$; the training code uses the least-squares form, as the paper does in practice.
+- **Cells 3–7: setup.** Shell scripts download the horse2zebra dataset and pretrained weights for all four networks. The arguments: 200 epochs, decay over the last 100, batch size 1, learning rate $2\cdot10^{-4}$, image size 256, `args.cuda = False`. The random seed is drawn at random and not printed.
+- **Cells 8–11: data.** Images are resized to $\lfloor 1.12 \cdot 256 \rfloor = 286$ pixels (bicubic), randomly cropped to 256, randomly flipped and scaled to $[-1, 1]$. With `unaligned=True` each horse is paired with a random zebra, so the batches carry no correspondence. Cell 11 shows five random pairs.
+- **Cells 12–13: models.** `Generator` and `Discriminator` as described above: the generator is `c7s1-64, d128, d256, 9 × R256, u128, u64, c7s1-3` with reflection padding and instance normalization. Convolution weights are initialized from $\mathcal N(0, 0.02^2)$, and then the pretrained weights are loaded into all four networks.
+- **Cells 14–18: inference.** Five zebras translated to horses (cell 16) and five horses to zebras (cell 18) with the pretrained generators.
+- **Cells 19–20: losses and optimizers.**
+  - $L_1$ cycle loss with weight 10, $L_1$ identity loss with weight 5, `MSELoss` for the adversarial terms.
+  - One Adam optimizer over both generators and one per discriminator, all with betas $(0.5, 0.999)$.
+  - `LambdaLR` with the factor $1 - \max(0, e - 100)/100$ at epoch $e$: 1 up to epoch 100, 0.5 at epoch 150, 0.01 at epoch 199.
+  - Two `ReplayBuffer`s of 50 images, which behave as described in [Training](#training).
+- **Cells 21–22: training loop.**
+  - Each step first updates the generators on the sum of the two identity, two adversarial (target label 1) and two cycle losses.
+  - Then it updates $D_A$ and $D_B$ on a real image (label 1) and a buffered fake (label 0), each loss halved.
+  - The progress bar prints the discriminator, total, identity, GAN and cycle losses. The schedulers step once per epoch.
+
+**Saved outputs.** Only cell 16 has one: the five zebra → horse translations by the pretrained generator. The training loop was not run, so there are no loss values or samples from training.
+
+**Notebook issues.**
+
+- **Averaged patch scores.** `Discriminator.forward` averages the $30 \times 30$ score map into one number before the loss, so the adversarial loss is $(\bar s - 1)^2$ with $\bar s$ the mean patch score, instead of the per-patch mean $\frac1{900}\sum_p (s_p - 1)^2$ of the reference implementation. The two differ by the variance of the scores: $\frac1{900}\sum_p (s_p - 1)^2 = (\bar s - 1)^2 + \operatorname{Var}_p(s_p)$. The averaged loss does not ask every patch to look real, only their average, which weakens the PatchGAN.
+- **Device.** `args.cuda = False` keeps everything on the CPU even when a GPU is present (cell 9 only prints a warning), which makes 200 epochs impractical. Set it to `True` on a GPU machine.
+- **Training starts from the pretrained weights.** Cell 13 loads them before the training loop, so cell 22 fine-tunes the pretrained model, although cell 21 suggests training from scratch. Empty the weight paths to train from scratch.
+- **Unused loss lists.** `g_losses`, `d_losses` and the other lists in cell 22 are created but never filled, so nothing is recorded for plotting.
+
+## Next
+
+CycleGAN translates between two domains with two generators. Ten domains, such as ten hair colours or facial expressions, would need 45 CycleGANs and 90 generators, each trained on two domains' data only. The [next note](/notes/generative-models/stargan) replaces them with a single generator that receives the target domain as an input.
+
+## References
+
+- J.-Y. Zhu, T. Park, P. Isola, A. A. Efros. [Unpaired image-to-image translation using cycle-consistent adversarial networks](https://arxiv.org/abs/1703.10593). ICCV, 2017. Section numbers refer to the extended arXiv version (v7): the losses in Section 3, implementation in Section 4 and Appendix 7, the ablation in Section 5.1.4, limitations in Section 6.
+- P. Isola, J.-Y. Zhu, T. Zhou, A. A. Efros. [Image-to-image translation with conditional adversarial networks](https://arxiv.org/abs/1611.07004). CVPR, 2017. pix2pix: the conditional objective with $\lambda = 100$ (Section 3.1), the U-Net and the PatchGAN (Section 3.2).
+- J. Johnson, A. Alahi, L. Fei-Fei. [Perceptual losses for real-time style transfer and super-resolution](https://arxiv.org/abs/1603.08155). ECCV, 2016. The residual generator.
+- Y. Taigman, A. Polyak, L. Wolf. [Unsupervised cross-domain image generation](https://arxiv.org/abs/1611.02200). ICLR, 2017. The identity regularizer.
+- X. Mao, Q. Li, H. Xie, R. Y. K. Lau, Z. Wang, S. P. Smolley. [Least squares generative adversarial networks](https://arxiv.org/abs/1611.04076). ICCV, 2017.
+- A. Shrivastava, T. Pfister, O. Tuzel, J. Susskind, W. Wang, R. Webb. [Learning from simulated and unsupervised images through adversarial training](https://arxiv.org/abs/1612.07828). CVPR, 2017. The history of generated images.
+- D. Ulyanov, A. Vedaldi, V. Lempitsky. [Instance normalization: the missing ingredient for fast stylization](https://arxiv.org/abs/1607.08022). arXiv:1607.08022, 2016.
+- C. Chu, A. Zhmoginov, M. Sandler. [CycleGAN, a master of steganography](https://arxiv.org/abs/1712.02950). NIPS Workshop on Machine Deception, 2017.
+- Lornatang. [CycleGAN-PyTorch](https://github.com/Lornatang/CycleGAN-PyTorch), the implementation used by the notebook.
+- HSE-LAMBDA, *Deep Generative Models* course repository: [`CycleGAN.ipynb`](https://github.com/HSE-LAMBDA/DeepGenerativeModels/blob/spring-2025-long/seminars/04_Image-to-Image/CycleGAN.ipynb).

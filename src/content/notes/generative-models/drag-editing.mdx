@@ -1,0 +1,357 @@
+---
+title: "Point-based image editing: DragGAN and DragDiffusion"
+description: "Move a point of an image to a target by optimizing the latent code of a generative model: StyleGAN2's W+ space and GAN inversion, DragGAN's motion supervision and point tracking, and DragDiffusion's LoRA fine-tuning, DDIM inversion, latent optimization and reference-latent-control, evaluated on DragBench."
+course: generative-models
+section: Diffusion Models
+order: 26
+status: published
+tags: [draggan, dragdiffusion, image-editing, stylegan2, gan-inversion, ddim-inversion, lora, motion-supervision, point-tracking]
+prerequisites: [Generative adversarial networks, Latent diffusion and Stable Diffusion, LPIPS, LoRA]
+---
+
+import DragGanIteration from '../../../components/figures/drag-editing/DragGanIteration.astro';
+import DragToy from '../../../components/figures/drag-editing/DragToy.astro';
+import DragDiffusionFlow from '../../../components/figures/drag-editing/DragDiffusionFlow.astro';
+
+The [latent diffusion note](/notes/generative-models/latent-diffusion#editing-with-the-same-model) ended with four ways to edit an image with a trained model: image-to-image, inpainting, LoRA and textual inversion. All four steer *what* the image shows, through a prompt, a mask or a new concept. None of them says *where* things go. Many edits are geometric: open a mouth, turn a head, lift an ear, make a car taller. A user can state such an edit with two clicks, a **handle point** on the object and a **target point** where it should end up. Point-based editing turns the clicks into an optimization over the latent code of a generative model, so that every intermediate result is an image the model can produce. **DragGAN** ([Pan et al., 2023](#references)) does this in a StyleGAN2. **DragDiffusion** ([Shi et al., 2024](#references)) carries the same loop into Stable Diffusion, which can represent almost any photograph.
+
+**Notation.** Handle points $p_1, \dots, p_n$ and their targets $g_1, \dots, g_n$ are pixel positions; we write $g_i$ (goal) where DragGAN writes $t_i$, because $t$ is the diffusion step. $p_i^0$ is the initial position of a handle and $p_i^k$ its position after $k$ iterations. $M$ is an optional binary mask, 1 where the image may change. $d_i = (g_i - p_i)/\lVert g_i - p_i \rVert_2$ is the unit vector from a handle to its goal. $F_q(v) \in \mathbb R^C$ is the feature vector at position $q$ of a feature map computed from the variable $v$ that is being optimized; at a non-integer $q$ it is interpolated bilinearly from the four neighbouring positions. $\mathrm{sg}[\cdot]$ is the stop-gradient: its value passes forward, its gradient is zero. $\Omega_1(p, r_1) = \{q : \lVert q - p \rVert_2 < r_1\}$ is a disc of positions around $p$ and $\Omega_2(p, r_2) = \{q : |q_x - p_x| < r_2,\ |q_y - p_y| < r_2\}$ a square. $\lVert \cdot \rVert_1$ is the sum of absolute values. The diffusion symbols $z_t$, $\bar\alpha_t$, $\varepsilon_\theta$, $\tau(y)$, $\mathcal E$ and $\mathcal D$ are those of the latent diffusion note.
+
+## What a drag edit asks for
+
+DragGAN names three properties of an ideal tool for this kind of control ([Pan et al., 2023](#references), Section 1). It should be **flexible**: position, pose, shape, expression and layout can all be changed. It should be **precise**: the handle ends at the target, not near it. It should be **general**: not tied to one object category. Earlier approaches miss at least one. Methods built on 3D models or trained with manual annotations, such as a [conditional GAN](/notes/generative-models/gans#conditional-gan) driven by landmarks or segmentation maps, offer only the controls they were trained for and do not transfer to new categories. Text is general but cannot say "move this by 40 pixels".
+
+A fourth property comes with the choice of tool. If the edit is made by changing the latent code of a pretrained generator, every intermediate result is an output of that generator and stays realistic. Content that the motion uncovers is invented by the model: DragGAN opens a lion's mouth and teeth appear inside. A warp of pixels cannot do that. What remains is to say, in a differentiable way, "this point should move one step that way", and to know where the point is after each step.
+
+## The StyleGAN2 generator in brief
+
+The course has used GAN generators as black boxes that map noise to images ([GAN note](/notes/generative-models/gans)). DragGAN relies on four properties of one particular generator, StyleGAN2 ([Karras et al., 2020](#references)), trained with the usual adversarial game.
+
+- **Mapping network.** A noise vector $z \in \mathbb R^{512}$, $z \sim \mathcal N(0, I)$, first passes through an 8-layer MLP $f$, giving an intermediate code $w = f(z) \in \mathcal W \subset \mathbb R^{512}$ ([Karras, Laine and Aila, 2019](#references), Section 2). $\mathcal W$ is not forced to be Gaussian, and the StyleGAN paper argues that it is less entangled than the space of $z$: moving along a direction in $\mathcal W$ tends to change fewer attributes at once.
+- **Style modulation.** The synthesis network starts from a learned $4 \times 4 \times 512$ constant and doubles the resolution block by block up to $R \times R$. Every convolution receives a **style** $s = A(w)$, a learned affine function of $w$ with one scale per input channel. StyleGAN2 applies the style to the weights. With $\vartheta_{ijk}$ the weight from input channel $i$ to output channel $j$ at kernel position $k$,
+
+  $$
+  \vartheta'_{ijk} = s_i\, \vartheta_{ijk}, \qquad \vartheta''_{ijk} = \frac{\vartheta'_{ijk}}{\sqrt{\sum_{i,k} \big(\vartheta'_{ijk}\big)^2 + \epsilon}} ,
+  $$
+
+  where the second step, **demodulation**, divides each output channel by the norm of its weights, so that inputs of unit variance give outputs of unit variance again ([Karras et al., 2020](#references), Section 2.2). Per-pixel noise maps add stochastic detail such as the placement of hairs.
+- **The extended space $\mathcal W^+$.** Nothing forces every layer to receive the same $w$. Feeding each style input its own code gives $w = (w_1, \dots, w_l) \in \mathbb R^{l \times 512}$, the space $\mathcal W^+$ ([Xia et al., 2022](#references), Section IV-A). A generator with output $R \times R$ has $l = 2\log_2 R - 2$ style inputs: 14 at $256^2$, 16 at $512^2$ and 18 at $1024^2$. The first codes act at coarse resolutions. In StyleGAN's style-mixing experiments, the codes of the $4^2$ to $8^2$ layers carry pose, face shape and the general hair style, those of $16^2$ and $32^2$ smaller facial features, and the finest layers colour and microstructure ([Karras, Laine and Aila, 2019](#references), Section 3.1). The first six codes drive the layers up to about $16 \times 16$.
+- **Intermediate features.** Each synthesis block outputs a feature map at its resolution. DragGAN uses the map after the sixth block, resized bilinearly to the image size. Among the blocks it tested, this one gave the most precise edits: earlier blocks are coarser, later ones less discriminative ([Pan et al., 2023](#references), Sections 3.2 and 4.2). Counting from the $4 \times 4$ block, the sixth block outputs a $128 \times 128$ map, and this is the map the official code uses. The paper gives $256 \times 256$ (Section 3.3), the resolution of the seventh block.
+
+## Editing a real photo: GAN inversion
+
+A generated image comes with its latent code. A photograph does not, so it must first be **inverted**: find the code whose image reproduces it,
+
+$$
+w^* = \arg\min_{w}\ \ell\big(G(w),\ x\big),
+$$
+
+with $\ell$ a distance in pixel or feature space ([Xia et al., 2022](#references), Section II). The survey sorts methods into three families (Section IV-B).
+
+- **Optimization-based** methods solve the problem directly for each image by gradient descent. StyleGAN2's own projector optimizes $w$ and the noise maps for 1000 Adam iterations under the [LPIPS](/notes/generative-models/lpips) distance, computed on both images downsampled to $256 \times 256$ ([Karras et al., 2020](#references), Section 5 and Appendix D). Accurate, but slow.
+- **Encoder-based** methods train a network $E: x \mapsto w$ once on many images. Inversion is then one forward pass, at the price of a less exact reconstruction.
+- **Hybrid** methods start from the encoder's code and refine it by optimization.
+
+The choice of space matters. $\mathcal W^+$ has $l$ times more freedom than $\mathcal W$ and reproduces photos more closely, but a code found far from the codes the mapping network produces edits badly: the survey calls this the trade-off between distortion and editability (Section IV-A). **Pivotal tuning inversion** (PTI, [Roich et al., 2022](#references)) avoids it by changing the generator instead of the code. It first inverts the photo into $\mathcal W$, giving a pivot $w_p$ (450 optimization steps under LPIPS with a noise regularizer). It then fine-tunes the generator's weights for 350 steps so that $G(w_p)$ matches the photo under LPIPS plus a squared error, with a regularizer that keeps the generator unchanged away from $w_p$. The whole procedure takes under three minutes per image on one RTX 2080. DragGAN edits real photos this way: PTI first, then the drag loop on the resulting code ([Pan et al., 2023](#references), Section 4.1).
+
+Inversion bounds what a GAN-based editor can do. A face model can invert a portrait but not a person in full figure, a cat model cannot invert a car, and what lies off the generator's image manifold cannot be reached by moving on it.
+
+## DragGAN: motion supervision and point tracking
+
+DragGAN starts from a code $w_0$, its features $F_0 = F(w_0)$ and the initial handles $p_i^0$. Each iteration has two sub-steps ([Pan et al., 2023](#references), Section 3.1). **Motion supervision** nudges every handle a small step toward its goal by one gradient step on $w$. **Point tracking** then finds where each handle went. The two repeat until every handle has reached its goal. Nothing is trained: the generator stays frozen, and the only variable is the code of the image being edited.
+
+<DragGanIteration />
+
+1. The generator maps $w$ to the image and, after its sixth block, to the feature map $F$.
+2. Motion supervision compares the features in the patch $\Omega_1$ around each handle with the same patch moved one pixel along $d_i$.
+3. The loss is backpropagated to the first six codes $w_1, \dots, w_6$, and Adam takes one step.
+4. The generator runs again with the new code $w'$; in its features $F'$ the content around each handle has moved a little.
+5. Point tracking finds the new handle positions by nearest-neighbour search in $F'$. The loop returns to step 2 until every handle is close enough to its goal.
+
+### Motion supervision
+
+The loss of one iteration is
+
+$$
+\begin{aligned}
+\mathcal L(w) = {}&\sum_{i=1}^{n} \sum_{q \in \Omega_1(p_i, r_1)} \big\lVert F_{q + d_i}(w) - \mathrm{sg}\big[F_q(w)\big] \big\rVert_1 \\
+&+ \lambda\, \big\lVert \big(F(w) - F_0\big) \odot (1 - M) \big\rVert_1 .
+\end{aligned}
+$$
+
+The first term compares the patch of features around each handle with the same patch shifted by one pixel toward the goal. The reference $F_q(w)$ is frozen, so the only way to lower the term is to change the features at the shifted positions $q + d_i$ until they look like the current features at $q$: the content around $p_i$ is copied one step along $d_i$. The positions $q + d_i$ are not integers, so $F_{q + d_i}$ is read by bilinear interpolation. Interpolation is what lets a unit step point in any direction, not only along the grid, and it keeps the shifted features a differentiable function of the feature map. If a handle already sits on its goal, $d_i$ is taken as 0; its term is then identically zero and no longer acts on that handle. The second term, used when a mask is drawn, keeps the features outside the movable region equal to those of the original image.
+
+The variable is a code in $\mathcal W^+$, and only its first six codes are updated. The paper observes that spatial attributes are mainly set by these codes, while the later ones carry appearance; keeping the later codes fixed moves the content without repainting it, the same split as in style mixing ([Pan et al., 2023](#references), Section 3.2). $\mathcal W^+$ rather than $\mathcal W$ gives room for edits that are rare in the training data; the paper's example is closing one eye of a cat, which fails in $\mathcal W$ (Figure 16).
+
+### Why the reference is frozen
+
+Without the stop-gradient both sides of each difference depend on $w$, and the gradient becomes the difference of two nearly equal gradients. It no longer prefers the direction $d_i$: the loss can be lowered just as well by moving the content backwards, so that $F_q$ comes to resemble $F_{q + d_i}$, or by flattening the features in the patch until all positions look alike.
+
+**Worked example.** A one-dimensional toy generator draws a bump whose position is the latent $s$, and reads two feature channels at position $x$:
+
+$$
+F_x(s) = \Big(\phi(x - s),\ \tfrac{x - s}{\sigma}\, \phi(x - s)\Big), \qquad \phi(u) = e^{-u^2 / (2\sigma^2)}, \quad \sigma = 2 .
+$$
+
+The second channel tells the left flank of the bump from the right one. Take $s = 0$, a handle $p = 1$, a goal $g = 4$, so $d = 1$, and a patch of one position, $\Omega_1 = \{1\}$. The reference is $F_1(0) = (0.8825, 0.4412)$ and the shifted feature $F_2(0) = (0.6065, 0.6065)$, so the loss is $0.276 + 0.165 = 0.441$; the first difference is negative and the second positive.
+
+With the stop-gradient only $F_2(s)$ moves. Its derivatives are $\partial F_2 / \partial s = (0.3033, 0)$, so
+
+$$
+\frac{\partial \mathcal L}{\partial s} = -0.3033 + 0 = -0.3033 .
+$$
+
+Gradient descent increases $s$ and moves the bump toward the goal. With the reference frozen, the loss as a function of $s$ is $0.253$ at $s = 0.5$, $0$ at $s = 1$ and $0.286$ at $s = 1.5$: its minimum is exactly a shift of the content by $d$.
+
+Without the stop-gradient the reference moves too, with $\partial F_1 / \partial s = (0.2206, -0.3309)$, and
+
+$$
+\frac{\partial \mathcal L}{\partial s} = -(0.3033 - 0.2206) + \big(0 - (-0.3309)\big) = 0.248 .
+$$
+
+The sign flips: gradient descent now pushes the bump away from the goal.
+
+### Point tracking
+
+After the step, the content has moved, but by an amount the loss does not fix. One gradient step can move it by less than a pixel or by more, depending on the learning rate and on the object. If the next step supervised the old position, it would push the wrong content. DragGAN therefore re-locates each handle by nearest-neighbour search in feature space ([Pan et al., 2023](#references), Section 3.3):
+
+$$
+p_i \leftarrow \arg\min_{q \in \Omega_2(p_i, r_2)} \big\lVert F_q(w') - f_i \big\rVert_1, \qquad f_i = F_{p_i^0}(w_0),
+$$
+
+where $w'$ is the updated code and $f_i$ the feature of the handle in the original image. The reference is always the original feature, not the one from the previous iteration, so small tracking errors do not accumulate into drift. In the worked example, after the bump has moved to $s = 1$ and with $r_2 = 3$, the candidates $x = -1, 0, 1, 2, 3$ have distances $1.324, 0.882, 0.559, 0, 0.441$ to $f = (0.8825, 0.4412)$: the handle is found at $x = 2 = p + d$. With the first channel alone, $x = 0$ would tie with $x = 2$; tracking needs features that tell positions apart.
+
+Why not a dedicated tracker? The generator's features are already computed in the forward pass, and they are discriminative enough. Replacing the nearest-neighbour search by an optical-flow network (RAFT) or a point tracker (PIPs) gave larger final errors and slower edits in the paper's tests (table below). Motion supervision and tracking are kept apart because they answer different questions: the loss needs a current handle position to place its patch, and only a search after the step can say where that position now is.
+
+### The loop and its settings
+
+- The optimizer is Adam on the six codes, with learning rate $2 \cdot 10^{-3}$ for FFHQ, AFHQ-Cat and LSUN Car and $10^{-3}$ for the other datasets.
+- $\lambda = 20$, $r_1 = \mathrm{round}(3R/512)$ and $r_2 = \mathrm{round}(12R/512)$ for an $R \times R$ image: 3 and 12 pixels at $R = 512$, 6 and 24 at $R = 1024$.
+- The loop stops when every handle is within 1 pixel of its goal, or within 2 pixels when there are more than five handles ([Pan et al., 2023](#references), Section 3.4).
+- An edit usually takes 30 to 200 iterations, a few seconds on one RTX 3090 (Sections 1 and 3.1). The user can stop at any time, move the goals, add handles and continue.
+
+The toy below runs the whole loop in two dimensions, with the position of a blob as the latent.
+
+<DragToy />
+
+Two features of the toy carry over to the real method. The loss does not decrease from one iteration to the next; it stays between 7.4 and 8.5 throughout, because each iteration defines a new patch at the new handle position. Progress is measured by the distance to the goal, not by the loss. And tracking returns grid positions while the content moves continuously: at the end the content has moved by $(9.11, 4.01)$, and the tracked handle is 0.11 pixel from where the handle's content really is.
+
+### Results
+
+The main quantitative test is **face landmark manipulation** ([Pan et al., 2023](#references), Section 4.2). Two random faces are generated by a StyleGAN2 trained on FFHQ at $512 \times 512$; the facial landmarks of the first face, found by the dlib detector, are the handles, and those of the second face the goals. The mean distance (MD) between the landmarks detected in the edited image and the goals is averaged over 1000 tests, with at most 300 iterations per edit. The FID between edited and initial images checks that the edits stay realistic.
+
+| Method | MD, 1 point | MD, 5 points | MD, 68 points | FID | Time, s |
+| --- | --- | --- | --- | --- | --- |
+| No edit | 12.93 | 11.66 | 16.02 | – | – |
+| UserControllableLT | 11.64 | 10.41 | 10.15 | 25.32 | 0.03 |
+| DragGAN with RAFT tracking | 13.43 | 13.59 | 15.92 | 51.37 | 15.4 |
+| DragGAN with PIPs tracking | 2.98 | 4.83 | 5.30 | 31.87 | 6.6 |
+| DragGAN | 2.44 | 3.18 | 4.73 | 9.28 | 2.0 |
+
+FID and time are for the one-point task. UserControllableLT, an earlier point-based method, is fast but barely moves the landmarks. The feature block matters little near the chosen one: block 6 gives an MD of 2.44, blocks 5 and 7 give 2.50 and 2.51 for motion supervision and 2.55 and 2.58 for tracking, and block 4 gives 2.73 and 3.61 (Table 3). The radius $r_1$ matters even less, with MD between 2.44 and 2.51 for $r_1$ from 1 to 5 (Table 4). In a second test, an image generated from a perturbed code is to be reconstructed from the original one and 32 drags taken from the optical flow between them; DragGAN has the lowest squared error and LPIPS on all four categories (Table 2).
+
+## DragDiffusion: the same loop in a diffusion latent
+
+DragGAN edits only what its GAN can generate, and real photos only as well as inversion works. A text-to-image diffusion model covers far more images than any category-specific GAN, but it has no single code like $w$: an image is the end of a chain of denoising steps. DragDiffusion keeps DragGAN's two sub-steps and changes what is optimized: one noisy latent of Stable Diffusion 1.5 at one intermediate step ([Shi et al., 2024](#references)). Two additions keep the edited image faithful to the original: a LoRA fine-tuning of the U-Net on the input image before editing, and a change to self-attention during the final denoising.
+
+<DragDiffusionFlow />
+
+1. Identity-preserving fine-tuning trains LoRA weights of the U-Net on the input image alone.
+2. DDIM inversion turns the image latent $z_0$ into the noisy latent $z_{35}$, 35 steps of a 50-step schedule away from the image.
+3. Latent optimization moves the handles by motion supervision and point tracking on U-Net features; only $z_{35}$ changes.
+4. Denoising with reference-latent-control takes the edited latent back to an image, borrowing keys and values from the denoising of the original latent.
+
+### Identity-preserving fine-tuning
+
+DDIM inversion followed by denoising does not return exactly the input photo, and once the latent is edited the gap grows: faces change identity, textures change. Before editing, DragDiffusion therefore fine-tunes the U-Net on the one image with [LoRA](/notes/nlp/peft#lora-a-low-rank-update) updates in the query, key and value projections of all attention layers. The loss is the DDPM objective of the [latent diffusion note](/notes/generative-models/latent-diffusion#diffusion-in-the-latent), restricted to the single latent $z_0 = \mathcal E(x)$:
+
+$$
+\mathcal L_{\text{ft}}(\Delta\theta) = \mathbb E_{\varepsilon, t}\Big[\big\lVert \varepsilon - \varepsilon_{\theta + \Delta\theta}\big(\sqrt{\bar\alpha_t}\, z_0 + \sqrt{1 - \bar\alpha_t}\,\varepsilon,\ t,\ \tau(y)\big)\big\rVert_2^2\Big] ,
+$$
+
+where $\theta$ is frozen, $\Delta\theta$ are the LoRA weights and $y$ is a short prompt describing the image. The paper writes the noisy latent as $\alpha_t z + \sigma_t \varepsilon$, which is the same thing with $\alpha_t = \sqrt{\bar\alpha_t}$ and $\sigma_t = \sqrt{1 - \bar\alpha_t}$. The settings are rank 16, AdamW with learning rate $5 \cdot 10^{-4}$, batch size 4 and 80 steps, about 25 seconds on an A100 ([Shi et al., 2024](#references), Section 4.1 and Appendix D). After fine-tuning, the model reconstructs this image closely, and the edit stays recognisably the same picture. Without the fine-tuning the mean distance rises sharply and fidelity drops; both improve quickly with the number of steps and level off, and fewer than 80 steps leave artefacts such as distorted faces (Sections 4.4 and 4.6, Appendix G).
+
+### DDIM inversion to a single step
+
+Sampling with [DDIM](/notes/generative-models/latent-diffusion#fewer-steps) is deterministic. With 50 sampler steps indexed by $t$, and $\bar\alpha_t$ taken at the corresponding training timesteps, one step is
+
+$$
+\begin{aligned}
+z_{t-1} &= \sqrt{\bar\alpha_{t-1}}\; \hat z_0(z_t) + \sqrt{1 - \bar\alpha_{t-1}}\; \varepsilon_\theta(z_t, t), \\
+\hat z_0(z_t) &= \frac{z_t - \sqrt{1 - \bar\alpha_t}\; \varepsilon_\theta(z_t, t)}{\sqrt{\bar\alpha_t}} :
+\end{aligned}
+$$
+
+predict the clean latent, then re-noise it to the next level along the predicted noise ([Song, Meng and Ermon, 2021](#references), Eq. 12 with $\sigma_t = 0$). **DDIM inversion** runs the same update upward, from $z_t$ to $z_{t+1}$, using the noise predicted at $z_t$ in place of the noise at the unknown $z_{t+1}$. With small steps the substitution changes little, and denoising the inverted latent returns close to the original (Section 4.3 of the DDIM paper treats the update as the discretization of an ODE that can be run in either direction).
+
+DragDiffusion inverts the photo for 35 of the 50 steps and edits $z_{35}$; $t$ counts from the image, so $t = 0$ is the photo and $t = 50$ pure noise. For real photos, classifier-free guidance is switched off in both inversion and denoising, because it amplifies the inversion error ([Shi et al., 2024](#references), Section 4.1).
+
+Why is one latent enough? A drag changes layout, and the layout of a diffusion sample is settled early in the chain, at high noise; later steps add detail. The paper shows that the U-Net features at $t = 35$ already contain the shape and pose of the object (Figure 2), so optimizing that single latent can move it. Each iteration then costs one forward and one backward pass through the U-Net, instead of a backward pass through the whole chain of denoising steps. The step is a trade-off (Section 4.5). Image fidelity decreases steadily as $t$ grows, because a noisier latent is freer to change. The mean distance is lowest for $t$ between 30 and 40: with smaller $t$ the latent is too constrained to make the move, with larger $t$ the editing becomes unstable and the identity is lost.
+
+### Latent optimization on U-Net features
+
+The motion supervision of DragGAN carries over with the latent in place of $w$ and U-Net features in place of generator features. With $\hat z_t^k$ the latent after $k$ updates and $\hat z_t^0 = z_t$,
+
+$$
+\begin{aligned}
+\mathcal L_{\text{ms}}(\hat z_t^k) = {}&\sum_{i=1}^{n} \sum_{q \in \Omega(p_i^k, r_1)} \big\lVert F_{q + d_i}(\hat z_t^k) - \mathrm{sg}\big[F_q(\hat z_t^k)\big] \big\rVert_1 \\
+&+ \lambda\, \big\lVert \big(\hat z_{t-1}^k - \mathrm{sg}[\hat z_{t-1}^0]\big) \odot (1 - M) \big\rVert_1 ,
+\end{aligned}
+$$
+
+and each update is a gradient step on the latent, $\hat z_t^{k+1} = \hat z_t^k - \eta\, \partial \mathcal L_{\text{ms}} / \partial \hat z_t^k$, taken with Adam in practice ([Shi et al., 2024](#references), Section 3.3). Three things differ from DragGAN.
+
+- **Features.** $F(\hat z_t)$ is the output of one block of the U-Net decoder when the U-Net denoises $\hat z_t$ at step $t$. Among the four upsampling blocks, the third gives the lowest mean distance with a relatively high fidelity. The first blocks are too coarse for precise control, and the last carries texture rather than geometry and barely moves anything (Section 4.7). The official code resizes this map bilinearly to half the image resolution, $256 \times 256$ for a $512 \times 512$ image, and scales the points accordingly; $F_{q + d_i}$ is read by bilinear interpolation, as in DragGAN.
+- **Patches.** $\Omega(p, r)$ is a square of half-width $r$: $3 \times 3$ positions for supervision ($r_1 = 1$) and $7 \times 7$ for tracking ($r_2 = 3$) on that map.
+- **Mask term.** It acts on latents rather than features. $\hat z_{t-1}^k$ is one DDIM step of denoising from the current latent and $\hat z_{t-1}^0$ the same step from the unedited one, so outside the mask the next, slightly cleaner latent must not change. The default is $\lambda = 0.1$, which the user can raise if the unmasked region still moves.
+
+Tracking is DragGAN's, with U-Net features:
+
+$$
+p_i^{k+1} = \arg\min_{q \in \Omega(p_i^k, r_2)} \big\lVert F_q(\hat z_t^{k+1}) - F_{p_i^0}(z_t) \big\rVert_1 .
+$$
+
+The U-Net features play the role the generator features played in DragGAN. They are computed anyway in the forward pass, they depend differentiably on the latent being optimized, and they carry correspondence between images ([Tang et al., 2023](#references)). An optical-flow network would need a decoded image at every iteration, while motion supervision needs features that depend differentiably on the latent anyway. Adam runs with learning rate 0.01 for at most 80 steps, 10 to 30 seconds on an A100 depending on the size of the drag (Section 4.1 and Appendix D).
+
+### Reference-latent-control
+
+After optimization, $\hat z_t$ is denoised for the remaining $t$ steps and decoded. Plain denoising can drift from the original in identity and texture. **Reference-latent-control** runs the denoising of the original $z_t$ alongside and, in the self-attention layers of the U-Net's upsampling blocks, at every step, replaces the keys and values of the edited branch by those of the original:
+
+$$
+\begin{aligned}
+\mathrm{Attention}(\hat Q, K, V) &= \mathrm{softmax}\Big(\frac{\hat Q K^\top}{\sqrt{d}}\Big) V, \\
+\hat Q = W_Q\, \hat\varphi, \quad K &= W_K\, \varphi, \quad V = W_V\, \varphi ,
+\end{aligned}
+$$
+
+where $\hat\varphi$ and $\varphi$ are the flattened features of the edited and the original branch and $d$ the key dimension ([Shi et al., 2024](#references), Sections 3.4 and 4.1). The mechanism follows the mutual self-attention of MasaCtrl ([Cao et al., 2023](#references)). Each position of the edited image looks up the positions of the original whose keys match its query and copies their values, so a cat whose ear has moved still gets the fur of the original cat. In the cross-attention of the latent diffusion note, keys and values come from the prompt; here they come from the original image. Removing this step mainly lowers image fidelity (Section 4.4). The final denoising takes 1 to 2 seconds.
+
+### Evaluation on DragBench
+
+DragBench was built for this task ([Shi et al., 2024](#references), Section 4.2 and Appendix A). It has 205 images with 349 pairs of handle and target points in ten categories: animals, art works, buildings (city and countryside views), human heads, upper bodies and full bodies, interior design, landscapes and other objects. The human images were generated with Midjourney; the others are photos from Unsplash, Pexels and Pixabay. Two measures are reported.
+
+- **Image fidelity** $\mathrm{IF} = 1 - \mathrm{LPIPS}(x, x_{\text{edit}})$, averaged over the images: how much of the original survives, 1 for an unchanged image ([LPIPS](/notes/generative-models/lpips)).
+- **Mean distance** MD: the position that the handle's content ends up at is found in the edited image with DIFT, a correspondence method built on diffusion features ([Tang et al., 2023](#references)), and its distance to the goal is averaged over all pairs; 0 for a perfect drag.
+
+The two pull in opposite directions. Doing nothing gives perfect fidelity and the initial distance; a drastic change can reach the goals and lose the image. They have to be read together, and the paper plots one against the other (Figure 8). For DragGAN, each image is edited with the StyleGAN of a class-specific set whose class best matches the image's description by CLIP similarity (Section 4.4).
+
+| Category | MD, DragGAN | MD, DragDiffusion | IF, DragGAN | IF, DragDiffusion |
+| --- | --- | --- | --- | --- |
+| art works | 59.51 | 30.74 | 0.71 | 0.88 |
+| landscape | 47.60 | 36.55 | 0.84 | 0.88 |
+| city | 41.94 | 26.18 | 0.74 | 0.89 |
+| countryside | 46.96 | 43.21 | 0.79 | 0.88 |
+| animals | 60.12 | 39.22 | 0.72 | 0.87 |
+| head | 65.14 | 36.43 | 0.91 | 0.85 |
+| upper body | 82.98 | 39.75 | 0.33 | 0.89 |
+| full body | 37.01 | 20.56 | 0.31 | 0.95 |
+| interior design | 75.65 | 24.83 | 0.57 | 0.90 |
+| other objects | 58.25 | 39.52 | 0.71 | 0.87 |
+
+The values are from Tables 1 and 2 of the paper; MD is in pixels, lower is better, and IF higher is better. DragDiffusion leaves the handles closer to their goals in all ten categories and keeps more of the image in nine. The exception is the head category, where DragGAN keeps more (0.91 against 0.85) but leaves the handles much farther away (65.14 against 36.43). In the upper-body and full-body categories DragGAN's fidelity falls to 0.33 and 0.31: the inverted images lose most of the original.
+
+## What changed
+
+| | Image-to-image and inpainting | DragGAN | DragDiffusion |
+| --- | --- | --- | --- |
+| The user gives | a prompt, a mask | handles, goals, optional mask | handles, goals, optional mask, a prompt |
+| Model | Stable Diffusion | StyleGAN2 of one category | Stable Diffusion 1.5 |
+| What is optimized | nothing at edit time | first 6 codes of $w \in \mathcal W^+$, $6 \cdot 512 = 3072$ numbers | one latent $z_{35}$, $4 \cdot 64 \cdot 64 = 16{,}384$ numbers |
+| Features | none | generator, after block 6 | U-Net decoder, third upsampling block |
+| Keeping the rest | the mask | $\lambda = 20$ on features outside the mask | $\lambda = 0.1$ on the next latent, LoRA, reference-latent-control |
+| Real photos | yes | after PTI inversion | after LoRA and DDIM inversion |
+| Time per edit | one sampling run | a few seconds | about 25 + 10–30 + 1–2 s |
+
+## Limitations
+
+- **The model's range bounds the edit.** DragGAN cannot leave its GAN's domain, and out-of-distribution poses produce artefacts ([Pan et al., 2023](#references), Section 4.3). DragDiffusion's range is far wider, but every edit of a photo passes through an approximate inversion.
+- **Tracking can slip.** Nearest-neighbour search on features drifts in texture-less regions, where many positions look alike, and on symmetric objects, as the single-channel case of the worked example shows. DragGAN recommends texture-rich handles.
+- **Not every handle arrives.** DragDiffusion occasionally leaves handles short of their targets (Appendix E); on DragBench its mean distance is still between 20.56 and 43.21 pixels per category.
+- **A drag is ambiguous.** A few points do not determine an image. Without a mask, DragGAN tends to choose the solution closest to its learned manifold, for example moving a whole dog when only its head was dragged (Section 4.3).
+- **Per-image cost.** PTI for DragGAN on photos and LoRA fine-tuning for DragDiffusion add a training run before each new image.
+- **Evaluation is a pair of numbers.** Fidelity rewards doing nothing and mean distance rewards reaching the goal at any price.
+- **Misuse.** Both tools make it easy to change the pose, expression or shape of a real person in a photo (Section 4.3).
+
+## Summary
+
+- A drag edit is an optimization of a generator's latent: every intermediate result stays on the model's image manifold, which keeps it realistic and lets the model invent uncovered content.
+- StyleGAN2 maps $z$ to $w$, modulates every convolution with a style from $w$, and in $\mathcal W^+$ takes a separate code per layer; its first codes set layout and its later codes appearance. Real photos enter through GAN inversion, for DragGAN through PTI.
+- DragGAN alternates motion supervision, an L1 loss that copies a feature patch one pixel toward the goal with the reference frozen by a stop-gradient, and point tracking by nearest-neighbour search of the handle's original feature. Only the first six codes of $w$ are updated.
+- DragDiffusion runs the same loop in Stable Diffusion: LoRA fine-tuning on the input, DDIM inversion to $t = 35$ of 50, optimization of that single latent on U-Net decoder features, and denoising with keys and values borrowed from the original.
+- DragGAN is fast and precise on the images its GAN can produce. DragDiffusion handles real photos of any kind, and on DragBench it reaches the goals more closely in every category and keeps more of the image in all but one.
+
+## Notebook
+
+The [DragGAN notebook](https://github.com/HSE-LAMBDA/DeepGenerativeModels/blob/spring-2025-long/seminars/11_DragGAN/draggan.ipynb) of the HSE-LAMBDA *Deep Generative Models* repository covers both methods: markdown summaries, two Gradio apps (a community implementation of DragGAN and the official DragDiffusion interface), and two short implementations written from scratch (cell numbers count every cell, markdown included, from 1). It has no saved outputs, so it documents procedures and the note quotes no results from it.
+
+- **Cell 1**: an "Open in Colab" badge that points to a copy on Google Drive, which may differ from the repository version.
+- **Cells 2–4: DragGAN.** The plan, the motivation (cell 3), and the method (cell 4): the pipeline, both losses, what is trained (nothing but the latent), the settings (Adam, learning rate $2 \cdot 10^{-3}$ or $10^{-3}$, $r_1 \approx 3$, $r_2 \approx 12$ scaled with the image size, $\lambda = 20$, stop within 1–2 pixels or at an iteration cap such as 300), the cost (seconds on an RTX 3090) and GAN inversion for real photos. Cell 4 says the initial image comes from "a pre-trained StarGANv2"; it is StyleGAN2. It says the gradient flows "through the target locations, not the original handle points"; in the loss the gradient flows through the shifted features $F_{q + d_i}$ of the patch and not through the reference $F_q$, and the goal itself enters only through $d_i$. The motion-supervision sum runs from $i = 0$ to $n$, as in the paper; for $n$ handles it is $i = 1, \dots, n$.
+- **Cells 5–10: the DragGAN Gradio app.** Cell 6 clones `Zeqiang-Lai/DragGAN`, which now redirects to `OpenGVLab/DragGAN`, an unofficial implementation (the official one is `XingangPan/DragGAN`); cell 7 installs its requirements, which pin Gradio 3.34.0; cells 8 and 10 import `gradio_app.main` and launch it with `queue(concurrency_count=1, max_size=20)`, an argument that exists only in Gradio 3. The app needs a CUDA GPU (`device = 'cuda'` is hard-coded) and defaults to the AFHQ-Cat model at $512 \times 512$. Its `drag_gan` follows the method: it optimizes the first six codes of $\mathcal W^+$ with Adam at $2 \cdot 10^{-3}$, takes the features of the seventh synthesis block, $256 \times 256$, resized bilinearly to the image (the official code takes the sixth, $128 \times 128$), uses a disc with $r_1 = 3$ and a square with $r_2 = 12$, detaches the reference patch and stops within 2 pixels. Two deviations matter to a user: the mask term is commented out, so a mask drawn in the interface has no effect, and the tracking step reuses the features computed before the Adam step, so tracking and the displayed image lag one iteration behind the code. The stopping test, `torch.allclose(handle_points, target_points, atol=2)`, checks each coordinate separately rather than the distance.
+- **Cells 11–20: DragGAN "from scratch".** A configuration, model and pipeline in the style of the Hugging Face classes wrap the StyleGAN2-ADA AFHQ-Cat generator (`ada/afhqcat.pkl` from `ZeqiangLai/StyleGAN2-pkl`); cell 17 clones `stylegan2-ada-pytorch`, and cell 14 loads the pickle from the Colab path `/content/stylegan2-ada-pytorch`. Cell 18 drags two points, given as $(y, x)$, from $(200, 250)$ and $(120, 160)$ to $(400, 450)$ and $(320, 410)$ with Adam at learning rate 0.01 for 20 steps, and cells 19–20 show the images before and after. This is not DragGAN. An untrained `Linear` + `LeakyReLU` layer is placed in front of the generator, whose own mapping network then runs on its output, so the variable is a noise vector rather than the first six codes of $\mathcal W^+$. The loss, `F.l1_loss(handle_feats, target_feats)`, compares the RGB values of the output image at the handle pixel and at the target pixel, 283 and 320 pixels away. There is no shifted patch, no stop-gradient, no tracking and no mask: the loss can be lowered by changing the target pixel as well as the handle pixel, and it asks for two pixels to share a colour, not for content to move. A faithful version registers a hook on the sixth synthesis block (`G.synthesis.b128`, $128 \times 128$, as in the official code), obtains `ws = G.mapping(z, None)`, optimizes `ws[:, :6]`, computes the shifted-patch loss with `grid_sample` against a detached reference, and tracks after each step; the app of cells 6–10 does the same on the seventh block.
+- **Cells 21–22: DragDiffusion.** Motivation, the three stages, the fine-tuning loss and its settings (LoRA in the attention modules, AdamW, $5 \cdot 10^{-4}$, batch 4, 80 steps, rank 16, about 25 s on an A100), DDIM inversion to $t = 35$, the motion-supervision loss with its symbols, tracking, the optimization settings (Adam, 0.01, at most 80 steps, $r_1 = 1$, $r_2 = 3$, $\lambda = 0.1$), reference-latent-control, the summarized inference pipeline, DragBench with IF and MD, timings and limitations. The markdown says GANs limit edits "to synthetic images"; DragGAN edits real photos through inversion, and the limit is the capacity of the GAN. "DDIM inversion steps: typically 35" means 35 steps of a 50-step schedule. "Less precise on synthetic data" is not a finding of either paper, and "slower than DragGAN" holds for GAN samples; on a real photo DragGAN first needs PTI, which takes minutes.
+- **Cells 23–28: the DragDiffusion Gradio app.** Cell 24 clones `Yujun-Shi/DragDiffusion`; cell 25 pins Gradio 3.41.1, Diffusers 0.24.0, Transformers 4.27.0, Accelerate 0.17.0, PEFT 0.4.0, `huggingface_hub` 0.20.3 and PyTorch Lightning 1.5.0; cell 27 describes the two workflows of the interface (a real image: enter a prompt, train the LoRA, draw a mask, click handles and targets, run; a generated image: generate, then drag); cell 28 starts `drag_ui.py`. The official code takes the features of the third upsampling block resized to half the image resolution, with $r_1 = 1$ and $r_2 = 3$ on that map; its README asks for about 14 GB of GPU memory.
+- **Cells 29–37: DragDiffusion "from scratch", without LoRA.** `DragDiffusionPipeline` (cell 30) encodes the prompt, samples a latent from noise with classifier-free guidance at scale 7.5, optionally runs `drag_step`, and decodes. `drag_step` takes 5 plain gradient steps of size 0.1 on the final clean latent with the loss `F.mse_loss(latents[0,:,sy,sx], latents[0,:,ty,tx])`. Cell 31 loads Stable Diffusion 1.5 with `LMSDiscreteScheduler`; cells 33–34 generate "A photograph of a cute cat in a hat" at $512 \times 512$ with 20 steps and no drag; cells 36–37 generate "A cartoon cat on the table" at $256 \times 256$ with a drag from $(32, 32)$ to $(32, 64)$. Issues:
+  - The sampling loop does not multiply the initial noise by `scheduler.init_noise_sigma` (about 14.6 for this schedule) and does not pass the U-Net input through `scheduler.scale_model_input`; `LMSDiscreteScheduler` needs both, so the samples are wrong. With `DDIMScheduler` both are identities.
+  - The drag is not DragDiffusion: it acts on the clean latent after sampling, not on an inverted $z_t$; it compares raw latent channels at two positions instead of U-Net features in a shifted patch; and it has no stop-gradient, tracking, mask, LoRA, inversion of a real image or reference-latent-control. The U-Net call inside `drag_step`, at a random timestep, is computed and discarded: the loss does not depend on it.
+  - The points are latent-grid coordinates clamped to the grid. At $256 \times 256$ the latent is $32 \times 32$, so both $(32, 32)$ and $(32, 64)$ become $(31, 31)$: source and target coincide, the loss is identically zero, and the drag changes nothing.
+  - The two runs use different prompts, sizes and unseeded noise, so they are not a before-and-after pair, and Stable Diffusion 1.5 at $256 \times 256$ is far below its training resolution.
+  - `runwayml/stable-diffusion-v1-5` has been removed from the Hugging Face Hub; the same weights are published as `stable-diffusion-v1-5/stable-diffusion-v1-5`.
+- **Cell 38: conclusion and eleven questions.** The conclusion contrasts DragGAN, precise on the images its GAN generates, with DragDiffusion, which extends dragging to real images. The questions are answered in this note: how the two methods supervise motion and what their objectives optimize (questions 1 and 10) in [Latent optimization on U-Net features](#latent-optimization-on-u-net-features) and [What changed](#what-changed); why tracking is needed, why it uses features rather than optical flow and why it is separate from supervision (2, 5, 8) in [Point tracking](#point-tracking) and after the tracking formula of DragDiffusion; what GANs cannot do (3) in [GAN inversion](#editing-a-real-photo-gan-inversion); why one diffusion step suffices and how the result depends on it (4, 11) in [DDIM inversion to a single step](#ddim-inversion-to-a-single-step); the role of LoRA (6) in [Identity-preserving fine-tuning](#identity-preserving-fine-tuning); which layers of $\mathcal W^+$ are optimized (7) and why bilinear interpolation is used (9) in [Motion supervision](#motion-supervision).
+- **Cell 39** is empty.
+
+The README of the folder also links a background-matting paper as "Sengupta et al., 2020, arXiv:2011.02225"; that identifier belongs to an unrelated materials-science paper, the matting paper is [Lin et al. (2021), arXiv:2012.07810](https://arxiv.org/abs/2012.07810), and nothing in the notebook uses matting.
+
+## Code
+
+The worked example in PyTorch, with `detach()` as the stop-gradient. It runs in about a second on a CPU.
+
+```python
+import torch
+
+sigma = 2.0
+
+def features(x, s):
+    """Toy generator: a bump at position s, read at positions x; two channels."""
+    u = x - s
+    phi = torch.exp(-u**2 / (2 * sigma**2))
+    return torch.stack([phi, u / sigma * phi])
+
+p, g = 1.0, 4.0
+d = 1.0 if g > p else -1.0  # unit step from the handle toward the goal
+
+for stop_grad in (True, False):
+    s = torch.tensor(0.0, requires_grad=True)       # the latent: position of the bump
+    ref = features(torch.tensor(p), s)
+    if stop_grad:
+        ref = ref.detach()                          # sg[F_p(s)]
+    loss = (features(torch.tensor(p + d), s) - ref).abs().sum()
+    loss.backward()
+    print(stop_grad, round(loss.item(), 4), round(s.grad.item(), 4))
+# True 0.4412 -0.3033
+# False 0.4412 0.2483
+
+# Point tracking once the content has moved by d (s = 1):
+f = features(torch.tensor(p), torch.tensor(0.0))   # the handle's original feature
+xs = torch.arange(-1.0, 4.0)                        # Omega_2 around p = 1 with r2 = 3
+dist = (features(xs, torch.tensor(1.0)) - f[:, None]).abs().sum(0)
+print(xs[dist.argmin()].item(), [round(v, 3) for v in dist.tolist()])
+# 2.0 [1.324, 0.882, 0.559, 0.0, 0.441]
+```
+
+## Next
+
+Both methods move an image along the manifold of a model that produces the whole image at once, from a latent code or by repeated denoising of the whole picture, and neither gives the probability of the result. The last family of the course builds an image one piece at a time: [autoregressive models](/notes/generative-models/autoregressive-models) factor the density of an image into a product of conditionals, predict one pixel or one token at a time, and compute the likelihood exactly.
+
+## References
+
+- X. Pan, A. Tewari, T. Leimkühler, L. Liu, A. Meka, C. Theobalt. [Drag Your GAN: Interactive Point-based Manipulation on the Generative Image Manifold](https://arxiv.org/abs/2305.10973). SIGGRAPH 2023 Conference Proceedings, 2023. Sections 3.1–3.4 (method and settings), 4.1–4.3 (PTI for real images, Tables 1–4, discussion and limitations), Figure 16 ($\mathcal W$ against $\mathcal W^+$).
+- Y. Shi, C. Xue, J. H. Liew, J. Pan, H. Yan, W. Zhang, V. Y. F. Tan, S. Bai. [DragDiffusion: Harnessing Diffusion Models for Interactive Point-based Image Editing](https://arxiv.org/abs/2306.14435). CVPR, 2024. Section numbers refer to arXiv version 6: Sections 3.2–3.4 (method), 4.1 (settings), 4.2 and Appendix A (DragBench), 4.4–4.7 (results and ablations), Appendices D (timings) and E (limitations), Tables 1–2.
+- T. Karras, S. Laine, M. Aittala, J. Hellsten, J. Lehtinen, T. Aila. [Analyzing and Improving the Image Quality of StyleGAN](https://arxiv.org/abs/1912.04958). CVPR, 2020. Section 2.2 (modulation and demodulation), Section 5 and Appendix D (projection).
+- T. Karras, S. Laine, T. Aila. [A Style-Based Generator Architecture for Generative Adversarial Networks](https://arxiv.org/abs/1812.04948). CVPR, 2019. Section 2 (mapping network), Section 3.1 (style mixing).
+- W. Xia, Y. Zhang, Y. Yang, J.-H. Xue, B. Zhou, M.-H. Yang. [GAN Inversion: A Survey](https://arxiv.org/abs/2101.05278). *IEEE Transactions on Pattern Analysis and Machine Intelligence*, 45, 3121–3138, 2023 (published online in 2022). Sections II and IV.
+- D. Roich, R. Mokady, A. H. Bermano, D. Cohen-Or. [Pivotal Tuning for Latent-based Editing of Real Images](https://arxiv.org/abs/2106.05744). *ACM Transactions on Graphics*, 2022.
+- E. J. Hu, Y. Shen, P. Wallis, Z. Allen-Zhu, Y. Li, S. Wang, L. Wang, W. Chen. [LoRA: Low-Rank Adaptation of Large Language Models](https://arxiv.org/abs/2106.09685). ICLR, 2022.
+- J. Song, C. Meng, S. Ermon. [Denoising Diffusion Implicit Models](https://arxiv.org/abs/2010.02502). ICLR, 2021. Eq. 12 (the update) and Section 4.3 (the ODE view and encoding).
+- M. Cao, X. Wang, Z. Qi, Y. Shan, X. Qie, Y. Zheng. [MasaCtrl: Tuning-Free Mutual Self-Attention Control for Consistent Image Synthesis and Editing](https://arxiv.org/abs/2304.08465). ICCV, 2023.
+- L. Tang, M. Jia, Q. Wang, C. P. Phoo, B. Hariharan. [Emergent Correspondence from Image Diffusion](https://arxiv.org/abs/2306.03881). NeurIPS, 2023. DIFT.
+- HSE-LAMBDA, *Deep Generative Models* course repository: [`draggan.ipynb`](https://github.com/HSE-LAMBDA/DeepGenerativeModels/blob/spring-2025-long/seminars/11_DragGAN/draggan.ipynb).

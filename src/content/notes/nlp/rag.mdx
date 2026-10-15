@@ -1,6 +1,6 @@
 ---
 title: Retrieval-augmented generation
-description: "Put a language model after a retriever: retrieve, rerank, assemble a context under a token budget, generate with an instruction to use it, and evaluate the two halves separately. The note gives the pipeline, a decision list for when retrieval is the right tool, the failure modes that each stage introduces, and structured output as the way to make the generator's answer machine-readable."
+description: "Put a language model after a retriever: retrieve, rerank, assemble a context under a token budget, generate with an instruction to use it, and evaluate the two halves separately. The note gives the pipeline and the chain of stages each query passes through, prompt and chat templates, follow-up questions in a conversation, a decision list for when retrieval is the right tool, the failure modes that each stage introduces, and structured output as the way to make the generator's answer machine-readable."
 course: nlp
 section: Modern LLM Systems
 order: 33
@@ -26,16 +26,27 @@ Prompt an instruction-tuned model with the question alone. For general knowledge
 
 <RagPipeline />
 
-1. **Index** (offline). Chunk the documents, embed the chunks, store vectors with their text and metadata (source, position, date). Keep a lexical index too for hybrid retrieval.
+1. **Index** (offline). Chunk the documents, embed the chunks, store vectors with their text and metadata (source, position, date) in a [persistent index](/notes/nlp/semantic-search#the-index), so that the corpus is embedded once. Keep a lexical index too for hybrid retrieval.
 2. **Retrieve.** Embed the query (optionally after rewriting it), fetch the top-$k$ chunks by similarity, merge with BM25 results.
 3. **Rerank.** Re-score the candidates with a cross-encoder and keep the top $k'$ (3–10).
 4. **Build the context.** Concatenate the kept chunks with their sources, in an order the model handles well, within the token budget; include the instruction.
 5. **Generate.** Produce the answer; optionally with citations to the chunk identifiers, and in a structured format when a program will consume it.
 6. **Evaluate** retrieval and generation separately (below).
 
+### One query, four stages
+
+Steps 2 to 5, followed by postprocessing, run for every query as a chain of four stages, each consuming what the previous one returns. Retrieval augmentation and the prompt together cover steps 2 to 4, and generation is step 5:
+
+1. **Retrieval augmentation.** The question goes to the retriever (and the reranker); the passages it returns are joined into one context string, each with its identifier, while the question itself is passed on unchanged. The output is a record of two fields, context and question.
+2. **Prompt.** A template fills the record into the instruction, and the model's chat template renders the result into tokens (below).
+3. **Generation.** The model continues the prompt.
+4. **Postprocessing.** The raw output is cut down to the answer: anything the generation library returns besides the new text (some return the prompt followed by the continuation), a closing special token, the start of a further turn the model began to write. When a program reads the answer, it is parsed here.
+
+Written as composed stages, each part can be replaced and tested on its own: the first stage is scored on the golden set of the [previous note](/notes/nlp/semantic-search#measuring-a-retriever), the prompt is inspected as text, and the postprocessing is tested on recorded outputs.
+
 ### Building the context
 
-The context is a prompt, and prompt details change answers. Three decisions recur.
+The context is a prompt, and prompt details change answers. Four decisions recur.
 
 **Budget.** With a 4,096-token context window, an instruction of 200 tokens, a question of 50 and an answer allowance of 500, 3,346 tokens remain for chunks: thirteen 256-token chunks, or five parent chunks of 600. More chunks raise the chance the answer is present and lower the chance the model attends to it; the reranker's job is to make the first few count.
 
@@ -45,9 +56,44 @@ The context is a prompt, and prompt details change answers. Three decisions recu
 
 **Instruction.** State the rule explicitly: answer only from the provided passages; if they do not contain the answer, say so; cite the passage identifiers you used. The instruction does not guarantee compliance; it shifts the distribution toward it, and the evaluation checks the rest.
 
+**Template.** The prompt has two layers. The application's template is text with slots: the instruction, the passages as one `{context}` string, the `{question}`, and in a conversation a `{history}` slot (below). The model's [chat template](/notes/nlp/instruction-tuning#baseline-the-base-model-and-the-chat-template) then wraps the resulting messages in the role markers the model was tuned on. The chat template is stored with the tokenizer as a small program in Jinja, a text-templating language with loops and conditions. Simplified, the Llama 3 template is
+
+```
+{{ bos_token }}{% for message in messages %}<|start_header_id|>{{ message['role'] }}<|end_header_id|>
+
+{{ message['content'] | trim }}<|eot_id|>{% endfor %}{% if add_generation_prompt %}<|start_header_id|>assistant<|end_header_id|>
+
+{% endif %}
+```
+
+and a RAG request with one system and one user message renders as
+
+```
+<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+
+Answer only from the passages. If they do not contain the answer, say so.<|eot_id|><|start_header_id|>user<|end_header_id|>
+
+Passages:
+[1] …
+[2] …
+
+Question: How is pneumonia treated?<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+
+```
+
+The model writes its answer after the last header. Rendering with the tokenizer's own template, rather than typing the markers by hand, keeps the prompt in exactly the format the model was tuned on; a prompt in another model's format, or in plain text, tends toward base-model behaviour (continuing the text instead of answering, not stopping cleanly).
+
 ### Structured output
 
 When the answer feeds a program (a classification, an extracted record, a rating), free text is a liability: the model adds explanations, hedges and formatting that break parsers on some fraction of inputs. **Constrained decoding** fixes it at the token level: given a schema, the sampler masks every token that cannot continue a valid output, so the result is a parseable object by construction. With a pydantic schema of a recipe (name, optional preparation time, a list of ingredients with name and quantity, a list of instruction strings), a model given a paragraph of free-form cooking text returns that object; for one such paragraph the object lists nine ingredients with their quantities and seven instruction steps. The same mechanism restricts a classifier to its label set and a rating to an integer in $[1, 5]$. Hosted APIs expose it as a JSON-schema response format; local models use libraries that compile the schema into a token mask.
+
+### Follow-up questions in a conversation
+
+A chat over documents gets follow-ups: *What about in children?* after *How is pneumonia treated?* Two parts of the pipeline have to change.
+
+**The prompt carries the history.** A buffer memory stores the earlier turns and fills them into the `{history}` slot of the template, next to the context and the question, so the model knows what *in children* refers to. The buffer grows with every turn and is bounded like any conversation state: the last few turns, a token budget, or a running summary, as described for [conversation memory](/notes/nlp/tools-and-agents#where-the-memory-of-a-conversation-lives) in the next note.
+
+**Retrieval needs a standalone question.** The retriever sees only the text it is given. Searching for *What about in children?* returns passages about children in general, not about pneumonia in children, and adding the history to the prompt does not repair what retrieval missed. The usual remedy is a rewriting step before retrieval: a model reads the history and the follow-up and writes a self-contained question, *How is pneumonia treated in children?*, which is used for the search, while the prompt still gets the history and the original follow-up. It costs one more generation per turn.
 
 ## When retrieval is the right tool
 
@@ -106,12 +152,15 @@ The system has two halves and they fail independently, so they are measured sepa
 - **Chunks lose structure.** Tables, code and cross-references suffer from being cut.
 - **Evaluation is manual or model-judged**, and both are noisy; the golden set has to be maintained like code.
 - **Not a security boundary.** Retrieved text can carry instructions; the system design has to keep them out of the control channel.
+- **Conversations cost more.** Each follow-up needs a rewriting step for retrieval and a bounded history in the prompt; the history competes with the passages for the token budget.
 
 ## What you should remember
 
 - RAG = index offline (chunk, embed), then per query retrieve, rerank, build a budgeted context, generate under an instruction to use it.
 - Use retrieval when the answer depends on documents the model lacks and that exceed the context window; otherwise prompt directly.
 - Build the context deliberately: budget, order (top ranks at the edges), instruction with abstention and citations.
+- A query passes four stages: retrieval augmentation (context and question), prompt (the application's template rendered with the model's own Jinja chat template), generation, postprocessing to the answer alone.
+- In a conversation, keep a bounded history in the prompt and rewrite each follow-up into a standalone question before retrieval.
 - Constrain decoding to a schema when a program reads the output.
 - Evaluate retrieval (Hit@$k$, MRR) and generation (faithfulness, quality) separately; the end-to-end accuracy is bounded by retrieval recall.
 - Retrieved text is data, not instructions.
@@ -128,6 +177,20 @@ The system has two halves and they fail independently, so they are measured sepa
 
 The saved notebook has no outputs for the retrieval, evaluation and structured-output cells, so no numbers are quoted from it; the recipe comes from the example written into cell 102.
 
+The medical RAG task notebook of the HSE-LAMBDA *Deep Generative Models* course, [`05_hw_LLM-RAG.ipynb`](https://github.com/HSE-LAMBDA/DeepGenerativeModels/blob/spring-2025-long/homeworks/05_hw_LLM-RAG.ipynb), builds a question-answering assistant over medical texts with Hugging Face models and LangChain (same cell-number convention). It is a template with the key lines left to fill in, so it has no outputs. Its indexing and retrieval cells (7–20) are described in the [semantic search note](/notes/nlp/semantic-search#notebook).
+
+- **Cells 3–6: the data.** MeDAL ([Wen, Lu and Reddy, 2020](#references)), whose `train.csv` is read from a Google Drive copy in Colab; only the `TEXT` and `LABEL` columns are used. The notebook describes it as medical articles for various clinical diagnoses, which it is not. MeDAL is a dataset for medical abbreviation disambiguation built from 14,393,619 PubMed abstracts: terms with known abbreviations were replaced by the abbreviation with probability 0.3, using 24,005 abbreviation–expansion pairs over 5,886 abbreviations. Each row of the pretraining split (3 million training, 1 million validation and 1 million test rows) is one abstract, the word position of one replaced term (`LOCATION`) and its expansion (`LABEL`). The text is normalized: the examples in the dataset's repository and card are in lower case, without punctuation and with numbers dropped, and abbreviations such as TAC or ROS are in capitals, so a dosage reads "about percent ld mg kg". Diagnosis prediction appears in the paper only as a downstream task on separate hospital notes (MIMIC-III). For an assistant this means that the documents are research abstracts rather than clinical guidance, that they read as normalized text with unexpanded abbreviations, and that `LABEL` is the meaning of one abbreviation, not a diagnosis. The 2,000 rows the notebook indexes are 0.07 % of the training split, so many questions have no relevant abstract in the index, and the instruction to abstain matters.
+- **Cells 21–24: the prompt.** Cell 22 prints the tokenizer's `chat_template`, the Jinja program of the chosen model; cell 23 points to collections of templates and quotes the Llama 3 format; cell 24 builds a `PromptTemplate` from a system prompt and an instruction, with a second variant that includes the conversation history.
+- **Cells 25–29: the chain.** The four stages of [One query, four stages](#one-query-four-stages): retrieval augmentation (`format_docs` joins the retrieved documents with blank lines, and `RunnablePassthrough` passes the question on), the prompt, the model, and postprocessing (`StrOutputParser` is imported for it). Cells 28–29 ask "How to treat pneumonia?" and "Tell in details what is ceftobiprole bpr?".
+- **Cell 30: an optional extension.** Conversation history with `ConversationBufferMemory`, which stores the earlier turns and hands them to the template as a `history` variable of `Human: …` and `AI: …` lines.
+
+Issues in these cells:
+
+- Cell 26 writes the chain as `{FEATURE_ENGINEERING_STAGE} | {PREPROCESSING_STAGE} | llm | (POSTPROCESSING_STAGE)`. With the stages assigned to the variables, as the cell asks, the braces make Python sets and the chain cannot be built. Drop the braces, or write the first stage as the dictionary `{"context": retriever | format_docs, "question": RunnablePassthrough()}` in their place.
+- Cell 23's example passes `tokenizer.chat_template` to `PromptTemplate` with the input variable `content`. A chat template loops over a list `messages` and reads `bos_token` and `add_generation_prompt`, so it cannot be filled from `content`. Either write a template with `context` and `question` slots in the model's format, or render the messages with `tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)`. A Jinja template also needs `template_format="jinja2"`, which cell 24 does not pass. The link to `llama-3-chat.jinja` in the chujiezheng/chat_templates repository is dead; the file is `llama-3-instruct.jinja`.
+- A text-generation pipeline wrapped as a LangChain LLM returns the prompt followed by the answer unless the pipeline is created with `return_full_text=False`; otherwise the postprocessing stage has to cut the prompt off.
+- `from langchain.prompts import PromptTemplate` and `langchain.memory.ConversationBufferMemory` are paths of LangChain before 1.0, which the unpinned install line no longer gets; in LangChain 1.x they are in `langchain-core` and `langchain-classic`. `ConversationBufferMemory` has been deprecated since LangChain 0.3.1 in favour of checkpointed state, the mechanism of [conversation memory](/notes/nlp/tools-and-agents#where-the-memory-of-a-conversation-lives).
+
 ## Next
 
 A retriever is a tool: a function the system calls with the query and whose result goes into the prompt. The [next note](/notes/nlp/tools-and-agents) generalizes that: the model itself decides which function to call, with which arguments, reads the result, and calls again, which is tool use; a loop around that with state and a stopping rule is an agent. The note also asks when that loop is not worth building.
@@ -140,4 +203,5 @@ A retriever is a tool: a function the system calls with the query and whose resu
 - S. Es, J. James, L. Espinosa-Anke, S. Schockaert. [RAGAS: Automated Evaluation of Retrieval Augmented Generation](https://aclanthology.org/2024.eacl-demo.16/). EACL (demo), 2024. Faithfulness and answer-relevance metrics.
 - K. Greshake, S. Abdelnabi, S. Mishra, C. Endres, T. Holz, M. Fritz. [Not what you've signed up for: Compromising Real-World LLM-Integrated Applications with Indirect Prompt Injection](https://arxiv.org/abs/2302.12173). AISec, 2023.
 - B. T. Willard, R. Louf. [Efficient Guided Generation for Large Language Models](https://arxiv.org/abs/2307.09702). arXiv, 2023. Schema-constrained decoding.
+- Z. Wen, X. H. Lu, S. Reddy. [MeDAL: Medical Abbreviation Disambiguation Dataset for Natural Language Understanding Pretraining](https://aclanthology.org/2020.clinicalnlp-1.15/). Clinical NLP Workshop, 2020. §2 (dataset statistics and creation), §3 (downstream tasks). The dataset of the medical RAG task notebook.
 - J. Cohen. [A Coefficient of Agreement for Nominal Scales](https://doi.org/10.1177/001316446002000104). *Educational and Psychological Measurement*, 20(1), 1960.

@@ -1,0 +1,354 @@
+---
+title: "StarGAN: one generator for many domains"
+description: "Multi-domain image-to-image translation with one network: StarGAN conditions the generator on a target label, adds a domain classifier to a WGAN-GP discriminator, returns with the original label for reconstruction and trains across datasets with a mask vector; StarGAN v2 replaces the label by a style code from a mapping network or a style encoder, injected with AdaIN, to give many outputs per input."
+course: generative-models
+section: GANs
+order: 12
+status: published
+tags: [stargan, stargan-v2, image-to-image-translation, multi-domain, conditional-gan, adain, style-code, r1-regularization, gan]
+prerequisites: ["CycleGAN: unpaired image-to-image translation", Wasserstein GANs and Lipschitz constraints]
+---
+
+import StarGanFlow from '../../../components/figures/stargan/StarGanFlow.astro';
+import StarGanV2Flow from '../../../components/figures/stargan/StarGanV2Flow.astro';
+
+The [CycleGAN note](/notes/generative-models/cyclegan) ended with two limits of translating between two domains. Covering $k$ domains takes a separate model for every pair, $k(k-1)$ generators in all, and each of them learns from the images of only two domains. And every generator is deterministic: a horse has exactly one zebra version. **StarGAN** ([Choi et al., 2018](#references)) removes the first limit. One generator receives the target domain as an input, one discriminator also says which domain an image belongs to, and the cycle loss comes back with the original domain as the target of the way back. **StarGAN v2** ([Choi et al., 2020](#references)) removes the second. The target is no longer a fixed label but a style code drawn from a learned space of styles of that domain, so one input image has many translations.
+
+**Notation.** A **domain** is a set of images that share an attribute value: blond hair, male, a happy expression ([Choi et al., 2018](#references), Section 1). $x$ is a real image and $c'$ its original domain label; $c$ is a target label. Labels are vectors with $n_c$ entries: binary for attributes that can occur together (hair colour, gender, age), one-hot for categories that exclude each other (facial expressions). $G$ is the generator and $D$ the discriminator. For StarGAN v2, $y$ is the original domain of $x$ and $\tilde y$ a target domain, $z \sim \mathcal N(0, I)$ a latent code and $s$ a style code; $F$ is the **mapping network** (not the inverse generator of CycleGAN) and $E$ the **style encoder**. As in the CycleGAN note, $\|a - b\|_1$ is the sum of absolute pixel differences, which implementations average over pixels.
+
+## Why not one CycleGAN per pair?
+
+A translator between $k$ domains must handle every ordered pair $(i, j)$ of them, $k(k-1)$ directions. CycleGAN learns the two directions of a pair together, one generator each, so it needs $k(k-1)/2$ models with $k(k-1)$ generators and as many discriminators. Four domains take 12 generators; the eight facial expressions of the RaFD dataset take 56. A new domain adds $k$ pairs, $2k$ generators. The count is not the only cost. Each generator learns from the images of two domains, although most of what it needs, the shape of a face or the texture of skin, is shared by all of them ([Choi et al., 2018](#references), Section 1 and Figure 2).
+
+StarGAN makes the target an input. Its generator takes an image and a target label and returns the translation, $G(x, c)$. In training, $c$ is drawn at random, so the same network learns every direction, and at test time any label can be requested. This is the [conditional GAN](/notes/generative-models/gans#conditional-gan) with an image in place of the noise. The discriminator is shared too: besides real versus fake, it predicts the domain of its input, $D: x \mapsto \{D_{\mathrm{src}}(x),\, D_{\mathrm{cls}}(x)\}$.
+
+## How the generator reads the label
+
+On CelebA, the label has five binary entries: black, blond and brown hair, male, young. On RaFD it is one-hot over eight expressions. The generator copies each entry over a constant $h \times w$ map and concatenates these maps with the three colour channels, so its first layer sees an $h \times w \times (3 + n_c)$ tensor ([Choi et al., 2018](#references), Figure 3 and Table 4).
+
+The rest is essentially the [CycleGAN generator](/notes/generative-models/cyclegan#the-networks) at $128 \times 128$, with $4 \times 4$ kernels for down- and upsampling: a $7 \times 7$ convolution, two stride-2 convolutions, six residual blocks, two stride-2 transposed convolutions and a $7 \times 7$ convolution with $\tanh$, with instance normalization after every layer but the last. It has 8.43 million parameters. Each label entry adds $64 \cdot 7 \cdot 7 = 3136$ weights to the first convolution, and nothing else in the generator depends on the number of domains.
+
+<aside class="callout"><strong>Why StarGAN pads with zeros.</strong> The CycleGAN generator pads by reflection; the StarGAN generator pads with zeros, and the label is the reason. A convolution is linear, so its output is the response to the image plus the response to the label maps. Away from the border every tap of the $7 \times 7$ kernel lands on a constant map, and the label adds $\sum_j c_j \sum_{\text{taps}} w_{o,j}$ to output channel $o$: the same number at every position. Instance normalization subtracts the mean of each channel over positions, and a constant added everywhere leaves with it. With reflection padding the padded label map is still constant, so the label is erased completely and the generator cannot know where to translate. With zero padding the kernel is cut off near the edges, the label's contribution varies in a band 3 pixels wide along the border, 9.2% of the positions of a $128 \times 128$ map, and it also shifts the channel statistics slightly. The label survives there, and the later layers spread it inward. The authors point this out in their implementation (<a href="#references">Choi, 2018</a>). StarGAN v2 injects its condition after the normalization instead, as described below.</aside>
+
+## The discriminator: real or fake, and which domain
+
+The discriminator is six stride-2 $4 \times 4$ convolutions with LeakyReLU (slope 0.01) and no normalization, followed by two heads on the same features ([Choi et al., 2018](#references), Table 5). $D_{\mathrm{src}}$, a $3 \times 3$ convolution, scores realism; for a $128 \times 128$ input it outputs a $2 \times 2$ map in the manner of a PatchGAN, although each of the four scores sees the whole image. $D_{\mathrm{cls}}$, a convolution whose kernel covers the whole $2 \times 2$ feature map, outputs one logit per label entry. The discriminator holds 44.76 million of the model's 53.19 million parameters.
+
+The second head is the auxiliary classifier of AC-GAN ([Odena, Olah and Shlens, 2017](#references)). It enters two losses ([Choi et al., 2018](#references), Eqs. 2–3):
+
+$$
+\begin{aligned}
+\mathcal L^{r}_{\mathrm{cls}} &= \mathbb E_{x, c'}\big[-\log D_{\mathrm{cls}}(c' \mid x)\big],\\
+\mathcal L^{f}_{\mathrm{cls}} &= \mathbb E_{x, c}\big[-\log D_{\mathrm{cls}}\big(c \mid G(x, c)\big)\big].
+\end{aligned}
+$$
+
+The first is minimized by $D$: on real images it learns to predict their true labels. The second is minimized by $G$: a translated image must be classified as the target domain. The classifier never learns from fakes. It is trained on real images only, so it encodes what the domains look like in the data, and the generator is rewarded for producing exactly that.
+
+What $D_{\mathrm{cls}}(c \mid x)$ means depends on the label. For a one-hot label it is the softmax probability of the target class, and $-\log$ of it is the cross-entropy. The entries of a binary attribute vector can co-occur, so $D_{\mathrm{cls}}$ gives each attribute its own sigmoid and treats them as independent given the image. Then $D_{\mathrm{cls}}(c \mid x) = \prod_i \sigma(\ell_i)^{c_i}\big(1 - \sigma(\ell_i)\big)^{1 - c_i}$ for the logits $\ell_i$, and $-\log D_{\mathrm{cls}}(c \mid x)$ is a sum of binary cross-entropies, which is what the authors' implementation computes for CelebA ([Choi, 2018](#references)).
+
+### Worked example: classifying a fake
+
+Take toy logits that $D_{\mathrm{cls}}$ might return for a translated face whose target is $c = (0, 1, 0, 1, 1)$: blond, male, young. Each attribute contributes $-\big[c_i \log \sigma(\ell_i) + (1 - c_i)\log\big(1 - \sigma(\ell_i)\big)\big]$:
+
+| | black | blond | brown | male | young |
+| --- | --- | --- | --- | --- | --- |
+| target $c_i$ | 0 | 1 | 0 | 1 | 1 |
+| logit $\ell_i$ | −2.0 | 1.5 | −1.0 | 0.5 | 2.0 |
+| $\sigma(\ell_i)$ | 0.119 | 0.818 | 0.269 | 0.622 | 0.881 |
+| loss term | 0.127 | 0.201 | 0.313 | 0.474 | 0.127 |
+
+The sum is $1.243 = -\log 0.289$: the classifier gives the full target label a probability of 0.289. The largest term is gender, where it is least sure. If the generator had ignored the hair entries and left the hair black, the black and blond logits might be swapped to $1.5$ and $-2.0$, and the loss would rise to $4.743$. The gradient of $\mathcal L^{f}_{\mathrm{cls}}$ flows through the classifier into $G$ and pushes the hair towards blond.
+
+## Adversarial loss and the way back
+
+The adversarial loss is first written as the standard GAN value, $\mathbb E_x \log D_{\mathrm{src}}(x) + \mathbb E_{x, c} \log\big(1 - D_{\mathrm{src}}(G(x, c))\big)$, and then replaced by the [WGAN-GP](/notes/generative-models/wgan#wgan-gp-gradient-penalty) objective to stabilize training ([Choi et al., 2018](#references), Eq. 8):
+
+$$
+\begin{aligned}
+\mathcal L_{\mathrm{adv}} = {}& \mathbb E_x\big[D_{\mathrm{src}}(x)\big] - \mathbb E_{x, c}\big[D_{\mathrm{src}}(G(x, c))\big]\\
+&- \lambda_{\mathrm{gp}}\, \mathbb E_{\hat x}\Big[\big(\|\nabla_{\hat x} D_{\mathrm{src}}(\hat x)\|_2 - 1\big)^2\Big],
+\end{aligned}
+$$
+
+with $\hat x$ drawn on segments between real and translated images and $\lambda_{\mathrm{gp}} = 10$. $D_{\mathrm{src}}$ is a critic with a real-valued output. The discriminator maximizes $\mathcal L_{\mathrm{adv}}$ and the generator minimizes it, but the generator's loss contains only the second term: the penalty is computed on interpolates involving $G(x, c)$, and only the discriminator is trained on it.
+
+Neither $\mathcal L_{\mathrm{adv}}$ nor $\mathcal L^{f}_{\mathrm{cls}}$ mentions the input: both are satisfied by any realistic image of domain $c$, whatever $x$ was. This is the problem CycleGAN met with [the adversarial loss alone](/notes/generative-models/cyclegan#without-pairs-the-adversarial-loss-is-not-enough), and StarGAN uses the same remedy, a [cycle-consistency](/notes/generative-models/cyclegan#cycle-consistency) loss ([Choi et al., 2018](#references), Eq. 4):
+
+$$
+\mathcal L_{\mathrm{rec}} = \mathbb E_{x, c, c'}\, \big\|x - G\big(G(x, c),\, c'\big)\big\|_1 .
+$$
+
+The way back is the same generator with the original label $c'$. There is no second network to undo the first: inverting a translation is just another translation. StarGAN has no identity loss.
+
+## The full objective
+
+The two players minimize different objectives ([Choi et al., 2018](#references), Eqs. 5–6):
+
+$$
+\begin{aligned}
+\mathcal L_D &= -\mathcal L_{\mathrm{adv}} + \lambda_{\mathrm{cls}}\, \mathcal L^{r}_{\mathrm{cls}},\\
+\mathcal L_G &= \mathcal L_{\mathrm{adv}} + \lambda_{\mathrm{cls}}\, \mathcal L^{f}_{\mathrm{cls}} + \lambda_{\mathrm{rec}}\, \mathcal L_{\mathrm{rec}},
+\end{aligned}
+$$
+
+with $\lambda_{\mathrm{cls}} = 1$ and $\lambda_{\mathrm{rec}} = 10$ in all experiments. This is not one minimax value: each player has its own classification term, and each minimizes it. Training uses Adam with learning rate $10^{-4}$ and betas $(0.5, 0.999)$, five critic updates per generator update as in WGAN-GP, batch size 16 and random horizontal flips. On CelebA (202,599 faces with 40 binary attributes, cropped from $178 \times 218$ to $178 \times 178$ and resized to $128 \times 128$, 2,000 held out) the learning rate is constant for 10 epochs and decays linearly to zero over 10 more (Sections 5.2–5.3). The authors' implementation draws target labels by shuffling the labels of the batch, so every requested label is a combination that occurs in the data ([Choi, 2018](#references)).
+
+<StarGanFlow />
+
+1. **Translate.** The generator receives the real image $x$ and a random target label $c$, tiled into constant maps and concatenated with the colour channels, and produces $G(x, c)$.
+2. **Fool the discriminator.** The critic $D_{\mathrm{src}}$ scores the fake, and the generator wants a high score. The classifier $D_{\mathrm{cls}}$ must assign the fake to $c$, which is $\mathcal L^{f}_{\mathrm{cls}}$.
+3. **Return.** The same generator maps the fake back with the original label $c'$, and $\mathcal L_{\mathrm{rec}} = \|x - G(G(x, c), c')\|_1$ asks for the input.
+4. **Train the discriminator.** On real images and fakes, the critic learns to score real above fake under the gradient penalty; on real images only, the classifier learns the original label $c'$, which is $\mathcal L^{r}_{\mathrm{cls}}$.
+
+## Training on several datasets: the mask vector
+
+CelebA labels hair colour, gender and age; RaFD (4,824 images of 67 people, each showing eight expressions) labels expressions. A model trained on both could give CelebA faces the expressions learned from RaFD. The obstacle is the reconstruction loss: it needs the full original label $c'$, and each dataset knows only its own part of it ([Choi et al., 2018](#references), Section 3.2).
+
+StarGAN appends a **mask vector** $m$, a one-hot vector over the $n$ datasets that says which part of the label is known, and sets the unknown parts to zero (Eq. 7):
+
+$$
+\tilde c = [\,c_1, \dots, c_n, m\,].
+$$
+
+For CelebA and RaFD the unified label has $5 + 8 + 2 = 15$ entries. A blond young woman from CelebA is $(0, 1, 0, 0, 1 \mid 0, \dots, 0 \mid 1, 0)$; the request "make her happy" is $(0, 0, 0, 0, 0 \mid$ one-hot for happy $\mid 0, 1)$. The generator is unchanged apart from its input width. The classifier predicts all $5 + 8 = 13$ labels, but on a batch from one dataset only the outputs for that dataset's labels enter $\mathcal L^{r}_{\mathrm{cls}}$ and $\mathcal L^{f}_{\mathrm{cls}}$, and training alternates between the datasets.
+
+The jointly trained model gives CelebA faces sharper expressions than a model trained on RaFD alone, which never sees a CelebA image (Section 5.6, Figure 6). The mask is used as intended. Given an expression label with the wrong mask $[1, 0]$, the model ignores the expression, reads the all-zero CelebA part as "not young", and ages the face (Figure 7).
+
+## What one generator buys
+
+- **Quality.** In a user study on CelebA against DIAT, CycleGAN and IcGAN, StarGAN received 66.2% of the votes for the best translation of hair colour, 39.1% for gender and 70.6% for age ([Choi et al., 2018](#references), Table 1).
+- **Correct domains.** On RaFD, translating neutral faces to the seven other expressions, a ResNet-18 expression classifier that errs on 0.45% of real test images errs on 2.12% of StarGAN's translations, against 5.99% for CycleGAN, 4.10% for DIAT and 8.07% for IcGAN (Table 3).
+- **Size.** The same seven translations take 53.2 million parameters with StarGAN and $52.6\text{M} \times 14$ with CycleGAN, about 14 times more (Table 3). The architecture tables give 8.43 million for the generator and 44.76 million for the discriminator, 53.19 million in total.
+
+The authors attribute the quality to multi-task learning: a model trained on two RaFD expressions sees about 1,000 images, StarGAN about 4,000, and the features it learns serve all directions (Section 5.5).
+
+## One output per image and domain
+
+$G(x, c)$ is a function: the same image and label always give the same translation. A domain contains many appearances. "Female" covers every hairstyle and every kind of makeup, and StarGAN picks one of them for each input. Its authors put it plainly in the follow-up paper: the generator receives a fixed label and "inevitably produces the same output per each domain, given a source image" ([Choi et al., 2020](#references), Section 1). On CelebA-HQ, StarGAN changes the gender of a face only locally, by applying makeup (Section 3.1, Figure 3a).
+
+The obvious fix is to give the generator noise as well. StarGAN v2 tried it: feed a latent code $z$ to $G$ next to the domain, and ask an encoder to recover it, $\|z - E(G(x, z, y))\|_1$. Outputs became varied, but the codes had no way to separate domains, so they learned variations shared by all domains, such as colour, rather than domain-specific ones, such as hairstyle (Section 3.1). The fix that worked maps the noise to a style of a particular domain first.
+
+## StarGAN v2: a style code instead of a label
+
+### Four networks
+
+StarGAN v2 has four networks ([Choi et al., 2020](#references), Section 2.1 and Appendix E):
+
+- the **generator** $G(x, s)$ translates $x$ to an image that reflects the style code $s \in \mathbb R^{64}$. It receives no domain label: the style code already belongs to a domain;
+- the **mapping network** $F$ turns a latent code $z \in \mathbb R^{16}$, $z \sim \mathcal N(0, I)$, into a style code of a chosen domain, $s = F_y(z)$. It is an MLP with four shared linear layers of width 512 and, for each of the $k$ domains, a branch of four more;
+- the **style encoder** $E$ extracts the style code of an image of domain $y$, $s = E_y(x)$: six shared residual blocks and one linear output head per domain;
+- the **discriminator** $D$ has the same trunk and one output per domain. $D_y(x)$ says whether $x$ is a real image of domain $y$.
+
+The two style sources give two ways to translate. **Latent-guided**: sample $z$ and use $s = F_{\tilde y}(z)$; each $z$ gives another output. **Reference-guided**: take a real image $x_{\mathrm{ref}}$ of the target domain and use $s = E_{\tilde y}(x_{\mathrm{ref}})$; the output takes on the reference's style. A new domain costs one branch of $F$ (0.82 million parameters), a linear head of $E$ (32,832) and a head of $D$ (513).
+
+### How the style enters: AdaIN
+
+For channel $i$ of a feature map $h$, let $\mu_i$ and $\sigma_i$ be its mean and standard deviation over the spatial positions of one image. **Adaptive instance normalization** replaces them with values computed from the style:
+
+$$
+\mathrm{AdaIN}(h, s)_i = \gamma_i(s)\, \frac{h_i - \mu_i}{\sigma_i} + \beta_i(s),
+$$
+
+where $\gamma(s)$ and $\beta(s)$ are learned affine functions of $s$, one per AdaIN layer. All their biases start at 0 except that of the scale $\gamma$, which starts at 1 ([Choi et al., 2020](#references), Appendices B and E); the official code writes the scale as $1 + \gamma(s)$ with a zero bias, which is equivalent ([Clova AI Research, 2020](#references)). AdaIN comes from style transfer, where $\gamma$ and $\beta$ were the standard deviation and the mean of the features of a style image ([Huang and Belongie, 2017](#references), Eq. 8); StyleGAN computed them from a learned style vector instead ([Karras, Laine and Aila, 2019](#references)). In the StarGAN v2 generator, the downsampling blocks and the first two bottleneck blocks use plain instance normalization; the last two bottleneck blocks and all upsampling blocks use AdaIN, and the style code enters every one of them.
+
+**Worked example (toy numbers).** A channel holds $h = (1, 2, 3, 6)$ over four positions. Its mean is $3$ and its standard deviation $\sqrt{3.5} \approx 1.871$, so the normalized values are $(-1.069, -0.535, 0, 1.604)$. A style that gives $\gamma = 0.5$ and $\beta = 2$ turns them into $(1.465, 1.733, 2.000, 2.802)$, whose mean is exactly $2$ and standard deviation exactly $0.5$. The input $10h - 7$ would give the same normalized values: AdaIN discards each channel's incoming mean and scale and imposes the ones chosen by the style. The style acts after the normalization, so, unlike the concatenated label of StarGAN, it cannot be normalized away.
+
+### One discriminator head per domain
+
+StarGAN's discriminator answered two questions with two heads: is the image real, and which domain is it. StarGAN v2's asks one question per domain: is this a real image of domain $y$? Each head $D_y$ is a binary real-versus-fake classifier, and there is no classification loss. This **multi-task discriminator** ([Mescheder, Geiger and Nowozin, 2018](#references); [Liu et al., 2019](#references)) lets the generator change the global structure of an image, not only local details ([Choi et al., 2020](#references), Section 3.1).
+
+### Losses
+
+Let $x$ be a real image of domain $y$, and draw a target domain $\tilde y$ and a latent code $z$, with the target style $s = F_{\tilde y}(z)$ ([Choi et al., 2020](#references), Section 2.2). The paper writes target quantities with a tilde, $\tilde s$; we keep the tilde only on the domain.
+
+**Adversarial loss.** The head of the target domain judges the translation (Eq. 1):
+
+$$
+\mathcal L_{\mathrm{adv}} = \mathbb E_{x, y}\big[\log D_y(x)\big] + \mathbb E_{x, \tilde y, z}\big[\log\big(1 - D_{\tilde y}(G(x, s))\big)\big],
+$$
+
+where $D_y$ here denotes a probability, a sigmoid of the head's logit. In practice the generator uses the [non-saturating loss](/notes/generative-models/gans#which-generator-loss-is-used-in-practice) $-\log D_{\tilde y}(G(x, s))$ (Appendix B).
+
+**Style reconstruction.** The generator must use the style code, so the style encoder must be able to read it back from the output (Eq. 2):
+
+$$
+\mathcal L_{\mathrm{sty}} = \mathbb E_{x, \tilde y, z}\, \big\|s - E_{\tilde y}\big(G(x, s)\big)\big\|_1 .
+$$
+
+**Style diversification.** A second latent code $z_2$ gives a second style code $s_2 = F_{\tilde y}(z_2)$, and the generator is rewarded for making the two outputs differ (Eq. 3):
+
+$$
+\mathcal L_{\mathrm{ds}} = \mathbb E_{x, \tilde y, z, z_2}\, \big\|G(x, s) - G(x, s_2)\big\|_1 .
+$$
+
+This term is *maximized*. Earlier versions divided it by the distance between the latent codes, $\|z - z_2\|_1$; when the two codes are close, the ratio becomes large and its gradients unstable, so StarGAN v2 drops the denominator (Section 2.2). The term has no upper bound, and its weight is decreased linearly to zero during training (Appendix B).
+
+**Cycle consistency.** The output must lead back to the input when the generator is given the input's own style (Eq. 4):
+
+$$
+\mathcal L_{\mathrm{cyc}} = \mathbb E_{x, y, \tilde y, z}\, \big\|x - G\big(G(x, s),\, \hat s\big)\big\|_1, \qquad \hat s = E_y(x).
+$$
+
+In StarGAN the way back used the original label $c'$, which says only which domain to return to. Here it uses the estimated style $\hat s$ of $x$ itself, so the return must restore the particular appearance of the input.
+
+**Full objective.** The generator, the mapping network and the style encoder play against the discriminator (Eq. 5):
+
+$$
+\min_{G, F, E}\; \max_D\; \mathcal L_{\mathrm{adv}} + \lambda_{\mathrm{sty}}\, \mathcal L_{\mathrm{sty}} - \lambda_{\mathrm{ds}}\, \mathcal L_{\mathrm{ds}} + \lambda_{\mathrm{cyc}}\, \mathcal L_{\mathrm{cyc}},
+$$
+
+with $\lambda_{\mathrm{sty}} = \lambda_{\mathrm{cyc}} = 1$ and $\lambda_{\mathrm{ds}} = 1$ on CelebA-HQ, $2$ on AFHQ (Appendix B). The same objective is also trained with reference-guided styles, $s = E_{\tilde y}(x_{\mathrm{ref}})$, in place of $F_{\tilde y}(z)$.
+
+<StarGanV2Flow />
+
+1. **Style.** The mapping network turns $z$ into a style code $s = F_{\tilde y}(z)$ for a random target domain $\tilde y$; in reference-guided steps the style encoder reads it from a reference image instead.
+2. **Translate and judge.** The generator injects $s$ through AdaIN and produces $G(x, s)$; the head $D_{\tilde y}$ judges whether it is a real image of domain $\tilde y$.
+3. **Style reconstruction.** The style encoder must recover $s$ from the output: $\mathcal L_{\mathrm{sty}}$.
+4. **Cycle.** With the input's own style $\hat s = E_y(x)$, the generator must map the output back to $x$: $\mathcal L_{\mathrm{cyc}}$.
+5. **Diversity.** A second code $s_2$ gives a second output, and $\mathcal L_{\mathrm{ds}}$ rewards the distance between the two.
+
+### R1: a penalty on real images only
+
+StarGAN used WGAN-GP. StarGAN v2 uses the non-saturating loss and adds the **R1 penalty** to the discriminator's loss ([Mescheder, Geiger and Nowozin, 2018](#references), Section 4.1, Eq. 9; [Choi et al., 2020](#references), Appendix B):
+
+$$
+R_1 = \frac{\gamma}{2}\, \mathbb E_{x \sim P}\, \big\|\nabla_x D(x)\big\|_2^2, \qquad \gamma = 1,
+$$
+
+where $D(x)$ is the logit of the discriminator (for StarGAN v2, of the head $D_y$ for a real image of domain $y$). The penalty acts on real images only and pulls the gradient towards zero, not towards norm 1 on interpolates as in WGAN-GP. The reasoning concerns the end of training. When the generator reproduces the data and the discriminator is constant on it, a discriminator with a non-zero gradient across the data could still push the generator off the data; R1 makes such a gradient cost something. Mescheder et al. prove that GAN training with zero-centered penalties of this kind converges locally, where unregularized training need not.
+
+**Worked example.** A discriminator with a linear logit $D(x) = w^\top x + b$ and $w = (0.6, -0.8, 0)$ has $\nabla_x D = w$ and $\|w\|_2 = 1$. WGAN-GP's penalty $(\|w\|_2 - 1)^2$ is $0$: the slope is exactly what WGAN-GP asks for. R1 with $\gamma = 1$ is $\tfrac12 \|w\|_2^2 = 0.5$: it asks for a discriminator that is flat at the data.
+
+**Training.** Batch size 8, 100,000 iterations (about three days on one V100), images at $256 \times 256$. Adam with betas $(0, 0.99)$; learning rate $10^{-4}$ for $G$, $D$ and $E$, and $10^{-6}$ for $F$. $\lambda_{\mathrm{ds}}$ decays linearly to zero over the 100,000 iterations. Evaluation uses an exponential moving average of the weights of every network except $D$ ([Choi et al., 2020](#references), Appendix B).
+
+## What each piece buys
+
+StarGAN v2 was built by adding one change at a time to StarGAN and measuring each step on CelebA-HQ, split into the domains male and female ([Choi et al., 2020](#references), Table 1). FID measures how far the translations are from real images of the target domain (lower is better); LPIPS here is the average distance between outputs generated for the same input (higher means more diverse).
+
+| Configuration | FID | LPIPS |
+| --- | --- | --- |
+| A. StarGAN: WGAN-GP, auxiliary classifier, concatenated label | 98.4 | – |
+| B. + multi-task discriminator | 91.4 | – |
+| C. + R1 penalty, AdaIN instead of concatenation | 80.5 | – |
+| D. + latent code fed to $G$, latent reconstruction | 32.3 | 0.312 |
+| E. + mapping network and style code, style reconstruction | 17.1 | 0.405 |
+| F. + style diversification: StarGAN v2 | 13.7 | 0.452 |
+
+Configurations A to C give one output per input, so they have no diversity score. The drop from C to D is not a better model: D produces ten outputs per input where C produces one, an FID computed from more generated images is lower, and the authors attribute the whole C–D gap to the number of samples (Section 3.1). This is the [sample-size bias of FID](/notes/generative-models/fid#drawbacks) in practice. Between configurations with the same number of outputs, the style code (D to E) and the diversity term (E to F) both lower FID and raise LPIPS. For reference, the FID between the training and the test images of CelebA-HQ is 14.8. It is not a floor: the test set is small, and StarGAN v2's 13.7 lies below it (Table 2).
+
+Against two-domain models that already produced diverse outputs, MUNIT, DRIT and MSGAN, each trained once per pair of domains, StarGAN v2 has the lowest FID in latent-guided translation: 13.7 against 31.4–52.1 on CelebA-HQ and 16.2 against 41.5–95.6 on AFHQ, a dataset of 15,000 cat, dog and wildlife faces (Table 2). Its LPIPS is the highest on CelebA-HQ (0.452), but on AFHQ MUNIT (0.511) and MSGAN (0.517) score higher than StarGAN v2 (0.450). The authors attribute this to spurious artifacts in those outputs: artifacts make outputs differ, and a diversity score counts them as diversity.
+
+## How translation models are measured
+
+The comparisons above follow a fixed protocol ([Choi et al., 2020](#references), Appendix C):
+
+- **[FID](/notes/generative-models/fid) for realism.** Every test image of a source domain is translated to a target domain with 10 random latent codes, and the FID between these translations and the training images of the target domain is computed. This is repeated for every pair of domains and averaged. Reference-guided synthesis uses 10 random reference images of the target domain instead.
+- **[LPIPS](/notes/generative-models/lpips#where-it-is-used) for diversity.** Every test image gets 10 outputs from 10 random latent codes. The LPIPS distances of all $\binom{10}{2} = 45$ pairs of outputs are averaged, and the result is averaged over the test images.
+
+Each number answers one question and misses others. FID never looks at the input, so a generator that ignores $x$ and produces good faces scores well. Diversity rewards differences of any kind, artifacts included. Two further checks cover what these miss. One is the domain: does a classifier trained on real images recognize the target domain in the output, as in StarGAN's RaFD experiment? The other is faithfulness: does the output keep what should not change, such as the pose and identity of the input? A distance between an output and its own input, such as LPIPS, measures how much the translation changed the image, which is neither realism nor diversity. The identity map scores 0, a perfect value, while translating nothing. A fair report gives realism, diversity, domain accuracy and faithfulness together.
+
+## What counts as a domain
+
+StarGAN and StarGAN v2 read labels differently. StarGAN takes a vector of attributes and can request any combination of them, such as blond, male and old at once. StarGAN v2 needs each image to belong to exactly one domain: the training pairs are $(x, y)$ with a single $y$, and $F_y$, $E_y$ and $D_y$ are heads indexed by it. Overlapping attributes are therefore not domains. In CelebA one face is male, young and smiling at once, so its 40 attributes cannot serve as 40 domains of StarGAN v2. A usable partition takes one binary attribute (male and female, as for CelebA-HQ in the paper), mutually exclusive values of one attribute (black, blond and brown hair, after dropping images with none or several), or the products of a few attributes (male or female times young or old, four domains).
+
+## Exploring the style space
+
+The mapping network makes the style space of each domain a learned transformation of a Gaussian, following StyleGAN, rather than the Gaussian itself, which the authors see as one reason for the diversity of the outputs ([Choi et al., 2020](#references), Section 4). The space can be probed directly. Interpolating between two style codes $F_y(z_1)$ and $F_y(z_2)$, or between the codes of two reference images, and translating one input with every intermediate code shows whether the outputs change smoothly and which attributes change; the authors show such interpolations in a video (Appendix D). Interpolating in $z$ and in $s$ gives different paths, because $F$ is nonlinear. Style codes extracted from many real images can be projected to two dimensions, for example with PCA, to see whether the domains separate and whether directions correspond to visible attributes. Swapping references within a domain separates what the style code controls (hairstyle, makeup, beard, age on CelebA-HQ) from what the input keeps (pose, identity).
+
+## What changed
+
+| | CycleGAN | StarGAN | StarGAN v2 |
+| --- | --- | --- | --- |
+| Networks for $k$ domains | $k(k-1)$ generators and $k(k-1)$ discriminators | one $G$, one $D$ | one each of $G$, $F$, $E$, $D$ |
+| Condition | none: one direction per generator | target label, tiled and concatenated | style code through AdaIN, from $F_{\tilde y}(z)$ or $E_{\tilde y}(x_{\mathrm{ref}})$ |
+| Discriminator | one per domain, $70 \times 70$ PatchGAN | shared: critic $D_{\mathrm{src}}$ and classifier $D_{\mathrm{cls}}$ | one real/fake head $D_y$ per domain |
+| Adversarial loss | least squares | WGAN-GP, $\lambda_{\mathrm{gp}} = 10$ | non-saturating, R1 with $\gamma = 1$ |
+| Tie to the input | two cycles and an identity loss | one cycle with the original label $c'$, $\lambda_{\mathrm{rec}} = 10$ | cycle with the input's style $E_y(x)$, $\lambda_{\mathrm{cyc}} = 1$ |
+| Outputs per input and target | one | one | many |
+| Labels | none: two unlabelled collections | any combination of attributes; several datasets via a mask vector | one domain per image |
+
+## Limitations
+
+- **StarGAN is deterministic.** One output per image and label; and the label, entering by concatenation, tends to produce local edits rather than changes of structure.
+- **StarGAN v2 needs a partition.** Every image must belong to one domain, and combinations of attributes must be enumerated as domains of their own. The mask vector of StarGAN, which joins datasets with different label sets, has no counterpart.
+- **The cycle checks recoverability, not meaning.** As in CycleGAN, a translation can be invertible and still wrong, or hide what it needs for the return in signals invisible to a human.
+- **Diversity has to be managed.** The diversity term has no upper bound and is switched off gradually during training. Diversity scores also reward artifacts, as the AFHQ results show.
+- **Style and content are split by the losses, not by definition.** What ends up in the style code depends on the data: breed and fur on AFHQ; hairstyle, makeup, beard and even age on CelebA-HQ.
+- **The numbers depend on the protocol.** FID depends on the number of generated images, and a distance to the input rewards doing nothing; comparisons are fair only under the same protocol.
+
+## Summary
+
+- One generator $G(x, c)$ conditioned on a target label replaces the $k(k-1)$ generators of pairwise models, and learns from the images of all domains.
+- StarGAN's discriminator has a WGAN-GP critic $D_{\mathrm{src}}$ and an auxiliary domain classifier $D_{\mathrm{cls}}$. The classifier is trained on real images ($\mathcal L^{r}_{\mathrm{cls}}$), and the generator must make fakes it assigns to the target ($\mathcal L^{f}_{\mathrm{cls}}$). A reconstruction with the original label, $\|x - G(G(x, c), c')\|_1$, ties the output to the input; $\lambda_{\mathrm{cls}} = 1$, $\lambda_{\mathrm{rec}} = 10$, $\lambda_{\mathrm{gp}} = 10$.
+- A mask vector marks which dataset's labels are known, so one model trains on CelebA and RaFD together.
+- StarGAN is deterministic. StarGAN v2 replaces the label with a style code from a mapping network ($z \to F_y(z)$) or a style encoder ($E_y(x_{\mathrm{ref}})$), injects it with AdaIN, judges outputs with one discriminator head per domain, and trains with style reconstruction, style diversification, a cycle with the input's own style and the R1 penalty.
+- Translation models are measured by FID for realism and pairwise LPIPS among outputs for diversity; domain accuracy and faithfulness to the input need checks of their own.
+
+## Notebook
+
+Two notebooks of the HSE-LAMBDA *Deep Generative Models* repository cover this note: the [StarGAN notebook](https://github.com/HSE-LAMBDA/DeepGenerativeModels/blob/spring-2025-long/seminars/04_Image-to-Image/StarGAN.ipynb), which presents the theory of both versions, and the task notebook [`02_hw_StarGAN.ipynb`](https://github.com/HSE-LAMBDA/DeepGenerativeModels/blob/spring-2025-long/homeworks/02_hw_StarGAN.ipynb), which asks the reader to implement, train and evaluate StarGAN on CelebA (cell numbers count every cell, markdown included, from 1). The README of the folder lists the StarGAN and StarGAN v2 papers next to the CycleGAN material.
+
+**The StarGAN notebook** contains no code; its only code cell (cell 6) is empty.
+
+- **Cells 1–2: introduction.** Pix2Pix and CycleGAN translate between two domains; StarGAN extends this to many domains, and StarGAN v2 adds diverse outputs.
+- **Cell 3: StarGAN.** The $K(K-1)$ count, $G(x, c)$, the two-headed discriminator, $\mathcal L^{r}_{\mathrm{cls}}$, $\mathcal L^{f}_{\mathrm{cls}}$ and $\mathcal L_{\mathrm{rec}}$, a combined objective, how StarGAN extends CycleGAN, and the limitation to one output per input and label. Figures 2 and 3 of the StarGAN paper are embedded.
+- **Cell 4: StarGAN v2.** $G$, $F$, $E$ and $D$; latent-guided and reference-guided styles; the adversarial, style-reconstruction, diversity and cycle losses and the full objective; improvements over StarGAN. Figure 2 of the StarGAN v2 paper is embedded.
+- **Cell 5: conclusions.**
+
+Issues in the StarGAN notebook:
+
+- **How the label enters.** Cell 3 says the label is injected "via channel-wise concatenation or AdaIN-like normalization in some variations". StarGAN tiles the label spatially and concatenates it with the input image; AdaIN is the StarGAN v2 mechanism.
+- **The adversarial loss and the weights.** Cell 3 calls the adversarial loss "WGAN-GP or similar" and gives no weights. StarGAN uses WGAN-GP with $\lambda_{\mathrm{gp}} = 10$, and $\lambda_{\mathrm{cls}} = 1$, $\lambda_{\mathrm{rec}} = 10$.
+- **One objective instead of two.** Cell 3 writes $\min_G \max_D \mathcal L_{\mathrm{adv}} + \lambda_{\mathrm{cls}}[\mathcal L^{r}_{\mathrm{cls}} + \mathcal L^{f}_{\mathrm{cls}}] + \lambda_{\mathrm{rec}}\mathcal L_{\mathrm{rec}}$. The discriminator minimizes $\mathcal L^{r}_{\mathrm{cls}}$ rather than maximizing it, so the paper writes two objectives, $\mathcal L_D$ and $\mathcal L_G$, as in [The full objective](#the-full-objective).
+- **The StarGAN v2 discriminator.** Cell 4 describes it as classifying "real vs. fake and the domain label". It has one binary real/fake output per domain and no classification loss; replacing the auxiliary classifier is configuration B of the ablation.
+- **The adversarial loss of StarGAN v2.** Cell 4 introduces "the non-saturating GAN loss" but writes the minimax value, and uses $y$ both for the domain of the real image and for the target. In the paper the real term uses the original domain $y$ and the fake term the target $\tilde y$; the non-saturating version changes only the generator's term to $-\log D_{\tilde y}(G(x, s))$.
+- **The diversity loss.** Cell 4 says it is "possibly normalized by $\|z_1 - z_2\|$". StarGAN v2 removes that denominator for stability and decays $\lambda_{\mathrm{ds}}$ linearly to zero.
+- **The cycle loss.** Cell 4 uses a style "$E_{\text{orig}}(x)$". It is the same style encoder, read at the head of the original domain: $\hat s = E_y(x)$.
+- **Missing pieces.** Cell 4 omits the R1 penalty and the loss weights ($\lambda_{\mathrm{sty}} = \lambda_{\mathrm{cyc}} = 1$, $\lambda_{\mathrm{ds}} = 1$ or $2$).
+
+**The task notebook** has three stages: data, model and training, evaluation and analysis. It loads CelebA through `CelebADataset` from the repository's `seminars/utils/datasets/celeba.py`.
+
+- **Cells 1–2**: title and the goal, generating faces with given attributes from CelebA.
+- **Cell 3: setup.** Installs `lpips`, adds `../../seminars/utils/` to `sys.path`, imports torch, `LPIPS`, torchvision transforms, `Munch`, `trange`, matplotlib, numpy and `CelebADataset`, and picks the device (CUDA, Apple MPS or CPU).
+- **Cell 4: data.** `args.img_size = 256`; images are resized so that the shorter side is 256, center-cropped to $256 \times 256$ and normalized with the ImageNet mean and standard deviation. The dataset root is `../../seminars/data/celeba`, which the helper fills by downloading CelebA and its attribute file from Google Drive if missing. Batch size 32, shuffled; `num_workers` is 0 on CUDA and 2 otherwise, `pin_memory` only on CUDA.
+- **Cell 5**: `args.num_domains = len(dataset.header)`, the number of attribute names in the annotation file, 40.
+- **Cells 6–7**: a $3 \times 3$ grid of random images, each min-max rescaled for display.
+- **Cells 8–10: the model.** The reader chooses StarGAN or StarGAN v2. Cell 10 prepares a `Munch` container with commented slots `generator`, `mapping_network`, `style_encoder` and `discriminator`, the four networks of StarGAN v2 under the names of the authors' implementation.
+- **Cells 11–12: training**, an empty cell for the reader's code.
+- **Cells 13–16: evaluation.** `LPIPS()` with its default AlexNet backbone. Cell 16 runs 100 iterations; each draws three fresh batches `x_real`, `x_ref`, `x_ref2` and uniformly random `y_trg` and `y_org` over `num_domains`, leaves the translation `x_fake` to the reader (a `NotImplementedError` placeholder), appends the LPIPS between `x_fake` and `x_real`, prints the mean and asserts that it is below 1.3.
+- **Cells 17–18: one output.** Under `no_grad`, a latent-guided translation, $z \sim \mathcal N(0, I)$ of size `args.latent_dim`, `s_trg = mapping_network(z_trg, y_trg)`, `x_fake = generator(x_real, s_trg)` (the reference-guided `style_encoder(x_ref2, y_trg)` is commented out), and a plot of the second image of the batch.
+- **Cell 19: analysis.** The reader is asked to analyse the latent space and to write a review of possible improvements; [Exploring the style space](#exploring-the-style-space) and [Limitations](#limitations) cover both.
+
+Neither notebook has saved outputs, so they document procedures rather than results; cells 4 and 12 of the task notebook carry execution counts but no output.
+
+Issues in the task notebook and its helper:
+
+- **Paths.** The notebook sits in `homeworks/`, one level below the repository root, but cells 3 and 4 go up two levels, to `../../seminars/utils/` and `../../seminars/data/celeba`. From `homeworks/` the paths are `../seminars/utils/` and `../seminars/data/celeba`.
+- **Imports.** `sys.path.append` puts the helper folder last, so an installed Hugging Face `datasets` package shadows the helper's `datasets` folder and `from datasets.celeba import CelebADataset` fails; `sys.path.insert(0, ...)` avoids this. The helper also needs `gdown`, and cell 3 installs neither it nor `munch`.
+- **40 attributes are not 40 domains.** CelebA's attributes overlap, so they cannot be the domains of StarGAN v2, which needs one domain per image (see [What counts as a domain](#what-counts-as-a-domain)); StarGAN would instead use a binary vector of a few attributes. The helper returns, for each image, a dictionary whose `attributes` entry holds all 40 values as $\pm 1$, the encoding of `list_attr_celeba.txt`; the labels must be converted to $\{0, 1\}$ or to a domain index before training. Cell 16 discards them (`x_real, _ = ...`) and draws `y_org` at random, so the "source domain" is not the domain of `x_real`.
+- **Pixel range.** The ImageNet normalization maps pixels to about $[-2.12, 2.64]$, not $[-1, 1]$. LPIPS expects inputs in $[-1, 1]$; the StarGAN generator ends in $\tanh$ and cannot produce the normalized range; and cell 18 plots the generator output without undoing the normalization, so `imshow` clips it. `Normalize([0.5] * 3, [0.5] * 3)` gives $[-1, 1]$.
+- **Resolution.** The aligned CelebA images are $178 \times 218$, so resizing the shorter side to 256 upsamples them by a factor of about 1.44. StarGAN used $178 \times 178$ crops resized to $128 \times 128$; StarGAN v2 trains at $256 \times 256$ on CelebA-HQ.
+- **The LPIPS line fails.** `lpips(x_fake, x_real)` returns one value per image, shape $(B, 1, 1, 1)$; `.squeeze().item()` raises an error for the batch size of 32. Use `.mean().item()`. The loop also runs without `torch.no_grad()` or `eval()`.
+- **What the metric measures.** The LPIPS between a translation and its own input measures how much the translation changed the image, not realism and not diversity; returning the input unchanged scores 0 and passes the assertion. StarGAN v2's LPIPS is the average over pairs of outputs for the same input (see [How translation models are measured](#how-translation-models-are-measured)).
+- **Cell 18 depends on cell 16.** It uses `batch_size`, `y_trg` and `x_real` from the last iteration of cell 16, and `args.latent_dim`, which no cell sets (16 in StarGAN v2).
+- **Data loading.** `next(iter(dataloader))` builds a new iterator three times per evaluation step, which is slow with worker processes, and the choice of 0 workers on CUDA but 2 elsewhere looks inverted.
+
+## Next
+
+GAN papers compare their models by numbers. StarGAN v2 claimed its advance with an FID of 13.7 and an LPIPS diversity of 0.452, and the ablation and the comparisons above showed that FID shifts with the number of samples and that LPIPS diversity counts artifacts. The next notes explain where these numbers come from and what they miss, starting with the [Inception Score](/notes/generative-models/inception-score), which scores generated images with a pretrained classifier.
+
+## References
+
+- Y. Choi, M. Choi, M. Kim, J.-W. Ha, S. Kim, J. Choo. [StarGAN: Unified generative adversarial networks for multi-domain image-to-image translation](https://arxiv.org/abs/1711.09020). CVPR, 2018. Section numbers refer to arXiv v3: the losses in Section 3.1 (Eqs. 1–6), the mask vector in Section 3.2 (Eq. 7), WGAN-GP and the networks in Section 4 (Eq. 8) and Appendix 7.2 (Tables 4–5), datasets and training in Sections 5.2–5.3, results in Tables 1–3 and Figures 6–7.
+- Y. Choi, Y. Uh, J. Yoo, J.-W. Ha. [StarGAN v2: Diverse image synthesis for multiple domains](https://arxiv.org/abs/1912.01865). CVPR, 2020. Section numbers refer to arXiv v2: the networks and losses in Section 2 (Eqs. 1–5), the ablation in Section 3.1 and Table 1, comparisons in Tables 2–3, training details in Appendix B, the evaluation protocol in Appendix C, the architectures in Appendix E.
+- A. Odena, C. Olah, J. Shlens. [Conditional image synthesis with auxiliary classifier GANs](https://arxiv.org/abs/1610.09585). ICML, 2017. The auxiliary classifier.
+- I. Gulrajani, F. Ahmed, M. Arjovsky, V. Dumoulin, A. Courville. [Improved training of Wasserstein GANs](https://arxiv.org/abs/1704.00028). NeurIPS, 2017.
+- L. Mescheder, A. Geiger, S. Nowozin. [Which training methods for GANs do actually converge?](https://arxiv.org/abs/1801.04406). ICML, 2018. The R1 penalty in Section 4.1, Eq. 9; its implementation is also the origin of the multi-task discriminator used by StarGAN v2.
+- M.-Y. Liu, X. Huang, A. Mallya, T. Karras, T. Aila, J. Lehtinen, J. Kautz. [Few-shot unsupervised image-to-image translation](https://arxiv.org/abs/1905.01723). ICCV, 2019. FUNIT; the multi-task adversarial discriminator in Section 3.2.
+- X. Huang, S. Belongie. [Arbitrary style transfer in real-time with adaptive instance normalization](https://arxiv.org/abs/1703.06868). ICCV, 2017. AdaIN, Eq. 8.
+- T. Karras, S. Laine, T. Aila. [A style-based generator architecture for generative adversarial networks](https://arxiv.org/abs/1812.04948). CVPR, 2019.
+- J.-Y. Zhu, T. Park, P. Isola, A. A. Efros. [Unpaired image-to-image translation using cycle-consistent adversarial networks](https://arxiv.org/abs/1703.10593). ICCV, 2017.
+- Y. Choi. [StarGAN](https://github.com/yunjey/stargan), official PyTorch implementation, 2018. `model.py`: label tiling and the remark on padding and instance normalization; `solver.py`: binary cross-entropy for CelebA labels, target labels by shuffling the batch, the mask vector.
+- Clova AI Research. [StarGAN v2](https://github.com/clovaai/stargan-v2), official PyTorch implementation, 2020. `core/model.py`: AdaIN with scale $1 + \gamma(s)$, the mapping network; `core/solver.py`: the losses and the R1 penalty.
+- HSE-LAMBDA, *Deep Generative Models* course repository: [`StarGAN.ipynb`](https://github.com/HSE-LAMBDA/DeepGenerativeModels/blob/spring-2025-long/seminars/04_Image-to-Image/StarGAN.ipynb), [`02_hw_StarGAN.ipynb`](https://github.com/HSE-LAMBDA/DeepGenerativeModels/blob/spring-2025-long/homeworks/02_hw_StarGAN.ipynb), and the dataset helper [`celeba.py`](https://github.com/HSE-LAMBDA/DeepGenerativeModels/blob/spring-2025-long/seminars/utils/datasets/celeba.py).

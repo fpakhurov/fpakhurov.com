@@ -3,7 +3,7 @@ title: Latent diffusion and Stable Diffusion
 description: "Run diffusion in the latent space of an autoencoder instead of on pixels: perceptual versus semantic compression, the autoencoder, text conditioning through cross-attention, classifier-free guidance, faster samplers, and the editing tools built on the same model (image-to-image, inpainting, LoRA, textual inversion)."
 course: generative-models
 section: Diffusion Models
-order: 20
+order: 25
 status: published
 tags: [diffusion, latent-diffusion, stable-diffusion, cross-attention, classifier-free-guidance, ddim, text-to-image]
 prerequisites: [Score matching and Langevin dynamics, "VAE variants: β-VAE and VQ-VAE"]
@@ -20,7 +20,7 @@ The [DDPM](/notes/generative-models/ddpm-training-objective) and [score matching
 
 A trained image model compresses in two senses. **Perceptual compression** throws away high-frequency detail that changes many bits of the image and almost nothing of what a person perceives. **Semantic compression** captures the layout and content of the image: which objects, where, in what style. A likelihood-based model in pixel space is charged for every bit, and the paper shows that most of those bits belong to the perceptual part. Latent diffusion assigns each part to a model suited to it: an autoencoder trained with perceptual and adversarial losses for the first, a diffusion model for the second.
 
-The savings are large. Stable Diffusion at $512 \times 512$ uses $f = 8$ and $c = 4$: the image has $512 \cdot 512 \cdot 3 = 786{,}432$ numbers and the latent $64 \cdot 64 \cdot 4 = 16{,}384$, 48 times fewer. Attention grows faster still. Self-attention over a $64 \times 64$ grid compares $4096^2 \approx 1.7 \cdot 10^7$ pairs; over the $512 \times 512$ pixels it would compare $262{,}144^2 \approx 6.9 \cdot 10^{10}$, 4096 times more, which is why pixel-space models attend only at coarse resolutions.
+The savings are large. Stable Diffusion at $512 \times 512$ uses $f = 8$ and $c = 4$: the image has $512 \cdot 512 \cdot 3 = 786{,}432$ numbers and the latent $64 \cdot 64 \cdot 4 = 16{,}384$, 48 times fewer. Attention grows faster still. Self-attention over a $64 \times 64$ grid compares $4096^2 \approx 1.7 \cdot 10^7$ pairs; over the $512 \times 512$ pixels it would compare $262{,}144^2 \approx 6.9 \cdot 10^{10}$, 4096 times more, which is why pixel-space models attend only at coarse resolutions. Memory matters as much as time: one $4096 \times 4096$ attention map already has $1.7 \cdot 10^7$ entries, 67 MB in 32-bit floats, for every head and every image of a batch. Libraries can compute attention in slices, a few heads or images at a time, which gives the same result with a lower peak memory at some cost in speed.
 
 ## The autoencoder
 
@@ -50,6 +50,14 @@ $$
 
 where $\varphi(z_t)$ are flattened intermediate features. Every spatial position of the latent attends over the tokens of the prompt, so different regions can follow different words. In Stable Diffusion $\tau$ is a frozen text encoder that turns a prompt into 77 token vectors: CLIP ViT-L/14 with 768 dimensions in versions 1.x, OpenCLIP ViT-H/14 with 1024 in versions 2.x. The same mechanism accepts other conditions, such as class labels, segmentation maps or low-resolution images.
 
+**Prompt weighting.** Every token reaches the U-Net as its own vector $\tau(y)_i$, so a concept can be emphasised or toned down after encoding, without retraining. A common rule moves the token's vector away from, or toward, the vector at the same position for an empty prompt,
+
+$$
+\tau(y)_i \;\leftarrow\; \tau(\varnothing)_i + w_i\,\big(\tau(y)_i - \tau(\varnothing)_i\big),
+$$
+
+with $w_i > 1$ to boost the concept and $w_i < 1$ to suppress it. The change acts through cross-attention: the token's key changes how much the latent attends to it, and its value what the latent reads from it. The [Compel](#references) library writes weights as suffixes, each `+` a factor $1.1$ and each `-` a factor $0.9$: `ball++` has weight $1.1^2 = 1.21$, `ball--` $0.9^2 = 0.81$, and `forest---` $0.9^3 = 0.729$. For weights below $1$ it also blends the result with the encoding of the prompt in which those tokens are masked out.
+
 ## Classifier-free guidance
 
 A conditional model sampled as it is follows the prompt only loosely. **Classifier-free guidance** ([Ho and Salimans, 2022](#references)) strengthens it without a separate classifier. During training the condition is replaced by an empty one in a fraction of the steps, 10 or 20 % in the paper, so one network learns both $\varepsilon_\theta(z_t, t, y)$ and $\varepsilon_\theta(z_t, t, \varnothing)$. At sampling time the two predictions are extrapolated:
@@ -72,14 +80,52 @@ and by Bayes' rule $p(z \mid y) \propto p(y \mid z)\, p(z)$ this is $\nabla \log
 
 ## Fewer steps
 
-DDPM samples with as many steps as it was trained with, 1000. Practical samplers treat the reverse process as a differential equation, the probability flow ODE of [Song et al. (2021)](#references), and integrate it with large steps. **DDIM** ([Song, Meng and Ermon, 2021](#references)) is a deterministic sampler for the same trained network that works with 50 steps or fewer and maps each noise latent to one image, which also makes an image invertible back to its noise. **DPM-Solver++** ([Lu et al., 2022](#references)) uses the semi-linear structure of the equation for higher-order steps and needs about 15 to 25. The Euler sampler of [Karras et al. (2022)](#references) is the first-order method on the same equation. The network does not change; only the update rule between its evaluations does, which is why diffusion libraries let the sampler (the **scheduler**) be swapped after training.
+DDPM samples with as many steps as it was trained with, 1000, because each step undoes one small Gaussian step. Fast samplers start from a deterministic description of the same model. In continuous time the forward process is a stochastic differential equation, and [Song et al. (2021)](#references) show that the **probability flow ODE**
+
+$$
+\begin{aligned}
+\frac{dz}{dt} &= -\tfrac12\,\beta(t)\,\big[z + \nabla_z \log q_t(z)\big] \\
+&= -\tfrac12\,\beta(t)\,\Big[z - \frac{\varepsilon_\theta(z, t)}{\sqrt{1 - \bar\alpha_t}}\Big]
+\end{aligned}
+$$
+
+has the same marginal $q_t$ as the noising process at every time. Here $\beta(t)$ is the noise rate in continuous time, with $\beta_t \approx \beta(t)\,\Delta t$ for one discrete step and $d\bar\alpha_t/dt = -\beta(t)\,\bar\alpha_t$, and the score is replaced by the scaled noise predictor ([score matching note](/notes/generative-models/score-matching#the-same-model-as-ddpm)). Integrating the ODE from $z_T \sim \mathcal N(0, I)$ down to $t = 0$ maps every noise latent to one sample, and a solver that takes large steps needs few network evaluations.
+
+**DDIM is Euler's method in the right coordinates.** Divide the latent by its signal coefficient and measure time by the noise-to-signal ratio,
+
+$$
+\bar z = \frac{z}{\sqrt{\bar\alpha_t}}, \qquad \sigma_t = \sqrt{\frac{1 - \bar\alpha_t}{\bar\alpha_t}},
+$$
+
+so that $\bar z = z_0 + \sigma_t\,\varepsilon$. Differentiating $\bar z$ with $d\bar\alpha_t/dt = -\beta(t)\,\bar\alpha_t$, the terms in $z$ cancel, and $d\bar z/dt$ and $d\sigma_t/dt$ both carry the factor $\beta(t)/\big(2\sqrt{\bar\alpha_t(1 - \bar\alpha_t)}\big)$. The ODE becomes $d\bar z/d\sigma = \varepsilon_\theta$ ([Song, Meng and Ermon, 2021](#references), §4.3, Eq. 14), with the exact solution from $\sigma_t$ to an earlier, smaller $\sigma_s$
+
+$$
+\bar z_s = \bar z_t + \int_{\sigma_t}^{\sigma_s} \varepsilon_\theta\, d\sigma .
+$$
+
+Euler's method holds $\varepsilon_\theta$ at its value at $\sigma_t$ for the whole step. Multiplying back by $\sqrt{\bar\alpha_s}$ gives the **DDIM** update (their Eq. 12 with no added noise):
+
+$$
+\begin{gathered}
+z_s = \sqrt{\bar\alpha_s}\;\hat z_0 + \sqrt{1 - \bar\alpha_s}\;\varepsilon_\theta(z_t, t), \\
+\hat z_0 = \frac{z_t - \sqrt{1 - \bar\alpha_t}\;\varepsilon_\theta(z_t, t)}{\sqrt{\bar\alpha_t}} .
+\end{gathered}
+$$
+
+Predict the clean latent, then noise it again to the level of step $s$ with the same predicted noise. The step $s$ can be any earlier step, so a 50-step schedule simply visits every twentieth $t$. The Euler sampler of diffusion libraries, after [Karras et al. (2022)](#references), makes this same update with its own choice of noise levels; its "ancestral" variant adds fresh noise after each step. DDIM is deterministic, maps each noise latent to one image, and can be run backwards to invert an image into its noise.
+
+**Worked example.** One-dimensional data $\mathcal N(0, 0.5^2)$, the exact noise predictor, DDPM's linear schedule, $z_T$ drawn from its exact distribution and DDIM steps evenly spaced in $t$. The samples should have standard deviation $0.5$. With 1 step they have $0.002$, with 10 steps $0.370$, with 50 steps $0.471$ and with 1000 steps $0.4985$. A single step from pure noise returns $\hat z_0$, the posterior mean $\mathbb E[z_0 \mid z_T]$, which is close to the average of all data; too few first-order steps shrink the samples toward that average.
+
+**DPM-Solver: integrate the known part exactly.** In the variable $\lambda = \log\big(\sqrt{\bar\alpha}/\sqrt{1 - \bar\alpha}\big) = -\log\sigma$, half the log signal-to-noise ratio, the same exact solution reads $\bar z_s = \bar z_t - \int_{\lambda_t}^{\lambda_s} e^{-\lambda}\,\hat\varepsilon_\theta(\lambda)\,d\lambda$ ([Lu et al., 2022a](#references), Eq. 3.4). DPM-Solver expands $\hat\varepsilon_\theta$ in a Taylor series in $\lambda$ around the start of each step and integrates the exponential weight exactly. Its first-order version is DDIM (their §4.1); the second- and third-order versions spend two or three network evaluations per step but need far fewer steps. **DPM-Solver++** ([Lu et al., 2022b](#references)) applies the same idea to the predicted clean latent $\hat z_0$ instead of the noise and uses a multistep second-order update that reuses the evaluation of the previous step. Earlier high-order solvers became unstable at the large guidance scales of text-to-image models, even slower than DDIM; the multistep form reduces the effective step size and keeps them stable.
+
+**How many steps.** The numbers depend on guidance. Without it, DPM-Solver produces high-quality samples in 10 to 20 network evaluations, with FID 4.70 at 10 and 2.87 at 20 on CIFAR-10 (Lu et al., 2022a). With guidance, Lu et al. (2022b) find that DDIM generally needs 100 to 250 steps to converge, while DPM-Solver++ gives high-quality samples in 15 to 20 steps, for pixel-space and latent-space models alike. On Stable Diffusion with guidance scale 7.5, DPM-Solver++ reaches with 15 to 20 steps the latent error that the default 50-step sampler (PNDM) has; in the same test every solver already gave an FID of about 15 to 16 at 10 steps, because the decoder turns a latent that has not quite converged into a good image (their §7.2). The network does not change; only the update rule between its evaluations does, which is why diffusion libraries let the sampler (the **scheduler**) be swapped after training.
 
 ## Editing with the same model
 
 - **Image-to-image** (SDEdit, [Meng et al., 2022](#references)). Encode an existing image, add noise to an intermediate step, $z_t = \sqrt{\bar\alpha_t}\, z_0 + \sqrt{1 - \bar\alpha_t}\,\varepsilon$, and run the remaining denoising steps with a new prompt. The **strength** $\lambda \in [0, 1]$ chooses the step: with 40 sampling steps and $\lambda = 0.6$, the last 24 are run. Low strength keeps the composition; strength 1 ignores the input.
-- **Inpainting.** To change only a masked region, at every step the latent outside the mask is replaced by the original latent noised to the same step, and only the masked part follows the model. Dedicated inpainting models instead receive the mask and the masked image as extra input channels and are trained for the task.
-- **LoRA.** Fine-tune the attention layers with low-rank updates $W + \frac{\alpha}{r} B A$ ([PEFT note](/notes/nlp/peft#lora-a-low-rank-update)) to teach a style or a subject from a small dataset; the update can be fused into the weights for inference.
-- **Textual inversion** ([Gal et al., 2023](#references)). Freeze everything and learn only the embedding of a new token, such as `<S*>`, by minimizing the diffusion loss on a few images of a concept; the token can then be used in any prompt.
+- **Inpainting.** To change only a masked region, at every step the latent outside the mask is replaced by the original latent noised to the same step, and only the masked part follows the model: $z_{t-1} \leftarrow (1 - m) \odot z^{\text{orig}}_{t-1} + m \odot z^*_{t-1}$, where $m$ is the mask downsampled to the latent grid (1 where the image may change), $z^{\text{orig}}_{t-1} = \sqrt{\bar\alpha_{t-1}}\, z_0 + \sqrt{1 - \bar\alpha_{t-1}}\,\varepsilon$ and $z^*_{t-1}$ is the sampler's update. With $f = 8$ the mask is applied on $8 \times 8$ pixel blocks, so its edge is blended by the decoder rather than followed exactly. Dedicated inpainting models instead receive the mask and the masked image as extra input channels and are trained for the task.
+- **LoRA.** Fine-tune the attention layers with low-rank updates $W + \frac{\alpha}{r} B A$ ([PEFT note](/notes/nlp/peft#lora-a-low-rank-update)) to teach a style or a subject from a small dataset; the update can be fused into the weights for inference. For a $d \times k$ weight it trains $r(d + k)$ numbers instead of $dk$: with $d = k = 1280$ that is $0.6\%$ of the layer for $r = 4$ and $5\%$ for $r = 32$.
+- **Textual inversion** ([Gal et al., 2023](#references)). Freeze everything and learn only the embedding $v$ of a new token, such as `<S*>`, by minimizing the diffusion loss on three to five images of a concept, $v^* = \arg\min_v \mathbb E_{z_0, y, \varepsilon, t}\, \lVert \varepsilon - \varepsilon_\theta(z_t, t, \tau(y_v))\rVert^2$ (their Eq. 2), where $y_v$ is a template prompt such as "a photo of `<S*>`" with $v$ in place of the token's embedding. The token can then be used in any prompt.
 
 ## What changed
 
@@ -89,7 +135,7 @@ DDPM samples with as many steps as it was trained with, 1000. Practical samplers
 | Who removes imperceptible detail | the diffusion model, slowly | the autoencoder, once |
 | Attention | only at coarse resolutions | affordable over the whole latent grid |
 | Conditioning | possible, costly | cross-attention to a text encoder |
-| Sampling | about 1000 steps | 20 to 50 steps with DDIM or DPM-Solver, two evaluations each with guidance |
+| Sampling | about 1000 steps | 15 to 20 steps with DPM-Solver++, about 50 with DDIM in common use (100 to 250 to converge with guidance), two evaluations each with guidance |
 | Ceiling on detail | the network | the decoder of the autoencoder |
 
 ## Limitations
@@ -97,41 +143,45 @@ DDPM samples with as many steps as it was trained with, 1000. Practical samplers
 - **The decoder bounds the detail.** Fine text, faces at small scale and exact textures depend on what the autoencoder can reconstruct; the diffusion model cannot add what $\mathcal D$ cannot express.
 - **Guidance is a trade-off.** Large $s$ improves prompt adherence and typicality at the cost of diversity and, beyond some value, of image quality.
 - **The text encoder limits understanding.** A frozen CLIP-like encoder with 77 tokens struggles with counting, spatial relations and long prompts.
-- **Still iterative.** Tens of network evaluations per image remain, twice that with guidance.
+- **Still iterative.** Tens of network evaluations per image remain, twice that with guidance, and too few steps of a first-order sampler shrink the samples toward their average.
+- **Memory.** Attention over the latent grid needs memory quadratic in the number of positions; slicing trades speed for memory.
 - **Data.** The models are trained on large scraped image–text collections, with the questions of consent, copyright and bias that come with them.
 
 ## Summary
 
 - An autoencoder removes perceptual detail once; diffusion runs in its latent, 48 times smaller than the image for Stable Diffusion at $512 \times 512$.
 - The autoencoder is trained with reconstruction, perceptual and patch-adversarial losses and a weak KL or VQ regularization; $f$ between 4 and 16 balances speed and fidelity.
-- Text enters the U-Net through cross-attention: queries from the latent, keys and values from the text encoder.
+- Text enters the U-Net through cross-attention: queries from the latent, keys and values from the text encoder. Per-token weights move token vectors away from or toward those of an empty prompt.
 - Classifier-free guidance extrapolates from the unconditional to the conditional prediction; it samples from $p^{1-s}\, p(\cdot \mid y)^s$, which narrows the distribution toward the prompt.
-- Samplers such as DDIM and DPM-Solver integrate the same model in 20 to 50 steps; image-to-image, inpainting, LoRA and textual inversion reuse it for editing.
+- Samplers integrate the probability flow ODE of the same model: DDIM is Euler's method in $(\bar z, \sigma)$ coordinates, DPM-Solver integrates the linear part exactly and expands the network in $\lambda$; with guidance DPM-Solver++ needs 15 to 20 steps. Image-to-image, inpainting, LoRA and textual inversion reuse the model for editing.
 
 ## Notebook
 
-The [advanced diffusion notebook](https://github.com/HSE-LAMBDA/DeepGenerativeModels/blob/spring-2025-long/seminars/14_Advanced-Diffusion-Models/Advanced_Diffusion.ipynb) of the HSE-LAMBDA *Deep Generative Models* repository uses the Hugging Face Diffusers library (cell numbers count every cell from 1). It has no saved outputs, so it documents the procedure rather than results.
+The [advanced diffusion notebook](https://github.com/HSE-LAMBDA/DeepGenerativeModels/blob/spring-2025-long/seminars/14_Advanced-Diffusion-Models/Advanced_Diffusion.ipynb) of the HSE-LAMBDA *Deep Generative Models* repository uses the Hugging Face Diffusers library (cell numbers count every cell, markdown included, from 1). It has no saved outputs, so it documents the procedure rather than results.
 
-- **Cells 5–9**: a recap of DDPM and the Stable Diffusion pipeline, then text-to-image with `stabilityai/stable-diffusion-2-1-base` in float32, 25 steps and guidance scale 7.5. The markdown of cell 6 gives the text embedding as $77 \times 768$, the size for Stable Diffusion 1.x; the 2.1 model used here has an OpenCLIP encoder with 1024 dimensions.
-- **Cells 10–12**: schedulers. The ODE in the markdown keeps only the noise term: the probability flow ODE of the variance-preserving process also has a term proportional to $z_t$ and a factor $\frac12$. The Euler update is written with added noise, while `EulerDiscreteScheduler` is deterministic by default (the stochastic variant is `EulerAncestralDiscreteScheduler`), and DDIM is said to allow parallel sampling, which it does not; it allows fewer steps and exact inversion. In cell 11 `swap_scheduler` replaces the scheduler of the same pipeline object and returns it, so `pipe_euler` and `pipe_dpm` are one pipeline: both images of the side-by-side are produced with DPM-Solver++.
-- **Cells 13–16**: batch generation of three prompts and prompt weighting with Compel (`ball++`, `ball--`, `forest---`). The markdown describes the `(token:weight)` syntax of another tool and a normalized weighted sum of token embeddings; Compel's syntax is the one used in the code, and its weighting acts on the text-encoder output.
+- **Cells 5–9**: a recap of DDPM and the Stable Diffusion pipeline, then text-to-image with `stabilityai/stable-diffusion-2-1-base` in float32, 25 steps and guidance scale 7.5. `enable_attention_slicing()` computes attention in slices to lower the peak memory, as described [above](#two-kinds-of-compression). The markdown of cell 6 gives the text embedding as $77 \times 768$, the size for Stable Diffusion 1.x; the 2.1 model used here has an OpenCLIP encoder with 1024 dimensions.
+- **Cells 10–12**: schedulers. The ODE in the markdown keeps only the noise term: the [probability flow ODE](#fewer-steps) of the variance-preserving process also has a term proportional to $z_t$ and a factor $\frac12$. The Euler update is written with added noise, while `EulerDiscreteScheduler` is deterministic by default (the stochastic variant is `EulerAncestralDiscreteScheduler`), and DDIM is said to allow parallel sampling, which it does not; it allows fewer steps and exact inversion. The markdown and the README give 10–15 steps for DPM-Solver++ and 20–30 for Euler. The DPM-Solver++ paper reports 15 to 20 steps for guided sampling, which is what Stable Diffusion does; about 10 steps is the figure for DPM-Solver without guidance; and the papers give no step count for the Euler sampler. The README lists the DPM-Solver paper, cited [above](#fewer-steps). In cell 11 `swap_scheduler` replaces the scheduler of the same pipeline object and returns it, so `pipe_euler` and `pipe_dpm` are one pipeline: both images of the side-by-side are produced with DPM-Solver++.
+- **Cells 13–16**: batch generation of three prompts and [prompt weighting](#conditioning-through-cross-attention) with Compel: `ball--` (weight $0.81$), `ball++` ($1.21$), and `ball++` together with `forest---` ($0.729$). The markdown describes the `(token:weight)` syntax of another tool and a normalized weighted sum of token embeddings; Compel's syntax is the one used in the code, and its weighting acts on the text-encoder output.
 - **Cells 17–20**: image-to-image on a $768 \times 768$ picture, with strength 0.6 (24 of 40 steps) and 1.0.
-- **Cells 21–22**: inpainting with the same base checkpoint. Its U-Net has 4 input channels, so the pipeline uses the latent replacement described in the markdown rather than the mask-conditioned inpainting models.
-- **Cells 23–24**: a pixel-art LoRA loaded into Stable Diffusion XL and fused with scale 0.8.
-- **Cells 25–26**: textual inversion with a concept token from the `sd-concepts-library`, loaded into `runwayml/stable-diffusion-v1-5`. That repository has been removed from the Hugging Face Hub; the same weights are published as `stable-diffusion-v1-5/stable-diffusion-v1-5`.
+- **Cells 21–22**: inpainting with the same base checkpoint, 50 steps. Its U-Net has 4 input channels, so the pipeline uses the latent replacement written [above](#editing-with-the-same-model) rather than the mask-conditioned inpainting models.
+- **Cells 23–24**: a pixel-art LoRA loaded into Stable Diffusion XL and fused with scale 0.8. The markdown says a LoRA trains about 0.2% of the parameters of SD-XL. The adapter loaded here has rank 32 and 85.1 million parameters, all in the U-Net (from the header of its weight file), about 3.3% of the 2.6 billion parameters of the SD-XL U-Net ([Podell et al., 2023](#references)); 0.2% would correspond to rank 2. The share depends on the rank and on which layers are adapted.
+- **Cells 25–26**: textual inversion with a concept token from the `sd-concepts-library`, loaded into `runwayml/stable-diffusion-v1-5`. That repository is no longer published under this name; the same weights are at `stable-diffusion-v1-5/stable-diffusion-v1-5`, to which the Hub API redirects the old id. The markdown gives the textual-inversion objective written [above](#editing-with-the-same-model).
 
 ## Next
 
-Diffusion builds an image by repeated denoising of the whole picture. The last section of the course builds it one piece at a time: [autoregressive models](/notes/generative-models/autoregressive-models) factor the density of an image into a product of conditionals, compute the likelihood exactly and sample pixel by pixel or token by token.
+Text, masks and the strength of image-to-image are coarse controls: they say what should appear and roughly where, but not exactly where a given point of the image should end up. The [next note](/notes/generative-models/drag-editing), *Point-based image editing: DragGAN and DragDiffusion*, asks for precise geometric edits of the form "move this point there": first by optimizing the latent code of a GAN (DragGAN), then by optimizing the noisy latent of a diffusion model (DragDiffusion).
 
 ## References
 
 - R. Rombach, A. Blattmann, D. Lorenz, P. Esser, B. Ommer. [High-Resolution Image Synthesis with Latent Diffusion Models](https://arxiv.org/abs/2112.10752). CVPR, 2022.
 - J. Ho, T. Salimans. [Classifier-Free Diffusion Guidance](https://arxiv.org/abs/2207.12598). NeurIPS Workshop on Deep Generative Models, 2021.
 - J. Song, C. Meng, S. Ermon. [Denoising Diffusion Implicit Models](https://arxiv.org/abs/2010.02502). ICLR, 2021.
-- C. Lu, Y. Zhou, F. Bao, J. Chen, C. Li, J. Zhu. [DPM-Solver++: Fast Solver for Guided Sampling of Diffusion Probabilistic Models](https://arxiv.org/abs/2211.01095). arXiv, 2022.
+- C. Lu, Y. Zhou, F. Bao, J. Chen, C. Li, J. Zhu. [DPM-Solver: A Fast ODE Solver for Diffusion Probabilistic Model Sampling in Around 10 Steps](https://arxiv.org/abs/2206.00927). NeurIPS, 2022 (cited as Lu et al., 2022a). Eq. 3.4 (exact solution), §4.1 (DDIM as DPM-Solver-1).
+- C. Lu, Y. Zhou, F. Bao, J. Chen, C. Li, J. Zhu. [DPM-Solver++: Fast Solver for Guided Sampling of Diffusion Probabilistic Models](https://arxiv.org/abs/2211.01095). arXiv:2211.01095, 2022 (cited as Lu et al., 2022b). §1 and §7.2 (step counts with guidance, Stable Diffusion).
 - T. Karras, M. Aittala, T. Aila, S. Laine. [Elucidating the Design Space of Diffusion-Based Generative Models](https://arxiv.org/abs/2206.00364). NeurIPS, 2022.
 - Y. Song, J. Sohl-Dickstein, D. P. Kingma, A. Kumar, S. Ermon, B. Poole. [Score-Based Generative Modeling through Stochastic Differential Equations](https://arxiv.org/abs/2011.13456). ICLR, 2021.
 - C. Meng, Y. He, Y. Song, J. Song, J. Wu, J.-Y. Zhu, S. Ermon. [SDEdit: Guided Image Synthesis and Editing with Stochastic Differential Equations](https://arxiv.org/abs/2108.01073). ICLR, 2022.
 - R. Gal, Y. Alaluf, Y. Atzmon, O. Patashnik, A. H. Bermano, G. Chechik, D. Cohen-Or. [An Image is Worth One Word: Personalizing Text-to-Image Generation using Textual Inversion](https://arxiv.org/abs/2208.01618). ICLR, 2023.
 - E. J. Hu, Y. Shen, P. Wallis, Z. Allen-Zhu, Y. Li, S. Wang, L. Wang, W. Chen. [LoRA: Low-Rank Adaptation of Large Language Models](https://arxiv.org/abs/2106.09685). ICLR, 2022.
+- D. Podell, Z. English, K. Lacey, A. Blattmann, T. Dockhorn, J. Müller, J. Penna, R. Rombach. [SDXL: Improving Latent Diffusion Models for High-Resolution Image Synthesis](https://arxiv.org/abs/2307.01952). arXiv:2307.01952, 2023. §2.1 (2.6 billion parameters in the U-Net).
+- D. Stewart. [Compel](https://github.com/damian0815/compel): prompt weighting for Diffusers. Software; syntax in `doc/syntax.md`, weighting in `src/compel/embeddings_provider.py`.

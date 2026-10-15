@@ -1,0 +1,333 @@
+---
+title: "Audio generation: text-to-speech and music"
+description: "The course's tools applied to sound: waveforms and mel spectrograms, the text-to-speech pipeline, Glow-TTS as a normalizing flow with a text-conditioned prior and monotonic alignment search, neural audio codecs with residual vector quantization, and MusicGen, one transformer over parallel codebook streams with text, melody and audio prompts."
+course: generative-models
+section: Audio Generation
+order: 29
+status: published
+tags: [audio, text-to-speech, glow-tts, normalizing-flows, encodec, residual-vector-quantization, musicgen, classifier-free-guidance]
+prerequisites: ["Autoregressive transformers: ImageGPT, VQGAN, DALL·E and Parti", Flow architectures, "VAE variants: β-VAE and VQ-VAE", Latent diffusion and Stable Diffusion]
+---
+
+import ResidualVQ from '../../../components/figures/audio-generation/ResidualVQ.astro';
+import CodebookPatterns from '../../../components/figures/audio-generation/CodebookPatterns.astro';
+
+The [previous note](/notes/generative-models/autoregressive-transformers) turned images into sequences of discrete tokens and generated them with a transformer, steered by temperature, top-$k$ and classifier-free guidance. Sound poses the same problem at a larger scale. One second of audio is tens of thousands of numbers, more than a small image, and a piece of music lasts minutes. This note follows two answers. Text-to-speech keeps a continuous intermediate representation, the mel spectrogram, and Glow-TTS generates it with a normalizing flow whose prior is set by the text. Music generation compresses the waveform with a neural codec into a few parallel streams of tokens, and MusicGen models all of them with one transformer, conditioned on a text, a melody or the beginning of a recording.
+
+**Notation.** A waveform $a \in \mathbb R^{d f_s}$ is $d$ seconds of sound sampled at $f_s$ samples per second. A mel spectrogram $x \in \mathbb R^{F \times T_{\text{mel}}}$ has $F$ frequency bands and $T_{\text{mel}}$ frames. A text is a sequence of tokens $c = (c_1, \dots, c_{T_{\text{text}}})$: phonemes for speech, subwords for music descriptions. A codec encodes a waveform into $T = d f_r$ latent frames $z_t \in \mathbb R^D$ at a frame rate $f_r \ll f_s$ and quantizes each frame with $K$ codebooks $\mathcal C_1, \dots, \mathcal C_K$ of $M$ vectors each, which gives codes $q_{t,k} \in \{1, \dots, M\}$. As in the flow notes, a flow maps the latent to the data, $f: z \mapsto x$, and the variance is the second argument of $\mathcal N$.
+
+## Sound as a signal
+
+A microphone records air pressure. Sampled $f_s$ times per second, it becomes a waveform, a sequence of numbers in $[-1, 1]$, and the sampling theorem says that frequencies up to $f_s / 2$ are kept. Speech is commonly sampled at 16 to 22.05 kHz; music needs the whole audible range and is recorded at 44.1 or 48 kHz ([Copet et al., 2023](#references), §1). The LJ Speech dataset, a standard single-speaker corpus, stores 16-bit mono audio at 22,050 Hz: 352,800 bits and 22,050 numbers per second ([Ito and Johnson, 2017](#references)). An autoregressive model over raw samples, such as WaveNet ([van den Oord et al., 2016](#references)), takes one network pass per sample, 22,050 passes per second of speech.
+
+The **spectrogram** describes the same sound by which frequencies are present when. The short-time Fourier transform cuts the waveform into overlapping windows and takes the Fourier transform of each; the magnitudes form a time–frequency image. For example, with a window of 1024 samples (46.4 ms at 22,050 Hz) and a hop of 256 samples (11.6 ms) there are $22{,}050 / 256 \approx 86.13$ frames per second.
+
+The **mel spectrogram** compresses the frequency axis the way hearing does. Pitch perception is roughly linear below 1 kHz and logarithmic above, and the mel scale follows it; one common form is $m(f) = 2595 \log_{10}(1 + f / 700)$, which maps 1000 Hz to 1000 mel and 11,025 Hz to 3176 mel. A bank of triangular filters, equally spaced in mel, sums the magnitudes into $F$ bands, narrow at low frequencies and wide at high ones, and the result is put on a log scale. With $F = 80$ bands, one second of speech becomes $80 \times 22{,}050 / 256 \approx 6891$ numbers instead of 22,050, about 3.2 times fewer, and neighbouring frames are strongly correlated, which makes the sequence easy to model.
+
+The price is the **phase**. The magnitudes say how much of each frequency is present but not how the waves line up, and the filter bank discards detail as well, so a mel spectrogram does not determine its waveform. A **vocoder** has to produce a plausible one. The classical method, Griffin–Lim ([Griffin and Lim, 1984](#references)), alternates between the time and frequency domains, keeping the given magnitudes and re-estimating the phase; it needs no training, but its phase is only approximate and the result has audible artifacts. Neural vocoders learn the mapping from data.
+
+This gives the two routes of the note. Text-to-speech generates a mel spectrogram and hands it to a vocoder. Music generation learns a discrete code of the waveform itself, as VQGAN did for images, and generates the code.
+
+## The text-to-speech pipeline
+
+A text-to-speech (TTS) system turns written text into a waveform in stages, each a conditional model.
+
+1. **Text normalization** writes out what is not spelled as it is spoken: numbers, dates, abbreviations, symbols. "Dr. Smith paid £5 on 3 May" must become words before anything can be pronounced. LJ Speech ships each clip's text twice, as written and in a normalized form with numbers, ordinals and monetary units written out as words.
+2. **Grapheme-to-phoneme conversion** (G2P) maps letters to phonemes, for example in the International Phonetic Alphabet. English spelling is ambiguous: "read" has two pronunciations, and "though", "through" and "tough" spell the ending "ough" with three different vowels. A rule-based phonemizer such as eSpeak, or a learned G2P model, removes this burden from the acoustic model.
+3. **Linguistic and phonetic analysis** adds what the phonemes do not say: stress, phrase boundaries, intonation. In neural systems this is mostly implicit in the acoustic model.
+4. The **acoustic model** maps the phoneme sequence to a mel spectrogram.
+5. The **vocoder** maps the mel spectrogram to a waveform.
+
+The acoustic model faces the central difficulty of TTS: **alignment**. The input has tens of phonemes, the output hundreds of frames, and how many frames each phoneme lasts is not given by the data. Tacotron 2 ([Shen et al., 2018](#references)) decodes frames autoregressively and learns an attention over the input tokens that decides, frame by frame, which of them is being spoken; a WaveNet vocoder then produces the waveform. Generation is sequential, and attention errors make it skip or repeat words, especially on long or repetitive inputs ([Kim et al., 2020](#references), §1). FastSpeech ([Ren et al., 2019](#references)) generates all frames in parallel: a **length regulator** repeats each phoneme's hidden vector as many times as its predicted duration. Its duration targets, however, come from the attention of a pretrained autoregressive teacher, so the parallel model still depends on an external aligner.
+
+Vocoders span the families of the course. WaveNet is autoregressive over samples. WaveGlow ([Prenger, Valle and Catanzaro, 2019](#references)) is a normalizing flow from Gaussian noise to the waveform, conditioned on the mel spectrogram and trained by maximum likelihood. GAN vocoders are the fastest: HiFi-GAN ([Kong, Kim and Bae, 2020](#references)) trains a convolutional generator against a multi-scale discriminator and a **multi-period discriminator**, whose sub-discriminators look at every $p$-th sample for $p = 2, 3, 5, 7, 11$ to catch the periodic structure of voiced speech, together with an $L_1$ loss on mel spectrograms and a feature-matching loss. On LJ Speech its listeners' mean opinion score, 4.36, approaches the 4.45 of the recordings, at 167.9 times faster than real time on one V100 GPU. Multi-band MelGAN ([Yang et al., 2020](#references)) is a lighter GAN vocoder of the same kind, and LPCNet ([Valin and Skoglund, 2019](#references)) combines classical linear prediction with a small recurrent network, cheap enough for phones and embedded devices.
+
+The pipeline can also collapse into one model. VITS ([Kim, Kong and Son, 2021](#references)) is a conditional VAE whose prior is a normalizing flow conditioned on the phonemes and whose decoder is a HiFi-GAN generator trained adversarially; it outputs the waveform directly. **Speaker identity** is one more condition. A multi-speaker model either learns an embedding per speaker ID, as VITS does for the 109 speakers of the VCTK corpus, or reads a speaker embedding computed by a separate speaker encoder from a reference recording. YourTTS ([Casanova et al., 2022](#references)) builds on VITS with such an encoder, so a short recording of a voice unseen in training is enough to synthesize new text in it.
+
+## Glow-TTS: a flow with a text-conditioned prior
+
+Glow-TTS ([Kim et al., 2020](#references)) is a parallel acoustic model that learns its own alignment. It combines two ideas of the course: an exact likelihood from a [normalizing flow](/notes/generative-models/normalizing-flows), and a search over alignments by dynamic programming.
+
+### The likelihood
+
+The **decoder** $f_{\text{dec}}: z \mapsto x$ is an invertible flow from a latent sequence $z = (z_1, \dots, z_{T_{\text{mel}}})$, $z_j \in \mathbb R^F$, to the mel spectrogram, so the [change of variables](/notes/generative-models/normalizing-flows#change-of-variables) gives
+
+$$
+\log p_\theta(x \mid c) = \log p_Z\big(f_{\text{dec}}^{-1}(x) \mid c\big) + \log \left\lvert \det \frac{\partial f_{\text{dec}}^{-1}(x)}{\partial x} \right\rvert .
+$$
+
+The decoder does not see the text. The text enters through the **prior**: a text encoder $f_{\text{enc}}$ reads the phonemes and outputs a mean $\mu_i \in \mathbb R^F$ and standard deviations $\sigma_i \in \mathbb R^F$ for every token $i$. An **alignment** $A: \{1, \dots, T_{\text{mel}}\} \to \{1, \dots, T_{\text{text}}\}$ says which token each latent frame belongs to, and the prior is a product of Gaussians:
+
+$$
+\log p_Z(z \mid c; A) = \sum_{j=1}^{T_{\text{mel}}} \log \mathcal N\big(z_j;\ \mu_{A(j)},\ \operatorname{diag} \sigma_{A(j)}^2\big) .
+$$
+
+A person reads text in order without skipping words, so $A$ is required to be **monotonic** (it never goes back) and **surjective** (every token gets at least one frame).
+
+Maximizing over the parameters $\theta$ and the alignment $A$ jointly is intractable, so training alternates. Given $\theta$, find the most probable alignment $A^*$; given $A^*$, take a gradient step on $\theta$. Because $z = f_{\text{dec}}^{-1}(x)$ and the log-determinant do not depend on $A$, the first step only has to maximize the prior term. This is **Viterbi training**: it maximizes the likelihood under the single best alignment instead of summing over all of them.
+
+### Monotonic alignment search
+
+There are $\binom{T_{\text{mel}} - 1}{T_{\text{text}} - 1}$ monotonic surjective alignments, one for each choice of the frames at which a new token starts. For about 50 phonemes and 430 frames, five seconds of speech, that is $9.3 \cdot 10^{64}$. **Monotonic alignment search** (MAS) finds the best one by dynamic programming. Let $Q_{i,j}$ be the largest log-likelihood of the first $j$ frames aligned to the first $i$ tokens with frame $j$ on token $i$. Monotonicity and surjectivity leave frame $j - 1$ only two options, token $i$ or token $i - 1$, so
+
+$$
+Q_{i,j} = \max\big(Q_{i-1,\, j-1},\ Q_{i,\, j-1}\big) + \log \mathcal N\big(z_j;\ \mu_i,\ \operatorname{diag} \sigma_i^2\big), \qquad Q_{1,j} = \sum_{k=1}^{j} \log \mathcal N\big(z_k;\ \mu_1,\ \operatorname{diag} \sigma_1^2\big) .
+$$
+
+The table has $T_{\text{text}} \times T_{\text{mel}}$ cells, 21,500 in the example above. The alignment is read off backwards: start at $A^*(T_{\text{mel}}) = T_{\text{text}}$ and at each earlier frame take whichever of the two predecessors has the larger $Q$. The paper reports under 20 ms per iteration on a CPU, less than 2% of training time, and MAS is not needed at inference.
+
+**Worked example.** Take three tokens with one-dimensional means $\mu = (0, 2, 4)$ and $\sigma = 1$, the value the paper fixes during training, and six latent frames $z = (-0.2,\ 0.3,\ 2.4,\ 0.9,\ 3.7,\ 4.1)$. With $\sigma = 1$, $\log \mathcal N(z_j; \mu_i, 1) = -\tfrac12 \log 2\pi - \tfrac12 (z_j - \mu_i)^2$, and every alignment uses each frame exactly once, so maximizing $Q$ is minimizing the summed squared distance $C_{i,j} = \min(C_{i-1,j-1},\ C_{i,j-1}) + (z_j - \mu_i)^2$, with $Q_{i,j} = -\tfrac j2 \log 2\pi - \tfrac12 C_{i,j}$:
+
+| | $z_1 = -0.2$ | $z_2 = 0.3$ | $z_3 = 2.4$ | $z_4 = 0.9$ | $z_5 = 3.7$ | $z_6 = 4.1$ |
+| --- | --- | --- | --- | --- | --- | --- |
+| token 1, $\mu_1 = 0$ | **0.04** | **0.13** | 5.89 | 6.70 | 20.39 | 37.20 |
+| token 2, $\mu_2 = 2$ | — | 2.93 | **0.29** | **1.50** | 4.39 | 8.80 |
+| token 3, $\mu_3 = 4$ | — | — | 5.49 | 9.90 | **1.59** | **1.60** |
+
+Backtracking from the corner, 1.60, picks the bold cells: $A^* = (1, 1, 2, 2, 3, 3)$, durations $d = (2, 2, 2)$, total cost 1.60, and a prior log-likelihood of $-3 \log 2\pi - 0.80 = -6.31$. Frame $z_4 = 0.9$ is closer to $\mu_1$ (squared distance 0.81) than to $\mu_2$ (1.21). Assigning every frame to its nearest mean gives $(1, 1, 2, 1, 3, 3)$ with a smaller total, 1.20, but it returns from token 2 to token 1, which a reader never does. MAS pays 1.60 for the best alignment that is allowed.
+
+### Durations and sampling
+
+At inference there is no mel spectrogram to align, so the alignment must be predicted. MAS provides the training targets: the duration of token $i$ is the number of frames aligned to it, $d_i = \lvert \{ j : A^*(j) = i \} \rvert$, $(2, 2, 2)$ in the example. A **duration predictor** $f_{\text{dur}}$, two convolutional layers on top of the encoder output $h$, is trained with a squared error on log durations,
+
+$$
+\mathcal L_{\text{dur}} = \frac{1}{T_{\text{text}}} \sum_{i=1}^{T_{\text{text}}} \Big( f_{\text{dur}}\big(\mathrm{sg}[h]\big)_i - \log d_i \Big)^2 ,
+$$
+
+where the [stop-gradient](/notes/generative-models/vae-variants#training-through-the-argmin) $\mathrm{sg}$ keeps this loss from changing the encoder, which the likelihood trains.
+
+Synthesis is then parallel. The encoder gives $\mu_i, \sigma_i$; the predictor gives durations, which are rounded up and expand the means and standard deviations into a frame sequence, as FastSpeech's length regulator does; the latent is sampled as $z_j = \mu_{A(j)} + \tau\,\sigma_{A(j)} \odot \varepsilon_j$ with $\varepsilon_j \sim \mathcal N(0, I)$; and one pass of the decoder gives $x = f_{\text{dec}}(z)$. The **temperature** $\tau$ scales the standard deviations of the prior. The paper's experiments fix $\sigma = 1$ ([Kim et al., 2020](#references), §4), and so do the authors' released configuration and the default of Coqui TTS (`mean_only`): the encoder predicts only the means, the latent is $z_j = \mu_{A(j)} + \tau \varepsilon_j$, and $\tau$ is the standard deviation used at sampling, as in eq. 8 of the paper. Different noise $\varepsilon$ gives different stress and intonation of the same sentence, changing $\tau$ alone shifts the pitch while keeping a similar intonation, and multiplying all durations by a constant changes the speaking rate; the paper shows factors from 0.5 to 1.25. Listeners rated $\tau = 0.333$ best.
+
+### Inside the decoder
+
+The decoder is a Glow-style stack ([flow architectures](/notes/generative-models/flow-architectures)). Pairs of consecutive 80-band frames are first squeezed into single 160-channel frames, halving the length. Each of 12 blocks then applies an ActNorm layer, an invertible $1 \times 1$ convolution and an [affine coupling layer](/notes/generative-models/flow-architectures#a-coupling-layers-nice-realnvp) whose scale and shift come from a WaveNet-like convolutional network, as in WaveGlow. The [$1 \times 1$ convolution](/notes/generative-models/flow-architectures#c-invertible-convolutions-glow) is made cheaper: the 160 channels are split into 40 groups of four, mixed by one shared $4 \times 4$ matrix, so its log-determinant is $40$ times the number of squeezed frames times $\log \lvert \det W \rvert$ of one $4 \times 4$ matrix. The encoder is a Transformer encoder with relative position representations, 6 blocks of width 192. The whole model has 28.6 million parameters, fewer than FastSpeech's 30.1 million.
+
+On LJ Speech (13,100 clips, about 24 hours), with WaveGlow as the vocoder, listeners gave Glow-TTS a mean opinion score of 4.01 against 3.88 for Tacotron 2. The recordings scored 4.54, and the recordings converted to mel spectrograms and back by WaveGlow 4.19: no acoustic model with this vocoder can exceed that ceiling. Glow-TTS generated mel spectrograms 15.7 times faster than Tacotron 2, in an almost constant 40 ms regardless of length; for one minute of speech the whole synthesis took 1.5 seconds, 96% of it in the vocoder. On long sentences the character error rate of Tacotron 2 rose beyond about 260 characters while Glow-TTS stayed robust, because a hard monotonic alignment cannot skip or repeat. How such listening scores are collected and compared is the subject of the [human evaluation note](/notes/generative-models/human-evaluation#how-good-and-does-it-match).
+
+## Neural audio codecs: sound as tokens
+
+Music needs the full bandwidth and many overlapping instruments, and an autoregressive transformer wants discrete tokens. The image answer carries over: train an autoencoder with a discrete bottleneck, here on the waveform, and model its codes. Thirty seconds of music at 32 kHz is 960,000 samples; the codec has to shrink that by orders of magnitude while keeping the sound.
+
+### EnCodec
+
+EnCodec ([Défossez et al., 2023](#references)) follows SoundStream ([Zeghidour et al., 2022](#references)). The **encoder** is a one-dimensional convolutional network: a first convolution with 32 channels, then four blocks of a residual unit and a strided convolution with strides 2, 4, 5 and 8, doubling the channels at every downsampling, then a two-layer LSTM and a final convolution to $D$ channels. The total stride is $2 \cdot 4 \cdot 5 \cdot 8 = 320$ samples, so 24 kHz audio gives 75 latent frames per second and 48 kHz audio 150. The **decoder** mirrors the encoder with transposed convolutions. Between them, a **residual vector quantizer** turns each frame into $K$ codes.
+
+The losses are those of the VQGAN family, adapted to sound. Reconstruction is measured by an $L_1$ distance on the waveform and by $L_1$ and $L_2$ distances between 64-band mel spectrograms at seven resolutions, with windows of $2^5$ to $2^{11}$ samples. A multi-scale STFT discriminator, five convolutional networks of the same structure on spectrograms with windows of 2048 down to 128 samples, adds a hinge adversarial loss and a feature-matching loss. The quantizer adds a commitment loss. A **loss balancer** normalizes the gradient of each loss with respect to the output by its running norm, so that each loss contributes a share of the total gradient proportional to its weight, whatever its natural scale; the weights are 0.1 for time, 1 for frequency, 3 for adversarial and 3 for feature matching.
+
+One model serves several bitrates: in training, each batch keeps a randomly chosen number of codebooks, 2, 4, 8, 16 or 32 at 24 kHz. An optional small transformer predicts the codes for entropy coding and saves up to 40% more. In listening tests of the streamable models (MUSHRA, scores from 0 to 100) at 6 kbps, EnCodec scored 83.1 on clean speech and 92.9 on music against 30.1 and 20.6 for the Opus codec at the same bitrate. The model inside MusicGen is a 32 kHz mono EnCodec with stride 640, so 50 frames per second, and four codebooks of 2048 entries ([Copet et al., 2023](#references), §3.1).
+
+### Residual vector quantization
+
+A [VQ-VAE](/notes/generative-models/vae-variants#vq-vae-a-discrete-latent-code) replaces each encoder vector by the nearest entry of one codebook. **Residual vector quantization** (RVQ) quantizes what that leaves, again and again. For a frame $z$,
+
+$$
+r^{(0)} = z, \qquad e^{(k)} = \arg\min_{e \in \mathcal C_k} \big\lVert r^{(k-1)} - e \big\rVert^2, \qquad r^{(k)} = r^{(k-1)} - e^{(k)}, \qquad k = 1, \dots, K,
+$$
+
+and the decoder receives the sum of the chosen vectors,
+
+$$
+\hat z = \sum_{k=1}^{K} e^{(k)} = \sum_{k=1}^{K} \big(r^{(k-1)} - r^{(k)}\big) = z - r^{(K)} .
+$$
+
+The sum telescopes, so the quantization error is exactly the last residual. The code of the frame is the list of $K$ indices, and stage $k$ only has to describe what stages $1, \dots, k - 1$ missed: its codebook is trained on residuals, which are smaller than the frames. With $K = 1$ this is the VQ-VAE, and training is the same: the straight-through estimator across the argmin, a commitment term per stage, $\sum_k \lVert r^{(k-1)} - \mathrm{sg}[e^{(k)}] \rVert^2$, and codebooks updated as moving averages of the vectors assigned to them, with unused entries replaced by vectors from the current batch.
+
+<ResidualVQ />
+
+**Worked example.** The figure follows one vector of a toy cloud through three codebooks of four entries, each fitted by k-means to the residuals of the previous stages (values rounded to two decimals). The vector $z = (2.67, 0.93)$, with $\lVert z \rVert^2 = 8.01$, is nearest to entry 2 of the first codebook, $e^{(1)} = (1.42, 1.25)$, which leaves $r^{(1)} = (1.25, -0.32)$ with $\lVert r^{(1)} \rVert^2 = 1.66$. The second codebook picks entry 1, $e^{(2)} = (0.56, -0.52)$, leaving $r^{(2)} = (0.69, 0.21)$ and 0.51. The third picks entry 4, $e^{(3)} = (0.40, 0.03)$, leaving $r^{(3)} = (0.28, 0.18)$ and 0.11. The code is $(2, 1, 4)$, six bits, and the decoder reconstructs $\hat z = (2.39, 0.76) = z - r^{(3)}$. Over all 160 points the mean squared error per coordinate falls from 1.396 (the variance of the cloud) to 0.394, 0.137 and 0.051: each stage removes 63 to 72% of what is left.
+
+**Why not one large codebook?** SoundStream's example makes the case ([Zeghidour et al., 2022](#references), §III-C). At 6 kbps and 75 frames per second each frame gets $6000 / 75 = 80$ bits. A single codebook would need $2^{80} \approx 1.2 \cdot 10^{24}$ entries; eight residual stages of $2^{10} = 1024$ entries spend the same 80 bits with 8192 stored vectors and 8192 distance computations per frame. A single codebook is not worse per bit: the $M^K$ possible sums of an RVQ form one particular codebook of that size, searched greedily, so the best codebook of size $M^K$ is at least as good. The toy cloud shows the gap. With 2000 training and 2000 test points from the same distribution (test variance 1.525 per coordinate):
+
+| Bits per point | RVQ: stages × entries | Test error | One codebook: entries | Test error |
+| --- | --- | --- | --- | --- |
+| 2 | 1 × 4 | 0.447 | 4 | 0.447 |
+| 4 | 2 × 4 | 0.165 | 16 | 0.139 |
+| 6 | 3 × 4 | 0.066 | 64 | 0.044 |
+
+RVQ pays some error per bit for a codebook that grows linearly in the number of bits instead of exponentially. It gains two more properties. The first codes carry the most information, so the streams are ordered from coarse to fine. And training with a random number of stages per example, which SoundStream calls **quantizer dropout**, gives one model for many bitrates, since dropping the last stages only removes refinements.
+
+### How many bits
+
+A codec with $K$ codebooks of $M$ entries at $f_r$ frames per second spends
+
+$$
+R = K \cdot \log_2 M \cdot f_r \ \text{bits per second}.
+$$
+
+| Codec | Sample rate | Stride | Frames per second | $K$ | $M$ | Bits per frame | Bitrate |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| SoundStream, 6 kbps | 24 kHz | 320 | 75 | 8 | 1024 | 80 | 6 kbps |
+| EnCodec, 24 kHz | 24 kHz | 320 | 75 | 2 to 32 | 1024 | 20 to 320 | 1.5 to 24 kbps |
+| EnCodec, 48 kHz stereo | 48 kHz | 320 | 150 | 2 to 16 | 1024 | 20 to 160 | 3 to 24 kbps |
+| EnCodec in MusicGen | 32 kHz | 640 | 50 | 4 | 2048 | 44 | 2.2 kbps |
+
+For MusicGen's codec, $R = 4 \cdot 11 \cdot 50 = 2200$ bits per second, against $32{,}000 \cdot 16 = 512{,}000$ for 16-bit samples: 233 times less. As a sequence, one second is 200 codes instead of 32,000 samples. A transformer that emits one frame of four codes per step, as MusicGen does, needs 50 steps per second, 640 times fewer than a sample-level model.
+
+## MusicGen: one transformer over parallel streams
+
+MusicGen ([Copet et al., 2023](#references)) generates the four code streams of that codec with a single autoregressive transformer decoder, conditioned on a text description and optionally on a melody, and decodes the codes with EnCodec. Earlier systems cascaded several models over such streams: MusicLM ([Agostinelli et al., 2023](#references)) models semantic and acoustic tokens with a hierarchy of transformers, and VALL-E ([Wang et al., 2023](#references)), a speech model, generates the first codebook autoregressively and the rest with a second, non-autoregressive model. MusicGen's question is how to lay out $K$ parallel streams so that one model can predict them.
+
+### Interleaving the codebooks
+
+The exact answer is to **flatten** the codes into one sequence, frame by frame and codebook by codebook within a frame: $q_{1,1}, q_{1,2}, \dots, q_{1,K}, q_{2,1}, \dots$. The chain rule then factorizes the joint distribution exactly, as for pixels, but the sequence has $K \cdot T$ steps, 6000 for 30 seconds, and the gain of the low frame rate is partly lost.
+
+The cheap answer predicts several codes in one step from the same past. Predicting all $K$ codes of frame $t$ together means modelling
+
+$$
+p(q_{t,1}, \dots, q_{t,K} \mid q_{<t}) \approx \prod_{k=1}^{K} p(q_{t,k} \mid q_{<t}) ,
+$$
+
+which is exact only if the codes of a frame are independent given the past. In RVQ they are not: stage $k$ encodes exactly what the stages before it missed. The paper describes all such choices as a **pattern**: a sequence of sets $P_1, \dots, P_S$ that partition the cells $(t, k)$, with each codebook at most once per set. At step $n$ the model predicts all cells of $P_n$ in parallel from the cells of $P_1, \dots, P_{n-1}$. Four patterns:
+
+- **Flattening**, one cell per step: $S = K T$.
+- **Parallel**, $P_n = \{(n, k) : k = 1, \dots, K\}$: $S = T$, and the codes of a frame are chosen independently of each other.
+- **Coarse first**, all of codebook 1, then codebooks 2 to $K$ in parallel frame by frame: $S = 2T$. This is the VALL-E arrangement in a single model.
+- **Delay**, $P_n = \{(n - k + 1, k) : k = 1, \dots, K,\ n \ge k\}$ ([Copet et al., 2023](#references), eq. 6): codebook $k$ is shifted by $k - 1$ steps, so $S = T + K - 1$.
+
+<CodebookPatterns />
+
+In the delay pattern the code $(t, k)$ is predicted at step $t + k - 1$, after the codes of codebooks $1, \dots, k - 1$ of the same frame, which come at steps $t, \dots, t + k - 2$. It therefore sees the coarser codes of its own frame, the dependency RVQ creates, at almost the cost of the parallel pattern. What it does not see are the finer codes of the latest frames: codebook 1 of frame $t$ is predicted in the same step as codebook 2 of frame $t - 1$, codebook 3 of frame $t - 2$ and codebook 4 of frame $t - 3$. The ablation of the paper (Table 4, a 300-million-parameter model, 30-second excerpts) measures the trade-off with the **Fréchet audio distance** (FAD), the [FID](/notes/generative-models/fid) of audio computed on embeddings of the VGGish audio classifier ([Kilgour et al., 2018](#references)). Flattening scores 0.86 with 6000 steps, delay 0.96 with 1500, coarse first 1.98 with 3000, and parallel 2.58 with 1500. Listeners rated flattening and delay equally, 79.7, and parallel lower, 72.2. The delay pattern buys nearly the quality of the exact factorization at a quarter of its steps, and MusicGen uses it.
+
+### The transformer and its objective
+
+At step $n$ the input is the sum of $K$ embeddings of size $d_{\text{model}}$, the width of the transformer, one from each codebook's own table of $M$ entries; a codebook that is absent from $P_n$ contributes a special empty token. A [sinusoidal encoding](/notes/nlp/positional-encoding#sinusoidal-encoding) of $n$ is added. Each of $L$ layers has causal self-attention over the earlier steps, cross-attention to the conditioning, and a feed-forward block from width $d_{\text{model}}$ to $4 d_{\text{model}}$ and back, with [layer normalization before each block](/notes/nlp/transformers#pre-norm-versus-post-norm). The output feeds $K$ linear heads, one per codebook, each giving $M$ logits for that codebook's cell in $P_{n+1}$. Training minimizes the cross-entropy of every code given the steps before it,
+
+$$
+\mathcal L(\theta) = -\sum_{n=1}^{S} \sum_{(t,k) \in P_n} \log p_\theta\big(q_{t,k} \mid q_{P_1}, \dots, q_{P_{n-1}},\ C\big) ,
+$$
+
+where $C$ is the conditioning. The models have 300 million parameters ($d_{\text{model}} = 1024$, 16 heads, 24 layers), 1.5 billion (1536, 24, 48) and 3.3 billion (2048, 32, 48). They were trained on 30-second crops of 20,000 hours of licensed music (10,000 high-quality tracks and 390,000 instrument-only tracks from stock collections), downmixed to mono at 32 kHz, for one million steps with AdamW and batches of 192.
+
+### Text conditioning
+
+A description such as "90s rock song with a guitar riff" is encoded by a pretrained T5 encoder ([Raffel et al., 2020](#references)), kept frozen in the released models, and projected linearly to the width of the decoder: a sequence of vectors $C \in \mathbb R^{T_C \times d_{\text{model}}}$, one per token of the description. Every decoder layer reads it through [cross-attention](/notes/nlp/transformers#three-arrangements): queries from the audio steps, keys and values from the text, as the U-Net of [latent diffusion](/notes/generative-models/latent-diffusion#conditioning-through-cross-attention) does. The paper also tried FLAN-T5 and CLAP, a joint text–audio embedding. T5 and FLAN-T5 performed alike (FAD 3.12 and 3.36 on MusicCaps), CLAP worse (4.16). Training descriptions are augmented: with probability 0.25 metadata such as genre, key and tempo is appended, the description itself is then dropped with probability 0.5, and words are dropped with probability 0.3.
+
+### Classifier-free guidance on logits
+
+As in [latent diffusion](/notes/generative-models/latent-diffusion#classifier-free-guidance), the condition is dropped during training, here with probability 0.2, so one network learns both $p_\theta(q \mid C)$ and $p_\theta(q \mid \varnothing)$; in the released implementations the null condition is a zero text encoding. At sampling time, for every code, the two sets of logits are extrapolated with a guidance scale $s$:
+
+$$
+\tilde\ell = \ell_\varnothing + s\,(\ell_C - \ell_\varnothing) .
+$$
+
+Logits are log-probabilities up to a constant per distribution, $\ell_C(q) = \log p_\theta(q \mid C) + a$ and $\ell_\varnothing(q) = \log p_\theta(q \mid \varnothing) + b$. Hence $\tilde\ell(q) = (1 - s) \log p_\theta(q \mid \varnothing) + s \log p_\theta(q \mid C) + \text{const}$, and the softmax removes the constant:
+
+$$
+\tilde p(q) \propto p_\theta(q \mid \varnothing)^{1-s}\, p_\theta(q \mid C)^{s} .
+$$
+
+This is the same tilted distribution as for scores in diffusion. Writing $p_\theta(q \mid C) \propto p(C \mid q)\, p_\theta(q \mid \varnothing)$ by Bayes' rule gives $\tilde p(q) \propto p_\theta(q \mid \varnothing)\, p(C \mid q)^{s}$: the unconditional distribution reweighted by an implicit classifier raised to the power $s$. MusicGen samples with $s = 3$.
+
+**Worked example.** Take three codes with $p(\cdot \mid \varnothing) = (0.5, 0.3, 0.2)$ and $p(\cdot \mid C) = (0.2, 0.3, 0.5)$. With $s = 3$ the unnormalized weights are $0.5^{-2} \cdot 0.2^{3} = 0.032$, $0.3^{-2} \cdot 0.3^{3} = 0.3$ and $0.2^{-2} \cdot 0.5^{3} = 3.125$, which normalize to $(0.009, 0.087, 0.904)$. The code that the condition favours more than the prior does takes almost all the mass, and the entropy falls from 1.49 to 0.50 bits: guidance makes samples follow the text more closely and vary less. Each step costs two forward passes, which are run as one batch.
+
+### Melody conditioning
+
+Text describes style but not a tune. MusicGen can also follow the melody of a reference recording through its **chromagram**: the energy in each of the 12 pitch classes (C, C♯, …, B, all octaves together) over time. The reference is first separated with Demucs ([Défossez et al., 2019](#references)) and its drums and bass are dropped, because they dominate the chromagram. The chromagram is computed with windows of $2^{14}$ samples and a hop of $2^{12}$ (0.128 s, about 7.8 frames per second), and only the strongest pitch class of each frame is kept. That information bottleneck matters: with the full chromagram the model learned to reconstruct the reference instead of composing. The quantized chromagram is given as a prefix to the decoder input instead of through cross-attention; the released melody model puts the text encoding in the same prefix. No labelled melody data is needed. For the 1.5-billion model, the cosine similarity between the chromagrams of the reference and the output rose from 0.10 without the melody condition to 0.66 with it, and listeners' melody-match ratings from 64.4 to 72.9 (Table 2).
+
+### Continuing a recording
+
+The codec also works in the other direction. The first seconds of a recording are encoded into codes, laid out by the delay pattern, and given as the beginning of the sequence; the model continues it, with or without a text description, and EnCodec decodes prompt and continuation together. This is the image completion of ImageGPT, done with sound. The limits are those of the training setup: positions were trained on 30-second crops, 1500 frames, and the prompt counts towards them.
+
+### Sampling and results
+
+Codes are sampled with [top-$k$](/notes/nlp/gpt#decoding-turning-probabilities-into-text) filtering, $k = 250$ of the 2048 codes, at temperature 1, after guidance. On the MusicCaps benchmark the 3.3-billion model had the best overall quality in the listening test, 84.8 out of 100 against 80.5 for MusicLM, and the 1.5-billion model the best match to the text, 83.7 (Table 1). By FAD the 300-million model, 3.1, beat MusicLM, 4.0, but not the diffusion model Noise2Music, 2.1. Scale helps the text more than the sound: on the authors' test set, the overall quality peaked at 1.5 billion parameters (81.9 against 78.3 and 79.2), while the text match improved steadily (82.5, 82.9, 83.5; Table 5).
+
+## What changed
+
+| | Image transformers (previous note) | Glow-TTS | MusicGen |
+| --- | --- | --- | --- |
+| Generated signal | image | mel spectrogram of speech | music waveform at 32 kHz |
+| Representation | grid of codes from one codebook | continuous frames, $80 \times 86$ per second | 4 parallel RVQ streams, 50 frames per second |
+| Generator | causal transformer, one token per step | normalizing flow, all frames in one pass | causal transformer, one frame step per pass |
+| Likelihood | exact over tokens | exact over mel frames, under the best alignment | exact, with codes of one step modelled as independent |
+| Conditioning | text tokens in the sequence or an encoder | prior means from a text encoder, durations from a predictor | frozen T5 by cross-attention; chroma prefix; audio prefix |
+| Alignment to the text | none needed | monotonic alignment search | none: attention decides |
+| Steering | top-$k$, top-$p$, guidance, reranking | prior temperature, duration scale | top-$k$ with $k = 250$, guidance with $s = 3$ |
+| From codes to signal | VQGAN decoder | separate vocoder | EnCodec decoder |
+
+## Limitations
+
+- **The vocoder sets a ceiling.** Recordings passed through mel spectrograms and back scored 4.19 against 4.54 for the originals; a two-stage system cannot do better than its second stage.
+- **One rhythm per sentence.** Glow-TTS predicts durations deterministically, so a sentence is always spoken with the same timing; only intonation varies with the noise. VITS adds a stochastic duration predictor for this reason. Viterbi training also learns from the best alignment only.
+- **The codec sets a ceiling.** As the reconstruction FID of VQGAN bounds its image transformer, the reconstruction quality of EnCodec at 2.2 kbps bounds MusicGen.
+- **The factorization is approximate.** Codes predicted in the same step are assumed independent given the past; the delay pattern narrows the gap to exact flattening (FAD 0.96 against 0.86) but does not close it.
+- **Length.** Training on 30-second crops limits generation to 30 seconds; longer pieces are built by repeated continuation, without a model of their global form.
+- **Sequential sampling.** MusicGen needs 50 decoder passes per second of audio, each over a doubled batch with guidance.
+- **Control and data.** Text gives coarse control, mainly through the guidance scale. The training music is mostly western-style, with Dance/EDM the largest genre. Voice cloning from a short recording makes impersonation easy, and speech corpora with few speakers make those voices easy to overuse.
+
+## Summary
+
+- Audio is long: 22,050 to 48,000 samples per second. Speech systems shorten it with a mel spectrogram, about 6900 numbers per second of speech, and a vocoder restores the phase; music systems learn a discrete code of the waveform.
+- The TTS pipeline is text normalization, grapheme-to-phoneme conversion, an acoustic model and a vocoder. Its core difficulty is the alignment between tens of phonemes and hundreds of frames.
+- Glow-TTS is a normalizing flow from mel frames to a Gaussian prior whose means come from a text encoder. Monotonic alignment search finds the most likely monotonic alignment by dynamic programming in $O(T_{\text{text}} T_{\text{mel}})$; a duration predictor replaces it at inference, and the flow generates all frames in one pass.
+- Neural codecs such as EnCodec are VQ-VAEs trained with GAN losses on waveforms. Residual vector quantization codes each frame with $K$ codebooks, each quantizing the residual of the previous ones; the error is the last residual, and the bitrate is $K \log_2 M f_r$, 2.2 kbps for MusicGen's codec.
+- MusicGen predicts the four code streams with one transformer. The delay pattern shifts codebook $k$ by $k - 1$ steps, so each code sees the coarser codes of its own frame, at $T + K - 1$ steps instead of $K T$.
+- Text enters through a frozen T5 encoder and cross-attention, a melody through an argmax chromagram prefix, a recording through its codes as a prefix. Classifier-free guidance on logits samples from $p(\cdot \mid \varnothing)^{1-s} p(\cdot \mid C)^s$, with $s = 3$ and top-$k$ 250.
+
+## Notebook
+
+The [audio generation notebook](https://github.com/HSE-LAMBDA/DeepGenerativeModels/blob/spring-2025-long/seminars/12_Audio-Generation/AudioGen.ipynb) of the HSE-LAMBDA *Deep Generative Models* repository runs text-to-speech with the Coqui TTS library and music generation with MusicGen in Hugging Face Transformers (cell numbers count every cell, markdown included, from 1).
+
+- **Cells 1–2: the TTS pipeline.** Contents, and the four stages: text preprocessing with normalization and G2P, linguistic and phonetic analysis, an acoustic model (Tacotron, FastSpeech or VITS) and a vocoder (WaveGlow, HiFi-GAN or LPCNet).
+- **Cells 3–5: setup.** Installs `transformers`, `datasets[audio]` and Coqui's `TTS` package, and the eSpeak phonemizer, which Coqui uses for G2P in English.
+- **Cells 6–9: pretrained inference.** `tts --list_models` prints Coqui's model registry. Cell 8 synthesizes "hello world" with `tts_models/en/ljspeech/glow-tts`, a Glow-TTS model trained on LJ Speech, which the registry pairs with a multi-band MelGAN vocoder by default; cell 9 plays the result.
+- **Cells 10–14: speaker IDs.** A single-speaker model has one voice; a multi-speaker model takes a speaker as a condition. `--list_speaker_idxs` lists the speakers of `tts_models/en/vctk/vits`, an end-to-end VITS model trained on VCTK, and cell 13 synthesizes a sentence as speaker `p341`.
+- **Cells 15–18: voice cloning.** Cell 16 downloads a speaker encoder, its configuration and one LJ Speech clip. Cell 17 runs YourTTS (`tts_models/multilingual/multi-dataset/your_tts`) with `--speaker_wav` set to that clip and `--language_idx en`: the speaker encoder turns the clip into an embedding that conditions the synthesis.
+- **Cells 19–22: data.** LJ Speech is downloaded and unpacked into `tts_train_dir`, and `BaseDatasetConfig` uses the `ljspeech` formatter on `metadata.csv`; the formatter reads the normalized text column.
+- **Cells 23–25: the training configuration.** `GlowTTSConfig` with batch size 32 (16 for evaluation), 4 data-loader workers, evaluation on, test sentences synthesized from the first epoch (`test_delay_epochs=-1`), 100 epochs, the `phoneme_cleaners` text cleaner (number and abbreviation expansion), phonemes for `en-us` with a phoneme cache, a log line every 25 steps, mixed precision and a checkpoint every 1000 steps. The model itself keeps the library defaults: 12 flow blocks of width 192, a six-layer relative-position Transformer encoder with two heads, a prior with $\sigma = 1$ as in the paper (`mean_only=True`), 10 steps of data-dependent ActNorm initialization, and RAdam at learning rate $10^{-3}$ with Noam warm-up over 4000 steps.
+- **Cells 26–28: the audio processor.** `AudioProcessor.init_from_config` with the default audio settings: 22,050 Hz, a window and FFT of 1024 samples, a hop of 256, 80 mel bands from 0 Hz to the Nyquist frequency, log magnitudes normalized to $[-4, 4]$, and Griffin–Lim with 60 iterations for inversion. These are the settings of the worked numbers in [Sound as a signal](#sound-as-a-signal). Cell 27 pins `numpy==1.21.0` (see the issues below).
+- **Cells 29–30: the tokenizer.** `TTSTokenizer.init_from_config` builds the IPA phoneme vocabulary and the eSpeak phonemizer and returns the updated configuration.
+- **Cells 31–32: the split.** `load_tts_samples` holds out the default 1% for evaluation, 131 of the 13,100 clips. Samples are dictionaries with `text`, `audio_file`, `speaker_name` and `root_path`; the markdown of cell 31 still describes them as lists.
+- **Cells 33–34: the model.** `GlowTTS(config, ap, tokenizer, speaker_manager=None)`, a single-speaker model.
+- **Cells 35–38: the one-batch test.** The markdown proposes overfitting a single batch, `train_samples[:batch_size]`, with "`TrainingArgs`". Cell 36 builds `TrainerArgs(shuffle=False, steps_per_epoch=1, epochs=100, output_path="output/", lr=1e-4, save_step=100, save_optimizer_state=True)` and a `Trainer` on `train_samples[:1]` and `eval_samples[:1]`; cell 37 calls `trainer.fit()`, and cell 38 opens TensorBoard on `tts_train_dir`.
+- **Cells 39–44: testing.** The markdown says that the overfitted model memorizes its one sentence. Cell 41 collects checkpoint and configuration paths with `glob` but does not use them. Cell 43 synthesizes "This is the test script for the GlowTTS model" from a hard-coded checkpoint, `/content/tts_train_dir/run-February-28-2025_01+53PM-0000000/best_model_1624.pth`, and cell 42 offers a 20-epoch checkpoint behind an empty link. Without `--vocoder_path` the `tts` command inverts the mel spectrogram with Griffin–Lim, so the quality of this test is limited by the phase reconstruction however well the model is trained. The sampling temperature is the configuration's `inference_noise_scale`, which `GlowTTSConfig` declares twice, 0.33 and then 0.0; the second declaration wins, so the trained model synthesizes from the prior means, $\tau = 0$.
+- **Cells 45–46: MusicGen in theory.** The three parts (text encoder, autoregressive decoder, EnCodec), EnCodec's encoder, quantizer and decoder, the count of 4 codebooks × 50 frames = 200 tokens per second against 32,000 samples, the RVQ recursion and the sum $\hat z = \sum_k e^{(k)}$, the transformer with code embeddings, positions, self- and cross-attention, the cross-entropy objective, the interleaving patterns and a list of the design choices.
+- **Cells 47–52: loading.** `facebook/musicgen-small`, the 300-million model (a comment lists medium 1.5B, melody 1.5B and large 3.3B), moved to the GPU when one is present.
+- **Cells 53–54: the generation configuration.** `model.generation_config` holds `do_sample=True`, `guidance_scale=3.0`, `max_length=1500` (30 seconds) and start and padding tokens 2048, one past the last code.
+- **Cells 55–61: unconditional generation.** `get_unconditional_inputs(num_samples=1)` supplies a zero text encoding and guidance 1; `generate(..., do_sample=True, max_new_tokens=256)`; the audio is played at the codec's 32,000 Hz and saved with `scipy.io.wavfile.write`; cell 61 computes the duration as `256 / frame_rate` = 5.12 s.
+- **Cells 62–66: text-conditional generation.** The processor tokenizes two prompts, a romantic ballad with acoustic guitar and an 80s synthwave track, with padding, and `generate(..., do_sample=True, guidance_scale=3, max_new_tokens=256)` produces both; cell 66 explains the guidance scale: values above 1 switch classifier-free guidance on, larger values follow the text more closely at some cost in quality, and 3 is the recommended default.
+- **Cells 67–68: audio-prompted generation.** The first clip of a streamed copy of GTZAN (999 clips stored at 32 kHz, the rate the processor requires) is cut to its first half, about 15 seconds, and encoded together with the text "add heavy drums"; `generate` continues it with guidance 3 for 256 steps. The returned audio contains the prompt followed by the continuation.
+- **Cell 69**: conclusion.
+
+**Saved outputs.** None: no cell of the notebook has been run, so it documents procedures, and there are no audio samples, losses or timings to quote.
+
+**Notebook issues.**
+
+- **`TrainerArgs` does not accept these arguments.** In Coqui's `trainer` package `TrainerArgs` is a dataclass with fields such as `restore_path`, `overfit_batch` and `small_run`; it has no `shuffle`, `steps_per_epoch`, `epochs`, `output_path`, `lr`, `save_step` or `save_optimizer_state`, so cell 36 stops with a `TypeError`. `epochs`, `lr`, `save_step` and `output_path` are fields of the model configuration (`GlowTTSConfig` inherits them), and the other three exist nowhere. A working version sets them on the configuration and calls `TrainerArgs()`, or `TrainerArgs(overfit_batch=True)`, which trains on a single batch, as the markdown intends.
+- **One sample, not one batch.** `train_samples[:1]` trains on a single clip; the markdown's `train_samples[:batch_size]` would give a batch of 32.
+- **NumPy 1.21.0.** Cell 27 pins a version with wheels only for Python 3.7 to 3.9, and Coqui's `TTS` 0.22.0 itself requires `numpy==1.22.0` on Python 3.10 and `numpy>=1.24.3` above, so the pin either fails to build or conflicts with the package. The original `TTS` package supports Python 3.9 to 3.11 only and is no longer released; on newer Python the maintained fork `coqui-tts` installs the same `TTS` module and `tts` command.
+- **The voice-cloning encoder.** YourTTS ships with its own speaker encoder and uses it when only `--speaker_wav` is given; cell 17's `--encoder_path` replaces it with the separately downloaded encoder of cell 16. (`--encoder_config` works as an abbreviation of `--encoder_config_path`.)
+- **VITS is not an acoustic model.** Cell 2 lists VITS among models that predict a mel spectrogram; VITS outputs the waveform directly.
+- **Two of the four patterns are described wrongly.** Cell 46 calls flattening "all tokens from codebook 1, then all tokens from codebook 2"; the paper's flattening interleaves the codebooks within each frame, as described [above](#interleaving-the-codebooks). The "VALL-E pattern" of the first version of the paper (renamed "coarse first" in the final one) generates codebook 1 for all frames and then the others in parallel, $2T$ steps; it is not a variant of the parallel pattern with offsets.
+- **Other inaccuracies in cell 46.** The released MusicGen models encode text with T5; BART is not used; its codec is the 32 kHz EnCodec (48 kHz is the stereo model of the EnCodec paper); EnCodec's encoder is convolutional with an LSTM, and a transformer appears only in its optional entropy coder. RVQ is not more accurate than a single codebook at the same bitrate; its advantage is a codebook that can be stored and searched, as [above](#residual-vector-quantization).
+- **Top-$k$ differs from the paper.** The generation configuration sets no `top_k`, so Transformers falls back to its default of 50 codes, while the paper and the original implementation sample from the top 250. Passing `top_k=250` to `generate` reproduces the paper's setting.
+- **The duration is slightly shorter.** With the start token and the delay pattern, 256 steps hold $256 + 1 - 4 = 253$ complete frames, 5.06 s, not the 5.12 s of cell 61.
+- **"add heavy drums" is a description.** MusicGen was trained on descriptions of the music it hears, not on editing instructions, so the prompt asks for music with heavy drums rather than for an edit of the clip.
+
+## The course in one paragraph
+
+The six families of the course answer the same question, how to train a generator when $p(x)$ is unknown, in six ways. [VAEs](/notes/generative-models/vae) bound the likelihood with an encoder. [GANs](/notes/generative-models/gans) avoid the likelihood and train against a discriminator; the same adversarial losses [translate images between domains](/notes/generative-models/cyclegan). [Normalizing flows](/notes/generative-models/normalizing-flows) compute the likelihood exactly with invertible layers. [Energy-based models](/notes/generative-models/energy-based-models) let any network define a density up to its normalizing constant and pay with Markov chains in training and sampling. [Diffusion models](/notes/generative-models/ddpm-forward-process) bound the likelihood again, with a fixed encoder, the noising chain, so that the bound becomes a regression on noise, equivalently on the [score](/notes/generative-models/score-matching). [Autoregressive models](/notes/generative-models/autoregressive-models) compute it exactly as a product of conditionals and pay at sampling time. The largest models combine the families: a discrete or continuous autoencoder compresses the image or the sound, and a diffusion model or an autoregressive transformer generates in its latent space. All of them are judged by the same metrics, from [Inception Score](/notes/generative-models/inception-score) to [precision and recall](/notes/generative-models/precision-recall) and [human judgement](/notes/generative-models/human-evaluation), and all rest on the [KL divergence](/notes/generative-models/entropy-and-divergences) and its relatives.
+
+## References
+
+- J. Kim, S. Kim, J. Kong, S. Yoon. [Glow-TTS: A Generative Flow for Text-to-Speech via Monotonic Alignment Search](https://arxiv.org/abs/2005.11129). NeurIPS, 2020. Monotonic alignment search in §3.2 and Algorithm 1; hyperparameters in Appendix A.2.
+- J. Copet, F. Kreuk, I. Gat, T. Remez, D. Kant, G. Synnaeve, Y. Adi, A. Défossez. [Simple and Controllable Music Generation](https://arxiv.org/abs/2306.05284). NeurIPS, 2023. MusicGen; codebook patterns in §2.2, setup in §3.1, ablations in §4.4 and Appendix A.
+- A. Défossez, J. Copet, G. Synnaeve, Y. Adi. [High Fidelity Neural Audio Compression](https://arxiv.org/abs/2210.13438). *Transactions on Machine Learning Research*, 2023. EnCodec.
+- N. Zeghidour, A. Luebs, A. Omran, J. Skoglund, M. Tagliasacchi. [SoundStream: An End-to-End Neural Audio Codec](https://arxiv.org/abs/2107.03312). *IEEE/ACM Transactions on Audio, Speech, and Language Processing*, 30, 2022. Residual vector quantization and quantizer dropout in §III-C.
+- J. Kong, J. Kim, J. Bae. [HiFi-GAN: Generative Adversarial Networks for Efficient and High Fidelity Speech Synthesis](https://arxiv.org/abs/2010.05646). NeurIPS, 2020.
+- R. Prenger, R. Valle, B. Catanzaro. [WaveGlow: A Flow-based Generative Network for Speech Synthesis](https://arxiv.org/abs/1811.00002). ICASSP, 2019.
+- A. van den Oord, S. Dieleman, H. Zen, K. Simonyan, O. Vinyals, A. Graves, N. Kalchbrenner, A. Senior, K. Kavukcuoglu. [WaveNet: A Generative Model for Raw Audio](https://arxiv.org/abs/1609.03499). arXiv, 2016.
+- J. Shen et al. [Natural TTS Synthesis by Conditioning WaveNet on Mel Spectrogram Predictions](https://arxiv.org/abs/1712.05884). ICASSP, 2018. Tacotron 2.
+- Y. Ren, Y. Ruan, X. Tan, T. Qin, S. Zhao, Z. Zhao, T.-Y. Liu. [FastSpeech: Fast, Robust and Controllable Text to Speech](https://arxiv.org/abs/1905.09263). NeurIPS, 2019.
+- G. Yang, S. Yang, K. Liu, P. Fang, W. Chen, L. Xie. [Multi-band MelGAN: Faster Waveform Generation for High-Quality Text-to-Speech](https://arxiv.org/abs/2005.05106). arXiv, 2020.
+- J.-M. Valin, J. Skoglund. [LPCNet: Improving Neural Speech Synthesis Through Linear Prediction](https://arxiv.org/abs/1810.11846). ICASSP, 2019.
+- J. Kim, J. Kong, J. Son. [Conditional Variational Autoencoder with Adversarial Learning for End-to-End Text-to-Speech](https://arxiv.org/abs/2106.06103). ICML, 2021. VITS.
+- E. Casanova, J. Weber, C. Shulby, A. Candido Junior, E. Gölge, M. A. Ponti. [YourTTS: Towards Zero-Shot Multi-Speaker TTS and Zero-Shot Voice Conversion for everyone](https://arxiv.org/abs/2112.02418). ICML, 2022.
+- D. Griffin, J. Lim. [Signal Estimation from Modified Short-Time Fourier Transform](https://doi.org/10.1109/TASSP.1984.1164317). *IEEE Transactions on Acoustics, Speech, and Signal Processing*, 32(2), 1984.
+- K. Ito, L. Johnson. [The LJ Speech Dataset](https://keithito.com/LJ-Speech-Dataset/). 2017.
+- C. Wang et al. [Neural Codec Language Models are Zero-Shot Text to Speech Synthesizers](https://arxiv.org/abs/2301.02111). arXiv, 2023. VALL-E.
+- A. Agostinelli et al. [MusicLM: Generating Music From Text](https://arxiv.org/abs/2301.11325). arXiv, 2023.
+- C. Raffel, N. Shazeer, A. Roberts, K. Lee, S. Narang, M. Matena, Y. Zhou, W. Li, P. J. Liu. [Exploring the Limits of Transfer Learning with a Unified Text-to-Text Transformer](https://jmlr.org/papers/v21/20-074.html). *JMLR*, 21(140), 2020. T5.
+- K. Kilgour, M. Zuluaga, D. Roblek, M. Sharifi. [Fréchet Audio Distance: A Metric for Evaluating Music Enhancement Algorithms](https://arxiv.org/abs/1812.08466). arXiv, 2018.
+- A. Défossez, N. Usunier, L. Bottou, F. Bach. [Music Source Separation in the Waveform Domain](https://arxiv.org/abs/1911.13254). arXiv, 2019. Demucs.
+- J. Ho, T. Salimans. [Classifier-Free Diffusion Guidance](https://arxiv.org/abs/2207.12598). NeurIPS Workshop on Deep Generative Models, 2021.
