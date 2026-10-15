@@ -1,0 +1,385 @@
+---
+title: "Sampling unnormalized densities: MALA, Hamiltonian Monte Carlo and NUTS"
+description: "How to sample a density known only up to its normalizing constant, as an energy-based model defines it: rejection and Metropolis–Hastings in brief, MALA and its gradient-informed proposal, Hamiltonian Monte Carlo with momentum, the leapfrog integrator and an acceptance test on the energy error, tuning the step size, trajectory length and mass matrix, NUTS with its U-turn criterion, doubling and dual averaging, and running the samplers in Pyro."
+course: generative-models
+section: Energy-Based Models
+order: 20
+status: published
+tags: [mcmc, mala, hamiltonian-monte-carlo, leapfrog, nuts, dual-averaging, pyro, energy-based-models]
+prerequisites: [Flow architectures, Markov chain Monte Carlo]
+---
+
+import SamplerPaths from '../../../components/figures/mcmc-samplers/SamplerPaths.astro';
+import HmcPhase from '../../../components/figures/mcmc-samplers/HmcPhase.astro';
+
+[Flows](/notes/generative-models/flow-architectures) give an exact density, but only for networks that are invertible and have a cheap Jacobian determinant. An **energy-based model** drops every restriction on the architecture: any network with a scalar output $E_\theta(x)$ defines a density
+
+$$
+p_\theta(x) = \frac{e^{-E_\theta(x)}}{Z_\theta}, \qquad Z_\theta = \int e^{-E_\theta(x)}\,dx .
+$$
+
+The price is $Z_\theta$, an integral over the whole data space that nobody can compute for images. Without it we cannot evaluate $p_\theta(x)$, and we cannot draw from it by any direct method. What we can compute is a ratio $p_\theta(y)/p_\theta(x) = e^{E_\theta(x) - E_\theta(y)}$, in which $Z_\theta$ cancels, and the gradient $\nabla_x \log p_\theta(x) = -\nabla_x E_\theta(x)$, which does not contain $Z_\theta$ at all. Sampling and training an energy-based model therefore need samplers that use only ratios or gradients of the unnormalized density. This note builds them, from the random walk of Metropolis–Hastings to the gradient-driven samplers that are used in practice: MALA, Hamiltonian Monte Carlo and its adaptive form NUTS. The [next note](/notes/generative-models/energy-based-models) puts them inside training.
+
+**Notation.** The target is a density on $\mathbb R^d$ known up to a constant, $\pi(x) = e^{-U(x)}/Z$; $U$ is the **potential energy**, and for an energy-based model $U = E_\theta$. Its gradient $\nabla \log \pi(x) = -\nabla U(x)$ is the **score**. $q(y \mid x)$ is a proposal density, $\alpha(x, y)$ an acceptance probability, $\mathcal N(\mu, \Sigma)$ a normal with covariance $\Sigma$ (variance as the second argument), and $z \sim \mathcal N(0, I)$ always denotes fresh standard normal noise. In Hamiltonian Monte Carlo $p \in \mathbb R^d$ is a **momentum** (never a density), $H(x, p)$ the total energy, $\varepsilon$ a step size and $L$ a number of steps. $d$ is the dimension.
+
+## The starting point: rejection and Metropolis–Hastings \{#the-starting-point\}
+
+The probability course has two samplers that already work with an unnormalized density; we only recall what they deliver.
+
+**Rejection sampling** ([Monte Carlo methods](/notes/probability/monte-carlo#rejection-sampling)) draws $x \sim q$ from a proposal and keeps it with probability $\pi(x)/(M q(x))$, where $M \ge \sup_x \pi(x)/q(x)$. The kept points are exact, independent draws from $\pi$: a point is drawn and kept with density $q(x) \cdot \pi(x)/(M q(x)) = \pi(x)/M$, which is proportional to $\pi$. The acceptance rate is $1/M$ for a normalized target, so on average $M$ proposals buy one sample; with $\tilde\pi = Z\pi$ in place of $\pi$ the bound becomes $\tilde\pi \le M q$ and the rate $Z/M$. The best constant is $M = \sup_x \pi(x)/q(x)$, and the proposal must have tails at least as heavy as the target's, otherwise the supremum is infinite. The bound is also what kills the method in many dimensions. For a target $\mathcal N(0, 1)$ and the proposal $\mathcal N(0, 2^2)$, the ratio $\pi/q = 2 e^{-3x^2/8}$ peaks at $x = 0$, so $M = 2$ and half of the proposals are kept. For $\mathcal N(0, I_d)$ against $\mathcal N(0, 4 I_d)$ the ratio is the product over coordinates, $M = 2^d$: one proposal in 1024 is kept in ten dimensions, one in $10^{30}$ in a hundred.
+
+**Metropolis–Hastings** ([Markov chain Monte Carlo](/notes/probability/markov-chain-monte-carlo#metropolis-hastings)) gives up independence. From the current state $x$ it proposes $y \sim q(\cdot \mid x)$ and accepts it with
+
+$$
+\alpha(x, y) = \min\Big(1, \frac{\pi(y)\, q(x \mid y)}{\pi(x)\, q(y \mid x)}\Big) ,
+$$
+
+otherwise it stays at $x$. Only the ratio $\pi(y)/\pi(x)$ enters, so $Z$ cancels. The chain satisfies [detailed balance](/notes/probability/markov-chain-monte-carlo#detailed-balance), $\pi(x) P(x \to y) = \pi(y) P(y \to x)$, which makes $\pi$ stationary; if it is also irreducible (it can reach every region of positive density) and aperiodic, it converges to $\pi$ from any start, by the [ergodic theorem](/notes/probability/markov-chains#stationary-distributions) on finite spaces and its analogue on continuous ones. Its states are correlated, and $n$ of them are worth an [effective sample size](/notes/probability/markov-chain-monte-carlo#mixing-and-diagnostics) $n/(1 + 2\sum_{k \ge 1} \rho_k)$ of independent draws, where $\rho_k$ is the autocorrelation at lag $k$. With the symmetric **random-walk** proposal $y = x + \sigma z$ the ratio reduces to $\pi(y)/\pi(x)$, and the step $\sigma$ decides everything: too small and the chain crawls, too large and it is rejected.
+
+## Why a random walk is slow
+
+A random walk moves by independent steps, so after $n$ accepted steps of size $\sigma$ it has typically travelled $\sigma\sqrt n$, not $\sigma n$. The step is capped by the narrowest direction of the target: a step much longer than the target's width in some direction lands in low density and is rejected. Crossing the widest direction then takes about $(\sigma_{\max}/\sigma_{\min})^2$ steps. For a bivariate normal with unit variances and correlation $0.95$ the standard deviations along the two axes of the ellipse are $\sqrt{1.95} = 1.40$ and $\sqrt{0.05} = 0.22$, a ratio of $6.2$ and a squared ratio of $39$.
+
+Dimension makes it worse. For a target with $d$ independent coordinates, the change in $\log\pi$ is a sum of $d$ terms, and keeping the acceptance rate away from zero requires a proposal variance $\sigma^2$ proportional to $1/d$. The chain then needs on the order of $d$ steps per independent sample, and the optimal acceptance rate tends to $0.234$ as $d$ grows, with $\sigma = 2.38/\sqrt d$ for standard normal coordinates ([Roberts, Gelman and Gilks, 1997](#references)). Both problems have the same cause: the proposal knows nothing about where the probability is. The rest of the note feeds it the gradient.
+
+## MALA: let the gradient propose \{#mala\}
+
+The **Langevin diffusion**
+
+$$
+dX_t = \tfrac12 \nabla \log \pi(X_t)\, dt + dW_t ,
+$$
+
+with $W_t$ a standard Brownian motion, drifts uphill on $\log\pi$ and diffuses, and under mild conditions it has $\pi$ as its stationary distribution. Run it for a time $\varepsilon$ with one Euler step and you get the proposal
+
+$$
+\begin{gathered}
+y = x + \frac{\varepsilon}{2} \nabla \log \pi(x) + \sqrt{\varepsilon}\, z, \\
+q(y \mid x) = \mathcal N\Big(y;\ x + \frac{\varepsilon}{2} \nabla \log \pi(x),\ \varepsilon I\Big) .
+\end{gathered}
+$$
+
+Used on its own as the update of a chain, this is **unadjusted Langevin dynamics** ([Langevin dynamics](/notes/probability/markov-chain-monte-carlo#langevin-dynamics)), and its stationary distribution is slightly wrong for any finite $\varepsilon$: on $\mathcal N(0, 1)$ its variance is $1/(1 - \varepsilon/4)$. The **Metropolis-adjusted Langevin algorithm**, MALA ([Roberts and Tweedie, 1996](#references)), uses the same move as a Metropolis–Hastings proposal and corrects the error with the accept test. The proposal is not symmetric, because the drift at $y$ differs from the drift at $x$, so both directions enter the Metropolis–Hastings ratio:
+
+$$
+\begin{gathered}
+\alpha(x, y) = \min\Big(1, \frac{\pi(y)\, q(x \mid y)}{\pi(x)\, q(y \mid x)}\Big), \\
+q(x \mid y) = \mathcal N\Big(x;\ y + \frac{\varepsilon}{2} \nabla \log \pi(y),\ \varepsilon I\Big) .
+\end{gathered}
+$$
+
+Each step needs one new gradient, at $y$; the gradient at $x$ is kept from the previous step. Everything is computed in logarithms: $\log \pi(y) - \log \pi(x) = U(x) - U(y)$, and the normalizing constants of the two Gaussians are equal and cancel.
+
+### Worked example: MALA on a standard normal
+
+Take $\pi = \mathcal N(0, 1)$, so $\nabla \log \pi(x) = -x$, and write $a = 1 - \varepsilon/2$. The proposal mean from $x$ is $a x$, and
+
+$$
+\begin{aligned}
+\log \frac{q(x \mid y)}{q(y \mid x)} &= \frac{(y - a x)^2 - (x - a y)^2}{2\varepsilon} \\
+&= \frac{(1 - a^2)(y^2 - x^2)}{2\varepsilon} = \Big(1 - \frac{\varepsilon}{4}\Big)\frac{y^2 - x^2}{2},
+\end{aligned}
+$$
+
+using $(y - ax)^2 - (x - ay)^2 = (1 - a^2)(y^2 - x^2)$ and $1 - a^2 = \varepsilon - \varepsilon^2/4$. Adding $\log \pi(y) - \log \pi(x) = (x^2 - y^2)/2$ leaves
+
+$$
+\log \frac{\pi(y)\, q(x \mid y)}{\pi(x)\, q(y \mid x)} = \frac{\varepsilon}{8}\,(x^2 - y^2) .
+$$
+
+The random walk's log-ratio for the same pair is $(x^2 - y^2)/2$; MALA's is that times $\varepsilon/4$. The proposal already carries most of the change in density, and the test only corrects the remainder. With $x = 2$ and $\varepsilon = 1$ the proposal is $\mathcal N(1, 1)$. A draw that lands farther out, at $y = 2.8$, has $\pi(y)/\pi(x) = e^{-1.92} = 0.15$, so a random walk would accept it with probability $0.15$, while MALA accepts it with $e^{-0.48} = 0.62$: the reverse proposal from $2.8$ has mean $1.4$, only $0.6$ from $x = 2$, so the move is easy to undo.
+
+### How the step scales with dimension
+
+MALA's errors come only from discretizing a dynamics that keeps $\pi$ invariant, and they are smaller than a random walk's. For targets with independent coordinates, [Roberts and Rosenthal (1998)](#references) show that the step can shrink as $\varepsilon \propto d^{-1/3}$ instead of $d^{-1}$, so a chain needs on the order of $d^{1/3}$ steps per independent sample instead of $d$, and that the optimal acceptance rate tends to $0.574$, against $0.234$ for the random walk.
+
+A toy check on $\mathcal N(0, I_d)$, each sampler tuned to its asymptotically optimal acceptance rate, counts the effective sample size of $x_1$ per 1000 evaluations of the target (one run of 40,000 evaluations each; Hamiltonian Monte Carlo, introduced below, with trajectories of length about 1 and acceptance about $0.65$):
+
+| $d$ | random walk: $\sigma$ | ESS per 1000 | MALA: $\varepsilon$ | ESS per 1000 | HMC: $\varepsilon$ | ESS per 1000 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 10 | 0.75 | 33 | 1.27 | 316 | 1.05 | 290 |
+| 100 | 0.24 | 4.4 | 0.59 | 108 | 0.65 | 126 |
+| 1000 | 0.075 | 0.4 | 0.27 | 43 | 0.37 | 66 |
+
+Every tenfold increase in $d$ costs the random walk a factor of about ten. MALA's step follows $\varepsilon \approx 2.7\, d^{-1/3}$ and its efficiency falls by factors of three and two and a half; the last column is the subject of the next sections.
+
+Two cautions. The step is limited by the stiffest direction of the target, because the drift $\frac{\varepsilon}{2}\nabla\log\pi$ overshoots where the curvature is large: on a Gaussian with smallest variance $\sigma^2_{\min}$ the drift alone is stable only for $\varepsilon < 4\sigma^2_{\min}$. On a narrow target MALA is therefore limited much as the random walk is (Figure 2 below). A **preconditioned** proposal $\mathcal N(x + \frac{\varepsilon}{2} A \nabla \log \pi(x),\ \varepsilon A)$ with a matrix $A$ close to the target's covariance removes the problem, and a position-dependent $A$ gives the Riemann manifold version of [Girolami and Calderhead (2011)](#references). Second, for targets with tails lighter than Gaussian the unadjusted chain can diverge and MALA can fail to converge geometrically fast ([Roberts and Tweedie, 1996](#references)).
+
+## Hamiltonian Monte Carlo: momentum and energy \{#hamiltonian-monte-carlo\}
+
+MALA and the random walk both forget their direction after every step. **Hamiltonian Monte Carlo** (HMC) adds a velocity that persists. Introduce a momentum $p \in \mathbb R^d$, independent of $x$ and normal, $p \sim \mathcal N(0, M)$, with a **mass matrix** $M$ (the identity unless said otherwise). The joint density is
+
+$$
+\pi(x, p) \propto e^{-H(x, p)}, \qquad H(x, p) = U(x) + K(p), \qquad K(p) = \tfrac12\, p^\top M^{-1} p ,
+$$
+
+and its marginal in $x$ is $\pi$: sampling $(x, p)$ and dropping $p$ samples $\pi$. In physical language $x$ is the position of a particle, $U$ its potential energy, $K$ its kinetic energy and $H$ the total energy ([Neal, 2011](#references), Section 3.1). The particle moves by **Hamilton's equations**
+
+$$
+\frac{dx}{dt} = \frac{\partial H}{\partial p} = M^{-1} p, \qquad \frac{dp}{dt} = -\frac{\partial H}{\partial x} = -\nabla U(x) .
+$$
+
+The momentum carries the particle forward, and the force $-\nabla U$, which is the score, bends its path towards high probability. The exact flow has three properties, and HMC rests on all three ([Neal, 2011](#references), Section 2.2).
+
+- **It conserves $H$.** By the chain rule, $\frac{dH}{dt} = \nabla U \cdot \frac{dx}{dt} + \nabla K \cdot \frac{dp}{dt} = \nabla U \cdot M^{-1}p - M^{-1}p \cdot \nabla U = 0$.
+- **It preserves volume.** The vector field $(M^{-1}p,\ -\nabla U(x))$ has divergence $\sum_i \partial_{x_i}(M^{-1}p)_i - \sum_i \partial_{p_i}\partial_{x_i}U = 0$, because the first term does not depend on $x$ and the second does not depend on $p$; a flow with zero divergence keeps the volume of every region (Liouville's theorem).
+- **It is reversible.** Running the flow for time $t$, negating the momentum and running again for time $t$ returns to the start with negated momentum.
+
+If the flow could be computed exactly, a proposal made by following it for some time would have the same $H$ and would always be accepted, however far it went. The work is in the integrator.
+
+## The leapfrog integrator
+
+Euler's method updates $x$ and $p$ with the derivatives at the current point. On $\mathcal N(0, 1)$, where $H = x^2/2 + p^2/2$ and exact trajectories are circles in the $(x, p)$ plane, one Euler step maps $(x, p)$ to $(x + \varepsilon p,\ p - \varepsilon x)$, and
+
+$$
+(x + \varepsilon p)^2 + (p - \varepsilon x)^2 = (1 + \varepsilon^2)(x^2 + p^2) :
+$$
+
+every step multiplies the energy by $1 + \varepsilon^2$, and the trajectory spirals outwards. The **leapfrog** (Störmer–Verlet) method splits the momentum update in two halves around a full position step:
+
+$$
+\begin{aligned}
+p_{1/2} &= p - \tfrac{\varepsilon}{2} \nabla U(x), \\
+x' &= x + \varepsilon\, M^{-1} p_{1/2}, \\
+p' &= p_{1/2} - \tfrac{\varepsilon}{2} \nabla U(x') .
+\end{aligned}
+$$
+
+In a chain of $L$ steps the last half step of one and the first of the next use the same gradient, so $L$ steps cost $L$ gradients. Leapfrog does not conserve $H$, but it keeps the other two properties exactly ([Neal, 2011](#references), Section 2.3):
+
+- **Volume.** Each of the three lines is a shear: it changes one block of variables by an amount that depends only on the other block. Its Jacobian is block-triangular with identity blocks on the diagonal, so its determinant is 1, and so is the determinant of the composition. This is the same triangular-Jacobian argument that makes [coupling layers](/notes/generative-models/flow-architectures#a-coupling-layers-nice-realnvp) cheap; here the determinant is not just cheap but equal to one.
+- **Reversibility.** The step is symmetric: negating $p'$ and applying the same step returns to $(x, -p)$.
+
+Its energy error stays bounded instead of growing. On $\mathcal N(0, 1)$ the step is the linear map $x' = (1 - \varepsilon^2/2)x + \varepsilon p$, $p' = (1 - \varepsilon^2/2)p - \varepsilon(1 - \varepsilon^2/4)x$, and a direct check shows that it conserves exactly the **shadow energy**
+
+$$
+\tilde H(x, p) = \frac{p^2}{2} + \Big(1 - \frac{\varepsilon^2}{4}\Big)\frac{x^2}{2} ,
+$$
+
+so along any leapfrog trajectory $H - \tilde H = \varepsilon^2 x^2/8$ only oscillates. For $\varepsilon \ge 2$ the coefficient of $x^2$ is no longer positive and the trajectories are no longer bounded; for a Gaussian of standard deviation $\sigma$ the limit is $\varepsilon < 2\sigma$, set by the narrowest direction. In general the leapfrog error in $H$ is of order $\varepsilon^3$ after one step and of order $\varepsilon^2$ over a trajectory of fixed length.
+
+**Worked example.** On $\mathcal N(0, 1)$ from $x = 1$, $p = 0.5$ with $\varepsilon = 0.5$: $p_{1/2} = 0.5 - 0.25 \cdot 1 = 0.25$, $x' = 1 + 0.5 \cdot 0.25 = 1.125$, $p' = 0.25 - 0.25 \cdot 1.125 = -0.03125$. The energy goes from $H = 0.5 + 0.125 = 0.625$ to $0.63330$, so $\Delta H = 0.0083$ and the move would be accepted with probability $e^{-0.0083} = 0.992$. Euler's step from the same point gives $(1.25, 0)$ with $H = 0.78125$, an error $\Delta H = 0.156 = \varepsilon^2 H$, nineteen times larger. The shadow energy $\tilde H = 0.59375$ is the same before and after the leapfrog step.
+
+## One HMC iteration
+
+An iteration of HMC from the current state $x$ has three steps, which the chain then repeats ([Neal, 2011](#references), Section 3.2):
+
+<HmcPhase />
+
+1. **Refresh the momentum.** Draw $p \sim \mathcal N(0, M)$, independently of everything else. In the $(x, p)$ plane this is a vertical move, and it is the only step that changes the energy level.
+2. **Simulate.** Apply $L$ leapfrog steps of size $\varepsilon$ to $(x, p)$ to get $(x', p')$. The trajectory follows a contour of $H$ up to the small leapfrog error.
+3. **Accept or reject.** Accept $x'$ with probability $\min(1, e^{-\Delta H})$, where $\Delta H = H(x', p') - H(x, p)$; otherwise keep $x$. Drop the momentum.
+4. **Repeat** from step 1 with a new momentum.
+
+In the figure, each fresh momentum puts the chain on a different circle, the leapfrog points stay close to their circle, and Euler's points drift off. Exploration of different energy levels comes from step 1; long moves at a fixed level come from step 2.
+
+<aside class="callout"><strong>The bias of unadjusted Langevin is a shadow energy.</strong> One leapfrog step of size $h$ from a fresh momentum $p = z$ moves $x$ to $x + h z - \frac{h^2}{2}\nabla U(x)$: this is the MALA proposal with $\varepsilon = h^2$, and the HMC acceptance $e^{-\Delta H}$ for $L = 1$ equals the MALA ratio (<a href="#references">Neal, 2011</a>, Section 5.2). Without the accept test the chain is unadjusted Langevin dynamics. On $\mathcal N(0, 1)$ each leapfrog step preserves volume and the shadow energy $\tilde H = p^2/2 + (1 - h^2/4)x^2/2$, so it leaves the density $e^{-\tilde H}$ invariant, and so does the momentum refresh, which redraws $p$ from its exact conditional under $e^{-\tilde H}$. The unadjusted chain therefore samples the $x$-marginal of $e^{-\tilde H}$, a normal with variance $1/(1 - h^2/4) = 1/(1 - \varepsilon/4)$: exactly the stationary variance of unadjusted Langevin dynamics. The accept test of MALA, whose log-ratio is $-\Delta H$, is what removes it.</aside>
+
+## Why the acceptance needs only the energy error
+
+Write $z = (x, p)$, let $\Lambda$ be one leapfrog step and $F(x, p) = (x, -p)$ the momentum flip, and define the proposal map $\Phi = F \circ \Lambda^L$: run $L$ steps, then negate the momentum. Two facts about $\Phi$ make the acceptance simple.
+
+- **$\Phi$ is an involution**, $\Phi(\Phi(z)) = z$. Reversibility says $F \circ \Lambda \circ F = \Lambda^{-1}$, so $F \Lambda^L F = \Lambda^{-L}$ and $\Phi \circ \Phi = F\Lambda^L F \Lambda^L = \Lambda^{-L}\Lambda^L$, the identity.
+- **$\Phi$ preserves volume**, $\lvert\det \partial\Phi/\partial z\rvert = 1$, because each leapfrog step and the flip do.
+
+Accept the deterministic proposal $\Phi(z)$ with probability $\alpha(z) = \min\big(1, \pi(\Phi(z))/\pi(z)\big)$. For any two regions $A$ and $B$ of phase space, the probability flow from $A$ to $B$ is
+
+$$
+\begin{aligned}
+\int_A \pi(z)\, \alpha(z)\, \mathbf 1[\Phi(z) \in B]\, dz &= \int_B \pi(\Phi(w))\, \alpha(\Phi(w))\, \mathbf 1[\Phi(w) \in A]\, dw \\
+&= \int_B \pi(w)\, \alpha(w)\, \mathbf 1[\Phi(w) \in A]\, dw ,
+\end{aligned}
+$$
+
+the flow from $B$ to $A$. The first line substitutes $z = \Phi(w)$, which is allowed because $\Phi$ is its own inverse, with unit Jacobian because $\Phi$ preserves volume. The second uses $\pi(z)\,\alpha(z) = \min\big(\pi(z), \pi(\Phi(z))\big)$, which is symmetric under $z \leftrightarrow \Phi(z)$. This is detailed balance, so the accept step leaves $\pi(x, p)$ invariant. The ratio itself is
+
+$$
+\frac{\pi(\Phi(z))}{\pi(z)} = e^{-H(x', -p') + H(x, p)} = e^{-\Delta H} ,
+$$
+
+since $K(-p') = K(p')$; for the same reason the flip changes nothing in practice and is dropped, the momentum being redrawn anyway. The momentum refresh is an exact draw from the conditional of $p$ given $x$, a Gibbs step, so it leaves $\pi(x, p)$ invariant too, and so does the whole iteration ([Neal, 2011](#references), Section 3.2).
+
+Volume preservation is what keeps the ratio free of Jacobians. A proposal map that stretched space would need the factor $\lvert\det \partial\Phi/\partial z\rvert$ in the ratio, the same change-of-variables term that [normalizing flows](/notes/generative-models/normalizing-flows) pay for in their likelihood. With Euler's method the determinant on $\mathcal N(0,1)$ is $1 + \varepsilon^2$ per step, and the plain ratio $e^{-\Delta H}$ would sample the wrong distribution.
+
+## The three samplers on a narrow Gaussian
+
+Figure 2 runs a random walk, MALA and HMC on the bivariate normal with correlation $0.95$ from the section on random walks, with the same budget of 3000 evaluations of the target each. The random walk uses $\sigma = 1.0$ and accepts 22%, close to the $0.234$ rule; MALA uses $\varepsilon = 0.17$, just below its stability limit $4\sigma^2_{\min} = 0.2$, and accepts 57%; HMC uses $\varepsilon = 0.3$ and $L = 10$, so 300 iterations, and accepts 86%.
+
+<SamplerPaths />
+
+The effective sample sizes of $x_1$ are 92, 38 and 300. After ten evaluations the autocorrelation of $x_1$ is still $0.59$ for the random walk and $0.79$ for MALA, and $-0.41$ for HMC, which has finished one iteration. Each HMC trajectory lasts $\varepsilon L = 3$ time units. Along the long axis of the ellipse, whose standard deviation is $1.40$, ten leapfrog steps advance the oscillation by $2.15$ radians ($123°$), so a trajectory tends to end on the other side of the mean; the negative autocorrelation is that swing. On this target the gradient buys MALA nothing, and it does worse than a well-tuned random walk: its step is capped by the narrow direction, and along the long direction it still diffuses. Its advantage is the scaling with dimension in the table above. HMC is different in kind, because its momentum keeps it moving along the long direction for a whole trajectory.
+
+## Tuning HMC: step size, trajectory length and mass matrix \{#tuning-hmc\}
+
+**Step size.** $\varepsilon$ must stay below the stability limit, about twice the standard deviation of the narrowest direction ($0.45$ for the target above), and in practice somewhat below, because the acceptance rate falls as the energy error grows. For targets with $d$ independent coordinates the step has to shrink as $\varepsilon \propto d^{-1/4}$, a trajectory of fixed length then needs on the order of $d^{1/4}$ leapfrog steps, and the optimal acceptance rate tends to $0.65$ ([Neal, 2011](#references), Section 4.4; [Beskos et al., 2013](#references), who give $0.651$). Since each gradient costs order $d$, the total cost per independent sample grows like $d^{5/4}$, against $d^2$ for the random walk and $d^{4/3}$ for MALA ([Neal, 2011](#references), Sections 4.4 and 5.2).
+
+**Trajectory length.** $\varepsilon L$ decides how far a proposal goes. Too short, and HMC degenerates into a random walk of small steps (with $L = 1$ it is MALA). Too long, and the trajectory turns back towards its start and the extra gradients are wasted. Worse, a fixed length can resonate with the target's periods. On the target above, the leapfrog step in the narrow direction is, after rescaling, a rotation by an angle $\theta$ with $\cos\theta = 1 - \varepsilon^2/(2\sigma^2_{\min})$. With $\varepsilon = 0.25$ and $L = 10$ that is $1.19$ radians per step and $1.89$ turns per trajectory, so the narrow coordinate comes back close to where it started (the cosine of the total angle is $0.76$); the effective sample size of $x_1 - x_2$ drops to between 46 and 78 out of 300 iterations over four runs, while $\varepsilon = 0.3$ gives 300 in all four. Randomizing $\varepsilon$ or $L$ a little at every iteration breaks such resonances ([Neal, 2011](#references), Section 3.2), and NUTS removes the choice of $L$ altogether.
+
+**Mass matrix.** With $K(p) = \frac12 p^\top M^{-1} p$ the leapfrog position step becomes $x' = x + \varepsilon M^{-1} p_{1/2}$. Choosing $M^{-1}$ equal to an estimate $\Sigma$ of the covariance of $\pi$ is equivalent to running HMC with identity mass on the linearly transformed variable $\Sigma^{-1/2} x$ ([Neal, 2011](#references), Section 4.1; [Betancourt, 2017](#references), Section 4.2), in which the target is roughly isotropic: on a Gaussian the stability limit no longer depends on its correlations, and short trajectories reach nearly independent points. In high dimensions a diagonal $M$, one scale per coordinate, is the usual compromise; it is estimated from the chain during warm-up.
+
+## NUTS: stop at the U-turn \{#nuts\}
+
+The **No-U-Turn Sampler** ([Hoffman and Gelman, 2014](#references)) keeps HMC's dynamics and removes $L$: it extends the trajectory until it starts to come back.
+
+### The U-turn criterion
+
+With identity mass, the distance from the start $x$ of a trajectory to its current point $\tilde x$ changes at the rate
+
+$$
+\frac{d}{dt}\, \frac{(\tilde x - x)\cdot(\tilde x - x)}{2} = (\tilde x - x) \cdot \frac{d\tilde x}{dt} = (\tilde x - x) \cdot \tilde p .
+$$
+
+While this is positive, more simulation moves the proposal further away; once it is negative, the trajectory is turning back (with a mass matrix, $\tilde p$ is replaced by the velocity $M^{-1}\tilde p$). Simply stopping at the first negative value would break reversibility: the trajectory run back from the stopping point would usually stop somewhere else, so detailed balance would fail ([Hoffman and Gelman, 2014](#references), Section 3.1).
+
+### Doubling the trajectory
+
+NUTS builds the trajectory as a balanced binary tree. It starts from the single state $(x, p)$ after the momentum refresh. At doubling $j = 0, 1, 2, \dots$ it picks a direction $v \in \{-1, +1\}$ uniformly at random and takes $2^j$ leapfrog steps of size $v\varepsilon$ from the corresponding end, forwards or backwards in time, which doubles the number of states. It stops when, for the whole trajectory or for any of its balanced subtrees, the leftmost and rightmost states $(x^-, p^-)$ and $(x^+, p^+)$ satisfy
+
+$$
+(x^+ - x^-) \cdot p^- < 0 \quad \text{or} \quad (x^+ - x^-) \cdot p^+ < 0 ,
+$$
+
+that is, when continuing in either direction would bring the two ends closer. It also stops if the simulation becomes wildly inaccurate, with an energy error beyond $\Delta_{\max} = 1000$, a **divergence** ([Hoffman and Gelman, 2014](#references), Section 3.1.1). Because the tree is built by random doublings, every state in it could have generated the same tree with the same probability $2^{-j}$ after $j$ doublings, and this symmetry, together with volume preservation, replaces the reversibility that a simple stopping rule would lose.
+
+### Which state to keep
+
+NUTS has no single accept/reject step for the end point. It draws the next state from the states of the trajectory, in a way that keeps the joint distribution of position and momentum invariant.
+
+- **Slice sampling**, the original version: draw $u \sim U\big(0, e^{-H(x, p)}\big)$ and choose uniformly among the trajectory states with $e^{-H} \ge u$, leaving out the states of a final doubling that would have triggered a stop before the whole tree was built ([Hoffman and Gelman, 2014](#references), Section 3.1.1). The efficient version stores only $O(j)$ states and biases the choice towards the newer half of the tree, so that the next state tends to be far from the current one (Section 3.1.2).
+- **Multinomial sampling**: choose a state with probability proportional to $e^{-H}$ among all states of the trajectory, with no slice variable. Removing the auxiliary variable improves performance by a Rao–Blackwell argument, and this is what Stan and Pyro use by default ([Betancourt, 2017](#references), Appendices A.2.2 and A.5).
+
+One iteration of NUTS costs $2^j - 1$ gradients after $j$ doublings, and implementations cap the depth of the tree, at 10 doublings by default in Pyro.
+
+### Adapting the step size: dual averaging
+
+NUTS still needs $\varepsilon$. It is tuned during warm-up so that an acceptance statistic $\alpha_t$ averages to a target $\delta$. For NUTS, $\alpha_t$ is the average of $\min(1, e^{-\Delta H})$ over the states of the final doubling of iteration $t$, the acceptance HMC would have had for those states. **Dual averaging**, adapted from Nesterov's primal–dual method, updates
+
+$$
+\begin{aligned}
+\bar H_t &= \Big(1 - \frac{1}{t + t_0}\Big)\bar H_{t-1} + \frac{\delta - \alpha_t}{t + t_0}, \\
+\log \varepsilon_t &= \mu - \frac{\sqrt t}{\gamma}\, \bar H_t, \\
+\log \bar\varepsilon_t &= t^{-\kappa} \log \varepsilon_t + (1 - t^{-\kappa}) \log \bar\varepsilon_{t-1} .
+\end{aligned}
+$$
+
+When the chain accepts less than $\delta$, $\bar H_t$ grows and the step shrinks; the shrinkage towards $\mu = \log(10\,\varepsilon_1)$ favours steps larger than the initial guess $\varepsilon_1$, and $\bar\varepsilon_t$ is a running average that converges. Hoffman and Gelman use $\gamma = 0.05$, $t_0 = 10$, $\kappa = 0.75$ and, after warm-up, keep $\varepsilon$ fixed at $\bar\varepsilon$ ([Hoffman and Gelman, 2014](#references), Section 3.2). They found NUTS efficient for any $\delta$ between 0.45 and 0.65 and suggested $0.6$, against about $0.65$ for HMC (Section 4.4). Stan and Pyro default to $\delta = 0.8$: a smaller step, fewer divergences on difficult geometry, and more leapfrog steps per trajectory.
+
+### Warm-up
+
+The first part of a run, the **warm-up**, is spent adapting and is discarded. In Pyro, following Stan, it starts with a buffer of 75 iterations in which only the step size adapts, continues with windows of 25, 50, 100, … iterations at the end of each of which the mass matrix is re-estimated from the chain's states, and ends with a buffer of 50 iterations that adapts the step size to the final mass matrix. When the warm-up is too short for this schedule, the two buffers shrink to 15% and 10% of it. After warm-up the kernel is frozen. A kernel that kept adapting would no longer be a fixed Markov chain, and its stationary distribution would no longer be guaranteed.
+
+Two diagnostics come with every run. **Divergences** mark trajectories whose energy error exploded; they signal regions of high curvature that the chain cannot explore with its step size, and persistent divergences mean biased estimates ([Betancourt, 2017](#references), Section 6.2). The effective sample size and the split $\hat R$ across several chains measure mixing as in the [probability course](/notes/probability/markov-chain-monte-carlo#mixing-and-diagnostics).
+
+## Running the samplers in Pyro
+
+Probabilistic programming libraries implement all of this behind two objects: a kernel (`HMC` or `NUTS`) that makes one transition, and `MCMC`, which runs warm-up and sampling. The density can be given as a model, a program that calls `pyro.sample`:
+
+```python
+import torch
+import pyro
+import pyro.distributions as dist
+from pyro.infer import MCMC, NUTS
+
+Sigma = torch.tensor([[1.0, 0.95], [0.95, 1.0]])
+
+def model():
+    pyro.sample("x", dist.MultivariateNormal(torch.zeros(2), covariance_matrix=Sigma))
+
+mcmc = MCMC(NUTS(model), num_samples=1000, warmup_steps=500)
+mcmc.run()
+x = mcmc.get_samples()["x"]   # tensor of shape (1000, 2)
+mcmc.summary()                # mean, sd, quantiles, n_eff and r_hat per coordinate
+```
+
+From the model, Pyro builds the potential $U$: the negative log joint density, with each constrained variable mapped to an unconstrained one and the log-Jacobian of that map added to the log density, so that leapfrog moves on all of $\mathbb R^d$. Its defaults are the choices described above: `step_size` is only the initial $\varepsilon_1$, adapted by dual averaging to `target_accept_prob=0.8`; a diagonal mass matrix is adapted during warm-up (`adapt_mass_matrix=True`, `full_mass=False`); NUTS uses multinomial sampling and `max_tree_depth=10`; `warmup_steps` defaults to `num_samples`. For plain HMC, `HMC(model, step_size=0.1, num_steps=10)` fixes the trajectory length $\varepsilon L = 1$, and $L$ is recomputed as the integer part of $1/\varepsilon$ whenever the step size adapts.
+
+For an energy-based model the potential is the energy itself, and it can be passed directly:
+
+```python
+energy = ...                       # a trained network E_theta: a tensor of shape (2,) -> a scalar
+
+def potential(params):             # U(x) = E_theta(x); the normalizing constant is never needed
+    return energy(params["x"])
+
+mcmc = MCMC(NUTS(potential_fn=potential), num_samples=1000, warmup_steps=500,
+            initial_params={"x": torch.zeros(2)})
+mcmc.run()
+```
+
+With `potential_fn` there is no model to draw a starting point from, so `initial_params` is required. Gradients of $U$ come from automatic differentiation; each leapfrog step is one forward and one backward pass of the network.
+
+## What changed
+
+| Sampler | Proposal | Needs | Accept step | Tuned to | Steps per independent sample, $d$ coordinates | Fails when |
+| --- | --- | --- | --- | --- | --- | --- |
+| Rejection | independent draw from $q$ | $\pi$ up to a constant, a bound $M$ | keep with $\pi/(Mq)$ | the best $M = \sup \pi/q$ | about $M$, often exponential in $d$ | no tight envelope |
+| Random-walk MH | $x + \sigma z$ | ratios of $\pi$ | $\min(1, \pi(y)/\pi(x))$ | acceptance $\approx 0.234$ | order $d$ | narrow or high-dimensional targets |
+| MALA | $x + \frac{\varepsilon}{2}\nabla\log\pi + \sqrt\varepsilon\, z$ | ratios and the score | MH ratio with $q$ both ways | acceptance $\approx 0.574$ | order $d^{1/3}$ | stiff directions, light tails |
+| HMC | $L$ leapfrog steps from a fresh momentum | ratios and the score | $\min(1, e^{-\Delta H})$ | acceptance $\approx 0.65$; $L$ and $M$ by hand | order $d^{1/4}$ leapfrog steps | bad $L$, divergences |
+| NUTS | trajectory doubled until a U-turn | ratios and the score | a state of the trajectory, by weight $e^{-H}$ | $\delta = 0.8$ by dual averaging; $M$ in warm-up | as HMC, with $L$ chosen per iteration | divergences, several modes |
+
+## Limitations
+
+- **Local moves cannot cross empty regions.** All of these samplers move continuously through regions of positive density. On a target with separated modes a chain stays in the mode it found, as the [probability course](/notes/probability/markov-chain-monte-carlo#mixing-and-diagnostics) shows for the random walk; HMC and NUTS are no exception ([Neal, 2011](#references), Section 4.2). Tempering and annealing methods address this at extra cost.
+- **Gradients are required.** MALA, HMC and NUTS need a differentiable $\log\pi$ on a continuous space. Discrete variables must be summed out or updated by other moves, and constrained variables need a change of variables.
+- **One step size for the whole space.** A region of high curvature, such as the neck of a hierarchical model's funnel, needs a smaller step than the rest; a global $\varepsilon$ either wastes gradients elsewhere or produces divergences there.
+- **The guarantees are asymptotic.** Stationarity, warm-up length and mixing can be checked only through diagnostics, which detect some failures and never all.
+- **Each gradient is a network pass.** For an energy-based model every leapfrog or Langevin step is a forward and a backward pass through $E_\theta$, and training needs fresh samples after every parameter update. Chains run to convergence are unaffordable there, which is where the next note starts.
+
+## Summary
+
+- An unnormalized density gives ratios $\pi(y)/\pi(x)$ and the score $\nabla\log\pi$ without $Z$; every sampler here uses only these.
+- Rejection sampling needs a bound $M \ge \sup \pi/q$ and accepts $1/M$ of the proposals; Metropolis–Hastings needs only ratios but a random walk diffuses, with order $d$ steps per independent sample and an optimal acceptance of $0.234$.
+- MALA proposes one Euler step of the Langevin diffusion, $\mathcal N(x + \frac{\varepsilon}{2}\nabla\log\pi(x), \varepsilon I)$, and corrects with an asymmetric Metropolis–Hastings ratio; its step scales as $d^{-1/3}$ and its optimal acceptance is $0.574$. On $\mathcal N(0,1)$ its log-ratio is $\frac{\varepsilon}{8}(x^2 - y^2)$.
+- HMC adds a momentum $p \sim \mathcal N(0, M)$ and follows Hamilton's equations for $H = U + K$ with the leapfrog integrator. Leapfrog is volume-preserving and reversible, so the acceptance is $\min(1, e^{-\Delta H})$ with no Jacobian; its energy error stays bounded, while Euler's method multiplies the energy by $1 + \varepsilon^2$ per step on a Gaussian.
+- HMC's step must stay below about twice the narrowest standard deviation, scales as $d^{-1/4}$ and is best at acceptance $\approx 0.65$; the trajectory length must avoid both random-walk behaviour and resonance; a mass matrix close to the inverse covariance makes the target isotropic.
+- NUTS doubles the trajectory in random directions until a U-turn, $(x^+ - x^-)\cdot p^- < 0$ or $(x^+ - x^-)\cdot p^+ < 0$, picks the next state from the whole trajectory (slice or multinomial sampling), and tunes $\varepsilon$ by dual averaging during warm-up, together with the mass matrix.
+- In Pyro, `MCMC(NUTS(model), num_samples, warmup_steps)` runs all of this; for an energy-based model, `NUTS(potential_fn=...)` takes the energy as the potential.
+
+## Notebook
+
+The [MCMC notebook](https://github.com/HSE-LAMBDA/DeepGenerativeModels/blob/spring-2025-long/seminars/05_Energy-Based-Models-and-MCMC/MCMC.ipynb) of the HSE-LAMBDA *Deep Generative Models* repository implements five samplers on one target, the one-dimensional $\mathcal N(0, 1)$ (cell numbers count every cell, markdown included, from 1). It has no saved outputs, so it documents procedures rather than results.
+
+- **Cell 1: introduction.** Pyro as a probabilistic programming library on PyTorch, and the list of samplers: rejection sampling, Metropolis–Hastings, MALA, HMC and NUTS.
+- **Cells 2–3: setup.** Imports of `torch`, `pyro`, `pyro.distributions`, `pyro.infer.mcmc`, matplotlib and seaborn, the seed 42, and a helper `time_sampling` that times a sampler.
+- **Cell 4: rejection sampling, theory.** The bound $\pi \le Mq$, the proof that accepted points have density $\pi$, the acceptance rate $1/M$ with a geometric number of draws of mean $M$, the optimal $M = \sup \pi/q$, and the advantages and limitations, including the exponential growth of $M$ with the dimension.
+- **Cells 5–6: rejection sampling, code.** Target $\mathcal N(0, 1)$, proposal $\mathcal N(0, 2^2)$ (`dist.Normal(0, 2)`, scale 2), $M = 1.5$, 1000 samples drawn one proposal at a time, and a histogram with a kernel density estimate.
+- **Cell 7: Metropolis–Hastings, theory.** The acceptance ratio, ergodicity and detailed balance, burn-in, the effect of the proposal width, and the random-walk proposal $\mathcal N(x, \sigma^2)$ with $\sigma = 0.5$.
+- **Cells 8–9: Metropolis–Hastings, code.** 1000 steps from $x = 0$ with the symmetric ratio $\pi(y)/\pi(x)$; histogram.
+- **Cell 10: MALA, theory.** The Langevin diffusion, the proposal and the asymmetric ratio, why MALA beats the random walk, and step-size advice. The cell's step $s$ is a standard deviation: its proposal $\mathcal N(x + \frac{s^2}{2}\nabla\log\pi(x), s^2)$ is this note's with $\varepsilon = s^2$.
+- **Cells 11–12: MALA, code.** Gradients of $\log\pi$ by autograd at the current and the proposed point, forward and reverse proposal densities, the accept test, `step_size = 0.1`, 1000 samples from $x = 0$; histogram.
+- **Cell 13: HMC, theory.** Position, momentum, $H = U + K$ with $K = p^2/2$, Hamilton's equations, the leapfrog step, the acceptance $\min(1, e^{-\Delta H})$, and the effect of $\varepsilon$ and $L$.
+- **Cells 14–15: HMC in Pyro.** A model with one site `x ~ Normal(0, 1)`, `mcmc.HMC(hmc_model, step_size=0.1, num_steps=10)`, `MCMC(..., num_samples=500, warmup_steps=100)`, samples from `get_samples()["x"]`; histogram.
+- **Cell 16: NUTS, theory.** Why $L$ is hard to set, the U-turn, trajectory doubling, step-size adaptation by dual averaging during warm-up.
+- **Cells 17–18: NUTS in Pyro.** The same model with `mcmc.NUTS(model)`, `MCMC(nuts_kernel, num_samples=500, warmup_steps=100)`; histogram.
+- **Cell 19: summary** and a comparison table of the five methods, which the What changed table above replaces.
+
+Issues, with the correct versions:
+
+- **Cell 5: $M = 1.5$ does not bound $\pi/q$.** The ratio is $2e^{-3x^2/8}$, with maximum 2 at $x = 0$, and it exceeds 1.5 for $\lvert x\rvert < 0.876$. There $\pi/(Mq)$ exceeds 1, every proposal is kept, and the accepted points have density proportional to $\min(\pi, 1.5\,q)$ instead of $\pi$: a normal with its top cut off, density $0.337$ at zero instead of $0.399$, variance $1.107$ instead of 1, and acceptance rate $0.593$ instead of the $1/M = 0.667$ the theory would predict. The correct constant is $M = 2$, with acceptance rate $1/2$.
+- **Cell 4: the proposal for heavy tails.** A normal proposal cannot cover a heavy-tailed target: $\pi/q$ is then unbounded in the tails. The proposal needs tails at least as heavy as the target's (for example a Student-t). The cell's remark that $\pi$ need not be normalized holds, but then $\pi$ is replaced by $\tilde\pi$ in the bound and the acceptance rate is $Z/M$, not $1/M$.
+- **Cells 7–8: the random-walk step.** The recommended acceptance of 25–50% mixes two results: the optimum is $0.234$ in high dimensions and about $0.44$ in one dimension. With $\sigma = 0.5$ on $\mathcal N(0, 1)$ the stationary acceptance rate is $(2/\pi)\arctan(2/\sigma) = 0.84$, so the chain takes small, highly correlated steps; $\sigma = 2.4$ gives $0.44$. The claim that Metropolis–Hastings works for multimodal targets is misleading: it is valid for them but may never cross between modes. Cell 8 also forms the ratio as a quotient of `exp(log_prob)`; differences of log-densities avoid overflow and underflow on other targets.
+- **Cells 10–11: the MALA step is far too small.** `step_size = 0.1` means $\varepsilon = 0.01$. On $\mathcal N(0,1)$ the proposal is $0.995\,x$ plus noise of standard deviation $0.1$, practically every proposal is accepted, and the integrated autocorrelation time is $(1 + 0.995)/(1 - 0.995) \approx 400$ steps, so 1000 steps from $x = 0$ are worth two or three independent samples and the histogram cannot resemble $\mathcal N(0, 1)$. For this one-dimensional target a `step_size` between 1 and 1.4 accepts 79–92% of the proposals and gives roughly 370 to 780 effective samples per 1000 steps. The rule of thumb of 50% acceptance corresponds to the high-dimensional optimum $0.574$. "RMSprop MALA" is not an established method: RMSprop preconditioning appears in preconditioned SGLD ([Li et al., 2016](#references)), which has no accept step, and the preconditioned MALA with a Metropolis correction is the Riemann manifold MALA of [Girolami and Calderhead (2011)](#references).
+- **Cell 13: energy conservation.** The cell attributes the high acceptance to Hamiltonian dynamics preserving volume and energy. The exact dynamics would be accepted always; leapfrog preserves volume and reversibility exactly but energy only approximately, and the acceptance below 1 measures its energy error.
+- **Cell 14: the HMC settings are adapted away.** Pyro's `HMC` adapts the step size by dual averaging towards `target_accept_prob=0.8` and a diagonal mass matrix during warm-up, both on by default. `step_size=0.1, num_steps=10` therefore only fixes the trajectory length $\varepsilon L = 1$ and the initial step; after warm-up $L$ is the integer part of $1/\varepsilon$ for the adapted $\varepsilon$. To run HMC with exactly these values, pass `adapt_step_size=False` and `adapt_mass_matrix=False`.
+- **Cell 16: how NUTS chooses the next state.** The cell describes a Metropolis accept/reject of the trajectory's end point. NUTS has no such step: it draws the next state from the states of the trajectory, by slice sampling in the original algorithm and by multinomial sampling in Pyro's default (`use_multinomial_sampling=True`). Each doubling extends the trajectory in one randomly chosen direction, not in both. The "acceptance rate of 60–90%" is the adaptation target $\delta$, 0.8 by default, not a property of the method.
+- **Cell 19: the comparison table.** Its acceptance ranges are rules of thumb; the asymptotically optimal values are $0.234$, $0.574$ and $0.65$, rejection sampling accepts exactly $1/M$, and NUTS's rate is whatever $\delta$ is set to. No sampler in the table handles well-separated modes, and NUTS is the default only for continuous, differentiable targets.
+- **All cells: one target.** On the one-dimensional $\mathcal N(0, 1)$ the five samplers look alike. The correlated two-dimensional Gaussian of Figure 2 separates them.
+
+## Next
+
+The samplers of this note assume a fixed target and enough time to converge. An energy-based model needs samples from its own density after every update of $\theta$, to estimate the gradient of $\log Z_\theta$, and cannot afford converged chains. The [next note](/notes/generative-models/energy-based-models) derives that gradient, with its [negative phase that needs model samples](/notes/generative-models/energy-based-models#why-the-negative-phase-needs-samples-from-the-model), and trains energy-based models with [short Langevin chains](/notes/generative-models/energy-based-models#contrastive-divergence-stopping-the-chains-early), [persistent chains and a replay buffer](/notes/generative-models/energy-based-models#persistent-chains-and-the-replay-buffer). It also covers the two relatives of these samplers used there: stochastic gradient Langevin dynamics, and annealed importance sampling, which [estimates the normalizer](/notes/generative-models/energy-based-models#evaluating-a-model-without-its-normalizer) to report a likelihood.
+
+## References
+
+- R. M. Neal. [MCMC Using Hamiltonian Dynamics](https://arxiv.org/abs/1206.1901). In S. Brooks, A. Gelman, G. Jones, X.-L. Meng (eds.), *Handbook of Markov Chain Monte Carlo*, Chapter 5, Chapman & Hall/CRC, 2011. Sections 2.2–2.3 (properties of the dynamics, leapfrog), 3.1–3.2 (the HMC algorithm and its invariance), 4.1–4.2 and 4.4 (linear transformations, tuning, scaling with dimension), 5.2 (the Langevin method as one leapfrog step).
+- M. D. Hoffman, A. Gelman. [The No-U-Turn Sampler: Adaptively Setting Path Lengths in Hamiltonian Monte Carlo](https://jmlr.org/papers/v15/hoffman14a.html). *Journal of Machine Learning Research*, 15(47), 1593–1623, 2014. [arXiv:1111.4246](https://arxiv.org/abs/1111.4246). Sections 3.1 (U-turn criterion, doubling, slice sampling), 3.2 (dual averaging), 4.4 (choice of $\delta$).
+- M. Betancourt. [A Conceptual Introduction to Hamiltonian Monte Carlo](https://arxiv.org/abs/1701.02434). arXiv, 2017. Sections 4.2 (Euclidean–Gaussian kinetic energies, the mass matrix), 4.3 (integration time), 6.2 (divergences), Appendices A.2.2 and A.5 (multinomial sampling, the current NUTS in Stan).
+- G. O. Roberts, R. L. Tweedie. [Exponential Convergence of Langevin Distributions and Their Discrete Approximations](https://doi.org/10.2307/3318418). *Bernoulli*, 2(4), 341–363, 1996.
+- G. O. Roberts, J. S. Rosenthal. [Optimal Scaling of Discrete Approximations to Langevin Diffusions](https://doi.org/10.1111/1467-9868.00123). *Journal of the Royal Statistical Society: Series B*, 60(1), 255–268, 1998.
+- G. O. Roberts, A. Gelman, W. R. Gilks. [Weak Convergence and Optimal Scaling of Random Walk Metropolis Algorithms](https://doi.org/10.1214/aoap/1034625254). *The Annals of Applied Probability*, 7(1), 110–120, 1997.
+- A. Beskos, N. Pillai, G. Roberts, J.-M. Sanz-Serna, A. Stuart. [Optimal Tuning of the Hybrid Monte Carlo Algorithm](https://doi.org/10.3150/12-BEJ414). *Bernoulli*, 19(5A), 1501–1534, 2013. [arXiv:1001.4460](https://arxiv.org/abs/1001.4460).
+- M. Girolami, B. Calderhead. [Riemann Manifold Langevin and Hamiltonian Monte Carlo Methods](https://doi.org/10.1111/j.1467-9868.2010.00765.x). *Journal of the Royal Statistical Society: Series B*, 73(2), 123–214, 2011.
+- C. Li, C. Chen, D. Carlson, L. Carin. [Preconditioned Stochastic Gradient Langevin Dynamics for Deep Neural Networks](https://doi.org/10.1609/aaai.v30i1.10200). *AAAI*, 2016. [arXiv:1512.07666](https://arxiv.org/abs/1512.07666).
+- Pyro documentation: [MCMC, HMC and NUTS](https://docs.pyro.ai/en/stable/mcmc.html).
+- HSE-LAMBDA, *Deep Generative Models* course repository: [`MCMC.ipynb`](https://github.com/HSE-LAMBDA/DeepGenerativeModels/blob/spring-2025-long/seminars/05_Energy-Based-Models-and-MCMC/MCMC.ipynb).
