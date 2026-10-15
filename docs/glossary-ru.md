@@ -152,6 +152,55 @@ How the course notes are translated into Russian. The Russian notes live in `src
 | variance-reduction trick | приём снижения дисперсии |
 | conditions on (a variable) | в условии стоит …; not «обусловлено», which reads as «вызвано» |
 
+### Probability and statistics
+
+Terms settled in the Probability Theory course; the course's Russian notes use them.
+
+| English | Russian |
+| --- | --- |
+| sample space, outcome, event | пространство элементарных исходов (sample space) †, исход, событие |
+| disjoint events | несовместные события |
+| σ-algebra, countable additivity | σ-алгебра, счётная аддитивность |
+| inclusion–exclusion | формула включений–исключений |
+| union bound | оценка объединения (неравенство Буля, union bound) † |
+| law of total probability | формула полной вероятности |
+| odds, likelihood ratio | шансы, отношение правдоподобий |
+| independence: mutual, pairwise, conditional | независимость в совокупности, попарная, условная |
+| CDF, quantile | функция распределения, квантиль |
+| exponential distribution | показательное (экспоненциальное) распределение; «показательное» after first use |
+| memorylessness | отсутствие памяти (memoryless) † |
+| inverse transform sampling | метод обратной функции † |
+| probability integral transform | интегральное преобразование вероятности † |
+| linearity of expectation, indicator | линейность математического ожидания, индикатор |
+| moment generating function, characteristic function | производящая функция моментов, характеристическая функция |
+| kurtosis | куртозис (без вычитания 3) † |
+| convolution (of distributions) | свёртка |
+| Schur complement | дополнение Шура |
+| tower property | свойство башни / формула полного математического ожидания † |
+| law of total variance | закон полной дисперсии |
+| irreducible error | неустранимая ошибка |
+| Markov's, Chebyshev's, Hoeffding's inequality | неравенство Маркова, Чебышёва, Хёфдинга |
+| weak / strong law of large numbers | слабый / усиленный закон больших чисел |
+| convergence in probability, almost surely, in distribution, in mean square | сходимость по вероятности, почти наверное, по распределению, в среднем квадратичном |
+| continuity correction | поправка на непрерывность |
+| estimator, bias, consistency | оценка, смещение, состоятельность |
+| standard error | стандартная ошибка |
+| score (derivative of the log-likelihood) | функция вклада (score) † |
+| Fisher information, Cramér–Rao bound | информация Фишера, неравенство Крамера–Рао |
+| conjugate prior | сопряжённое априорное распределение |
+| credible interval | байесовский доверительный интервал (credible interval) † |
+| MAP estimate | MAP-оценка |
+| ridge regression, lasso | гребневая регрессия, лассо |
+| confidence interval, coverage | доверительный интервал, покрытие (coverage) † |
+| bootstrap | бутстрэп |
+| null hypothesis, p-value, power | нулевая гипотеза, p-значение, мощность |
+| type I / type II error | ошибка первого / второго рода |
+| false discovery rate | доля ложных открытий (FDR) |
+| permutation test | перестановочный тест |
+| Markov chain, transition matrix, stationary distribution | цепь Маркова (also «марковская цепь»), матрица переходов, стационарное распределение |
+| irreducible, aperiodic, mixing time | неприводимая, апериодическая, время перемешивания |
+| rejection sampling, importance sampling | выборка с отклонением, выборка по значимости (importance sampling) † |
+
 ### Learning and networks
 
 | English | Russian |

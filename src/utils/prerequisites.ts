@@ -16,18 +16,19 @@ const D2L_BACKPROP = 'https://d2l.ai/chapter_multilayer-perceptrons/backprop.htm
 const D2L_LINEAR = 'https://d2l.ai/chapter_linear-classification/index.html';
 
 const background: Record<string, PrerequisiteTarget> = {
-  // Probability and mathematics: Deisenroth, Faisal and Ong, "Mathematics for Machine Learning".
-  'Probability': { href: MML },
-  'Basic probability': { href: MML },
-  'Conditional probability': { href: MML },
-  'Probability and statistics at an introductory level': { href: MML },
-  'Expectation': { href: MML },
+  // Probability: the notes of the probability course.
+  'Probability': { note: 'probability/what-probability-is' },
+  'Basic probability': { note: 'probability/what-probability-is' },
+  'Conditional probability': { note: 'probability/conditional-probability-and-bayes' },
+  'Probability and statistics at an introductory level': { note: 'probability/what-probability-is' },
+  'Expectation': { note: 'probability/expectation-and-variance' },
+  'Теория вероятностей': { note: 'probability/what-probability-is' },
+  'Математическое ожидание': { note: 'probability/expectation-and-variance' },
+  'Условная вероятность': { note: 'probability/conditional-probability-and-bayes' },
+  // Mathematics: Deisenroth, Faisal and Ong, "Mathematics for Machine Learning".
   'Linear algebra': { href: MML },
   'Calculus': { href: MML },
   'Determinants': { href: MML },
-  'Теория вероятностей': { href: MML },
-  'Математическое ожидание': { href: MML },
-  'Условная вероятность': { href: MML },
   'Линейная алгебра': { href: MML },
   'Математический анализ': { href: MML },
   'Определители': { href: MML },
@@ -49,8 +50,8 @@ const background: Record<string, PrerequisiteTarget> = {
   'Дивергенция Йенсена–Шеннона': { note: 'generative-models/entropy-and-divergences', anchor: 'jensenshannon-divergence' },
   'Binary cross-entropy': { note: 'generative-models/entropy-and-divergences', anchor: 'cross-entropy-surprise-under-a-wrong-belief' },
   'Бинарная кросс-энтропия': { note: 'generative-models/entropy-and-divergences', anchor: 'cross-entropy-surprise-under-a-wrong-belief' },
-  'Maximum likelihood': { note: 'generative-models/generative-modeling', anchor: 'what-approximate-means-a-divergence-to-minimize' },
-  'Метод максимального правдоподобия': { note: 'generative-models/generative-modeling', anchor: 'what-approximate-means-a-divergence-to-minimize' },
+  'Maximum likelihood': { note: 'probability/maximum-likelihood' },
+  'Метод максимального правдоподобия': { note: 'probability/maximum-likelihood' },
   'Gradient descent': { note: 'generative-models/fitting-distributions-with-kl', anchor: 'how-the-parameters-are-trained' },
   'Градиентный спуск': { note: 'generative-models/fitting-distributions-with-kl', anchor: 'how-the-parameters-are-trained' },
   'Gaussian distributions': { note: 'generative-models/gaussian-distributions' },
