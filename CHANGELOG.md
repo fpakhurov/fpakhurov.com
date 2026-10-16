@@ -4,6 +4,14 @@ Notable changes to the site, newest first. Each entry gives the date, what chang
 
 ## 2026-10-16
 
+- **Generative Models: how a computer samples, written out step by step.** The sampling section of *What generative modeling is* was too compressed: it did not say where the computer's random numbers come from, and the move from uniform numbers to other distributions skipped steps. Each of the five steps now gives the idea, the key formula in a frame, why it works, and the same step in a few lines of code that run as written.
+  - **Where the numbers come from:** physical noise against pseudo-random generators, a 16-state toy generator worked through number by number, what real generators (PCG64, the Mersenne Twister, Philox) change, how a 64-bit integer becomes a number in [0, 1), and the seed.
+  - **Inverse transform sampling:** built up from a discrete example (cutting [0, 1) into pieces) to the continuous case, with the three-line proof and the exponential distribution solved step by step.
+  - **Box–Muller:** in four numbered steps with a worked example.
+  - Three new figures, one of them step-through, and a column in the families table on how each model draws a sample.
+
+  Why: a reader asked where the numbers come from and found the transition from uniform to other distributions hard to follow.
+
 - **Machine Learning: the course written.** Every topic of the course map is now a note, in English and Russian: 27 notes in seven sections.
   - *The Learning Problem*: what machine learning is, data, features and leakage, validation and overfitting, nearest neighbours.
   - *Linear Regression*: least squares, gradient descent, stochastic and adaptive optimizers, regularization.
