@@ -158,4 +158,4 @@ Turn a business question into a supervised problem with a target, features and a
 1. Course maps in `src/utils/courses.ts` with every topic planned, the course pages and the course graph on `/notes`.
 2. The two opening notes (EN and RU), with figures.
 3. Notes section by section, in the order of the maps; each published note replaces its planned topic and, where it covers a background prerequisite of another course, takes over that prerequisite in `src/utils/prerequisites.ts`.
-4. Notebooks: the HSE ML course repository (github.com/esokolov/ml-course-hse) has no license, so its materials are a reference to read and cite, not to copy; the courses get their own small notebooks (one per section) whose saved outputs are the numbers quoted in the worked examples, and the probability course uses short simulations in the same way.
+4. Code instead of notebooks: the HSE ML course repository (github.com/esokolov/ml-course-hse) has no license, so its materials are a reference to read and cite, not to copy. Each note of both courses ends with a Code section that runs as written and prints the numbers quoted in the note.

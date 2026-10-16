@@ -1,0 +1,336 @@
+---
+title: Learning to rank
+description: "When the answer is an order rather than a label: queries, documents and graded relevance; the ranking metrics precision at k, MAP, MRR and NDCG; pointwise, pairwise and listwise losses with RankNet and ListNet; LambdaRank and LambdaMART, whose gradients are weighted by the change in NDCG; and clicks as labels biased by position."
+course: ml
+section: Beyond Classification
+order: 25
+status: published
+tags: [learning-to-rank, ranking-metrics, ndcg, ranknet, listnet, lambdarank, lambdamart, position-bias]
+prerequisites: [Anomaly detection, Logistic regression, Classification metrics, Gradient boosting]
+---
+
+import NdcgSteps from '../../../components/figures/learning-to-rank/NdcgSteps.astro';
+import LambdaBars from '../../../components/figures/learning-to-rank/LambdaBars.astro';
+
+The [anomaly detection note](/notes/ml/anomaly-detection) ended with a score per point and an analyst who reads the list from the top. Only the order of the scores mattered there: a detector is useful if the true anomalies come first, and nobody looks at the thousandth entry. That was already a ranking problem, solved without labels. This note supervises it. A search engine, a product catalogue, a news feed and the retriever of a question-answering system all return an ordered list, and people judge the list by its top. The output is an order, not a label. The note defines how to measure an order, explains why such measures cannot be trained directly, and builds the three families of losses that replace them, ending with LambdaMART, the gradient-boosted ranker that most production systems still start from.
+
+**Notation.** A query $q$ comes with $n$ candidate documents. Document $i$ is described by a feature vector $x_i \in \mathbb R^d$ of the pair (query, document) and has a graded relevance label $y_i \in \{0, 1, 2, 3, 4\}$, from irrelevant to perfect; a binary label $y_i \in \{0, 1\}$ is the special case. A model $f$ gives each document a score $s_i = f(x_i)$, and the ranking sorts the documents by decreasing score. $y_{(j)}$ is the label of the document in position $j$ of that ranking, and $k$ is a cutoff: a metric "at $k$" looks only at the first $k$ positions. $\sigma(t) = 1/(1 + e^{-t})$ is the logistic function.
+
+## Queries, documents and relevance
+
+Training data for ranking is grouped. Each query has its own list of candidates, usually the few hundred documents that a cheap first stage retrieved from millions, and each candidate has a label assigned by a human assessor who read the query and the document. Orders are compared only within a query: whether a document about jaguars the animal should come before one about Jaguar the car depends on what was asked. A consequence is that the model's scores are meaningful only up to a shift per query. Adding a constant to all scores of a query changes nothing.
+
+The features describe the pair, and they come in three kinds:
+
+- **Query features** depend only on the query: its length, its frequency in the logs, whether it names a product. They cannot change the order within one query, but they can change how other features should be read.
+- **Document features** depend only on the document: its length, its freshness, its link-based importance such as [PageRank](/notes/probability/markov-chains#pagerank), the stationary distribution of a random surfer.
+- **Query–document features** measure the match: the [BM25 score](/notes/nlp/semantic-search#baseline-lexical-matching) of the text against the query terms, the cosine between their embeddings, the share of query words in the title.
+
+Two practical rules follow from the grouping. Validation splits by query, never by row: documents of one query in both training and validation would let the model learn the query's quirks and report a score it will not reach on new queries, the leakage of the [data and leakage note](/notes/ml/data-features-and-leakage) and the grouped splits of the [validation note](/notes/ml/validation-and-overfitting). And a ranker usually works as the second stage of a cascade: a fast retriever narrows millions of documents to hundreds, and the learned ranker orders those. The [semantic search note](/notes/nlp/semantic-search#reranking-with-a-cross-encoder) builds exactly this pair for text, a bi-encoder that retrieves and a cross-encoder that reranks.
+
+## Measuring an order
+
+Classification metrics count errors on individual items. A ranking metric must weigh errors by position: an irrelevant document in first place costs more than one in fortieth, because the reader sees the first and not the fortieth. All metrics below are computed per query and then averaged over queries, so every query counts equally whatever the length of its list.
+
+The running example of the note is one query with six documents. In the order the model ranks them, their labels are
+
+$$
+(y_{(1)}, \dots, y_{(6)}) = (0, 3, 1, 0, 2, 0).
+$$
+
+### Binary relevance: precision, MAP and MRR
+
+For the binary metrics call a document relevant if $y > 0$: here positions 2, 3 and 5.
+
+**Precision at $k$** is the share of relevant documents among the first $k$:
+
+$$
+\mathrm{P@}k = \frac1k \sum_{j=1}^k [\,y_{(j)} > 0\,].
+$$
+
+In the example $\mathrm{P@1} = 0$, $\mathrm{P@3} = 2/3 = 0.667$ and $\mathrm{P@5} = 3/5 = 0.6$. It is easy to read, and it ignores the order inside the top $k$: a relevant document in first or in $k$-th place counts the same.
+
+**Average precision** rewards relevant documents for coming early. It averages the precision at the position of each relevant document, over all $R$ relevant documents of the query:
+
+$$
+\mathrm{AP} = \frac1R \sum_{j:\, y_{(j)} > 0} \mathrm{P@}j .
+$$
+
+With relevant documents at positions 2, 3 and 5, $\mathrm{AP} = \frac13\big(\frac12 + \frac23 + \frac35\big) = 0.589$. A relevant document that is never retrieved contributes precision 0 but still counts in $R$, so AP penalizes misses ([Manning, Raghavan and Schütze, 2008](#references), §8.4). Libraries differ on truncated versions, AP@$k$, some dividing by $R$ and some by $\min(R, k)$; it is worth checking which one a reported number used. The mean of AP over queries is **MAP**.
+
+**Reciprocal rank** looks only at the first relevant document: $\mathrm{RR} = 1/j^*$, where $j^*$ is its position, and 0 if there is none. Here $\mathrm{RR} = 1/2$. Its mean over queries, **MRR**, suits tasks with one right answer, such as a question with one passage that answers it, which is how the [semantic search note](/notes/nlp/semantic-search#measuring-a-retriever) measures a retriever.
+
+**Worked example over two queries.** A second query with binary labels $(1, 0, 0, 1)$ in ranked order has $\mathrm{AP} = \frac12\big(1 + \frac24\big) = 0.75$ and $\mathrm{RR} = 1$. Averaged with the first query, $\mathrm{MAP} = (0.589 + 0.75)/2 = 0.669$ and $\mathrm{MRR} = (0.5 + 1)/2 = 0.75$.
+
+### Graded relevance: DCG and NDCG
+
+Binary metrics throw away the difference between a perfect answer and a passable one. **Discounted cumulative gain** keeps it. Each document contributes a gain that grows with its label, divided by a discount that grows with its position:
+
+$$
+\mathrm{DCG@}k = \sum_{j=1}^{k} \frac{2^{y_{(j)}} - 1}{\log_2(1 + j)} .
+$$
+
+The idea of cumulated gain with a logarithmic discount is due to [Järvelin and Kekäläinen (2002)](#references), §2.2, who used the label itself as the gain and no discount before a chosen position. The exponential gain $2^y - 1$, which makes one perfect document worth more than several fair ones, with a logarithmic discount from the first position on, is the form used by [Burges et al. (2005)](#references), §5, and the one most libraries implement ([Manning, Raghavan and Schütze, 2008](#references), §8.4). The base of the logarithm cancels in NDCG below; base 2 is the convention. DCG has no fixed scale: a query with many relevant documents reaches higher values than one with a single good answer. **NDCG** divides by the DCG of the ideal order, the documents sorted by label, so that 1 means a perfect ranking:
+
+$$
+\mathrm{NDCG@}k = \frac{\mathrm{DCG@}k}{\mathrm{IDCG@}k} .
+$$
+
+**Worked example.** The six documents contribute
+
+| position $j$ | 1 | 2 | 3 | 4 | 5 | 6 |
+| --- | --- | --- | --- | --- | --- | --- |
+| label $y_{(j)}$ | 0 | 3 | 1 | 0 | 2 | 0 |
+| gain $2^{y} - 1$ | 0 | 7 | 1 | 0 | 3 | 0 |
+| discount $1/\log_2(1+j)$ | 1 | 0.631 | 0.5 | 0.431 | 0.387 | 0.356 |
+| contribution | 0 | 4.417 | 0.5 | 0 | 1.161 | 0 |
+
+so $\mathrm{DCG@6} = 6.077$. The ideal order $(3, 2, 1, 0, 0, 0)$ gives $\mathrm{IDCG@6} = 7 + 3 \cdot 0.631 + 1 \cdot 0.5 = 9.393$, and $\mathrm{NDCG@6} = 6.077/9.393 = 0.647$. At $k = 3$ the document with label 2 drops out of the numerator but not of the ideal, and $\mathrm{NDCG@3} = 4.917/9.393 = 0.523$. Most of the loss comes from position 1: the label-3 document sits one place too low, and moving it up would multiply its contribution by $1/0.631 = 1.58$.
+
+<aside class="callout"><strong>AUC is a ranking metric that ignores position.</strong> The area under the ROC curve of the [classification metrics note](/notes/ml/classification-metrics) equals the share of (relevant, irrelevant) pairs that the scores put in the right order. In the example there are $3 \times 3 = 9$ such pairs and 5 are ordered correctly, so AUC $= 0.556$. Every pair counts the same wherever it sits in the list, which is why a classifier with a good AUC can still put junk at the top. The pairwise losses below start from AUC's pairs and the lambdas add the positions back.</aside>
+
+### Why the metrics cannot be trained directly
+
+Every metric above depends on the scores only through the order they induce. A small change of one score either leaves the order unchanged, and the metric with it, or swaps two neighbours, and the metric jumps. As a function of the scores, and therefore of the model's parameters, NDCG is piecewise constant: its gradient is zero almost everywhere and undefined at the jumps ([Burges, 2010](#references), §3). Gradient descent gets no signal from it.
+
+<NdcgSteps />
+
+This is the problem the [linear classifiers note](/notes/ml/linear-classifiers) met with the 0–1 loss, and the answer is the same: train a smooth surrogate whose minimization tends to improve the metric, and use the metric itself for validation and early stopping. The surrogates differ in what they look at: one document at a time, pairs, or the whole list.
+
+## Pointwise: regress the labels
+
+The simplest approach forgets that the task is ranking. Treat every (query, document) pair as an example with target $y_i$, fit a regression with squared error or an ordinal classifier, and sort by the prediction. Any model of the course works, gradient boosting included, and the method is a strong baseline.
+
+Its loss, however, measures the wrong thing. Take two documents of one query with labels 1 and 2. Predictions $(1.9, 1.1)$ are close to the labels, with mean squared error $0.81$, but put the documents in the wrong order. Predictions $(-1, 0)$ are far from the labels, with mean squared error $4$, but the order is right. Regression prefers the first. More generally, a pointwise loss spends effort on things that do not affect the order: the exact value of every irrelevant document at the bottom of a long list, and the overall level of a query's labels, which a query feature might predict but which shifts all scores of the query together. The Code section shows a boosted regressor putting half of its split gain on such a query feature.
+
+## Pairwise: RankNet
+
+Ranking is a statement about pairs: document $i$ should come before document $j$ whenever $y_i > y_j$. **RankNet** ([Burges et al., 2005](#references)) models the probability of that preference with the difference of the two scores,
+
+$$
+P(i \rhd j) = \sigma(s_i - s_j) = \frac{1}{1 + e^{-(s_i - s_j)}},
+$$
+
+and maximizes the likelihood of the preferences observed in the labels. For every pair of one query with $y_i > y_j$ the loss is the negative log-likelihood
+
+$$
+C_{ij} = -\log \sigma(s_i - s_j) = \log\big(1 + e^{-(s_i - s_j)}\big).
+$$
+
+This is the logistic loss of a classifier whose input is the pair and whose output says which document wins, the cross-entropy of the [maximum likelihood note](/notes/probability/maximum-likelihood#loss-functions-are-likelihoods) applied to preferences. With a linear score $s = w^\top x$ it is literally [logistic regression](/notes/ml/logistic-regression) on the difference vectors $x_i - x_j$, with no intercept since a shift of all scores cancels. Burges et al. used a neural network for $f$ and target probabilities $\bar P_{ij}$ in place of the hard 0 or 1, which allows ties ($\bar P_{ij} = 1/2$) and preferences measured by several judges (§3, Eqs. 1–3). Replacing the logistic loss with the hinge loss gives RankSVM ([Joachims, 2002](#references)).
+
+**Worked example.** A misordered pair with $s_i = 0.5$, $s_j = 1.0$ costs $\log(1 + e^{0.5}) = 0.974$. The same pair ordered correctly by a margin of 2, $s_i = 2$, $s_j = 0$, costs $\log(1 + e^{-2}) = 0.127$; at equal scores the cost is $\log 2 = 0.693$. The loss keeps pushing correctly ordered pairs apart, weakly, until the margin is large.
+
+The loss is a smooth upper bound on the number of misordered pairs, up to a factor: $[\,s_i \le s_j\,] \le C_{ij}/\log 2$. Minimizing it therefore pushes AUC-like pair counts up, not NDCG.
+
+**The gradient, and the forces it defines.** The derivative of $C_{ij}$ with respect to the scores is
+
+$$
+\frac{\partial C_{ij}}{\partial s_i} = -\sigma(s_j - s_i) = -\frac{\partial C_{ij}}{\partial s_j} .
+$$
+
+Write $\lambda_{ij} = \sigma(s_j - s_i) > 0$ for the size of this push: it is close to 1 for a badly misordered pair and close to 0 for a pair ordered with a large margin. A gradient step raises $s_i$ by $\eta\lambda_{ij}$ and lowers $s_j$ by the same amount. Summing over all pairs that contain a document gives one number per document, its total force
+
+$$
+\lambda_i = \sum_{j:\, y_i > y_j} \lambda_{ij} \;-\; \sum_{j:\, y_j > y_i} \lambda_{ji},
+$$
+
+positive if the document should move up. In the worked example a misordered pair at 0.5 against 1.0 has $\lambda_{ij} = \sigma(0.5) = 0.622$, the correctly ordered pair at 2 against 0 has $\lambda_{ij} = \sigma(-2) = 0.119$. Burges (2010, §2.1) observed that the parameter update needs only these per-document sums: for a neural network the gradient is $\sum_i \lambda_i\, \partial s_i / \partial w$, one backward pass per document instead of one per pair, which brought the training time per query from close to quadratic in the number of documents to close to linear. Burges writes the gradient with the opposite sign; the convention here, positive means up, keeps the figures readable.
+
+## Listwise: a distribution over orders
+
+A pairwise loss sees two documents at a time. A **listwise** loss compares the whole predicted list with the whole ideal one. Since orders are discrete, the trick, as for classes, is to turn scores into a probability distribution. The **Plackett–Luce** model draws an order one position at a time: the first document is chosen with probability proportional to $e^{s_i}$, the second among the rest in the same way, and so on, so the probability of an order $\pi$ is
+
+$$
+P_s(\pi) = \prod_{j=1}^{n} \frac{e^{s_{\pi(j)}}}{\sum_{l=j}^{n} e^{s_{\pi(l)}}} .
+$$
+
+The order that sorts by score is the most probable one, and swapping a higher-scored document below a lower-scored one makes an order less probable ([Cao et al., 2007](#references), §4.1). Summing over all $n!$ orders is impractical, so **ListNet** keeps only the first factor, the **top-one probability** of each document,
+
+$$
+P_s(i) = \frac{e^{s_i}}{\sum_{l=1}^n e^{s_l}},
+$$
+
+a softmax over the list (§4.2, Theorem 6). The labels give a target distribution in the same way, $P_y(i) = e^{y_i}/\sum_l e^{y_l}$, and the loss is the cross-entropy $-\sum_i P_y(i) \log P_s(i)$ (§5).
+
+**Worked example.** Three documents with scores $(2, 1, 0)$ have top-one probabilities $e^2/(e^2 + e + 1) = 0.665$, then $0.245$ and $0.090$; the probability of the full order $(1, 2, 3)$ is $0.665 \cdot e/(e + 1) = 0.486$. If their labels are $(2, 0, 1)$, the target is $(0.665, 0.090, 0.245)$ and the cross-entropy is $0.987$: the loss wants the second and third documents swapped.
+
+The softmax over candidates with a cross-entropy reappears whenever one item must be picked from a list: the [multiclass note](/notes/ml/multiclass-and-multilabel) uses it over classes, and the contrastive loss that trains the [bi-encoders of semantic search](/notes/nlp/semantic-search#the-embedding-model) uses it over passages, with one relevant passage per query and the other passages of the batch as the list. A listwise loss sees the whole list but still treats all positions alike: nothing in it says that the first place matters more than the fifth.
+
+## LambdaRank: gradients weighted by NDCG
+
+RankNet minimizes the number of misordered pairs, and on the running example that leads it to the wrong priorities. Its strongest force falls on the label-2 document in fifth place, which loses three pairs to less relevant documents above it. NDCG cares more about the label-3 document in second place: one swap with the irrelevant document at the top would raise NDCG by more than anything that can happen at position 5.
+
+The observation behind **LambdaRank** ([Burges, Ragno and Le, 2006](#references)) is that training needs only the gradients with respect to the scores, the $\lambda$s, not a loss whose gradients they are. So write the gradients down directly: keep RankNet's force for each pair and multiply it by how much the pair matters to the metric,
+
+$$
+\lambda_{ij} = \sigma(s_j - s_i)\, \lvert \Delta\mathrm{NDCG}_{ij} \rvert ,
+$$
+
+where $\Delta\mathrm{NDCG}_{ij}$ is the change in NDCG if documents $i$ and $j$ swapped positions in the current ranking, all others staying put ([Burges, 2010](#references), §4.1, Eq. 6). The per-document forces $\lambda_i$ are summed as before. Of the ten force functions Burges, Ragno and Le tried, this one, the RankNet gradient scaled by the NDCG change of the swap, worked best on their validation data (§6.2).
+
+**The swap change has a closed form.** Swapping documents $i$ and $j$ at positions $p_i$ and $p_j$ changes only their two terms of the DCG. With gains $g = 2^y - 1$ and discounts $D(p) = 1/\log_2(1 + p)$, the two terms $g_i D(p_i) + g_j D(p_j)$ become $g_i D(p_j) + g_j D(p_i)$, so
+
+$$
+\lvert \Delta \mathrm{NDCG}_{ij} \rvert = \frac{\lvert g_i - g_j \rvert \, \lvert D(p_i) - D(p_j) \rvert}{\mathrm{IDCG}} .
+$$
+
+**Worked example.** In the running list, swapping the label-3 document at position 2 with the irrelevant one at position 1 changes NDCG by $7 \times (1 - 0.631)/9.393 = 0.275$. Swapping it with the label-2 document at position 5 changes NDCG by $(7 - 3)(0.631 - 0.387)/9.393 = 0.104$, and swapping the documents with labels 1 and 2 at positions 3 and 5 by only $(3 - 1)(0.5 - 0.387)/9.393 = 0.024$. With scores $2.5, 2.0, \dots, 0.0$, the totals are:
+
+<LambdaBars />
+
+The signs agree except for the label-1 document in third place, which LambdaRank pushes very slightly down, and the priorities change. RankNet's strongest upward push, $+2.429$, goes to the document in fifth place; LambdaRank's, $+0.286$ against $+0.184$, goes to the document in second place. Both push the irrelevant document at the top down hardest.
+
+**Is there a loss?** For a fixed order of the documents, the $\lambda$s are the negative gradients of $\sum \lvert\Delta \mathrm{NDCG}_{ij}\rvert \log(1 + e^{-(s_i - s_j)})$, the RankNet loss with weights; but the weights change every time the order changes, so there is no single function of the scores behind them ([Burges, 2010](#references), §4.3 and §7). Empirically, training with them appears to reach a local maximum of NDCG: Burges (2010, §4.2) describes perturbing a trained model's weights in hundreds of random directions and finding NDCG decrease in all of them. Replacing $\Delta\mathrm{NDCG}$ by the change in another metric, MAP or MRR, trains for that metric instead (§4.1).
+
+## LambdaMART: lambdas as boosting targets
+
+[Gradient boosting](/notes/ml/gradient-boosting) needs nothing but the gradient of the loss with respect to the current scores: each new tree is fitted to the negative gradient at every training point, and its leaves are set by a line search or a Newton step. Lambdas are exactly such gradients, so they plug in directly. **LambdaMART** ([Wu et al., 2010](#references); [Burges, 2010](#references), §7) is MART, Friedman's gradient boosting with regression trees, with the targets replaced by the $\lambda_i$:
+
+1. For every query, sort the documents by the current scores $F(x_i)$ and compute each document's $\lambda_i$ and its curvature $w_i = \sum_j \lvert\Delta\mathrm{NDCG}_{ij}\rvert\, \rho_{ij}(1 - \rho_{ij})$, where $\rho_{ij} = \sigma(s_j - s_i)$ and the sum runs over all pairs that contain $i$.
+2. Fit a regression tree to the $\lambda_i$ of all documents of all queries, by least squares.
+3. Set the value of leaf $l$ by a Newton step, $\gamma_l = \sum_{i \in l} \lambda_i / \sum_{i \in l} w_i$, and add the tree with a learning rate: $F \leftarrow F + \eta\, \gamma_{l(x)}$.
+
+The forces of a query sum to zero, since every pair adds $+\lambda_{ij}$ to one document and $-\lambda_{ij}$ to the other. A split on a feature that is constant within each query, such as a query feature, sends whole queries to each side; the forces on each side therefore still sum to zero, and a split over whole queries reduces no squared error. A query feature can still help deeper in a tree, once a node holds only part of each query's documents, but the overall level of a query, which a pointwise booster must model, gives LambdaMART nothing to fit. An ensemble of LambdaMART rankers won Track 1 of the 2010 Yahoo! Learning to Rank Challenge (§1), and the method is what the ranking objectives of the common boosting libraries implement, for instance `lambdarank` in LightGBM and `rank:ndcg` in XGBoost.
+
+On the synthetic data of the Code section, 1,000 test queries of 30 documents each, a linear model scores the same NDCG@5 with a pointwise and with a pairwise loss (0.647 and 0.646), boosted trees fitted pointwise reach 0.766, and LambdaMART with the same number and depth of trees reaches 0.814. The pointwise booster spends 51% of its split gain on the query feature, LambdaMART none. The gap varies with the random draw of the data: over five draws it ranged from 0.007 to 0.048, always in LambdaMART's favour. On data without a query-level effect the two boosters come much closer, which is the general picture: LambdaMART's advantage is real but often small, and a well-tuned pointwise booster is a hard baseline.
+
+## Clicks and position bias
+
+Assessor labels are expensive, and a search engine sees millions of clicks a day. Clicks are labels too, but biased ones. A user can click only on what they examine, and people examine the top of a list far more than the bottom. In an eye-tracking study, [Joachims et al. (2005)](#references) swapped the top two results of a search engine for some users and reversed the whole list for others: the first position still drew more clicks than its relevance justified, a **trust bias** in the engine's order (§5.2.1). A model trained on raw clicks learns to put first whatever was shown first.
+
+The standard model separates the two steps with the [chain rule of probability](/notes/probability/conditional-probability-and-bayes#the-chain-rule):
+
+$$
+P(\text{click} \mid \text{document}, \text{position } p) = \underbrace{P(\text{examined} \mid p)}_{\text{propensity } \theta_p} \cdot P(\text{click} \mid \text{examined}, \text{document}),
+$$
+
+with the second factor standing for relevance and the examination probability $\theta_p$ depending only on the position ([Joachims, Swaminathan and Schnabel, 2017](#references), §5.1). Dividing each click by the propensity of the position where it happened, **inverse propensity scoring**, gives an unbiased estimate of what the clicks would have been had every document been examined (Eq. 5): it is [importance sampling](/notes/probability/monte-carlo#importance-sampling), with the logged ranking as the proposal. The propensities themselves are estimated from small randomized experiments, such as swapping a result between two positions for a fraction of users (§5.3).
+
+**Worked example (simulated).** A document that 30% of users who examine it would click is shown 100,000 times at position 1, examined always, and 100,000 times at position 3, examined 40% of the time. The simulated click-through rates are 0.299 and 0.119: raw clicks say the document is two and a half times worse at position 3. Divided by the propensities 1.0 and 0.4, the estimates are 0.299 and 0.297, the same document.
+
+A second remedy changes what is extracted from the clicks rather than how they are weighted. A click on the result in position 3 when positions 1 and 2 were skipped says that the user preferred it to those two, a pairwise preference that is much less sensitive to position than the click itself (Joachims et al., 2005, §5.3). Such preferences feed a pairwise loss directly. Whatever the labels, the final judgement of a new ranker is an online experiment: an [A/B test](/notes/probability/hypothesis-tests#the-ab-test) on the behaviour of real users.
+
+## What changed
+
+| | Classification and regression | Learning to rank |
+| --- | --- | --- |
+| Output | a label or a number per item | an order of the candidates of each query |
+| Data | independent examples | lists grouped by query; split by query |
+| Metric | per item: accuracy, log loss, AUC | per list, weighted by position: P@$k$, MAP, MRR, NDCG |
+| Training signal | the gradient of the loss | the metric has none; pointwise, pairwise or listwise surrogates |
+| Best-known method | logistic regression, gradient boosting | LambdaMART: boosting on NDCG-weighted pairwise gradients |
+| Labels | given | assessors, or clicks corrected for position bias |
+
+## Limitations
+
+- **The metric is a modelling choice.** The gain $2^y - 1$, the logarithmic discount and the cutoff $k$ encode assumptions about how people read a list. Different metrics prefer different rankers, and an offline metric is only a proxy for what users do.
+- **Lambdas are a heuristic.** They are not the gradient of a fixed loss, and their success on NDCG is empirical. Each training step costs time quadratic in the length of a query's list, since every pair is visited.
+- **Documents are scored independently.** Sorting by independent scores cannot express that two near-duplicates should not both be at the top, or that a list should cover several meanings of an ambiguous query. Diversity needs a model of the whole list.
+- **Labels are scarce or biased.** Assessors disagree and are expensive; clicks need a model of user behaviour, and an error in the propensities becomes a bias in the ranker.
+- **Feedback loops.** A ranker trained on clicks on its own past rankings learns from what it chose to show; documents it never showed get no clicks and no chance.
+
+## What you should remember
+
+- Ranking data are grouped by query; only orders within a query matter, and validation must split by query.
+- P@$k$ counts relevant documents in the top $k$; AP averages precision at each relevant position; RR is $1/$position of the first relevant one; DCG sums gains $2^y - 1$ discounted by $\log_2(1 + j)$, and NDCG divides by the ideal DCG.
+- Ranking metrics are piecewise constant in the scores: zero gradient almost everywhere. Train a surrogate and validate on the metric.
+- Pointwise: regress the labels. Pairwise (RankNet): logistic loss on $s_i - s_j$ for every pair with $y_i > y_j$. Listwise (ListNet): cross-entropy between softmaxes of labels and scores.
+- LambdaRank multiplies each pair's RankNet gradient $\sigma(s_j - s_i)$ by $\lvert\Delta\mathrm{NDCG}_{ij}\rvert$; LambdaMART fits boosted trees to these lambdas with Newton leaf values.
+- Clicks are relevance times examination; inverse propensity weighting is importance sampling with the logged ranking as the proposal.
+
+## Code
+
+The running example, the forces of the figure, a comparison of four rankers on synthetic queries, and clicks under position bias:
+
+```python
+import numpy as np
+from sklearn.linear_model import Ridge, LogisticRegression
+from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.tree import DecisionTreeRegressor
+
+def dcg(y, k):                                    # y: labels in ranked order (last axis); gain 2^y - 1, discount log2(1 + position)
+    y = np.asarray(y, float)[..., :k]
+    return ((2 ** y - 1) / np.log2(np.arange(2, y.shape[-1] + 2))).sum(-1)
+def ndcg(y, s, k):                                # y, s: (queries, documents); a query without relevant documents gives nan
+    ranked = np.take_along_axis(y, np.argsort(-s, axis=-1), -1)
+    with np.errstate(invalid='ignore'):
+        return dcg(ranked, k) / dcg(-np.sort(-y, axis=-1), k)
+
+# the running example: labels in the order the model ranks six documents
+lab = np.array([0, 3, 1, 0, 2, 0]); rel = lab > 0
+ap = (np.cumsum(rel) / np.arange(1, 7))[rel].mean()
+print(rel[:3].mean().round(3), rel[:5].mean(), ap.round(4), 1 / (np.argmax(rel) + 1))  # 0.667 0.6 0.5889 0.5
+print(dcg(lab, 6).round(3), dcg(np.sort(lab)[::-1], 6).round(3), (dcg(lab, 6) / dcg(np.sort(lab)[::-1], 6)).round(3))  # 6.077 9.393 0.647
+
+def lambdas(y, s):                                # LambdaRank forces, Newton weights and RankNet forces for a batch of queries
+    g = 2.0 ** y - 1
+    pos = np.argsort(np.argsort(-s, axis=-1), axis=-1) + 1
+    disc = 1 / np.log2(1 + pos)
+    ideal = np.maximum(dcg(-np.sort(-y, axis=-1), y.shape[-1]), 1e-12)[..., None, None]
+    better = y[..., :, None] > y[..., None, :]                       # pairs (i, j) with i more relevant than j
+    rho = 1 / (1 + np.exp(s[..., :, None] - s[..., None, :]))       # the RankNet force of a pair: sigmoid(s_j - s_i)
+    dn = np.abs((g[..., :, None] - g[..., None, :]) * (disc[..., :, None] - disc[..., None, :])) / ideal
+    lam, hes, rn = np.where(better, rho * dn, 0), np.where(better, rho * (1 - rho) * dn, 0), np.where(better, rho, 0)
+    return lam.sum(-1) - lam.sum(-2), hes.sum(-1) + hes.sum(-2), rn.sum(-1) - rn.sum(-2)
+
+lam, _, ranknet = lambdas(lab[None].astype(float), np.array([[2.5, 2.0, 1.5, 1.0, 0.5, 0.0]]))
+print(ranknet.round(3), lam.round(3))
+# [[-2.234  1.571  0.182 -1.269  2.429 -0.679]] [[-0.383  0.286 -0.005 -0.052  0.184 -0.031]]
+
+# synthetic queries: 30 documents each, 6 features; feature 5 is a query feature, shared by all documents of a query
+rng = np.random.default_rng(0)
+Q, N, d = 1300, 30, 6
+X = rng.normal(size=(Q, N, d))
+X[..., 5] = rng.normal(size=(Q, 1))
+z = X[..., 0] + 0.7 * X[..., 1] + X[..., 2] * X[..., 3] + 1.5 * X[..., 5] + rng.normal(0, 0.7, (Q, N))
+Y = np.digitize(z, [1, 2, 3, 4]).astype(float)                       # graded relevance 0..4
+tr, te = slice(0, 300), slice(300, Q)                                  # split by query: 300 to train, 1000 to test
+Xtr, Ytr, Xte = X[tr].reshape(-1, d), Y[tr].ravel(), X[te].reshape(-1, d)
+score = lambda s: np.nanmean(ndcg(Y[te], s.reshape(1000, N), 5)).round(3)
+
+print('random', score(rng.normal(size=(1000, N))))                    # random 0.19
+print('linear, pointwise', score(Ridge(1.0).fit(Xtr, Ytr).predict(Xte)))   # linear, pointwise 0.647
+i = np.nonzero(Y[tr][:, :, None] > Y[tr][:, None, :])                 # linear RankNet: logistic regression on differences
+diff = X[tr][i[0], i[1]] - X[tr][i[0], i[2]]
+pairwise = LogisticRegression(fit_intercept=False).fit(np.vstack([diff, -diff]), np.r_[np.ones(len(diff)), np.zeros(len(diff))])
+print('linear, RankNet', score(Xte @ pairwise.coef_.ravel()))         # linear, RankNet 0.646
+gbm = GradientBoostingRegressor(n_estimators=100, max_depth=3, random_state=0).fit(Xtr, Ytr)
+print('trees, pointwise', score(gbm.predict(Xte)), gbm.feature_importances_.round(2))
+# trees, pointwise 0.766 [0.25 0.13 0.06 0.06 0.   0.51]
+
+F, Ft, imp = np.zeros((300, N)), np.zeros(len(Xte)), np.zeros(d)   # LambdaMART: trees fit the lambdas, leaves take a Newton step
+for m in range(100):
+    lam, hes, _ = lambdas(Y[tr], F)
+    tree = DecisionTreeRegressor(max_depth=3, random_state=0).fit(Xtr, lam.ravel())
+    leaf = tree.apply(Xtr)
+    imp += tree.tree_.compute_feature_importances(normalize=False)
+    gamma = np.bincount(leaf, lam.ravel(), leaf.max() + 1) / np.maximum(np.bincount(leaf, hes.ravel(), leaf.max() + 1), 1e-12)
+    F += 0.1 * gamma[leaf].reshape(300, N)
+    Ft += 0.1 * gamma[tree.apply(Xte)]
+print('trees, LambdaMART', score(Ft), (imp / imp.sum()).round(2))
+# trees, LambdaMART 0.814 [0.49 0.41 0.05 0.04 0.   0.  ]
+
+# clicks under position bias: relevance 0.3, examination 1.0 at position 1 and 0.4 at position 3
+for p in (1.0, 0.4):
+    clicks = rng.random(100_000) < p * 0.3
+    print(p, clicks.mean().round(3), (clicks / p).mean().round(3))   # 1.0 0.299 0.299 | 0.4 0.119 0.297
+```
+
+## Next
+
+Learning to rank assumed that every (query, document) pair comes with features, and that relevance is a property of the pair that an assessor can judge. Recommendation is ranking where the query is a person: the feed of a user, the next film, the products for a basket. Often there is no description of either side worth the name, only a record of who chose what. The [next note](/notes/ml/recommender-systems), the last of the course, learns from that record alone: the user–item matrix, the neighbours and the low-rank factors hidden in it, and how to evaluate a recommender without fooling ourselves.
+
+## References
+
+- C. Burges, T. Shaked, E. Renshaw, A. Lazier, M. Deeds, N. Hamilton, G. Hullender. [Learning to Rank using Gradient Descent](https://doi.org/10.1145/1102351.1102363). ICML, 2005. RankNet: the probabilistic pairwise cost (§3, Eqs. 1–3); NDCG with gain $2^r - 1$ (§5, Eq. 16).
+- C. J. C. Burges, R. Ragno, Q. V. Le. [Learning to Rank with Nonsmooth Cost Functions](https://papers.nips.cc/paper_files/paper/2006/hash/af44c4c56f385c43f2529f9b1b018f6a-Abstract.html). NeurIPS, 2006. LambdaRank; the choice of the force function (§6.2).
+- C. J. C. Burges. [From RankNet to LambdaRank to LambdaMART: An Overview](https://www.microsoft.com/en-us/research/wp-content/uploads/2016/02/MSR-TR-2010-82.pdf). Microsoft Research Technical Report MSR-TR-2010-82, 2010. RankNet and its factorization (§2, §2.1), IR measures (§3), LambdaRank (§4.1–4.3, Eq. 6), LambdaMART and its Newton step (§7).
+- Q. Wu, C. J. C. Burges, K. M. Svore, J. Gao. [Adapting Boosting for Information Retrieval Measures](https://doi.org/10.1007/s10791-009-9112-1). *Information Retrieval*, 13(3), 2010. LambdaMART.
+- Z. Cao, T. Qin, T.-Y. Liu, M.-F. Tsai, H. Li. [Learning to Rank: From Pairwise Approach to Listwise Approach](https://doi.org/10.1145/1273496.1273513). ICML, 2007; extended version as [MSR-TR-2007-40](https://www.microsoft.com/en-us/research/wp-content/uploads/2016/02/tr-2007-40.pdf). ListNet: permutation probability (§4.1), top-one probability (§4.2), the loss (§5).
+- T. Joachims. [Optimizing Search Engines using Clickthrough Data](https://doi.org/10.1145/775047.775067). KDD, 2002. RankSVM.
+- K. Järvelin, J. Kekäläinen. [Cumulated Gain-Based Evaluation of IR Techniques](https://doi.org/10.1145/582415.582418). *ACM Transactions on Information Systems*, 20(4), 2002. Discounted cumulated gain (§2.2) and its normalized version (§2.3).
+- C. D. Manning, P. Raghavan, H. Schütze. [*Introduction to Information Retrieval*](https://nlp.stanford.edu/IR-book/). Cambridge University Press, 2008. §8.4 (evaluation of ranked results: precision at $k$, MAP, NDCG).
+- T. Joachims, L. Granka, B. Pan, H. Hembrooke, G. Gay. [Accurately Interpreting Clickthrough Data as Implicit Feedback](https://doi.org/10.1145/1076034.1076063). SIGIR, 2005. Trust bias (§5.2.1), clicks as relative preferences (§5.3).
+- T. Joachims, A. Swaminathan, T. Schnabel. [Unbiased Learning-to-Rank with Biased Feedback](https://arxiv.org/abs/1608.04468). WSDM, 2017. The position-based propensity model and the IPS estimator (§5.1, Eq. 5), propensity estimation by swaps (§5.3).
+- E. Sokolov et al. *Машинное обучение* (HSE), lecture notes, [lecture 24: learning to rank](https://github.com/esokolov/ml-course-hse/blob/master/2019-spring/lecture-notes/lecture24-ranking.tex), 2019.

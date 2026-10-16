@@ -1,0 +1,235 @@
+---
+title: Anomaly detection
+description: "Finding the rare points that do not fit: supervised, novelty and outlier settings, density scores from a Gaussian or a mixture, distance scores from nearest neighbours and the local outlier factor, the isolation forest and its path-length score, the one-class SVM, and how to evaluate a detector and choose a threshold when anomalies are rare."
+course: ml
+section: Learning Without Labels
+order: 24
+status: published
+tags: [anomaly-detection, outliers, novelty-detection, mahalanobis, local-outlier-factor, isolation-forest, one-class-svm, average-precision]
+prerequisites: [Mixtures and the EM algorithm, Nearest neighbours, Support vector machines, Classification metrics]
+---
+
+import IsolationPaths from '../../../components/figures/anomaly-detection/IsolationPaths.astro';
+import ScoreComparison from '../../../components/figures/anomaly-detection/ScoreComparison.astro';
+
+The [previous note](/notes/ml/dimensionality-reduction) ended with models that are densities: a Gaussian mixture or probabilistic PCA says not only where the data are but how probable each point is. A fraudulent transaction, a failing sensor, a corrupted record or an intrusion is usually a point that such a model finds improbable. **Anomaly detection** turns that observation into a method: assign every point a score, high for points that do not fit, and flag the points above a threshold. Anomalies are rare, varied and often never seen before, so there is rarely a labelled training set for them, and the notion of "not fitting" has the same freedom as the notion of a cluster had. This note goes through the main families of scores, each with its own definition of unusual: low density, far from neighbours, quick to isolate, outside a learned boundary. It ends with the question that decides whether a detector is useful in practice: how to evaluate it and set its threshold when only a handful of points are anomalies.
+
+**Notation.** $x_1, \dots, x_n \in \mathbb R^d$ are the training points, $s(x)$ an anomaly score (higher means more anomalous) and $\tau$ a threshold: $x$ is flagged when $s(x) > \tau$. $y \in \{0, 1\}$ marks a true anomaly when labels exist for evaluation. $\nu$ is the expected share of anomalies (the contamination). $d_k(x)$ is the distance from $x$ to its $k$-th nearest neighbour among the training points.
+
+## Three settings
+
+What can be learned depends on what is labelled.
+
+- **Supervised.** Normal points and anomalies are both labelled. This is classification with very unequal classes, handled with the tools of the [classification metrics note](/notes/ml/classification-metrics#accuracy-and-the-imbalance-trap): class weights, resampling, and metrics that do not reward always predicting "normal". It finds anomalies of the kinds it was shown and can miss new kinds.
+- **Semi-supervised, or novelty detection.** The training set contains only normal points, known to be clean. The model describes them, and a new point is flagged if it does not fit the description. Most of the methods below are designed for this setting.
+- **Unsupervised, or outlier detection.** The training set is unlabelled and contaminated with a small share $\nu$ of anomalies; the task is to find them in the same data. The methods are the same, but they must be robust to the anomalies they are fitted on, and $\nu$ often sets the threshold.
+
+Most methods find **point anomalies**, single points unusual in themselves. A **contextual anomaly** is unusual only given a context: $-10\,^\circ$C is normal in January and anomalous in July. Such cases are reduced to point anomalies by adding the context as features or by modelling the conditional distribution given the context.
+
+## Density scores
+
+The most direct definition: an anomaly is a point of low probability under a model of the normal data. Fit a density $\hat p$ by [maximum likelihood](/notes/probability/maximum-likelihood) and use $s(x) = -\log \hat p(x)$.
+
+**One Gaussian.** For $\hat p = \mathcal N(\hat\mu, \hat\Sigma)$, the negative log-density is, up to constants, half the squared [Mahalanobis distance](/notes/probability/multivariate-gaussian#the-density)
+
+$$
+s(x) = (x - \hat\mu)^\top \hat\Sigma^{-1} (x - \hat\mu) ,
+$$
+
+the distance from the mean measured in standard deviations along each principal axis. If the normal data are Gaussian, $s(x)$ has the chi-squared distribution with $d$ degrees of freedom, which gives a threshold with a known false-alarm rate. For $d = 2$ the 99% quantile is $9.21$: flagging points with $s(x) > 9.21$, a Mahalanobis distance above $3.03$, flags 1% of normal points. Without the Gaussian assumption, [Chebyshev's inequality](/notes/probability/inequalities-and-concentration#chebyshevs-inequality) still bounds the share of normal points beyond $k$ standard deviations in one dimension by $1/k^2$, a much more conservative threshold.
+
+The mean and covariance are themselves pulled by the anomalies they should detect: a few far points inflate $\hat\Sigma$ and hide each other (**masking**). Robust estimates fit the covariance to the most concentrated part of the data, for example the minimum covariance determinant ([Rousseeuw and Van Driessen, 1999](#references)). They assume one cluster of normal points: on the two-cluster data of the Code section, a robust fit describes the dense cluster only and flags the whole second cluster, and its ROC-AUC drops from 0.886 for the ordinary Gaussian to 0.738.
+
+**A mixture.** Normal data with several modes need a [Gaussian mixture](/notes/ml/em-algorithm), with $s(x) = -\log \sum_k \pi_k \mathcal N(x \mid \mu_k, \Sigma_k)$; on the same data a two-component mixture reaches ROC-AUC 0.911. Kernel density estimates and [probabilistic PCA](/notes/ml/dimensionality-reduction#probabilistic-pca) are other choices; for PCA, the reconstruction error $\lVert x - WW^\top x \rVert^2$, the distance from the principal subspace, is a common score in its own right.
+
+Density scores have two weaknesses. Estimating a density needs many points per dimension, which limits nonparametric estimates to a few dimensions. And in high dimension **high density is not typicality**: the samples of a standard Gaussian in 100 dimensions lie in a [thin shell](/notes/probability/multivariate-gaussian#high-dimensions-the-shell) far from the mode, where the density is highest, so a point at the mode would be highly unusual and yet get the best score. Deep generative models show the same effect on images: models trained on CIFAR-10 assign higher likelihood to house numbers from SVHN than to CIFAR-10 test images, the likelihood paradox discussed with [energy-based models](/notes/generative-models/energy-based-models#out-of-distribution-detection) and [normalizing flows](/notes/generative-models/flow-architectures#interpolating-and-encoding-with-the-exact-inverse).
+
+## Distance scores: nearest neighbours and LOF
+
+A density-free definition: an anomaly is far from the other points. The **$k$-nearest-neighbour score** is $s(x) = d_k(x)$, the distance to the $k$-th nearest neighbour ([Ramaswamy, Rastogi and Shim, 2000](#references)), or the mean distance to the $k$ nearest. It needs no model, works for any distance and adapts to clusters of any shape. It inherits the weaknesses of [nearest neighbours](/notes/ml/nearest-neighbours#the-curse-of-dimensionality): the cost of neighbour search, the dependence on feature scaling, and distances that concentrate in high dimension.
+
+It also uses one global scale. Next to a dense cluster, a point at distance 1 is clearly anomalous; inside a sparse cluster, distance 1 is ordinary. A single threshold on $d_k$ either misses the first or flags the edge of the sparse cluster. The **local outlier factor** (LOF) of [Breunig et al. (2000)](#references) compares each point's density with the density of its neighbours. With $N_k(x)$ the $k$ nearest neighbours of $x$:
+
+1. The **reachability distance** of $x$ from a neighbour $o$ is $\max\big(d_k(o),\, \lVert x - o \rVert\big)$: the true distance, but never less than $o$'s own $k$-distance, which smooths the statistics for points very close to $o$.
+2. The **local reachability density** is the inverse of the mean reachability distance from the neighbours, $\text{lrd}(x) = \Big(\frac1k \sum_{o \in N_k(x)} \max\big(d_k(o), \lVert x - o \rVert\big)\Big)^{-1}$.
+3. The **local outlier factor** is the ratio of the neighbours' density to the point's own,
+
+$$
+\text{LOF}(x) = \frac{1}{k} \sum_{o \in N_k(x)} \frac{\text{lrd}(o)}{\text{lrd}(x)} .
+$$
+
+Deep inside a cluster, dense or sparse, a point is as dense as its neighbours and $\text{LOF} \approx 1$. A point next to a dense cluster but in a sparse spot has neighbours much denser than itself, and its LOF is large, even though its absolute distances are small.
+
+**Worked example.** On a line, take $k = 1$ and the points $0, 1, 2, 10, 11$. Every point except $10$ and $11$ has its nearest neighbour at distance 1; so do $10$ and $11$ (each other). All $d_1 = 1$, all reachability distances are 1, all densities are 1, and every LOF equals 1: two well-separated groups of equal density contain no local outlier. Add the point $5$: its nearest neighbour is $2$ at distance 3, so $\text{lrd}(5) = 1/\max(d_1(2), 3) = 1/3$, while $\text{lrd}(2) = 1$, and $\text{LOF}(5) = 1/(1/3) = 3$.
+
+<ScoreComparison />
+
+The figure puts four scores side by side on data built to separate them: a dense and a sparse cluster, six anomalies far from everything and two close to the dense cluster. The two local anomalies are closer to their neighbours than the fringe points of the sparse cluster are to theirs, so the 10-nearest-neighbour distance ranks the fringe first; LOF, which compares densities locally, is the only score that puts all eight anomalies on top. The comparison is built to show what LOF adds, not to rank the methods in general: on the uniform anomalies of the Code section, LOF has the lowest ROC-AUC of the distance-based scores.
+
+## Isolation forest
+
+The scores so far model the normal data and measure the distance from it. The **isolation forest** ([Liu, Ting and Zhou, 2008](#references)) measures how easy a point is to separate from the rest. Split the data recursively at random: pick a coordinate at random and a threshold uniformly between the minimum and maximum of the current points in that coordinate, and continue in each part until every point is alone. An anomaly, few and different, tends to be cut off after a few splits; a point in a dense region needs many. The number of splits on the path from the root to a point's leaf, its **path length** $h(x)$, is the score, averaged over many random trees, as in the random forests of the [bagging note](/notes/ml/bagging-and-random-forests).
+
+<IsolationPaths />
+
+The path length needs a reference scale, because trees on more points are deeper. A tree that isolates $n$ points has $n - 1$ internal nodes, like a binary search tree with $n - 1$ keys, and for random binary search trees the average depth of an unsuccessful search, which ends at one of the $n$ leaves, is known (Liu et al., Section 2, citing Preiss). It gives the normalizer
+
+$$
+c(n) = 2H(n - 1) - \frac{2(n - 1)}{n}, \qquad H(i) = 1 + \frac12 + \dots + \frac1i ,
+$$
+
+the average path length of a point in a tree on $n$ points. Since $H(n - 1) = H(n) - 1/n$, the same quantity is $c(n) = 2H(n) - 2$. The anomaly score is
+
+$$
+s(x, n) = 2^{-\mathbb E[h(x)] / c(n)} ,
+$$
+
+which is $0.5$ when the average path length equals $c(n)$, tends to 1 as it shrinks to 0, and tends to 0 as it grows to $n - 1$. Points with $s$ close to 1 are almost certainly anomalies, points with $s$ well below $0.5$ are normal, and when all points have $s \approx 0.5$ the sample has no distinct anomalies (Section 2).
+
+**Worked example.** For $n = 256$, $H(255) = 6.1204$, so $c(256) = 2 \cdot 6.1204 - 2 \cdot 255/256 = 10.249$. A point isolated after 3 splits on average scores $2^{-3/10.249} = 0.816$; one that needs 10.249 scores $0.5$; one that needs 15 scores $2^{-15/10.249} = 0.363$. The paper approximates the harmonic number by $H(i) \approx \ln i + 0.5772$ (Euler's constant), which gives $c(256) = 10.245$, a negligible difference. For small $n$ the approximation is poor: $c(3) = 2(1 + \frac12) - \frac43 = 1.667$ exactly, against $1.207$ with the logarithm. This matters for the adjustment below, applied to leaves with a few points; scikit-learn uses the exact values $c(1) = 0$ and $c(2) = 1$ and the logarithmic approximation from $n = 3$ on.
+
+Three design choices make the method fast and robust (Section 4). Each tree is grown on a **subsample** of $\psi$ points drawn without replacement, $\psi = 256$ by default, with $t = 100$ trees. Small subsamples help: fewer normal points crowd around the anomalies (swamping), and fewer anomalies shield each other (masking). Trees are grown only to the **height limit** $\lceil \log_2 \psi \rceil = 8$, the average depth, because only short paths matter; a point that reaches a leaf still holding $m > 1$ points gets $h(x) = e + c(m)$, its depth $e$ plus the average depth of the unbuilt subtree. And the score uses only comparisons, no distances, so training costs $O(t \psi \log \psi)$, scoring $O(t \log \psi)$ per point, independent of $n$, and the method is insensitive to the scale of each feature. Its weakness is the axis-aligned cuts: anomalies that differ from the data only along a diagonal, or that sit in a hole surrounded by normal points, are hard to isolate with cuts parallel to the axes, and the score map shows axis-aligned artefacts. The comparison figure above also shows the global view: like the neighbour distance, the isolation forest misses the two local anomalies of the comparison figure.
+
+## One-class SVM
+
+The **one-class SVM** ([Schölkopf et al., 2001](#references)) learns a boundary around the normal data instead of a score. In the feature space of a kernel, it separates the mapped points from the origin with the largest margin, allowing a share of them on the wrong side:
+
+$$
+\min_{w,\, \xi,\, \rho}\ \frac12 \lVert w \rVert^2 + \frac{1}{\nu n} \sum_{i=1}^n \xi_i - \rho \quad \text{subject to} \quad w^\top \varphi(x_i) \ge \rho - \xi_i,\quad \xi_i \ge 0 .
+$$
+
+The decision function is $f(x) = w^\top \varphi(x) - \rho$, negative for anomalies, and as for the [support vector machine](/notes/ml/support-vector-machines#the-dual-problem) the dual depends on the data only through the kernel: $f(x) = \sum_i \alpha_i k(x_i, x) - \rho$ with $0 \le \alpha_i \le 1/(\nu n)$ and $\sum_i \alpha_i = 1$. The parameter $\nu \in (0, 1]$ has a direct meaning, the **ν-property**: it is an upper bound on the share of training points outside the boundary and a lower bound on the share of support vectors. In the Code section, with $\nu = 0.2$, 18.7% of the training points fall outside and 21.4% are support vectors. With the [Gaussian kernel](/notes/ml/kernels#common-kernels-polynomial-and-rbf), $f$ is a weighted sum of bumps around the support vectors minus a threshold; for $\nu = 1$ the constraints force all $\alpha_i = 1/n$ and $f$ becomes a thresholded kernel density estimate. The method describes boundaries of any shape, but the kernel width and $\nu$ must be chosen without labels, the cost grows faster than linearly in $n$, and like all kernel methods it needs scaled features.
+
+## Evaluating with rare labels
+
+Even when training uses no labels, evaluation needs some: a set of points with known status, often a few hundred normal points and a few dozen anomalies collected from incidents. Three things make this evaluation unlike ordinary classification.
+
+**Accuracy is meaningless.** With 1% anomalies, flagging nothing is 99% accurate. Detectors are compared by their ranking of the points, since the threshold comes later: the ROC-AUC, the probability that a random anomaly scores above a random normal point, as derived in the [classification metrics note](/notes/ml/classification-metrics#auc-is-the-probability-of-ranking-a-positive-above-a-negative), and the **average precision** (AP), the area under the precision–recall curve.
+
+**ROC-AUC flatters rare positives.** The false-positive rate divides by the large number of normal points, so a detector can have a small false-positive rate and still bury its true alarms among false ones. Precision shows this directly, by the [base-rate calculation](/notes/probability/conditional-probability-and-bayes#bayes-formula): with 1% anomalies, a detector that finds 90% of them at a false-positive rate of 1% has precision
+
+$$
+\frac{0.9 \cdot 0.01}{0.9 \cdot 0.01 + 0.01 \cdot 0.99} = 0.476 ,
+$$
+
+so half of its alarms are false. On the 513 points of the Code section, with 13 anomalies, the methods' ROC-AUC values lie between 0.74 and 0.92 and look similar; their AP values lie between 0.15 and 0.69 and separate them far more. For rare anomalies, report the precision–recall curve and the AP ([Saito and Rehmsmeier, 2015](#references); the [precision–recall section](/notes/ml/classification-metrics#when-roc-flatters-the-precisionrecall-curve) of the metrics note), and precision among the top $k$ alarms when the alert budget is fixed.
+
+**Few labels, wide error bars.** With 13 anomalies, recall moves in steps of 7.7%, and a difference of one or two detections between methods is noise. A bootstrap over the labelled points, as in the [confidence intervals note](/notes/probability/confidence-intervals-and-bootstrap#the-bootstrap), shows how much.
+
+**Choosing the threshold.** The score ranks; the threshold decides how many points become alarms. Three common ways:
+
+- **From the contamination.** In the unsupervised setting, flag the top $\nu$ share of the training scores. scikit-learn's `contamination` parameter does this; it needs a guess of $\nu$.
+- **From a false-alarm rate.** In the novelty setting, score clean validation data and set $\tau$ at its $1 - \alpha$ quantile; about a share $\alpha$ of future normal points will be flagged. In the Code section the 99% quantile of 10,000 clean validation scores gives a false-alarm rate of 0.9% on fresh normal data, against the target 1%.
+- **From costs or capacity.** If an analyst can review 50 alerts a day, the threshold is the score of the 50th point; if a missed anomaly costs a hundred false alarms, the threshold follows from the costs, as in the [classification metrics note](/notes/ml/classification-metrics#costs-decide-the-threshold).
+
+## What changed
+
+| | Density (Gaussian, mixture) | kNN distance | LOF | Isolation forest | One-class SVM |
+| --- | --- | --- | --- | --- | --- |
+| An anomaly is | improbable under a model | far from its neighbours | sparser than its neighbours | quick to isolate | outside a learned boundary |
+| Scale | global | global | local | global | global |
+| Needs | a family of densities | a distance | a distance, $k$ | nothing but comparisons | a kernel, $\nu$ |
+| Cost to score | cheap | neighbour search | neighbour search | $O(t \log \psi)$ | kernel sum over support vectors |
+| Threshold | chi-squared quantile, likelihood | quantile | LOF well above 1 | $s$ near 1 | $f(x) < 0$, share set by $\nu$ |
+| Weak at | high dimension, multimodal data | varying densities | high dimension, cost | diagonal structure, local anomalies | choosing the kernel, large $n$ |
+
+## Limitations
+
+- **No definition fits all anomalies.** Each score encodes one notion of unusual; anomalies of another kind pass unnoticed. Combining scores, or choosing by labelled incidents, is the practical answer.
+- **High dimension.** Densities cannot be estimated, distances concentrate, and irrelevant features hide the relevant ones; scores are usually computed on a few principal components or on learned representations.
+- **Contaminated training data.** Models fitted on data that contain anomalies learn them as normal, and robust estimates assume structure (one cluster) that may not hold.
+- **Rare and changing labels.** Evaluation rests on a few dozen known anomalies, the error bars are wide, and new kinds of anomalies appear after deployment. A detector needs monitoring, like any model whose input distribution drifts.
+- **A score is not an explanation.** An analyst needs to know why a point was flagged; LOF and isolation forests give a number, not a reason.
+
+## What you should remember
+
+- Supervised detection is imbalanced classification; novelty detection learns from clean normal data; outlier detection finds anomalies in contaminated data without labels.
+- Density scores use $-\log \hat p(x)$; for one Gaussian this is the Mahalanobis distance, with a chi-squared threshold. High density is not typicality in high dimension.
+- The $k$-NN distance flags points far from their neighbours on a global scale; LOF compares a point's local density with its neighbours' and finds local outliers.
+- The isolation forest scores $s = 2^{-\mathbb E[h(x)]/c(n)}$ with $c(n) = 2H(n - 1) - 2(n - 1)/n = 2H(n) - 2$; short paths mean anomalies, $s = 0.5$ means average. Subsamples of 256 and height limit 8 keep it fast.
+- The one-class SVM separates the data from the origin in feature space; $\nu$ bounds the share of training points outside from above and the share of support vectors from below.
+- With rare anomalies, compare detectors by average precision, not accuracy or ROC-AUC alone; precision is ruled by the base rate.
+- Set the threshold from the contamination, a target false-alarm rate on clean data, or the cost and capacity of reviewing alarms.
+
+## Code
+
+The isolation-forest normalizer, a chi-squared threshold, seven scores on contaminated data, the ν-property, the base rate and a quantile threshold:
+
+```python
+import numpy as np
+from scipy import stats
+from sklearn.covariance import EmpiricalCovariance, MinCovDet
+from sklearn.mixture import GaussianMixture
+from sklearn.neighbors import NearestNeighbors, LocalOutlierFactor
+from sklearn.ensemble import IsolationForest
+from sklearn.svm import OneClassSVM
+from sklearn.metrics import roc_auc_score, average_precision_score
+
+# the isolation-forest normalizer c(n) = 2 H(n - 1) - 2 (n - 1) / n, exact and with H(i) ~ ln i + 0.5772
+H = lambda m: sum(1 / i for i in range(1, m + 1))
+c = lambda n: 2 * H(n - 1) - 2 * (n - 1) / n
+c_ln = lambda n: 2 * (np.log(n - 1) + np.euler_gamma) - 2 * (n - 1) / n
+print([round(c(n), 4) for n in (3, 256)], [round(float(c_ln(n)), 4) for n in (3, 256)], round(2 * H(256) - 2, 4))
+# [1.6667, 10.2487] [1.2074, 10.2448] 10.2487: c(n) = 2 H(n) - 2
+
+# a Gaussian threshold: squared Mahalanobis distance against the chi-squared quantile, d = 2
+print(round(stats.chi2(2).ppf(0.99), 2), round(np.sqrt(stats.chi2(2).ppf(0.99)), 2))    # 9.21 3.03
+
+# contaminated data: a dense and a sparse cluster, 13 uniform anomalies (2.5%); labels only for evaluation
+rng = np.random.default_rng(0)
+X = np.vstack([rng.normal([0, 0], 0.3, (300, 2)), rng.normal([4, 3], 1.2, (200, 2)), rng.uniform([-4, -4], [9, 8], (13, 2))])
+y = np.r_[np.zeros(500), np.ones(13)]
+d10 = NearestNeighbors(n_neighbors=11).fit(X).kneighbors(X)[0][:, 10]          # distance to the 10th neighbour
+scores = {
+    'gaussian': EmpiricalCovariance().fit(X).mahalanobis(X),
+    'robust gaussian': MinCovDet(random_state=0).fit(X).mahalanobis(X),
+    'gmm, K=2': -GaussianMixture(2, random_state=0).fit(X).score_samples(X),
+    '10-nn distance': d10,
+    'lof': -LocalOutlierFactor(n_neighbors=10).fit(X).negative_outlier_factor_,
+    'isolation forest': -IsolationForest(random_state=0).fit(X).score_samples(X),
+    'one-class svm': -OneClassSVM(nu=0.05, gamma=0.5).fit(X).decision_function(X),
+}
+for name, s in scores.items():
+    print(f'{name:17s} ROC-AUC {roc_auc_score(y, s):.3f}  AP {average_precision_score(y, s):.3f}')
+# gaussian          ROC-AUC 0.886  AP 0.512
+# robust gaussian   ROC-AUC 0.738  AP 0.145
+# gmm, K=2          ROC-AUC 0.911  AP 0.644
+# 10-nn distance    ROC-AUC 0.915  AP 0.693
+# lof               ROC-AUC 0.871  AP 0.515
+# isolation forest  ROC-AUC 0.915  AP 0.636
+# one-class svm     ROC-AUC 0.893  AP 0.516
+
+# the nu-property of the one-class SVM, solved to a tight tolerance: share outside <= nu <= share of support vectors
+for nu in (0.05, 0.2):
+    oc = OneClassSVM(nu=nu, gamma=0.5, tol=1e-7).fit(X)
+    print(nu, round((oc.decision_function(X) < -1e-6).mean(), 3), round(len(oc.support_) / len(X), 3))
+# 0.05 0.023 0.086 | 0.2 0.187 0.214
+
+# rare anomalies: precision of a detector with recall 0.9 and false-alarm rate 0.01 at a 1% base rate
+print(round(0.9 * 0.01 / (0.9 * 0.01 + 0.01 * 0.99), 3))         # 0.476
+
+# a threshold for a target false-alarm rate: the 99% quantile of scores on clean validation data
+normal = lambda m: np.vstack([rng.normal([0, 0], 0.3, (m // 2, 2)), rng.normal([4, 3], 1.2, (m // 2, 2))])
+iso = IsolationForest(random_state=0).fit(normal(1000))
+tau = np.quantile(-iso.score_samples(normal(10000)), 0.99)
+print(round((-iso.score_samples(normal(20000)) > tau).mean(), 4))   # 0.0087: the false-alarm rate on fresh normal data
+```
+
+`score_samples` of scikit-learn's isolation forest returns $-s(x, \psi)$, so its negative is the score of the paper.
+
+## Next
+
+Every detector in this note ends with a score per point, and in practice an analyst reads the list of points from the top: what matters is that the true anomalies come first, not the value of the score. That is a ranking problem, solved here without labels. The [next note](/notes/ml/learning-to-rank) supervises it: search engines, catalogues and retrievers learn to order items from relevance labels, with metrics and losses built for the top of the list.
+
+## References
+
+- V. Chandola, A. Banerjee, V. Kumar. [Anomaly detection: A survey](https://doi.org/10.1145/1541880.1541882). *ACM Computing Surveys*, 41(3), 1–58, 2009.
+- P. J. Rousseeuw, K. Van Driessen. [A Fast Algorithm for the Minimum Covariance Determinant Estimator](https://doi.org/10.1080/00401706.1999.10485670). *Technometrics*, 41(3), 212–223, 1999.
+- S. Ramaswamy, R. Rastogi, K. Shim. [Efficient algorithms for mining outliers from large data sets](https://doi.org/10.1145/335191.335437). *SIGMOD*, 427–438, 2000.
+- M. M. Breunig, H.-P. Kriegel, R. T. Ng, J. Sander. [LOF: Identifying Density-Based Local Outliers](https://doi.org/10.1145/342009.335388). *SIGMOD*, 93–104, 2000.
+- F. T. Liu, K. M. Ting, Z.-H. Zhou. [Isolation Forest](https://doi.org/10.1109/ICDM.2008.17). *ICDM*, 413–422, 2008. Section 2 (path length, $c(n)$ and the score), Section 3 (swamping and masking), Section 4 (training and evaluation, $\psi = 256$, $t = 100$, the height limit).
+- F. T. Liu, K. M. Ting, Z.-H. Zhou. [Isolation-Based Anomaly Detection](https://doi.org/10.1145/2133360.2133363). *ACM Transactions on Knowledge Discovery from Data*, 6(1), 1–39, 2012.
+- B. Schölkopf, J. C. Platt, J. Shawe-Taylor, A. J. Smola, R. C. Williamson. [Estimating the Support of a High-Dimensional Distribution](https://doi.org/10.1162/089976601750264965). *Neural Computation*, 13(7), 1443–1471, 2001.
+- E. Nalisnick, A. Matsukawa, Y. W. Teh, D. Gorur, B. Lakshminarayanan. [Do Deep Generative Models Know What They Don't Know?](https://arxiv.org/abs/1810.09136) *ICLR*, 2019.
+- T. Saito, M. Rehmsmeier. [The Precision-Recall Plot Is More Informative than the ROC Plot When Evaluating Binary Classifiers on Imbalanced Datasets](https://doi.org/10.1371/journal.pone.0118432). *PLOS ONE*, 10(3), e0118432, 2015.
+- E. Sokolov et al. *Машинное обучение* (HSE), [lecture notes, lecture 16: one-class methods and anomaly detection](https://github.com/esokolov/ml-course-hse/blob/master/2025-spring/lecture-notes/lecture16-anomaly.tex) (2025).

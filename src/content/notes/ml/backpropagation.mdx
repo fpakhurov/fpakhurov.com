@@ -1,0 +1,320 @@
+---
+title: Backpropagation
+description: "How the gradient of the loss with respect to every weight of a network is computed in one backward sweep: the computational graph, the chain rule in matrix form with shapes, the full forward and backward pass of a two-layer network with cross-entropy, why reverse mode costs about as much as a forward pass, what autograd in PyTorch computes, and checking gradients by finite differences."
+course: ml
+section: Neural Networks
+order: 19
+status: published
+tags: [backpropagation, chain-rule, computational-graph, automatic-differentiation, autograd, gradient-checking]
+prerequisites: [From linear models to networks, Gradient descent, Calculus, Linear algebra]
+---
+
+import BackpropFlow from '../../../components/figures/backpropagation/BackpropFlow.astro';
+import FiniteDifferenceError from '../../../components/figures/backpropagation/FiniteDifferenceError.astro';
+
+The [previous note](/notes/ml/neural-networks) built networks with thousands of parameters; the small digit classifier there already had 17,226. [Gradient descent](/notes/ml/gradient-descent) needs the gradient of the loss with respect to all of them at every step. For logistic regression the gradient had a closed form. For a network the loss is a composition of many functions, and writing out each partial derivative by hand is hopeless. **Backpropagation** computes all of them at once by applying the chain rule from the loss backwards, reusing every intermediate result. Its cost is a small constant times the cost of evaluating the loss, whatever the number of parameters. It was popularized for neural networks by [Rumelhart, Hinton and Williams (1986)](#references), and it is the special case for networks of **reverse-mode automatic differentiation**, which goes back to [Linnainmaa (1976)](#references) ([Baydin et al., 2018](#references), section 3.3).
+
+**Notation.** As in the previous note, $z_l = W_l h_{l-1} + b_l$ and $h_l = \varphi(z_l)$, with a scalar loss $L$. For any quantity $u$ (a scalar, a vector or a matrix), $\bar u = \partial L / \partial u$ is the gradient of the loss with respect to it, called its **adjoint**; it has the same shape as $u$. For a map $v = g(u)$ from $\mathbb R^n$ to $\mathbb R^m$, the **Jacobian** $J = \partial v / \partial u$ is the $m \times n$ matrix with entries $J_{ij} = \partial v_i / \partial u_j$. $\odot$ is the elementwise product and $e_y$ the one-hot vector of class $y$.
+
+## Why not differentiate numerically?
+
+The baseline is the definition of the derivative. Perturb one parameter, rerun the network, and divide:
+
+$$
+\frac{\partial L}{\partial \theta_i} \approx \frac{L(\theta + \varepsilon e_i) - L(\theta - \varepsilon e_i)}{2\varepsilon} .
+$$
+
+This costs two forward passes per parameter: 34,452 passes per step for the digit classifier, and impossibly many for a network with millions of weights. The result is also only approximate, as the last section shows. Symbolic differentiation, writing out each $\partial L / \partial \theta_i$ as a formula, avoids the approximation but repeats the same subexpressions in every formula.
+
+<aside class="callout"><strong>Key idea.</strong> All partial derivatives of $L$ share the factors that lie between the parameter and the loss. Computing them from the loss backwards, each adjoint is obtained from the adjoints of the quantities that use it, once, and reused for everything below it. One backward sweep then gives the whole gradient.</aside>
+
+## The computational graph
+
+Any computation of $L$ is a sequence of elementary operations. Drawn as a directed acyclic graph, the nodes are the intermediate values and an edge from $u$ to $v$ means that $v$ is computed from $u$. The forward pass evaluates the nodes in order. The backward pass visits them in reverse order and applies the chain rule: if $u$ is used by the nodes $v_1, \dots, v_k$, its influence on $L$ goes through all of them, and the multivariate chain rule adds the contributions,
+
+$$
+\bar u = \sum_{c=1}^{k} \bar v_c\, \frac{\partial v_c}{\partial u} .
+$$
+
+**Worked example: one unit.** A sigmoid unit with squared error, $z = wx + b$, $a = \sigma(z)$, $L = (a - y)^2$, at $x = 1.5$, $w = 0.8$, $b = -0.2$, $y = 1$:
+
+| | forward | | backward |
+| --- | --- | --- | --- |
+| $z = wx + b$ | $1.0$ | $\bar a = 2(a - y)$ | $-0.538$ |
+| $a = \sigma(z)$ | $0.731$ | $\bar z = \bar a\, \sigma(z)(1 - \sigma(z)) = -0.538 \cdot 0.197$ | $-0.106$ |
+| $L = (a - y)^2$ | $0.0723$ | $\bar w = \bar z\, x$, $\ \bar b = \bar z$ | $-0.159$, $\ -0.106$ |
+
+The backward column starts from $\bar L = 1$ and multiplies by one local derivative per node. The local derivative $\sigma'(z) = a(1 - a)$ uses the value $a$ stored during the forward pass, which is why the forward values are kept.
+
+## The chain rule in matrix form
+
+For vectors the same rule reads: if $v = g(u)$ with Jacobian $J$, then
+
+$$
+\bar u = J^\top \bar v \qquad (n \text{ entries} = (n \times m)\,(m \text{ entries})).
+$$
+
+The backward pass multiplies by transposed Jacobians, and it never needs to form them as matrices. Three operations cover an MLP.
+
+**A linear layer** $z = W h + b$, with $W \in \mathbb R^{m \times n}$. Since $z_i = \sum_j W_{ij} h_j + b_i$, the derivative of $L$ with respect to one weight collects only the output it feeds: $\partial L / \partial W_{ij} = \bar z_i h_j$. In matrix form,
+
+$$
+\bar W = \bar z\, h^\top \ (m \times n), \qquad \bar b = \bar z \ (m), \qquad \bar h = W^\top \bar z \ (n) .
+$$
+
+The weight gradient is an outer product of the adjoint arriving from above and the input stored from the forward pass.
+
+**An elementwise activation** $h = \varphi(z)$. Its Jacobian is diagonal, $\operatorname{diag}(\varphi'(z))$, so
+
+$$
+\bar z = \varphi'(z) \odot \bar h .
+$$
+
+For a ReLU, $\varphi'(z)$ is the mask $\mathbf 1[z > 0]$: the gradient passes through active units unchanged and is blocked at inactive ones.
+
+**A mini-batch.** With the examples as the rows of $H$, $Z = H W^\top + \mathbf 1 b^\top$ and the loss averaged over the batch,
+
+$$
+\bar H = \bar Z\, W, \qquad \bar W = \bar Z^\top H, \qquad \bar b = \bar Z^\top \mathbf 1 .
+$$
+
+$\bar Z^\top H$ sums the per-example outer products, which is how the gradients of the examples of a batch add up. A useful check: the adjoint of a quantity has its shape, and for each formula there is only one way to multiply the factors so that the shapes match.
+
+## A two-layer network, forward and backward
+
+Take $x \in \mathbb R^d$, a hidden layer of $H$ ReLU units and $K$ classes:
+
+$$
+\begin{aligned}
+z_1 &= W_1 x + b_1 \in \mathbb R^{H}, & h &= \operatorname{ReLU}(z_1), \\
+z_2 &= W_2 h + b_2 \in \mathbb R^{K}, & p &= \operatorname{softmax}(z_2), \qquad L = -\log p_y .
+\end{aligned}
+$$
+
+**Through softmax and cross-entropy.** Write $L = -z_{2,y} + \log \sum_j e^{z_{2,j}}$. Differentiating with respect to $z_{2,k}$, the first term gives $-\mathbf 1[k = y]$ and the second gives $e^{z_{2,k}} / \sum_j e^{z_{2,j}} = p_k$. Hence
+
+$$
+\bar z_2 = p - e_y :
+$$
+
+predicted probabilities minus the one-hot target, exactly the gradient of [logistic regression](/notes/ml/logistic-regression) with respect to its logits. Then the three rules above, in reverse order of the forward pass:
+
+$$
+\begin{aligned}
+\bar W_2 &= \bar z_2\, h^\top, & \bar b_2 &= \bar z_2, & \bar h &= W_2^\top \bar z_2, \\
+\bar z_1 &= \bar h \odot \mathbf 1[z_1 > 0], & \bar W_1 &= \bar z_1\, x^\top, & \bar b_1 &= \bar z_1 .
+\end{aligned}
+$$
+
+| quantity | shape | adjoint | shape of the product |
+| --- | --- | --- | --- |
+| $z_2$ | $K$ | $p - e_y$ | $K$ |
+| $W_2$ | $K \times H$ | $\bar z_2 h^\top$ | $(K \times 1)(1 \times H)$ |
+| $h$ | $H$ | $W_2^\top \bar z_2$ | $(H \times K)(K)$ |
+| $z_1$ | $H$ | $\bar h \odot \mathbf 1[z_1 > 0]$ | $H$ |
+| $W_1$ | $H \times d$ | $\bar z_1 x^\top$ | $(H \times 1)(1 \times d)$ |
+
+For a batch of $n$ examples with the loss averaged, $\bar Z_2 = (P - Y)/n$ with the one-hot targets as the rows of $Y$, and the batch formulas of the previous section take over.
+
+**Worked example.** Take $d = 2$, $H = 3$, $K = 2$, zero biases, true class $y = 1$ (the first), and
+
+$$
+x = \begin{pmatrix} 1 \\ 2 \end{pmatrix}, \qquad
+W_1 = \begin{pmatrix} 1 & 0 \\ -1 & 1 \\ 0.5 & -1 \end{pmatrix}, \qquad
+W_2 = \begin{pmatrix} 1 & -1 & 2 \\ 0.5 & 1 & -1 \end{pmatrix} .
+$$
+
+Forward: $z_1 = (1, 1, -1.5)$, so $h = (1, 1, 0)$; $z_2 = (0, 1.5)$, $p = (0.182, 0.818)$ and $L = -\log 0.182 = 1.701$. Backward:
+
+- $\bar z_2 = p - e_1 = (-0.818, 0.818)$;
+- $\bar W_2 = \bar z_2 h^\top$ has rows $(-0.818, -0.818, 0)$ and $(0.818, 0.818, 0)$;
+- $\bar h = W_2^\top \bar z_2 = (-0.409, 1.635, -2.453)$;
+- $\bar z_1 = \bar h \odot (1, 1, 0) = (-0.409, 1.635, 0)$;
+- $\bar W_1 = \bar z_1 x^\top$ has rows $(-0.409, -0.818)$, $(1.635, 3.270)$ and $(0, 0)$.
+
+The third hidden unit receives the adjoint largest in magnitude, $\bar h_3 = -2.453$, but it is inactive, so the mask stops it and its incoming weights get zero gradient from this example. A unit that is inactive for every example never learns, which is the dead ReLU of the previous note.
+
+<BackpropFlow />
+
+1. The first layer computes $z_1 = W_1 x + b_1$.
+2. The ReLU keeps the positive entries: $h = \max(0, z_1)$, and the forward pass stores the mask $\mathbf 1[z_1 > 0]$.
+3. The second layer gives the logits $z_2$, the softmax the probabilities $p$, and the loss is $L = -\log p_1$.
+4. The backward pass starts from $\bar L = 1$; through softmax and cross-entropy, $\bar z_2 = p - e_1$.
+5. The second layer gives its weight gradient $\bar W_2 = \bar z_2 h^\top$ and passes $\bar h = W_2^\top \bar z_2$ down.
+6. The ReLU mask, stored in step 2, zeroes the adjoint of the inactive unit: $\bar z_1 = \bar h \odot \mathbf 1[z_1 > 0]$.
+7. The first layer gives $\bar W_1 = \bar z_1 x^\top$ and $\bar b_1 = \bar z_1$.
+
+## Why reverse mode costs about one forward pass
+
+Count the work for one linear layer with a batch of $n$ examples. The forward product $H W^\top$ takes $n\, d_{\text{in}}\, d_{\text{out}}$ multiply–adds. The backward pass computes two products of the same size, $\bar Z W$ and $\bar Z^\top H$, so it costs twice the forward pass; the elementwise steps are negligible next to the matrix products. The whole gradient therefore costs about three forward passes, and this ratio does not depend on the number of parameters. In general, for $f: \mathbb R^n \to \mathbb R^m$, reverse mode computes the full Jacobian with $m$ backward sweeps at a cost of $m \cdot c \cdot \operatorname{ops}(f)$, where $c < 6$ is guaranteed and $c$ is typically between 2 and 3 ([Baydin et al., 2018](#references), section 3.2; [Griewank and Walther, 2008](#references)). A loss is a single number, $m = 1$, so one sweep gives the whole gradient.
+
+**Forward mode** applies the chain rule in the other direction. Along with every intermediate value $u$ it carries its derivative $\dot u = \partial u / \partial \theta_i$ with respect to one input direction, computing a Jacobian–vector product $J v$ in one pass. A gradient with respect to $n$ parameters then needs $n$ passes, at a cost of $n \cdot c \cdot \operatorname{ops}(f)$. Forward mode wins when there are few inputs and many outputs; training has millions of inputs (the parameters) and one output (the loss), which is why every deep learning library is built on reverse mode. The Code section computes the 17 partial derivatives of the worked example both ways: 17 forward-mode passes against one backward pass, with identical results.
+
+The price of reverse mode is **memory**. The backward pass needs the values of the forward pass, such as $h$ for $\bar W_2$ and the ReLU masks, so all activations of all layers must be kept until the backward pass reaches them. For large networks this, not the parameters, fills the accelerator's memory. **Gradient checkpointing** stores only some layers and recomputes the rest during the backward pass; for a network of $n$ layers it needs $O(\sqrt n)$ memory at the cost of one extra forward pass ([Chen et al., 2016](#references)).
+
+## What autograd computes
+
+Libraries such as PyTorch implement reverse mode automatically. While the forward pass runs, every operation on a tensor that requires gradients records a node of the computational graph, with a function that maps the adjoint of its output to the adjoints of its inputs. PyTorch rebuilds this graph on every forward pass, the operator-overloading approach to reverse-mode automatic differentiation ([Paszke et al., 2019](#references), section 4.3), so ordinary Python control flow is differentiable.
+
+| mathematics | PyTorch |
+| --- | --- |
+| parameters $\theta$ | tensors with `requires_grad=True` (every `nn.Parameter`) |
+| the forward computational graph | the chain of `grad_fn` nodes attached to each result |
+| start the backward pass with $\bar L = 1$ | `loss.backward()` |
+| the adjoint $\bar\theta$ | `param.grad` |
+| sum over the users of a node | gradients are added into `.grad`, so call `optimizer.zero_grad()` before each step |
+| one gradient step | `optimizer.step()` |
+| a vector–Jacobian product $v^\top J$ for a non-scalar output | `out.backward(v)` or `torch.autograd.grad(out, inputs, grad_outputs=v)` |
+| a forward pass that records nothing | `with torch.no_grad():` |
+
+Three consequences are worth knowing:
+
+- **Gradients accumulate.** Because `.grad` is added to, calling `backward()` twice without zeroing doubles the gradient. This is the multivariate chain rule's sum, and it allows gradient accumulation over several small batches on purpose.
+- **Kinks get a convention.** The ReLU has no derivative at 0; PyTorch uses 0 there. Any choice in $[0, 1]$ is a valid subgradient, and exact zeros are rare in practice.
+- **Shared weights add up.** A weight used in several places, such as the same recurrent matrix at every time step, gets the sum of the adjoints from all its uses. Unrolled over time, a recurrent network is just a computational graph with shared weights, and **backpropagation through time** is this note applied to it; the [NLP course](/notes/nlp/recurrent-networks#gradients-through-time) shows how the products of Jacobians along the time axis make those gradients vanish or explode.
+
+Autograd computes exact derivatives of the program that was run, up to floating point. It does not decide whether those derivatives are useful: a gradient that is exactly zero (a saturated sigmoid, a dead ReLU, an `argmax`) or astronomically large is computed just as faithfully.
+
+## Checking gradients by finite differences
+
+A hand-written backward pass, or a custom autograd function, can be wrong in ways that still let the loss decrease. The standard test compares it with the central difference of the first section, one coordinate at a time, through the relative error
+
+$$
+\frac{\lvert g_{\text{backprop}} - g_{\text{numeric}} \rvert}{\max(\lvert g_{\text{backprop}} \rvert, \lvert g_{\text{numeric}} \rvert)} .
+$$
+
+The central difference is better than the one-sided $[L(\theta + \varepsilon e_i) - L(\theta)]/\varepsilon$. By Taylor's theorem $L(\theta \pm \varepsilon e_i) = L \pm \varepsilon L' + \tfrac12 \varepsilon^2 L'' \pm \tfrac16 \varepsilon^3 L''' + \dots$, so the one-sided quotient has error $\tfrac12 \varepsilon L''$ while in the central one the even terms cancel and the error is $\tfrac16 \varepsilon^2 L'''$. A smaller $\varepsilon$ is not always better: each loss value carries a rounding error of about $10^{-16}$ relative in double precision, and dividing by $\varepsilon$ amplifies it.
+
+<FiniteDifferenceError />
+
+In practice:
+
+- compute in double precision (`torch.float64`); in single precision the rounding error is about $10^{-7}$ and the check becomes unreliable;
+- use $\varepsilon$ around $10^{-6}$ to $10^{-5}$ with central differences; a relative error near $10^{-8}$ or below means agreement, near $10^{-2}$ or above a bug;
+- avoid points next to kinks: if a ReLU input is within $\varepsilon$ of zero, the two sides see different slopes;
+- check a few random coordinates of each parameter tensor for a large network; `torch.autograd.gradcheck` does the same for a custom function.
+
+In the Code section, the hand-written backward pass of the worked example agrees with central differences on all 17 parameters to a relative error of $3.6 \cdot 10^{-10}$. Removing the ReLU mask from the backward pass, a typical bug, raises it to $1.0$: the third unit's weights get a nonzero gradient where the true one is zero.
+
+## What changed
+
+| | Numerical differentiation | Backpropagation |
+| --- | --- | --- |
+| Cost of the full gradient | two forward passes per parameter | about three forward passes in total |
+| Accuracy | truncation and rounding error | exact up to floating point |
+| Memory | one forward pass | all stored activations (or checkpoints) |
+| What must be written | only the forward pass | only the forward pass, with autograd |
+| Role today | testing a backward pass | how every network is trained |
+
+## Limitations
+
+- **Memory grows with depth and batch size**, because the activations of the forward pass are kept for the backward pass.
+- **It needs differentiable operations.** Discrete choices, sampling and `argmax` have zero or undefined gradients; tricks such as the [reparameterization trick](/notes/generative-models/vae#the-reparameterization-trick) of the Generative Models course make some of them differentiable.
+- **The gradient is local.** Backpropagation computes the derivative at the current weights exactly; it does not say whether gradient descent will reach a good solution, and products of many Jacobians can make the gradient vanish or explode in deep or recurrent networks.
+- **Sequential in depth.** The backward pass of a layer waits for the layer above it, which limits how much the layers of a deep network can be computed in parallel.
+
+## What you should remember
+
+- The adjoint $\bar u = \partial L / \partial u$ has the shape of $u$; a node used several times sums the contributions of its users.
+- Linear layer: $\bar W = \bar z h^\top$, $\bar b = \bar z$, $\bar h = W^\top \bar z$; activation: $\bar z = \varphi'(z) \odot \bar h$; softmax with cross-entropy: $\bar z = p - e_y$.
+- Reverse mode costs a small constant times one forward pass (about 3 for an MLP), independent of the number of parameters; forward mode needs one pass per parameter.
+- The price is memory: all activations are stored until the backward pass uses them.
+- PyTorch records the graph during the forward pass; `loss.backward()` fills `.grad` by adding, hence `zero_grad()`.
+- Check a hand-written gradient with central differences in double precision, $\varepsilon \approx 10^{-6}$, by relative error.
+
+## Code
+
+The worked example by hand and by autograd, a gradient check that catches a planted bug, the step size of finite differences, forward against reverse mode, and two autograd conventions:
+
+```python
+import numpy as np, torch
+import torch.autograd.forward_ad as fwAD
+
+# the worked example: x = (1, 2), true class 0 (the first), zero biases
+x = np.array([1.0, 2.0]); y = 0
+W1 = np.array([[1.0, 0.0], [-1.0, 1.0], [0.5, -1.0]]); b1 = np.zeros(3)
+W2 = np.array([[1.0, -1.0, 2.0], [0.5, 1.0, -1.0]]); b2 = np.zeros(2)
+
+def forward(W1, b1, W2, b2):
+    z1 = W1 @ x + b1; h = np.maximum(z1, 0); z2 = W2 @ h + b2
+    m = z2.max(); logZ = m + np.log(np.exp(z2 - m).sum())
+    return z1, h, z2, np.exp(z2 - logZ), logZ - z2[y]
+
+def backward(W1, b1, W2, b2, mask=True):
+    z1, h, z2, p, L = forward(W1, b1, W2, b2)
+    dz2 = p - np.eye(2)[y]                       # softmax + cross-entropy
+    dW2, db2, dh = np.outer(dz2, h), dz2, W2.T @ dz2
+    dz1 = dh * (z1 > 0) if mask else dh          # mask=False plants a bug: the ReLU is skipped
+    return np.outer(dz1, x), dz1, dW2, db2
+
+z1, h, z2, p, L = forward(W1, b1, W2, b2)
+dW1, db1, dW2, db2 = backward(W1, b1, W2, b2)
+print(p.round(3), round(L, 3))                   # [0.182 0.818] 1.701
+print(dW2.round(3).tolist())                      # [[-0.818, -0.818, -0.0], [0.818, 0.818, 0.0]]
+print((W2.T @ (p - np.eye(2)[y])).round(3), dW1.round(3).tolist())
+# [-0.409  1.635 -2.453] [[-0.409, -0.818], [1.635, 3.27], [-0.0, -0.0]]
+
+# the same gradients from autograd
+T = lambda a: torch.tensor(a, requires_grad=True)
+tW1, tb1, tW2, tb2 = T(W1), T(b1), T(W2), T(b2)
+loss = torch.nn.functional.cross_entropy((tW2 @ torch.relu(tW1 @ torch.tensor(x) + tb1) + tb2)[None], torch.tensor([y]))
+loss.backward()
+print(np.allclose(tW1.grad.numpy(), dW1), np.allclose(tW2.grad.numpy(), dW2))   # True True
+
+# gradient check: central differences on every parameter, relative error against backprop
+def check(mask):
+    params = [W1.copy(), b1.copy(), W2.copy(), b2.copy()]
+    grads = backward(*params, mask=mask)
+    worst, eps = 0.0, 1e-6
+    for P, G in zip(params, grads):
+        for i in np.ndindex(P.shape):
+            old = P[i]
+            P[i] = old + eps; Lp = forward(*params)[-1]
+            P[i] = old - eps; Lm = forward(*params)[-1]
+            P[i] = old
+            num = (Lp - Lm) / (2 * eps)
+            worst = max(worst, abs(num - G[i]) / max(abs(num), abs(G[i]), 1e-8))
+    return worst
+print(f'{check(True):.1e} {check(False):.1e}')   # 3.6e-10 1.0e+00
+
+# the step of a finite difference: truncation error for large steps, rounding error for tiny ones
+f = lambda a: forward(np.array([[a, 0.0], [-1.0, 1.0], [0.5, -1.0]]), b1, W2, b2)[-1]
+for eps in (1e-1, 1e-5, 1e-12):
+    print(eps, f'{abs((f(1 + eps) - f(1 - eps)) / (2 * eps) - dW1[0, 0]):.1e}')
+# 0.1 2.0e-05 | 1e-05 7.4e-12 | 1e-12 1.1e-04
+
+# forward mode needs one pass per parameter, reverse mode one pass in total
+flat = torch.cat([t.detach().flatten() for t in (tW1, tb1, tW2, tb2)])
+def L_of(theta):
+    A, a, B, b = theta[:6].view(3, 2), theta[6:9], theta[9:15].view(2, 3), theta[15:]
+    return torch.nn.functional.cross_entropy((B @ torch.relu(A @ torch.tensor(x) + a) + b)[None], torch.tensor([y]))
+def directional(v):                              # one forward-mode pass: the derivative along v
+    with fwAD.dual_level():
+        return fwAD.unpack_dual(L_of(fwAD.make_dual(flat, v))).tangent
+fwd = torch.stack([directional(torch.eye(17, dtype=flat.dtype)[i]) for i in range(17)])
+print(len(fwd), torch.allclose(fwd, torch.cat([t.grad.flatten() for t in (tW1, tb1, tW2, tb2)])))   # 17 True
+
+# autograd details: the ReLU has derivative 0 at 0, and .grad accumulates until it is zeroed
+u = torch.tensor(0.0, requires_grad=True); torch.relu(u).backward(); print(u.grad.item())   # 0.0
+w = torch.tensor(3.0, requires_grad=True)
+for _ in range(2):
+    (w ** 2).backward()
+print(w.grad.item())                              # 12.0: two backward calls add 6 + 6
+```
+
+## Next
+
+Backpropagation gives exact gradients for a network of any depth. Exact does not mean useful: in a deep stack the gradient is a product of one Jacobian per layer and can shrink or grow geometrically, and a network flexible enough to fit anything fits its training noise too. The [next note](/notes/ml/training-deep-networks) covers what makes deep networks trainable and keeps them from overfitting: initialization that preserves the scale of signals, dropout, weight decay, learning-rate schedules, data augmentation and residual connections.
+
+## References
+
+- D. E. Rumelhart, G. E. Hinton, R. J. Williams. [Learning representations by back-propagating errors](https://doi.org/10.1038/323533a0). *Nature*, 323(6088):533–536, 1986.
+- S. Linnainmaa. [Taylor expansion of the accumulated rounding error](https://doi.org/10.1007/BF01931367). *BIT Numerical Mathematics*, 16(2):146–160, 1976.
+- A. G. Baydin, B. A. Pearlmutter, A. A. Radul, J. M. Siskind. [Automatic differentiation in machine learning: a survey](https://arxiv.org/abs/1502.05767). *Journal of Machine Learning Research*, 18(153):1–43, 2018. Sections 3.1–3.2 (forward and reverse mode, their costs), section 3.3 (history).
+- A. Griewank, A. Walther. [*Evaluating Derivatives: Principles and Techniques of Algorithmic Differentiation*](https://doi.org/10.1137/1.9780898717761), 2nd ed. SIAM, 2008.
+- T. Chen, B. Xu, C. Zhang, C. Guestrin. [Training deep nets with sublinear memory cost](https://arxiv.org/abs/1604.06174). arXiv:1604.06174, 2016.
+- A. Paszke et al. [PyTorch: an imperative style, high-performance deep learning library](https://arxiv.org/abs/1912.01703). NeurIPS, 2019. Section 4.3 (automatic differentiation).
+- I. Goodfellow, Y. Bengio, A. Courville. [*Deep Learning*](https://www.deeplearningbook.org/). MIT Press, 2016. Section 6.5 (back-propagation and other differentiation algorithms).
+- C. M. Bishop. [*Pattern Recognition and Machine Learning*](https://www.microsoft.com/en-us/research/publication/pattern-recognition-machine-learning/). Springer, 2006. Section 5.3 (error backpropagation; 5.3.3 on its efficiency and numerical checks).
+- PyTorch documentation: [Autograd mechanics](https://pytorch.org/docs/stable/notes/autograd.html), [`torch.autograd.gradcheck`](https://pytorch.org/docs/stable/generated/torch.autograd.gradcheck.gradcheck.html), [forward-mode AD](https://pytorch.org/tutorials/intermediate/forward_ad_usage.html).
+- E. Sokolov et al. *Машинное обучение* (HSE), lecture notes, [lecture 7: introduction to deep learning](https://github.com/esokolov/ml-course-hse/blob/master/2025-fall/lecture-notes/lecture07-deeplearning.tex), and the class materials on [PyTorch tensors, autograd and MLPs](https://github.com/esokolov/ml-course-hse/blob/master/2025-fall/seminars/sem07-torch-mlp.ipynb).
