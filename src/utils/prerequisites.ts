@@ -11,8 +11,6 @@
 export type PrerequisiteTarget = { note: string; anchor?: string } | { href: string };
 
 const MML = 'https://mml-book.github.io/';
-const D2L_MLP = 'https://d2l.ai/chapter_multilayer-perceptrons/index.html';
-const D2L_BACKPROP = 'https://d2l.ai/chapter_multilayer-perceptrons/backprop.html';
 const D2L_LINEAR = 'https://d2l.ai/chapter_linear-classification/index.html';
 
 const background: Record<string, PrerequisiteTarget> = {
@@ -34,11 +32,11 @@ const background: Record<string, PrerequisiteTarget> = {
   'Определители': { href: MML },
   'Trigonometry': { href: 'https://en.wikipedia.org/wiki/Trigonometric_functions' },
   'Тригонометрия': { href: 'https://ru.wikipedia.org/wiki/Тригонометрические_функции' },
-  // Neural networks: Zhang, Lipton, Li and Smola, "Dive into Deep Learning".
-  'Neural networks': { href: D2L_MLP },
-  'Нейронные сети': { href: D2L_MLP },
-  'Backpropagation': { href: D2L_BACKPROP },
-  'Обратное распространение ошибки': { href: D2L_BACKPROP },
+  // Neural networks and other machine-learning background: the notes of the ML course.
+  'Neural networks': { note: 'ml/neural-networks' },
+  'Нейронные сети': { note: 'ml/neural-networks' },
+  'Backpropagation': { note: 'ml/backpropagation' },
+  'Обратное распространение ошибки': { note: 'ml/backpropagation' },
   'Python basics': { href: 'https://docs.python.org/3/tutorial/' },
   'Основы Python': { href: 'https://docs.python.org/3/tutorial/' },
   // Sections of the course notes.
@@ -51,12 +49,30 @@ const background: Record<string, PrerequisiteTarget> = {
   'Binary cross-entropy': { note: 'generative-models/entropy-and-divergences', anchor: 'cross-entropy-surprise-under-a-wrong-belief' },
   'Бинарная кросс-энтропия': { note: 'generative-models/entropy-and-divergences', anchor: 'cross-entropy-surprise-under-a-wrong-belief' },
   'Maximum likelihood': { note: 'probability/maximum-likelihood' },
+  'Conditional expectation': { note: 'probability/conditional-expectation' },
+  'Условное математическое ожидание': { note: 'probability/conditional-expectation' },
+  'The multivariate Gaussian': { note: 'probability/multivariate-gaussian' },
+  'Многомерное нормальное распределение': { note: 'probability/multivariate-gaussian' },
+  'The law of large numbers': { note: 'probability/law-of-large-numbers' },
+  'Закон больших чисел': { note: 'probability/law-of-large-numbers' },
+  'The central limit theorem': { note: 'probability/central-limit-theorem' },
+  'Центральная предельная теорема': { note: 'probability/central-limit-theorem' },
+  'Bayesian inference': { note: 'probability/bayesian-inference' },
+  'Байесовский вывод': { note: 'probability/bayesian-inference' },
+  'Confidence intervals and the bootstrap': { note: 'probability/confidence-intervals-and-bootstrap' },
+  'Доверительные интервалы и бутстрэп': { note: 'probability/confidence-intervals-and-bootstrap' },
   'Markov chain Monte Carlo': { note: 'probability/markov-chain-monte-carlo' },
   'LoRA': { note: 'nlp/peft', anchor: 'lora-a-low-rank-update' },
   'Марковские методы Монте-Карло (MCMC)': { note: 'probability/markov-chain-monte-carlo' },
   'Метод максимального правдоподобия': { note: 'probability/maximum-likelihood' },
-  'Gradient descent': { note: 'generative-models/fitting-distributions-with-kl', anchor: 'how-the-parameters-are-trained' },
-  'Градиентный спуск': { note: 'generative-models/fitting-distributions-with-kl', anchor: 'how-the-parameters-are-trained' },
+  'Gradient descent': { note: 'ml/gradient-descent' },
+  'Least squares': { note: 'ml/least-squares' },
+  'Метод наименьших квадратов': { note: 'ml/least-squares' },
+  'Regularization': { note: 'ml/regularization' },
+  'Регуляризация': { note: 'ml/regularization' },
+  'Stochastic gradient descent': { note: 'ml/stochastic-and-adaptive-optimizers' },
+  'Стохастический градиентный спуск': { note: 'ml/stochastic-and-adaptive-optimizers' },
+  'Градиентный спуск': { note: 'ml/gradient-descent' },
   'Gaussian distributions': { note: 'generative-models/gaussian-distributions' },
   'Convolutional networks': { note: 'generative-models/training-background', anchor: 'a-convolution-layer' },
   'Convolutions': { note: 'generative-models/training-background', anchor: 'a-convolution-layer' },
@@ -66,8 +82,8 @@ const background: Record<string, PrerequisiteTarget> = {
   'GAN Вассерштейна': { note: 'generative-models/wgan' },
   'Linear models': { href: D2L_LINEAR },
   'Линейные модели': { href: D2L_LINEAR },
-  'Logistic regression': { note: 'nlp/bag-of-words-and-tf-idf', anchor: 'a-linear-classifier-on-counts' },
-  'Логистическая регрессия': { note: 'nlp/bag-of-words-and-tf-idf', anchor: 'a-linear-classifier-on-counts' },
+  'Logistic regression': { note: 'ml/logistic-regression' },
+  'Логистическая регрессия': { note: 'ml/logistic-regression' },
 };
 
 export interface PrerequisiteLink { label: string; href: string; external: boolean }

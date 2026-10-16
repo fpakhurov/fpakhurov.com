@@ -2,6 +2,25 @@
 
 Notable changes to the site, newest first. Each entry gives the date, what changed and why.
 
+## 2026-10-16
+
+- **Machine Learning: the course written.** Every topic of the course map is now a note, in English and Russian: 27 notes in seven sections.
+  - *The Learning Problem*: what machine learning is, data, features and leakage, validation and overfitting, nearest neighbours.
+  - *Linear Regression*: least squares, gradient descent, stochastic and adaptive optimizers, regularization.
+  - *Linear Classification*: linear classifiers and surrogate losses, logistic regression, classification metrics, support vector machines, kernels, multiclass and multilabel classification.
+  - *Trees and Ensembles*: decision trees, the bias–variance decomposition, bagging and random forests, gradient boosting with stacking.
+  - *Neural Networks*: from linear models to networks, backpropagation, training deep networks.
+  - *Learning Without Labels*: clustering, mixtures and the EM algorithm, dimensionality reduction, anomaly detection.
+  - *Beyond Classification*: learning to rank, recommender systems.
+
+  The scope and order follow the HSE course "Машинное обучение" (E. Sokolov), whose lecture notes the notes cite; the text, figures, examples and code are the site's own.
+
+  The course is written as the bridge between the others. Each method links back to the probability result it rests on (losses as likelihoods, regularization as a prior, validation error bars from the limit theorems, the best predictor as a conditional expectation). It also points forward to where NLP and Generative Models use it: logistic regression and softmax in text classifiers and language models, backpropagation in recurrent networks, EM in the VAE, PCA in autoencoders, k-means in VQ codebooks, kernels in KID, ranking in retrieval. The opening note draws this bridge as a figure.
+
+  Each note ends with a Code section that runs as written, on synthetic data or scikit-learn's bundled datasets, and its printed numbers match the text. About 50 figures are computed at build time and assert their numbers. The prerequisites "Logistic regression", "Gradient descent", "Neural networks" and "Backpropagation" in the other courses now link to these notes instead of external textbooks.
+
+  Why: the course map was all planned topics, and the course graph runs through it from Probability Theory to NLP and Generative Models.
+
 ## 2026-10-15
 
 - **Generative Models: everything in the course notebooks is now on the site.** Every seminar and homework notebook of the HSE *Deep Generative Models* course (`spring-2025-long`) was checked cell by cell against the notes. Seven new notes, in English and Russian, cover the notebooks that had no note:
