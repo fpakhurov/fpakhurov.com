@@ -1,0 +1,409 @@
+---
+title: "Scaling GANs: progressive growing, self-attention and BigGAN"
+description: "How GANs reached megapixel faces and class-conditional ImageNet: ProGAN grows both networks from 4 × 4 with a fade-in, SAGAN adds self-attention, spectral normalization in both networks, two learning rates and the hinge loss, and BigGAN scales batch and width, conditions with shared embeddings and a projection discriminator, and trades variety for fidelity with the truncation trick."
+course: generative-models
+section: GANs
+order: 10
+status: published
+tags: [gan, progan, progressive-growing, sagan, self-attention, biggan, truncation-trick, hinge-loss, projection-discriminator, orthogonal-regularization]
+prerequisites: [Generative adversarial networks, Wasserstein GANs and Lipschitz constraints, "Batch normalization, gradients and convolutions", Self-attention]
+---
+
+import SelfAttentionFlow from '../../../components/figures/gan-scaling/SelfAttentionFlow.astro';
+import TruncationCurves from '../../../components/figures/gan-scaling/TruncationCurves.astro';
+
+The [previous note](/notes/generative-models/wgan) gave GAN training a loss that keeps its gradient when the two distributions do not overlap, and two ways to keep the critic Lipschitz: the gradient penalty and spectral normalization. With the [DCGAN guidelines](/notes/generative-models/gans#architecture-the-dcgan-guidelines) for the networks, that is enough to train on faces or bedrooms at $64 \times 64$. It is not enough for megapixel images or for a dataset of a thousand classes. Between 2017 and 2019 three papers closed most of that gap, each with a different idea. **ProGAN** grows both networks during training, from $4 \times 4$ to $1024 \times 1024$ ([Karras et al., 2018](#references)). **SAGAN** adds self-attention, so that distant parts of an image can be made consistent, and settles a set of stabilizing choices ([Zhang et al., 2019](#references)). **BigGAN** keeps SAGAN's recipe and scales it up: eight times the batch, wider layers and better class conditioning ([Brock, Donahue and Simonyan, 2019](#references)). This note follows the three steps and what each one measured.
+
+**Notation.** $G$ is the generator, $D$ the discriminator, $z \sim p_z$ the latent code and $x$ an image. As in the [GAN note](/notes/generative-models/gans), $P$ is the data distribution, with density $p_{\text{data}}$, and $p_g$ is the generator's density. $c \in \{1, \dots, K\}$ is a class label ($K = 1000$ for ImageNet) and $e(c)$ its learned embedding vector. A feature map has $C$ channels and $H \times W$ positions, $N = HW$. The **Inception Score** (IS, higher is better) and the **Fréchet Inception Distance** (FID, lower is better) are the two numbers every paper here reports. They are defined in the evaluation notes later in the course ([IS](/notes/generative-models/inception-score), [FID](/notes/generative-models/fid)); for now, IS rewards samples that a pretrained classifier recognizes confidently and that spread over many classes, and FID measures how far the features of generated images are from those of real ones.
+
+## Why bigger images and more classes are hard
+
+Three problems appear as soon as the resolution or the number of classes grows.
+
+- **The discriminator wins too easily.** Higher resolution makes generated images easier to tell apart from real ones, which amplifies the gradient problem of the [GAN note](/notes/generative-models/gans#step-2-substitute-the-optimal-discriminator-and-recognize-js). Large images also force small minibatches to fit in memory, which makes training less stable ([Karras et al., 2018](#references), Section 1).
+- **Convolutions are local.** On ImageNet, convolutional GANs drew classes defined by texture, such as ocean or sky, well, and failed on classes with consistent geometry: dogs had realistic fur but no clearly separated feet ([Zhang et al., 2019](#references), Section 1).
+- **One generator must cover many modes.** A thousand classes are a thousand groups of modes, and a [collapse](/notes/generative-models/gans#mode-collapse-and-how-to-fight-it) onto a few of them is easy.
+
+## ProGAN: growing the networks
+
+ProGAN's answer to the first problem is a curriculum. Start with tiny images, which carry less information and have fewer modes, and add resolution as training proceeds, so that the networks first learn the large-scale structure and then finer and finer detail ([Karras et al., 2018](#references), Section 2). Both networks start at $4 \times 4$. Each time the resolution doubles, a block of layers is added to the end of $G$ and its mirror image to the start of $D$. All existing layers stay trainable. At $1024 \times 1024$ the generator has eight such doublings behind it.
+
+### Fade-in of new layers
+
+A new block starts with random weights. Switching it on abruptly would shock the layers that are already trained. ProGAN fades it in (Figure 2 of the paper). Let $a_r$ be the generator's features at resolution $r$, $\mathrm{up}$ nearest-neighbour upsampling by 2, $\mathrm{toRGB}$ a $1 \times 1$ convolution from features to colours, and $\mathrm{block}_{2r}$ the new convolutions. During the transition to resolution $2r$ the output image is
+
+$$
+\begin{aligned}
+x_{2r} ={}& (1 - \alpha)\,\mathrm{up}\big(\mathrm{toRGB}_r(a_r)\big) \\
+&+ \alpha\,\mathrm{toRGB}_{2r}\big(\mathrm{block}_{2r}(\mathrm{up}(a_r))\big),
+\end{aligned}
+$$
+
+with $\alpha$ rising linearly from $0$ to $1$. At $\alpha = 0$ the network is the old one with its output upsampled; at $\alpha = 0.25$ three quarters of each pixel still come from the old path. The discriminator mirrors this with average pooling by 2 and $1 \times 1$ $\mathrm{fromRGB}$ layers. Real images are downscaled to the current resolution and, during a transition, interpolated between the two resolutions in the same way as the generator's output.
+
+The schedule is counted in real images shown to $D$: 800k images at $4 \times 4$, then for each new resolution 800k images of fade-in and 800k of stabilization. The minibatch is 16 up to $128 \times 128$ and shrinks to 14, 6 and 3 at $256^2$, $512^2$ and $1024^2$ to fit in memory (Appendix A.1).
+
+### Minibatch standard deviation
+
+To fight mode collapse, [minibatch discrimination](/notes/generative-models/gans#mode-collapse-and-how-to-fight-it) lets the discriminator see statistics of the whole batch through a learned tensor. ProGAN replaces it with a layer that has no parameters (Section 3). Near the end of $D$, at $4 \times 4$, it computes the standard deviation of every feature at every position over the minibatch, averages these into one number, and appends that number as an extra constant feature map, so 512 channels become 513 (Table 2). A collapsed batch has a small spread, and $D$ can learn to reject it.
+
+**Toy example.** One feature at one position, over a batch of four. Real images give $(1, -1, 2, 0)$, with standard deviation $1.118$. A collapsed generator gives $(1.0, 1.1, 0.9, 1.0)$, with standard deviation $0.071$. The extra channel carries $1.118$ for the real batch and $0.071$ for the fake one, and a single weight on it separates them.
+
+In the ablation the layer improved the sliced Wasserstein distance (a patch-statistics metric; see [below](#what-progressive-growing-bought)) where minibatch discrimination did not (Table 1, rows e and e*).
+
+### Equalized learning rate
+
+ProGAN initializes every weight from $\mathcal N(0, 1)$ and multiplies it at every forward pass by the per-layer constant of [He initialization](/notes/ml/training-deep-networks#initialization-that-preserves-the-scale) (Section 4.1):
+
+$$
+\hat w = \sqrt{2 / n_{\text{in}}}\;w, \qquad w \sim \mathcal N(0, 1),
+$$
+
+where $n_{\text{in}}$ is the fan-in of the layer. At initialization this is the He initialization. The difference shows during training. [Adam](/notes/ml/stochastic-and-adaptive-optimizers#adam) divides each update by a running estimate of the gradient's scale, so it moves every stored parameter by roughly the learning rate per step, whatever the parameter's own scale. If the stored parameters have different scales, the same step is a large relative change for some and a small one for others.
+
+**Worked example.** ProGAN uses learning rate $10^{-3}$. A $3 \times 3$ convolution with 512 input channels has $n_{\text{in}} = 4608$ and He scale $\sqrt{2/4608} = 0.0208$; a $1 \times 1$ $\mathrm{fromRGB}$ layer with 3 input channels has scale $\sqrt{2/3} = 0.816$. With He-initialized stored weights, one step changes the first by about $10^{-3}/0.0208 = 4.8\%$ of its scale and the second by $0.12\%$, a factor of 39. With the scaling at run time every stored weight has scale 1, and every layer changes by about $0.1\%$ per step: the learning speed is equal across layers, hence the name.
+
+### Pixelwise feature normalization
+
+GANs are prone to an escalation of signal magnitudes as the two networks compete (Section 4). Instead of batch normalization, the ProGAN generator normalizes the feature vector at each pixel after every $3 \times 3$ convolution (Section 4.2):
+
+$$
+b_{x,y} = \frac{a_{x,y}}{\sqrt{\frac1C\sum_{j=1}^{C}\big(a^{j}_{x,y}\big)^2 + \varepsilon}},
+$$
+
+where $a_{x,y} \in \mathbb R^C$ is the vector of the $C$ channels at pixel $(x, y)$ and $\varepsilon = 10^{-8}$. For $a = (3, 4)$ with $C = 2$, the mean square is $12.5$ and $b = (0.849, 1.131)$: the root mean square of the channels becomes 1, so the vector has length $\sqrt C = 1.414$. The layer has no parameters and does not mix examples. The authors found it rarely changed the results but prevented the escalation when it occurred.
+
+Neither network uses batch, layer or weight normalization (Appendix A.1). The loss is [WGAN-GP](/notes/generative-models/wgan#wgan-gp-gradient-penalty) with one critic step per generator step ($n_{\text{critic}} = 1$) and an extra term $0.001\,\mathbb E_{x\sim P}[D(x)^2]$ that keeps the critic's output from drifting far from zero; Adam has $\beta_1 = 0$, $\beta_2 = 0.99$. The latent is 512-dimensional, normalized to lie on a hypersphere. Images are sampled from an exponential moving average of the generator's weights with decay 0.999. The same network also trained with the least-squares loss, so the contributions are largely independent of the loss (Section 6.3).
+
+### What progressive growing bought
+
+Table 1 of the paper adds the contributions one at a time on CelebA at $128 \times 128$, in a deliberately small network trained for 10M real images. The metric is the **sliced Wasserstein distance** (SWD) between the distributions of $7 \times 7$ patches of real and generated images at several levels of a Laplacian pyramid, averaged over the levels; lower is better.
+
+| Configuration (cumulative) | Average SWD $\times 10^3$ |
+| --- | --- |
+| (a) WGAN-GP baseline, minibatch 64 | 9.28 |
+| (b) + progressive growing | 4.28 |
+| (c) + minibatch 16 | 46.23 |
+| (d) + revised hyperparameters, no batch or layer norm | 8.07 |
+| (e) + minibatch standard deviation | 7.04 |
+| (f) + equalized learning rate | 4.39 |
+| (g) + pixelwise normalization | 3.56 |
+| (h) full network, trained to convergence | 2.96 |
+
+Progressive growing alone more than halves the distance, from 9.28 to 4.28. Row (c) shows why the other changes were needed: shrinking the minibatch to what high resolution allows breaks the baseline. Progressive growing is also faster, since most iterations run at low resolution: at $1024 \times 1024$ it reached 6.4M images in 96 hours on one GPU, where the fixed network would have needed about 520 hours, a $5.4\times$ speed-up (Section 6.2).
+
+For the headline result the authors built **CelebA-HQ**, 30,000 face images at $1024 \times 1024$ selected and processed from CelebA (Appendix C), and trained on 8 Tesla V100 GPUs for 4 days (Section 6.3). The model also produced $256 \times 256$ images in 30 LSUN categories and set a record unsupervised Inception Score of 8.80 on CIFAR-10 (Section 6.5).
+
+## SAGAN: self-attention for long-range structure
+
+ProGAN worked on faces, which are aligned and of one kind. On ImageNet the difficulty is different: many classes, objects anywhere in the frame, and structure that spans the whole image.
+
+### Why convolutions miss long-range structure
+
+A $3 \times 3$ convolution with stride 1 mixes each position with its immediate neighbours. A stack of $L$ such layers sees a $(2L + 1) \times (2L + 1)$ window, so information travels at most one position per layer: the output at one position depends on an input 16 positions away only after 16 layers. A network can relate distant regions, but only through many layers that must coordinate, which a small model may not represent and an optimizer may not find. Larger kernels would help at the cost of the efficiency of local convolutions ([Zhang et al., 2019](#references), Section 1). Self-attention connects every pair of positions in one layer.
+
+### The self-attention block
+
+SAGAN adapts the non-local block, used earlier to model dependencies in video, to both networks of a GAN ([Zhang et al., 2019](#references), Section 3). In this section $x$ is not an image: it is the feature map that enters the block, viewed as $N$ vectors $x_i \in \mathbb R^C$, one per position. Three $1 \times 1$ convolutions, which act on each position separately, give
+
+$$
+f(x_i) = W_f x_i, \quad g(x_i) = W_g x_i, \quad h(x_i) = W_h x_i,
+$$
+
+with $W_f, W_g, W_h \in \mathbb R^{\bar C \times C}$. For every pair of positions a score and an attention weight are computed:
+
+$$
+\begin{gathered}
+s_{ij} = f(x_i)^\top g(x_j),\\
+\beta_{j,i} = \frac{\exp(s_{ij})}{\sum_{k=1}^{N}\exp(s_{kj})} .
+\end{gathered}
+$$
+
+$\beta_{j,i}$ is how much the block attends to position $i$ when it produces position $j$; for each $j$ the weights sum to 1 over $i$. The output at $j$ is a weighted sum of the values $h(x_i)$ from all positions, mapped back to $C$ channels by a fourth $1 \times 1$ convolution $W_v \in \mathbb R^{C \times \bar C}$, and added to the input with a learned scalar $\gamma$:
+
+$$
+\begin{gathered}
+o_j = W_v \sum_{i=1}^{N} \beta_{j,i}\, h(x_i),\\
+y_j = \gamma\, o_j + x_j .
+\end{gathered}
+$$
+
+<SelfAttentionFlow />
+
+1. Three $1 \times 1$ convolutions turn the feature map into $f(x)$, $g(x)$ and $h(x)$, each with $\bar C$ channels.
+2. The scores $s_{ij}$ form an $N \times N$ map; a softmax over $i$ turns each row into attention weights.
+3. Each position collects the values of all positions with its weights; $W_v$ restores $C$ channels.
+4. The result is scaled by $\gamma$ and added to the input.
+
+**Toy example.** Three positions and $\bar C = 1$. Let $f(x) = (2, 0, -1)$ over the positions $i = 1, 2, 3$, and take position $j = 1$ with $g(x_1) = 1$. The scores are $s_{i1} = (2, 0, -1)$ and the softmax gives $\beta_{1,\cdot} = (0.844, 0.114, 0.042)$, which sums to 1. With values $h(x) = (1, 3, 5)$, position 1 collects $0.844 \cdot 1 + 0.114 \cdot 3 + 0.042 \cdot 5 = 1.396$, which $W_v$ maps to $o_1$. While $\gamma = 0$, $y_1 = x_1$ whatever $o_1$ is.
+
+**Why $\gamma$ starts at 0.** At initialization the block is the identity, so the network first learns from local convolutional evidence, which is easier, and lets in the non-local evidence as $\gamma$ grows (Section 3). The three maps are narrow: SAGAN uses $\bar C = C/8$ to save memory, having seen no significant loss for $\bar C = C/k$ with $k = 1, 2, 4, 8$.
+
+In the language of the [self-attention note](/notes/nlp/attention#scaled-dot-product-attention), $g(x_j)$ is the query of position $j$, $f(x_i)$ the key and $h(x_i)$ the value of position $i$. Two differences from the Transformer's version: the scores are not divided by $\sqrt{\bar C}$, and the block is a single head inside a convolutional network rather than a stack of attention layers.
+
+**Where to put it.** The attention map has $N^2$ entries per image: $1{,}048{,}576$ on a $32 \times 32$ feature map and $16{,}777{,}216$ on $64 \times 64$. In SAGAN's experiments the block sits at one stage of the networks, and the stage matters. On larger maps it helped more: with the block at $8 \times 8$ the FID was 22.98, at $32 \times 32$ 18.28 and at $64 \times 64$ 18.65, against 22.96 without attention. Residual blocks with the same number of parameters did worse, for example 27.33 instead of 18.28 at $32 \times 32$, so the gain is not just extra capacity (Section 5.2, Table 1). On small maps attention plays a role similar to a local convolution. The learned attention maps follow object shapes and similar colours and textures rather than fixed neighbourhoods (Figure 5).
+
+### Spectral normalization in both networks
+
+SN-GAN applied [spectral normalization](/notes/generative-models/wgan#sn-gan-spectral-normalization) to the discriminator to keep it Lipschitz. SAGAN applies it to every layer of the generator too, on the evidence that a well-conditioned generator trains better: it prevents the escalation of parameter magnitudes and unusual gradients (Section 4.1). For the generator this is not a Lipschitz requirement of the loss; it is a stabilizer. With spectral normalization in both networks, training was stable with one discriminator step per generator step, whereas the baseline with spectral normalization only in $D$ collapsed early under 1:1 updates; the SN-GAN paper had avoided this with 5 discriminator steps per generator step (Section 5.1).
+
+### Two learning rates
+
+A regularized discriminator learns slowly, which is why WGAN-GP and SN-GAN take several discriminator steps per generator step. SAGAN instead gives the two networks different learning rates, the **two time-scale update rule** (TTUR) of [Heusel et al. (2017)](#references): $4 \cdot 10^{-4}$ for $D$ and $10^{-4}$ for $G$, with Adam $\beta_1 = 0$, $\beta_2 = 0.9$, and one step each (Section 5). One faster discriminator step is cheaper than five slow ones. The two changes add up (Figure 4): with spectral normalization in both networks but without TTUR, the FID reached 33.39 after 160k iterations and then worsened to 72.41 at 260k; with TTUR as well it kept improving, to 22.96 after one million iterations.
+
+### The hinge loss
+
+SAGAN trains with the **hinge** version of the adversarial loss, which SN-GAN and the projection discriminator also used (Eq. 4):
+
+$$
+\begin{aligned}
+\mathcal L_D ={}& \mathbb E_{x\sim P}\big[\max(0,\, 1 - D(x))\big]\\
+&+ \mathbb E_{z\sim p_z}\big[\max(0,\, 1 + D(G(z)))\big],\\
+\mathcal L_G ={}& -\mathbb E_{z\sim p_z}\big[D(G(z))\big].
+\end{aligned}
+$$
+
+$D$ outputs a real number without a sigmoid. It is asked to score real images at least $1$ and fakes at most $-1$; beyond these margins an example contributes nothing. The generator's loss is the same as in the [WGAN](/notes/generative-models/wgan#wgan-losses). In the class-conditional version, $D$ also receives the label: $D(x, c)$ on real pairs and $D(G(z, c), c)$ on generated ones.
+
+**Toy example.** Real scores $(1.5, 0.4)$ and fake scores $(-2, 0.3)$ give $\mathcal L_D = \tfrac12(0 + 0.6) + \tfrac12(0 + 1.3) = 0.95$. Only the second real image and the second fake contribute, and only they produce gradients for $D$; the other two are already beyond their margins. The generator's loss is $-\tfrac12(-2 + 0.3) = 0.85$.
+
+Compared with the WGAN critic loss, the hinge stops pushing scores apart once they clear the margin, so the discriminator gains nothing by making its scores ever larger. The margin of 1 is meaningful only because spectral normalization fixes the scale of $D$; an unconstrained network could rescale its output instead ([Brock, Donahue and Simonyan, 2019](#references), Appendix G.2, footnote 3).
+
+### SAGAN results on ImageNet
+
+SAGAN generates $128 \times 128$ ImageNet images conditioned on the class, with conditional batch norm in the generator and a projection discriminator, both described in the next section. Scores use 50k samples; **intra-FID** is the FID between generated and real images of the same class, aggregated over the classes (Section 5, Table 2):
+
+| Model, ImageNet $128 \times 128$ | IS | intra-FID | FID |
+| --- | --- | --- | --- |
+| AC-GAN | 28.5 | 260.0 | — |
+| SN-GAN with projection | 36.8 | 92.4 | 27.62 |
+| SAGAN | 52.52 | 83.7 | 18.65 |
+
+The gain was largest on classes with geometric structure, such as goldfish and Saint Bernard, and smallest on texture classes such as valley or stone wall (Figure 6), as the argument about convolutions predicts. Each model trained for about two weeks on 4 GPUs.
+
+## BigGAN: the same recipe at scale
+
+BigGAN starts from SAGAN: the same ResNet architecture with a self-attention block, the hinge loss, spectral normalization in both networks, conditional batch norm and a projection discriminator ([Brock, Donahue and Simonyan, 2019](#references), Section 3). It halves SAGAN's learning rates, to $2 \cdot 10^{-4}$ for $D$ and $5 \cdot 10^{-5}$ for $G$, takes two $D$ steps per $G$ step, uses Adam with $\beta_1 = 0$, $\beta_2 = 0.999$, orthogonal initialization, and samples from a moving average of $G$'s weights with decay 0.9999 (Appendix C). It trains on 128 to 512 cores of a TPU v3 Pod and computes batch-norm statistics across all devices. Progressive growing turned out to be unnecessary, even at $512 \times 512$.
+
+### Class conditioning: conditional batch norm and projection
+
+**In the generator.** A [batch-norm layer](/notes/generative-models/training-background#the-rest-of-the-layer) standardizes each channel and then applies a learned scale and shift. **Conditional batch norm** makes the scale and shift functions of a conditioning vector $u$ ([de Vries et al., 2017](#references)):
+
+$$
+\begin{aligned}
+\mathrm{CBN}(h_k; u) ={}& \big(1 + a_k^\top u\big)\,\frac{h_k - \mu_k}{\sqrt{\sigma_k^2 + \varepsilon}}\\
+&+ b_k^\top u,
+\end{aligned}
+$$
+
+for channel $k$ with batch statistics $\mu_k$, $\sigma_k^2$, and learned vectors $a_k$, $b_k$. The gain is centred at 1 and the bias at 0 (Appendix B). With $u = e(c)$ (BigGAN appends a piece of $z$, [below](#a-hierarchical-latent)) the label changes the scale and shift of every channel of every layer, so it acts on the whole generator rather than only on its input. Earlier models learned a separate class embedding for each layer; BigGAN uses one **shared embedding** $e(c)$ and projects it linearly to each layer's gains and biases. That reduced memory and computation and, in the paper's words, improved "training speed (in number of iterations required to reach a given performance) by 37%" (Section 3).
+
+**In the discriminator.** The [conditional GAN](/notes/generative-models/gans#conditional-gan) of the GAN note feeds the label to $D$ by concatenation. The **projection discriminator** ([Miyato and Koyama, 2018](#references)) derives a different form from the [optimal discriminator](/notes/generative-models/gans#step-1-the-optimal-discriminator-for-a-fixed-generator). On pairs $(x, c)$, the optimal logit for the original GAN loss is the log density ratio, which splits by the product rule $p(x, c) = p(c \mid x)\,p(x)$:
+
+$$
+\begin{aligned}
+\ln\frac{p_{\text{data}}(x, c)}{p_g(x, c)} ={}& \ln\frac{p_{\text{data}}(c \mid x)}{p_g(c \mid x)}\\
+&+ \ln\frac{p_{\text{data}}(x)}{p_g(x)} .
+\end{aligned}
+$$
+
+Assume both class posteriors are softmax classifiers on a shared feature vector $\phi(x)$, $\ln p(c \mid x) = v_c^\top\phi(x) - \ln Z(x)$, with class vectors $v_c^{\text{data}}$ and $v_c^{g}$ and normalizers $Z_{\text{data}}$, $Z_g$. Then the first term is $(v_c^{\text{data}} - v_c^{g})^\top\phi(x) - \ln\big(Z_{\text{data}}(x)/Z_g(x)\big)$. The normalizers and the second term depend on $x$ only, and are absorbed into one scalar function $\psi(\phi(x))$; the difference of class vectors becomes a learned embedding $e(c)$ (Section 3, Eqs. 2–7):
+
+$$
+D(x, c) = \psi\big(\phi(x)\big) + e(c)^\top\phi(x) .
+$$
+
+The label enters through an inner product with the image features: an unconditional realism score plus a score for how well the features match the class. In BigGAN, $\phi(x)$ is the discriminator's last features after a ReLU and global sum pooling, and $\psi$ is a linear layer (Table 4).
+
+### Batch size and width
+
+The first experiment simply increased the batch (Section 3, Table 1). The table also shows the iteration at which each setting collapsed, or that it was stable for $10^6$ iterations; rows 5–8 are averages over 8 seeds.
+
+| Batch, change | Width ch | Parameters | Stable to / collapse at | IS | FID |
+| --- | --- | --- | --- | --- | --- |
+| 256 | 64 | 81.5M | stable | 52.52 | 18.65 |
+| 512 | 64 | 81.5M | stable | 58.77 | 15.30 |
+| 1024 | 64 | 81.5M | stable | 63.03 | 14.88 |
+| 2048 | 64 | 81.5M | 732k | 76.85 | 12.39 |
+| 2048 | 96 | 173.5M | 295k | 92.98 | 9.54 |
+| + shared embedding | 96 | 160.6M | 185k | 94.94 | 9.18 |
+| + hierarchical latent | 96 | 158.3M | 152k | 98.76 | 8.73 |
+| + orthogonal regularization | 96 | 158.3M | 165k | 99.31 | 8.51 |
+
+Eight times the batch raised the IS by 46%. The authors conjecture that a larger batch covers more modes and gives both networks better gradients. Increasing the width by 50%, from 64 to 96 base channels, about doubled the parameters and raised the IS by another 21%. Doubling the depth did not help at first; the later BigGAN-deep made depth pay off with a different, bottleneck residual block. The price is visible in the collapse column: the larger settings reach better scores in fewer iterations and then **collapse**, and their scores are taken from checkpoints just before the collapse.
+
+### A hierarchical latent
+
+In a DCGAN the latent enters only the first layer. BigGAN splits $z$ into chunks, one per resolution, and concatenates each chunk with the shared class embedding to form the conditioning vector $u$ of one residual block (Appendix B). At $128 \times 128$, $z \in \mathbb R^{120}$ is split into six 20-dimensional chunks: one for the input layer and one for each of the five residual blocks of the generator. The latent can then influence features at every scale directly. This **skip-z** connection gave about 4% better performance and 18% faster training (Section 3).
+
+### The truncation trick
+
+GANs never backpropagate through the prior, so the latent distribution used for sampling need not be the one used for training. BigGAN trains with $z \sim \mathcal N(0, I)$ and samples from a **truncated normal**: every coordinate of $z$ whose magnitude exceeds a threshold $\tau$ is resampled until it falls inside $[-\tau, \tau]$ (Section 3.1). Each coordinate then follows $\mathcal N(0, 1)$ conditioned on $|z_k| \le \tau$. Smaller thresholds pull $z$ towards the mode of the prior, and the samples towards the most typical outputs of $G$: individual images look better while the set becomes less varied. The [precision–recall note](/notes/generative-models/precision-recall#where-the-trade-off-appears) gives this trade-off a name, precision against recall.
+
+<TruncationCurves />
+
+**Worked example.** One coordinate keeps a value with probability $\Pr(|z_k| \le \tau) = 2\Phi(\tau) - 1$, and after truncation its variance is $1 - 2\tau\varphi(\tau)/(2\Phi(\tau) - 1)$, with $\Phi$ and $\varphi$ the standard normal distribution function and density.
+
+| $\tau$ | mass kept per coordinate | standard deviation | $\sqrt{\mathbb E\lVert z\rVert^2}$, $d = 120$ | $\Pr(\text{no coordinate resampled})$ |
+| --- | --- | --- | --- | --- |
+| $\infty$ | 1 | 1 | 10.95 | 1 |
+| 2 | 0.9545 | 0.880 | 9.64 | 0.0037 |
+| 1 | 0.6827 | 0.540 | 5.91 | $1.3 \cdot 10^{-20}$ |
+| 0.5 | 0.3829 | 0.284 | 3.11 | $9.4 \cdot 10^{-51}$ |
+
+Even the mild threshold $\tau = 2$ changes almost every vector, because a 120-dimensional $z$ nearly always has a coordinate beyond 2. At $\tau = 1$ the vectors are short in a way the generator has practically never seen: under the training prior $\lVert z\rVert^2$ follows a $\chi^2$ distribution with 120 degrees of freedom, 90% of training codes have norms between 9.78 and 12.11, and the probability of a norm below 5.91 is about $10^{-15}$. Truncation is therefore a shift of the input distribution, and only a generator that behaves smoothly far from its training inputs can take it.
+
+**What the scores do.** IS and FID can be computed over a range of thresholds, which traces a curve rather than a point (Appendix D, Figures 17–18). In class-conditional models the IS does not penalize a lack of variety within a class, so it rises steadily as $\tau$ shrinks. FID penalizes the lost variety as well as rewarding quality, so it first improves a little and then gets much worse as $\tau$ approaches 0. Some models did not tolerate truncation at all and produced saturation artifacts (Figure 2b), which is what the next regularizer is for.
+
+### Orthogonal regularization
+
+To make $G$ smooth enough that the whole latent space, including the short vectors of truncation, maps to good images, BigGAN regularizes the generator's weights towards orthogonality (Section 3.1). For a weight matrix $W$ whose columns are the filters, the full orthogonality penalty is $\lambda\lVert W^\top W - I\rVert_F^2$, with $\lVert\cdot\rVert_F$ the Frobenius norm. It is known to be too limiting, so BigGAN drops the diagonal:
+
+$$
+R_\lambda(W) = \lambda\,\big\lVert W^\top W \odot (\mathbf 1 - I)\big\rVert_F^2,
+$$
+
+where $\mathbf 1$ is the all-ones matrix and $\odot$ the elementwise product. The diagonal of $W^\top W$ holds the squared norms of the filters, the off-diagonal entries their dot products, so the modified penalty pushes different filters apart without constraining their norms. The paper writes the strength as $\beta$ and uses $10^{-4}$.
+
+**Toy example.** Two filters, $w_1 = (2, 0)$ and $w_2 = (0.6, 0.8)$. Then $W^\top W$ has diagonal $(4, 1)$ and off-diagonal entries $1.2$. The full penalty is $(4 - 1)^2 + 2 \cdot 1.2^2 + 0 = 11.88$, most of it the demand that $\lVert w_1\rVert = 1$. The modified penalty is $2 \cdot 1.2^2 = 2.88$: it cares only about the overlap $w_1^\top w_2 = 1.2$.
+
+Across the runs of Table 1, 16% of the models without orthogonal regularization were amenable to truncation, against 60% with it (Section 3.1).
+
+### Training collapse at scale
+
+The large settings of the table above train well and then fail suddenly: within a few hundred iterations sample quality drops from its peak to its lowest value (Appendix G.1). BigGAN looked for the cause in the singular values of the weights (Section 4).
+
+- **Generator.** Most layers have well-behaved spectral norms, but a few, typically the first, fully connected layer, have a largest singular value that grows during training and explodes at the collapse. Clamping or regularizing it removed the explosion but did not prevent the collapse (Section 4.1).
+- **Discriminator.** Its spectra are noisy, with spikes, and jump at the collapse. A zero-centred gradient penalty on real data with the suggested strength 10 made training stable but cut the IS by 45%; strength 1, the lowest without a sudden collapse, still cost 20%. Dropout and stronger orthogonal or L2 penalties on $D$ behaved the same way: stability was bought with performance (Section 4.2).
+- **Memorization.** $D$'s loss goes towards zero during training. Evaluated on ImageNet, uncollapsed discriminators classified over 98% of training images correctly as real, but only 50–55% of validation images, no better than chance. $D$ memorizes the training set. Class-wise nearest neighbours of the generated images suggest that $G$ does not (Sections 4.2 and 5.1).
+- **Who must win.** Freezing $G$ before a collapse left $D$ stable; freezing $D$ made $G$ collapse at once, with $D$'s loss jumping above 300 against a normal range of 0 to 3. Raising either learning rate from a checkpoint caused an immediate collapse (Appendix G.1).
+
+The conclusion is practical: stability comes from the interaction of the two networks rather than from either alone, and current techniques can enforce it only at a large cost in quality. BigGAN therefore lets the collapse happen late and uses early stopping, keeping the checkpoint from before it (Section 4.3).
+
+### BigGAN results on ImageNet
+
+Because truncation trades variety for quality, BigGAN reports scores at several thresholds (Section 5.1, Table 2): without truncation, at the threshold with the best FID, at the threshold where the IS equals that of real validation images, and at the maximum IS. Real ImageNet images at $128 \times 128$ have an IS of 166 on the validation set and 233 on the training set, on which the Inception network was trained (Appendix C.3).
+
+| Model, ImageNet $128 \times 128$ | Sampling | IS | FID |
+| --- | --- | --- | --- |
+| SN-GAN with projection | untruncated | 36.8 | 27.62 |
+| SAGAN | untruncated | 52.52 | 18.65 |
+| BigGAN | untruncated | 98.8 | 8.7 |
+| BigGAN | threshold with the best FID | 126.5 | 7.7 |
+| BigGAN | IS of the validation data | 166.3 | 9.6 |
+| BigGAN | maximum IS | 206 | 25 |
+| BigGAN-deep | IS of the validation data | 166.5 | 7.4 |
+
+BigGAN rows are means over at least three seeds. The last row gives the headline result of the paper, IS 166.5 and FID 7.4 against SAGAN's 52.52 and 18.65. BigGAN-deep is four times deeper than BigGAN, with bottleneck residual blocks, and has fewer parameters: 50.4M in $G$ and 34.6M in $D$, against 70.4M and 88.0M (Appendix B). At $256 \times 256$ and $512 \times 512$ BigGAN-deep reached IS 232.5 and FID 8.1, and IS 241.5 and FID 11.5. On JFT-300M, a dataset two orders of magnitude larger than ImageNet, the same design choices helped, and the models did not collapse for hundreds of thousands of iterations (Section 5.2).
+
+## Mode coverage and evaluation
+
+All three papers worried about variety and found the standard measures wanting.
+
+- **Variety among samples is not closeness to the data.** MS-SSIM, as used in the ProGAN paper, measures how different generated images are from each other. In Table 1 it stayed at about 0.28 from the baseline (a) to the converged network (h), while the images improved visibly; SWD, which compares patches of generated images with patches of real ones, tracked the improvement ([Karras et al., 2018](#references), Section 6.1).
+- **IS ignores variety within a class.** A class-conditional model can raise its IS by producing one perfect image per class ([Brock, Donahue and Simonyan, 2019](#references), Section 3.1). Truncation pushes towards that: at its maximum IS, BigGAN's FID is 25, about three times its untruncated value.
+- **One FID mixes two failures.** FID improves with quality and worsens with lost variety, so it is a single point on a curve. Reporting the whole truncation curve, as BigGAN does, is the honest version; precision and recall later separate the two axes explicitly.
+- **Per-class scores.** Intra-FID, used by SAGAN, scores each class separately and exposes the classes a model handles badly, which a single FID over all classes hides. BigGAN observed new failure modes of this kind: **class leakage**, where an image of one class carries features of another, and, in some models, collapse to one or two samples for a few classes while the others stayed varied ([Brock, Donahue and Simonyan, 2019](#references), Section 5.1 and Appendix H).
+- **Memorization checks.** A discriminator that memorizes the training set raises the question of whether the generator copies it; nearest neighbours of samples among the training images of their class, in pixel space and in classifier features, are the check BigGAN uses ([Brock, Donahue and Simonyan, 2019](#references), Appendix A).
+
+The [Inception Score](/notes/generative-models/inception-score), [FID](/notes/generative-models/fid) and [precision and recall](/notes/generative-models/precision-recall) are derived in the evaluation section of the course.
+
+## What changed
+
+| | DCGAN | ProGAN | SAGAN | BigGAN |
+| --- | --- | --- | --- | --- |
+| Data and output | single domains, $64 \times 64$ | one domain up to $1024 \times 1024$ | ImageNet, $128 \times 128$, class-conditional | ImageNet up to $512 \times 512$, class-conditional |
+| Loss | non-saturating GAN | WGAN-GP, $n_{\text{critic}} = 1$, drift term | hinge | hinge |
+| Normalization in $G$ | batch norm | pixelwise feature norm, equalized learning rate | spectral norm, conditional batch norm | spectral norm, conditional batch norm with a shared embedding |
+| Normalization in $D$ | batch norm | equalized learning rate; minibatch standard deviation | spectral norm | spectral norm |
+| Label in $D$ | — | — | projection | projection |
+| Long-range structure | convolutions only | convolutions only | one self-attention block | one self-attention block |
+| Optimization | Adam $2 \cdot 10^{-4}$, $\beta_1 = 0.5$ | Adam $10^{-3}$, $\beta_1 = 0$; resolution grown with fade-in | TTUR: $4 \cdot 10^{-4}$ for $D$, $10^{-4}$ for $G$, 1:1 steps | batch 2048, width ×1.5, two $D$ steps per $G$ step |
+| Latent | 100-D uniform, input layer | 512-D on a hypersphere | $\mathcal N(0, I)$ | $\mathcal N(0, I)$, split across blocks; truncated for sampling |
+
+## Limitations
+
+- **Compute.** BigGAN trained on 128 to 512 TPU cores for 24 to 48 hours per model, SAGAN for two weeks on 4 GPUs, ProGAN's CelebA-HQ model for 4 days on 8 GPUs. The ablations behind the recipes cost far more than one run.
+- **Collapse is postponed, not solved.** The large BigGAN settings collapse; the remedies that stabilize them cost 20–45% of the IS, so practice relies on early stopping.
+- **Truncation is a distribution shift.** Its samples come from a different distribution than the one the generator was trained on. It needs orthogonal regularization, and even then only 60% of the models in the ablation tolerated it.
+- **Labels and curation.** BigGAN's quality depends on class labels for conditioning; ProGAN's megapixel faces depend on a curated, aligned dataset.
+- **Self-attention is quadratic.** The $N^2$ attention map limits the block to one moderate resolution in each network.
+- **No control.** The latent code is one entangled vector. Nothing in the training ties a direction in $z$ to one attribute of the image, so moving $z$ generally changes several attributes at once.
+
+## Summary
+
+- ProGAN grows $G$ and $D$ from $4 \times 4$ to $1024 \times 1024$, fading in each new block with a weight $\alpha$ from 0 to 1. Minibatch standard deviation exposes collapsed batches, equalized learning rate scales weights by the He constant at run time so every layer learns at the same relative speed, and pixelwise normalization keeps the generator's magnitudes in check.
+- SAGAN adds a self-attention block, $y = \gamma\,o + x$ with $\gamma$ initialized at 0, so any two positions interact in one layer. It applies spectral normalization to both networks, uses TTUR ($4 \cdot 10^{-4}$ for $D$, $10^{-4}$ for $G$) instead of extra discriminator steps, and trains with the hinge loss: IS 52.52 and FID 18.65 on ImageNet at $128 \times 128$.
+- BigGAN keeps SAGAN's recipe and scales it: batch 2048, 50% wider layers, a shared class embedding for conditional batch norm, a latent split across the generator's blocks, a projection discriminator and orthogonal regularization.
+- The truncation trick resamples latent coordinates beyond a threshold and trades variety for fidelity; at the threshold where its IS matches real validation data, BigGAN-deep reaches IS 166.5 and FID 7.4.
+- At scale, training collapses; the discriminator memorizes the training set, and stability can be bought only with quality, so models are early-stopped.
+
+## Code
+
+The self-attention block in PyTorch, and the numbers of the truncation and equalized-learning-rate examples:
+
+```python
+import math
+import torch, torch.nn as nn
+from scipy import stats
+
+# the SAGAN self-attention block: f, g, h, v are 1x1 convolutions, gamma starts at 0
+class SelfAttention(nn.Module):
+    def __init__(self, C, k=8):
+        super().__init__()
+        self.f, self.g, self.h = (nn.Conv2d(C, C // k, 1) for _ in range(3))
+        self.v = nn.Conv2d(C // k, C, 1)
+        self.gamma = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x):                                   # x: (B, C, H, W)
+        B, C, H, W = x.shape
+        f, g, h = (m(x).flatten(2) for m in (self.f, self.g, self.h))   # (B, C/k, N)
+        s = f.transpose(1, 2) @ g                           # s[b, i, j] = f(x_i)^T g(x_j), (B, N, N)
+        beta = s.softmax(dim=1)                             # normalize over i for every j
+        o = self.v((h @ beta).view(B, -1, H, W))            # o_j = W_v sum_i beta[i, j] h(x_i)
+        return self.gamma * o + x, beta
+
+torch.manual_seed(0)
+block = SelfAttention(C=64)
+x = torch.randn(2, 64, 16, 16)
+y, beta = block(x)
+print(tuple(beta.shape), torch.allclose(beta.sum(dim=1), torch.ones(2, 256)), torch.equal(y, x))
+# (2, 256, 256) True True
+
+# truncation trick, one coordinate: mass kept, standard deviation; the 120-D vector: P(untouched), RMS norm,
+# and P(||z|| <= that norm) under the training prior N(0, I), where ||z||^2 is chi-squared with 120 degrees of freedom
+for tau in (0.5, 1.0, 2.0):
+    kept = 2 * stats.norm.cdf(tau) - 1
+    var = 1 - 2 * tau * stats.norm.pdf(tau) / kept
+    print(tau, round(kept, 4), round(math.sqrt(var), 3), f"{kept ** 120:.1e}",
+          round(math.sqrt(120 * var), 2), f"{stats.chi2(120).cdf(120 * var):.0e}")
+# 0.5 0.3829 0.284 9.4e-51 3.11 1e-43 | 1.0 0.6827 0.54 1.3e-20 5.91 1e-15 | 2.0 0.9545 0.88 3.7e-03 9.64 3e-02
+print(round(math.sqrt(stats.chi2(120).ppf(0.05)), 2), round(math.sqrt(stats.chi2(120).ppf(0.95)), 2))   # 9.78 12.11
+
+# equalized learning rate: one Adam step of 1e-3 relative to the He scale sqrt(2 / n_in) of two layers
+for n_in in (3 * 3 * 512, 3):
+    print(n_in, round(1e-3 / math.sqrt(2 / n_in), 4))     # 4608 0.048 | 3 0.0012
+```
+
+In the block, `beta[b, i, j]` is $\beta_{j,i}$ of the text, and `torch.equal(y, x)` confirms that with $\gamma = 0$ the block is exactly the identity.
+
+## Next
+
+BigGAN gets its quality from scale and conditioning, but it offers little control over what it draws. The class label picks the category; everything else is decided by one entangled vector $z$. Its chunks reach different blocks, but nothing ties a direction in $z$ to one attribute, so moving $z$ in any direction changes many attributes of the image at once. The [next note](/notes/generative-models/stylegan) rebuilds the generator around that problem: StyleGAN maps $z$ to an intermediate latent space and injects it as a "style" at every resolution, which separates coarse attributes such as pose from fine ones such as texture.
+
+## Where to see the images
+
+These models are best judged by their samples. Each line says where to find them; figure numbers refer to the linked arXiv version.
+
+- **ProGAN** ([Karras et al., 2018](#references); [arXiv v3](https://arxiv.org/abs/1710.10196v3)): $1024 \times 1024$ CelebA-HQ faces in Figure 5 and more in Figure 11; LSUN categories at $256 \times 256$ in Figure 7; nearest training neighbours in Figure 10; [repository with the result video and generated images](https://github.com/tkarras/progressive_growing_of_gans).
+- **SAGAN** ([Zhang et al., 2019](#references); [arXiv v2](https://arxiv.org/abs/1805.08318v2)): ImageNet samples at $128 \times 128$, one class per row, in Figure 6; attention maps in Figures 1 and 5; the baseline against spectral normalization and TTUR in Figure 4.
+- **BigGAN** ([Brock, Donahue and Simonyan, 2019](#references); [arXiv v2](https://arxiv.org/abs/1809.11096v2)): class-conditional samples in Figure 1; increasing truncation in Figure 2(a); samples at $256 \times 256$ and $512 \times 512$ in Figures 5 and 6; easy and difficult classes in Figure 7; interpolations in Figures 8 and 9.
+
+## References
+
+- T. Karras, T. Aila, S. Laine, J. Lehtinen. [Progressive growing of GANs for improved quality, stability, and variation](https://arxiv.org/abs/1710.10196). ICLR, 2018. Sections 2–4 (progressive growing, minibatch standard deviation, equalized learning rate, pixelwise normalization), Section 6 and Table 1 (ablation, speed, CelebA-HQ, CIFAR-10), Appendix A (networks and training).
+- H. Zhang, I. Goodfellow, D. Metaxas, A. Odena. [Self-attention generative adversarial networks](https://arxiv.org/abs/1805.08318). ICML, 2019. Section 3 (Eqs. 1–4), Section 4 (spectral normalization in $G$, TTUR), Section 5 (Tables 1–2, Figures 3–6).
+- A. Brock, J. Donahue, K. Simonyan. [Large scale GAN training for high fidelity natural image synthesis](https://arxiv.org/abs/1809.11096). ICLR, 2019. Section 3 and Table 1 (scaling, shared embedding, skip-z, truncation, orthogonal regularization), Section 4 (collapse), Section 5 and Table 2 (results), Appendices B, C, G.
+- T. Miyato, M. Koyama. [cGANs with projection discriminator](https://arxiv.org/abs/1802.05637). ICLR, 2018. Sections 2–3, Eqs. 2–7.
+- M. Heusel, H. Ramsauer, T. Unterthiner, B. Nessler, S. Hochreiter. [GANs trained by a two time-scale update rule converge to a local Nash equilibrium](https://arxiv.org/abs/1706.08500). NeurIPS, 2017.
+- H. de Vries, F. Strub, J. Mary, H. Larochelle, O. Pietquin, A. Courville. [Modulating early visual processing by language](https://arxiv.org/abs/1707.00683). NeurIPS, 2017.
