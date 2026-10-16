@@ -2,6 +2,53 @@
 
 Notable changes to the site, newest first. Each entry gives the date, what changed and why.
 
+## 2026-10-17
+
+- **All four courses: corrections from an external audit.** An external review of the live site (16 October 2026) logged 295 findings across Probability Theory, Machine Learning, Generative Models and NLP: 28 of priority 1, 195 of priority 2 and 72 of priority 3. Each finding was checked against the current text before it was acted on:
+  - 267 were fixed;
+  - 18 were partly fixed (usually a reading route or an optional-depth mark where the audit proposed splitting a note);
+  - 10 were rejected as already fixed, out of date, or contradicted by the glossary.
+
+  Every change is made in English and Russian.
+  - **Claims that outran their assumptions**, corrected with a small calculation where one helps:
+    - diffusion is no longer called MCMC in disguise; equilibrium Langevin, annealed Langevin and reverse diffusion are told apart;
+    - the prior-odds correction states the label-shift assumption, with a counterexample;
+    - squared loss targets the conditional mean without Gaussian noise;
+    - precision and recall denominators are corrected;
+    - the RankNet and GPTQ signs are fixed, each with a numeric check;
+    - the self-attention example now shows that softmax weights are not symmetric (0.307 against 0.274);
+    - the Transformer note no longer calls the feed-forward network the only nonlinearity;
+    - the DDPM bound is written as NLL = bound − gap, with an example where the bound falls and the NLL rises;
+    - classifier-free guidance is described as a guided score at each noise level, not sampling from a tilted distribution; DDPM and DDIM are computed to end at different places;
+    - exact Gaussian supports are all of space, so the support-based precision and recall of Gaussians are both 1;
+    - affine coupling flows cite the published universality result;
+    - straight-through gradients are a surrogate, never exact;
+    - SFT can lower the probability of alternatives;
+    - text diffusion's 1/t weight emphasizes lightly masked steps.
+  - **Evidence:**
+    - the NLP results table records the split, training size and selection protocol of every number and no longer reads as a leaderboard;
+    - test-informed choices (a label word, an epoch) are labelled optimistic;
+    - the 0.342/0.253 BLEU gap between two greedy decoders is reported as unresolved;
+    - human–human agreement is no longer called a ceiling for a judge;
+    - the LPIPS notebook ranking is labelled a diagnostic of an input bug.
+  - **Course pages:**
+    - each course page opens with what to know before starting and links to the notes that map the course;
+    - every section states what a reader can do after it;
+    - Generative Models marks its architecture and application branches as Extension;
+    - the NLP stage strip names all ten sections;
+    - the course descriptions and the notes index no longer claim that every method answers the failure of the one before.
+  - **Proof detours** inside notes (the Vitali set, characteristic-function proofs, Borel–Cantelli, approximation theorems, VAPNEV and others) are marked as optional depth. Two Generative Models notes gained a self-check.
+  - **Layout:**
+    - three NLP comparison tables that a `|` inside math had broken are repaired;
+    - long inline code wraps instead of widening the page on phones;
+    - wide equations show a shadow where they scroll;
+    - phones get a collapsible "On this page" outline;
+    - the course graph switches to its stacked layout at tablet width;
+    - an empty prerequisites panel is no longer shown;
+    - BERT's breadcrumb names its own section.
+
+  Why: an external audit found claims that were wrong or overstated, comparisons that did not share a protocol, and places where readers could not tell the main route from the detours.
+
 ## 2026-10-16
 
 - **Generative Models: the main GAN variants.** Three new notes, in English and Russian, cover the GAN architectures the course had only mentioned in passing:

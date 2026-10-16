@@ -6,6 +6,8 @@ export interface CourseSection {
   title: string;
   /** One line on what the section answers. */
   summary?: string;
+  /** What a reader can do after the section. */
+  outcome?: string;
   topics: CourseTopic[];
 }
 
@@ -18,6 +20,12 @@ export interface Course {
   requires: CourseKey[];
   shortTitle: string;
   description: string;
+  /** What to know before starting, and how the course is meant to be read. */
+  entry: string;
+  /** Links from the course page to the notes that lay out the course as a whole (its map, its closing summary). */
+  guide: { label: string; note: string; anchor: string }[];
+  /** Notes (or `note#anchor` sections) that branch off the main route: the rest of the course reads without them. */
+  extensions?: string[];
   /** The course storyline as a sequence of stages; each stage links to a section of the course page (or to a note). */
   progression: ProgressionStage[];
   sections: CourseSection[];
@@ -26,6 +34,7 @@ export interface Course {
     title: string;
     shortTitle: string;
     description: string;
+    entry: string;
     /** Russian stage labels, in the order of `progression`. */
     progression?: string[];
     labels: Record<string, string>;
@@ -44,6 +53,8 @@ export const courses: Record<CourseKey, Course> = {
     requires: [],
     shortTitle: 'Probability',
     description: 'Reasoning exactly about outcomes we cannot predict: from counting to the limit theorems, and how they become the losses, estimates and guarantees of machine learning.',
+    entry: 'Before you start: school algebra, sums and limits. Derivatives and integrals are used from Continuous distributions on; matrix products, inverses and eigenvectors from The multivariate Gaussian on. No probability is assumed. Proof-heavy detours inside notes, such as the Vitali set or the characteristic-function proof of the central limit theorem, are marked as optional depth and can be skipped on a first reading.',
+    guide: [{ label: 'The course map', note: 'probability/what-probability-is', anchor: 'what-the-course-builds' }],
     progression: [
       { label: 'Events', section: 'Foundations' },
       { label: 'Random variables', section: 'Random Variables' },
@@ -56,8 +67,16 @@ export const courses: Record<CourseKey, Course> = {
       title: 'Теория вероятностей',
       shortTitle: 'Теорвер',
       description: 'Точные рассуждения об исходах, которые нельзя предсказать: от подсчёта вариантов до предельных теорем и того, как они становятся функциями потерь, оценками и гарантиями машинного обучения.',
+      entry: 'Что нужно знать: школьная алгебра, суммы и пределы. Производные и интегралы нужны начиная с непрерывных распределений; произведения и обращение матриц, собственные векторы — начиная с многомерного нормального распределения. Знакомство с теорией вероятностей не предполагается. Отступления с тяжёлыми доказательствами внутри заметок, например множество Витали или доказательство центральной предельной теоремы через характеристические функции, помечены как дополнительный материал, и при первом чтении их можно пропустить.',
       progression: ['События', 'Случайные величины', 'Зависимость', 'Пределы', 'Статистика', 'Сэмплирование'],
       labels: {
+        'The course map': 'Карта курса',
+        'Tell an event from a model and from evidence, and update a probability with Bayes\' formula.': 'Отличать событие от модели и от наблюдения и пересчитывать вероятность по формуле Байеса.',
+        'Pick a distribution for a quantity, find the distribution of a function of it, and compute its mean and variance.': 'Подбирать распределение для величины, находить распределение функции от неё и считать её среднее и дисперсию.',
+        'Work with joint and conditional distributions and the Gaussian in several dimensions; explain why least squares predicts a conditional mean and why zero covariance is not independence in general.': 'Работать с совместными и условными распределениями и многомерным нормальным распределением; объяснять, почему метод наименьших квадратов предсказывает условное среднее и почему нулевая ковариация в общем случае не означает независимости.',
+        'Say how far an average can be from its expectation, exactly, by a finite-sample bound or asymptotically, and under which conditions.': 'Оценивать, насколько среднее может отклониться от математического ожидания: точно, неравенством для конечной выборки или асимптотически, и при каких условиях.',
+        'Estimate a parameter by maximum likelihood or Bayes, attach an interval to it and run a test, keeping effect size and decision error apart.': 'Оценивать параметр методом максимального правдоподобия или по Байесу, строить для него интервал и проверять гипотезу, не путая величину эффекта с ошибкой решения.',
+        'A change of task: the distribution is known, perhaps only up to a constant, but its integrals cannot be computed and it cannot be sampled directly. Compute its predictions with Markov chains, Monte Carlo and MCMC, and check whether a chain has converged.': 'Смена задачи: распределение известно, возможно с точностью до константы, но его интегралы не берутся, а сэмплировать из него напрямую нельзя. Считать его предсказания цепями Маркова, методом Монте-Карло и MCMC и проверять, сошлась ли цепь.',
         'Foundations': 'Основы',
         'Random Variables': 'Случайные величины',
         'Several Random Variables': 'Несколько случайных величин',
@@ -99,19 +118,21 @@ export const courses: Record<CourseKey, Course> = {
       },
     },
     sections: [
-      { title: 'Foundations', summary: 'What probability is, how to count it, and how information changes it.', topics: [noteTopic('What probability is', 'probability/what-probability-is'), noteTopic('Outcomes, events and counting', 'probability/outcomes-events-and-counting'), noteTopic('Kolmogorov\'s axioms', 'probability/kolmogorovs-axioms'), noteTopic('Conditional probability and Bayes\' formula', 'probability/conditional-probability-and-bayes'), noteTopic('Independence', 'probability/conditional-probability-and-bayes', 'independence')] },
-      { title: 'Random Variables', summary: 'Numbers produced by chance, and how to summarize them.', topics: [noteTopic('Discrete distributions', 'probability/discrete-distributions'), noteTopic('Continuous distributions', 'probability/continuous-distributions'), noteTopic('Functions of random variables', 'probability/functions-of-random-variables'), noteTopic('Expectation and variance', 'probability/expectation-and-variance'), noteTopic('Moment and characteristic functions', 'probability/expectation-and-variance', 'moment-and-characteristic-functions')] },
-      { title: 'Several Random Variables', summary: 'How random quantities depend on each other.', topics: [noteTopic('Joint distributions and independence', 'probability/joint-distributions'), noteTopic('Covariance and correlation', 'probability/joint-distributions', 'covariance-and-correlation'), noteTopic('The multivariate Gaussian', 'probability/multivariate-gaussian'), noteTopic('Conditional expectation', 'probability/conditional-expectation')] },
-      { title: 'Limit Theorems', summary: 'Why averages work, how fast, and why the Gaussian is everywhere.', topics: [noteTopic('Inequalities and concentration', 'probability/inequalities-and-concentration'), noteTopic('The law of large numbers', 'probability/law-of-large-numbers'), noteTopic('The central limit theorem', 'probability/central-limit-theorem'), noteTopic('Modes of convergence', 'probability/central-limit-theorem', 'modes-of-convergence')] },
-      { title: 'From Probability to Statistics', summary: 'From data back to the distribution that produced it.', topics: [noteTopic('Estimators: bias and variance', 'probability/estimators'), noteTopic('Maximum likelihood', 'probability/maximum-likelihood'), noteTopic('Bayesian inference', 'probability/bayesian-inference'), noteTopic('Confidence intervals and the bootstrap', 'probability/confidence-intervals-and-bootstrap'), noteTopic('Hypothesis tests and A/B testing', 'probability/hypothesis-tests')] },
-      { title: 'Random Processes and Sampling', summary: 'Random systems that evolve, and sampling from distributions we cannot write down.', topics: [noteTopic('Markov chains', 'probability/markov-chains'), noteTopic('Monte Carlo methods', 'probability/monte-carlo'), noteTopic('Markov chain Monte Carlo', 'probability/markov-chain-monte-carlo')] },
+      { title: 'Foundations', summary: 'What probability is, how to count it, and how information changes it.', outcome: 'Tell an event from a model and from evidence, and update a probability with Bayes\' formula.', topics: [noteTopic('What probability is', 'probability/what-probability-is'), noteTopic('Outcomes, events and counting', 'probability/outcomes-events-and-counting'), noteTopic('Kolmogorov\'s axioms', 'probability/kolmogorovs-axioms'), noteTopic('Conditional probability and Bayes\' formula', 'probability/conditional-probability-and-bayes'), noteTopic('Independence', 'probability/conditional-probability-and-bayes', 'independence')] },
+      { title: 'Random Variables', summary: 'Numbers produced by chance, and how to summarize them.', outcome: 'Pick a distribution for a quantity, find the distribution of a function of it, and compute its mean and variance.', topics: [noteTopic('Discrete distributions', 'probability/discrete-distributions'), noteTopic('Continuous distributions', 'probability/continuous-distributions'), noteTopic('Functions of random variables', 'probability/functions-of-random-variables'), noteTopic('Expectation and variance', 'probability/expectation-and-variance'), noteTopic('Moment and characteristic functions', 'probability/expectation-and-variance', 'moment-and-characteristic-functions')] },
+      { title: 'Several Random Variables', summary: 'How random quantities depend on each other.', outcome: 'Work with joint and conditional distributions and the Gaussian in several dimensions; explain why least squares predicts a conditional mean and why zero covariance is not independence in general.', topics: [noteTopic('Joint distributions and independence', 'probability/joint-distributions'), noteTopic('Covariance and correlation', 'probability/joint-distributions', 'covariance-and-correlation'), noteTopic('The multivariate Gaussian', 'probability/multivariate-gaussian'), noteTopic('Conditional expectation', 'probability/conditional-expectation')] },
+      { title: 'Limit Theorems', summary: 'Why averages work, how fast, and why the Gaussian is everywhere.', outcome: 'Say how far an average can be from its expectation, exactly, by a finite-sample bound or asymptotically, and under which conditions.', topics: [noteTopic('Inequalities and concentration', 'probability/inequalities-and-concentration'), noteTopic('The law of large numbers', 'probability/law-of-large-numbers'), noteTopic('The central limit theorem', 'probability/central-limit-theorem'), noteTopic('Modes of convergence', 'probability/central-limit-theorem', 'modes-of-convergence')] },
+      { title: 'From Probability to Statistics', summary: 'From data back to the distribution that produced it.', outcome: 'Estimate a parameter by maximum likelihood or Bayes, attach an interval to it and run a test, keeping effect size and decision error apart.', topics: [noteTopic('Estimators: bias and variance', 'probability/estimators'), noteTopic('Maximum likelihood', 'probability/maximum-likelihood'), noteTopic('Bayesian inference', 'probability/bayesian-inference'), noteTopic('Confidence intervals and the bootstrap', 'probability/confidence-intervals-and-bootstrap'), noteTopic('Hypothesis tests and A/B testing', 'probability/hypothesis-tests')] },
+      { title: 'Random Processes and Sampling', summary: 'Random systems that evolve, and sampling from distributions we cannot write down.', outcome: 'A change of task: the distribution is known, perhaps only up to a constant, but its integrals cannot be computed and it cannot be sampled directly. Compute its predictions with Markov chains, Monte Carlo and MCMC, and check whether a chain has converged.', topics: [noteTopic('Markov chains', 'probability/markov-chains'), noteTopic('Monte Carlo methods', 'probability/monte-carlo'), noteTopic('Markov chain Monte Carlo', 'probability/markov-chain-monte-carlo')] },
     ],
   },
   ml: {
     title: 'Machine Learning',
     requires: ['probability'],
     shortTitle: 'ML',
-    description: 'How a program learns a rule from examples and how to tell whether it will work on new data: from a line through points to gradient boosting and neural networks, each method answering the failure of the previous one.',
+    description: 'How a program learns a rule from examples and how to tell whether it will work on new data: from a line through points to gradient boosting and neural networks. Each note either fixes a limitation of the previous method or changes the task, and says which.',
+    entry: 'Before you start: the Probability Theory course, or at least expectation, conditional probability and maximum likelihood; vectors, matrix products and derivatives; reading short NumPy code. Every note ends with a Code section that runs as written. Learning Without Labels and Beyond Classification branch off the supervised route: they change the task rather than replace a classifier.',
+    guide: [{ label: 'The course map', note: 'ml/what-machine-learning-is', anchor: 'the-course-map' }, { label: 'The course in one paragraph', note: 'ml/recommender-systems', anchor: 'the-course-in-one-paragraph' }],
     progression: [
       { label: 'Learning problem', section: 'The Learning Problem' },
       { label: 'Linear models', section: 'Linear Regression' },
@@ -124,9 +145,19 @@ export const courses: Record<CourseKey, Course> = {
     ru: {
       title: 'Машинное обучение',
       shortTitle: 'ML',
-      description: 'Как программа выучивает правило по примерам и как понять, что оно сработает на новых данных: от прямой через точки до градиентного бустинга и нейросетей, где каждый метод отвечает на провал предыдущего.',
+      description: 'Как программа выучивает правило по примерам и как понять, что оно сработает на новых данных: от прямой через точки до градиентного бустинга и нейросетей. Каждая заметка либо исправляет ограничение предыдущего метода, либо меняет задачу, и говорит, что именно.',
+      entry: 'Что нужно знать: курс теории вероятностей или хотя бы математическое ожидание, условную вероятность и метод максимального правдоподобия; векторы, произведения матриц и производные; умение читать короткий код на NumPy. Каждая заметка заканчивается разделом «Код», который запускается как написан. Разделы «Обучение без разметки» и «За пределами классификации» ответвляются от обучения с учителем: они меняют задачу, а не заменяют классификатор.',
       progression: ['Постановка', 'Линейные модели', 'Классификация', 'Деревья и ансамбли', 'Нейросети', 'Без разметки', 'Ранжирование'],
       labels: {
+        'The course map': 'Карта курса',
+        'The course in one paragraph': 'Курс в одном абзаце',
+        'Define the loss, the split and a baseline before fitting, and spot leakage in a pipeline.': 'Задавать функцию потерь, разбиение и базовое решение до обучения и находить утечку в конвейере.',
+        'Fit a linear model in closed form and by gradient descent, keeping the population target, the empirical loss, the optimizer and generalization apart.': 'Обучать линейную модель по формуле и градиентным спуском, не смешивая целевую величину для генеральной совокупности, эмпирический риск, оптимизатор и обобщение.',
+        'Tell a score from a probability and a calibrated probability from a threshold, and choose a metric that matches the cost of errors.': 'Отличать оценку от вероятности, а откалиброванную вероятность от порога и выбирать метрику, которая соответствует цене ошибок.',
+        'Explain what a tree can express, why averaging trees lowers variance and how boosting fits what the ensemble still gets wrong.': 'Объяснять, что может выразить дерево, почему усреднение деревьев снижает дисперсию и как бустинг дообучается на том, в чём ансамбль ещё ошибается.',
+        'Trace one forward and backward pass by hand and diagnose a training curve that fails.': 'Проходить вручную один прямой и обратный проход и диагностировать неудачную кривую обучения.',
+        'A change of task: find clusters, mixtures, low-dimensional structure and anomalies when there is no target.': 'Смена задачи: находить кластеры, смеси, низкоразмерную структуру и аномалии, когда целевой переменной нет.',
+        'Another change of task: learn an order or a recommendation, with metrics and splits that match how the list is used.': 'Ещё одна смена задачи: учиться порядку или рекомендации, с метриками и разбиениями, которые соответствуют тому, как используется список.',
         'Least squares as a projection': 'Наименьшие квадраты как проекция',
         'Robust losses': 'Устойчивые функции потерь',
         'The condition number': 'Число обусловленности',
@@ -209,7 +240,7 @@ export const courses: Record<CourseKey, Course> = {
       },
     },
     sections: [
-      { title: 'The Learning Problem', summary: 'What it means to learn from examples, and how to know it worked.', topics: [
+      { title: 'The Learning Problem', summary: 'What it means to learn from examples, and how to know it worked.', outcome: 'Define the loss, the split and a baseline before fitting, and spot leakage in a pipeline.', topics: [
         noteTopic('What machine learning is', 'ml/what-machine-learning-is'),
         noteTopic('The course as a bridge', 'ml/what-machine-learning-is', 'the-course-as-a-bridge'),
         noteTopic('Data, features and leakage', 'ml/data-features-and-leakage'),
@@ -220,7 +251,7 @@ export const courses: Record<CourseKey, Course> = {
         noteTopic('Nearest neighbours', 'ml/nearest-neighbours'),
         noteTopic('The curse of dimensionality', 'ml/nearest-neighbours', 'the-curse-of-dimensionality'),
       ] },
-      { title: 'Linear Regression', summary: 'A linear model fitted by formula and by descent, without fitting the noise.', topics: [
+      { title: 'Linear Regression', summary: 'A linear model fitted by formula and by descent, without fitting the noise.', outcome: 'Fit a linear model in closed form and by gradient descent, keeping the population target, the empirical loss, the optimizer and generalization apart.', topics: [
         noteTopic('Least squares', 'ml/least-squares'),
         noteTopic('Least squares as a projection', 'ml/least-squares', 'the-geometry-a-projection'),
         noteTopic('Robust losses', 'ml/least-squares', 'squared-error-and-outliers'),
@@ -233,7 +264,7 @@ export const courses: Record<CourseKey, Course> = {
         noteTopic('Ridge regression', 'ml/regularization', 'ridge-a-penalty-on-the-size-of-the-weights'),
         noteTopic('The lasso', 'ml/regularization', 'the-lasso'),
       ] },
-      { title: 'Linear Classification', summary: 'Separating classes with a hyperplane, and measuring the errors that matter.', topics: [
+      { title: 'Linear Classification', summary: 'Separating classes with a hyperplane, and measuring the errors that matter.', outcome: 'Tell a score from a probability and a calibrated probability from a threshold, and choose a metric that matches the cost of errors.', topics: [
         noteTopic('Linear classifiers and surrogate losses', 'ml/linear-classifiers'),
         noteTopic('The perceptron', 'ml/linear-classifiers', 'the-perceptron-stochastic-gradient-descent-at-zero-margin'),
         noteTopic('Logistic regression', 'ml/logistic-regression'),
@@ -248,7 +279,7 @@ export const courses: Record<CourseKey, Course> = {
         noteTopic('Multiclass and multilabel classification', 'ml/multiclass-and-multilabel'),
         noteTopic('Softmax regression', 'ml/multiclass-and-multilabel', 'multinomial-logistic-regression'),
       ] },
-      { title: 'Trees and Ensembles', summary: 'Nonlinear models from simple rules, and why averaging and boosting them works.', topics: [
+      { title: 'Trees and Ensembles', summary: 'Nonlinear models from simple rules, and why averaging and boosting them works.', outcome: 'Explain what a tree can express, why averaging trees lowers variance and how boosting fits what the ensemble still gets wrong.', topics: [
         noteTopic('Decision trees', 'ml/decision-trees'),
         noteTopic('Impurity criteria', 'ml/decision-trees', 'how-good-is-a-split'),
         noteTopic('Bias–variance decomposition', 'ml/bias-variance'),
@@ -260,7 +291,7 @@ export const courses: Record<CourseKey, Course> = {
         noteTopic('XGBoost, LightGBM and CatBoost', 'ml/gradient-boosting', 'xgboost-lightgbm-and-catboost'),
         noteTopic('Stacking', 'ml/gradient-boosting', 'stacking'),
       ] },
-      { title: 'Neural Networks', summary: 'Learning the features together with the model.', topics: [
+      { title: 'Neural Networks', summary: 'Learning the features together with the model.', outcome: 'Trace one forward and backward pass by hand and diagnose a training curve that fails.', topics: [
         noteTopic('From linear models to networks', 'ml/neural-networks'),
         noteTopic('Universal approximation', 'ml/neural-networks', 'what-one-hidden-layer-can-represent'),
         noteTopic('Backpropagation', 'ml/backpropagation'),
@@ -269,7 +300,7 @@ export const courses: Record<CourseKey, Course> = {
         noteTopic('Dropout', 'ml/training-deep-networks', 'dropout'),
         noteTopic('Residual connections', 'ml/training-deep-networks', 'residual-connections'),
       ] },
-      { title: 'Learning Without Labels', summary: 'Structure in data when there is no target.', topics: [
+      { title: 'Learning Without Labels', summary: 'Structure in data when there is no target.', outcome: 'A change of task: find clusters, mixtures, low-dimensional structure and anomalies when there is no target.', topics: [
         noteTopic('Clustering', 'ml/clustering'),
         noteTopic('k-means', 'ml/clustering', 'lloyds-algorithm-is-coordinate-descent'),
         noteTopic('DBSCAN', 'ml/clustering', 'dbscan-clusters-as-dense-regions'),
@@ -280,7 +311,7 @@ export const courses: Record<CourseKey, Course> = {
         noteTopic('Anomaly detection', 'ml/anomaly-detection'),
         noteTopic('Isolation forest', 'ml/anomaly-detection', 'isolation-forest'),
       ] },
-      { title: 'Beyond Classification', summary: 'When the answer is an order or a recommendation.', topics: [
+      { title: 'Beyond Classification', summary: 'When the answer is an order or a recommendation.', outcome: 'Another change of task: learn an order or a recommendation, with metrics and splits that match how the list is used.', topics: [
         noteTopic('Learning to rank', 'ml/learning-to-rank'),
         noteTopic('Ranking metrics', 'ml/learning-to-rank', 'measuring-an-order'),
         noteTopic('LambdaMART', 'ml/learning-to-rank', 'lambdamart-lambdas-as-boosting-targets'),
@@ -294,7 +325,10 @@ export const courses: Record<CourseKey, Course> = {
     title: 'Generative Models',
     requires: ['probability', 'ml'],
     shortTitle: 'Generative Models',
-    description: 'Probability, latent variables and the main families of modern generative models.',
+    description: 'How to learn a distribution from data, draw new samples from it and decide whether the model captured the data. Six families of models, each a different trade-off between exact likelihood, fast sampling and a useful latent representation.',
+    entry: 'Before you start: Probability Theory (distributions, expectation, maximum likelihood) and Machine Learning up to neural networks and backpropagation; some PyTorch helps with the Notebook sections. Flows, energy-based models, diffusion and autoregressive models are parallel routes, not a ladder. Notes marked Extension are architecture and application branches; the main route reads without them.',
+    guide: [{ label: 'The plan of the course', note: 'generative-models/generative-modeling', anchor: 'the-plan-of-the-course' }, { label: 'The course in one paragraph', note: 'generative-models/audio-generation', anchor: 'the-course-in-one-paragraph' }],
+    extensions: ['generative-models/gan-scaling', 'generative-models/stylegan', 'generative-models/alpha-gan', 'generative-models/cyclegan', 'generative-models/stargan', 'generative-models/image-translation', 'generative-models/flow-architectures', 'generative-models/mcmc-samplers#nuts', 'generative-models/drag-editing', 'generative-models/audio-generation'],
     progression: [
       { label: 'Probability', note: 'generative-models/gaussian-distributions' },
       { label: 'Divergences', note: 'generative-models/entropy-and-divergences' },
@@ -312,9 +346,30 @@ export const courses: Record<CourseKey, Course> = {
     ru: {
       title: 'Генеративные модели',
       shortTitle: 'Генеративные модели',
-      description: 'Вероятность, латентные переменные и основные семейства современных генеративных моделей.',
+      description: 'Как выучить распределение по данным, сэмплировать из него новые объекты и решить, уловила ли модель данные. Шесть семейств моделей, и каждое по-своему выбирает между точным правдоподобием, быстрым сэмплированием и полезным латентным представлением.',
+      entry: 'Что нужно знать: теорию вероятностей (распределения, математическое ожидание, метод максимального правдоподобия) и машинное обучение до нейросетей и обратного распространения; для разделов «Ноутбук» пригодится немного PyTorch. Потоки, энергетические модели, диффузия и авторегрессионные модели — параллельные пути, а не лестница. Заметки с пометкой «Ответвление» — архитектурные и прикладные ветви; основной маршрут читается без них.',
       progression: ['Вероятность', 'Дивергенции', 'Автоэнкодеры', 'VAE', 'GAN', 'Оценка', 'Потоки', 'EBM', 'Диффузия', 'Авторегрессия', 'Звук'],
       labels: {
+        'The plan of the course': 'План курса',
+        'The course in one paragraph': 'Курс в одном абзаце',
+        'Sampling from noise, the Gaussian, KL divergence and the network building blocks the later models use.': 'Сэмплирование из шума, нормальное распределение, KL-дивергенция и сетевые блоки, из которых собраны модели дальше.',
+        'Draw samples from simple noise, compute a KL divergence and say which direction of it a fit minimizes.': 'Сэмплировать из простого шума, вычислять KL-дивергенцию и говорить, какое её направление минимизирует подгонка.',
+        'A latent-variable model trained through a lower bound on the likelihood.': 'Модель с латентными переменными, обучаемая через нижнюю оценку правдоподобия.',
+        'Name the generative model, the approximate posterior and the bound a VAE actually optimizes.': 'Называть порождающую модель, приближённое апостериорное распределение и оценку, которую VAE на самом деле оптимизирует.',
+        'Learning by comparing samples: a generator against a discriminator or critic, then architectures and applications built on it.': 'Обучение сравнением сэмплов: генератор против дискриминатора или критика, затем архитектуры и приложения на этой основе.',
+        'Tell a density from a discriminator or critic and explain why the game is hard to train. The notes after WGAN are branches.': 'Отличать плотность от дискриминатора или критика и объяснять, почему эту игру трудно обучать. Заметки после WGAN — ответвления.',
+        'What “good” means for generated samples, and the blind spot of each metric.': 'Что значит «хорошо» для сгенерированных объектов и чего не видит каждая метрика.',
+        'Choose a metric and a protocol (feature extractor, sample size, direction of improvement) and say what the metric cannot see.': 'Выбирать метрику и протокол (экстрактор признаков, размер выборки, направление улучшения) и говорить, чего метрика не видит.',
+        'Exact likelihood through invertible maps.': 'Точное правдоподобие через обратимые отображения.',
+        'Compute a likelihood by the change of variables and keep its Jacobian cheap.': 'Вычислять правдоподобие по формуле замены переменных и держать якобиан дешёвым.',
+        'Unnormalized densities, and the samplers they need.': 'Ненормированные плотности и сэмплеры, которые для них нужны.',
+        'Sample an unnormalized density with MCMC and train an energy without computing its normalizing constant.': 'Сэмплировать из ненормированной плотности с помощью MCMC и обучать энергию, не вычисляя нормировочную константу.',
+        'Learning to reverse a gradual noising process.': 'Обучение обращению постепенного зашумления.',
+        'Write the forward process, the training objective and the sampler, and tell a local score from a claim about the final distribution.': 'Выписывать прямой процесс, функцию потерь и сэмплер и отличать локальный скор от утверждения об итоговом распределении.',
+        'Exact likelihood by the chain rule, one element at a time.': 'Точное правдоподобие по цепному правилу, по одному элементу за раз.',
+        'Factorize a distribution by the chain rule, sample it element by element and see why that is slow.': 'Раскладывать распределение по цепному правилу, сэмплировать его поэлементно и понимать, почему это медленно.',
+        'The same machinery applied to speech and music.': 'Те же методы в применении к речи и музыке.',
+        'Say what is compressed, conditioned, sampled and evaluated in a speech or music model.': 'Говорить, что в модели речи или музыки сжимается, чем она обусловлена, что сэмплируется и как оценивается.',
         'Foundations': 'Основы',
         'What generative modeling is': 'Что такое генеративное моделирование',
         'Sampling from simple noise': 'Сэмплирование из простого шума',
@@ -417,7 +472,7 @@ export const courses: Record<CourseKey, Course> = {
       },
     },
     sections: [
-      { title: 'Foundations', topics: [
+      { title: 'Foundations', summary: 'Sampling from noise, the Gaussian, KL divergence and the network building blocks the later models use.', outcome: 'Draw samples from simple noise, compute a KL divergence and say which direction of it a fit minimizes.', topics: [
         noteTopic('What generative modeling is', 'generative-models/generative-modeling'),
         noteTopic('Sampling from simple noise', 'generative-models/generative-modeling', 'how-a-computer-samples-at-all'),
         noteTopic('Multivariate Gaussian distributions', 'generative-models/gaussian-distributions'),
@@ -428,7 +483,7 @@ export const courses: Record<CourseKey, Course> = {
         noteTopic('Instance normalization', 'generative-models/training-background', 'instance-normalization'),
         noteTopic('Autoencoders', 'generative-models/autoencoders'),
       ] },
-      { title: 'Variational Autoencoders', topics: [
+      { title: 'Variational Autoencoders', summary: 'A latent-variable model trained through a lower bound on the likelihood.', outcome: 'Name the generative model, the approximate posterior and the bound a VAE actually optimizes.', topics: [
         noteTopic('Variational autoencoders', 'generative-models/vae'),
         noteTopic('ELBO', 'generative-models/vae', 'where-the-elbo-comes-from'),
         noteTopic('Reparameterization trick', 'generative-models/vae', 'the-reparameterization-trick'),
@@ -436,7 +491,7 @@ export const courses: Record<CourseKey, Course> = {
         noteTopic('β-VAE', 'generative-models/vae-variants', 'β-vae-a-weight-on-the-kl-term'),
         noteTopic('VQ-VAE', 'generative-models/vae-variants', 'vq-vae-a-discrete-latent-code'),
       ] },
-      { title: 'GANs', topics: [
+      { title: 'GANs', summary: 'Learning by comparing samples: a generator against a discriminator or critic, then architectures and applications built on it.', outcome: 'Tell a density from a discriminator or critic and explain why the game is hard to train. The notes after WGAN are branches.', topics: [
         noteTopic('Generative adversarial networks', 'generative-models/gans'),
         noteTopic('Conditional GAN', 'generative-models/gans', 'conditional-gan'),
         noteTopic('f-GAN', 'generative-models/gans', 'f-gan'),
@@ -468,7 +523,7 @@ export const courses: Record<CourseKey, Course> = {
         noteTopic('SPADE', 'generative-models/image-translation', 'spade-per-pixel-scale-and-shift-from-the-mask'),
         noteTopic('Super-resolution: SRGAN and ESRGAN', 'generative-models/image-translation', 'super-resolution-why-the-average-looks-blurry'),
       ] },
-      { title: 'Evaluation', topics: [
+      { title: 'Evaluation', summary: 'What “good” means for generated samples, and the blind spot of each metric.', outcome: 'Choose a metric and a protocol (feature extractor, sample size, direction of improvement) and say what the metric cannot see.', topics: [
         noteTopic('Inception Score', 'generative-models/inception-score'),
         noteTopic('Fréchet Inception Distance', 'generative-models/fid'),
         noteTopic('Kernel Inception Distance', 'generative-models/fid', 'kernel-inception-distance-an-unbiased-alternative'),
@@ -478,13 +533,13 @@ export const courses: Record<CourseKey, Course> = {
         noteTopic('Human evaluation', 'generative-models/human-evaluation'),
         noteTopic('Pairwise preferences and Elo', 'generative-models/human-evaluation', 'which-of-two-is-better'),
       ] },
-      { title: 'Normalizing Flows', topics: [
+      { title: 'Normalizing Flows', summary: 'Exact likelihood through invertible maps.', outcome: 'Compute a likelihood by the change of variables and keep its Jacobian cheap.', topics: [
         noteTopic('Normalizing flows: change of variables', 'generative-models/normalizing-flows'),
         noteTopic('Flow architectures', 'generative-models/flow-architectures'),
         noteTopic('Neural spline flows', 'generative-models/flow-architectures', 'd-spline-couplings-neural-spline-flows'),
         noteTopic('Flows on images', 'generative-models/flow-architectures', 'f-flows-on-images-squeeze-masks-and-multi-scale'),
       ] },
-      { title: 'Energy-Based Models', topics: [
+      { title: 'Energy-Based Models', summary: 'Unnormalized densities, and the samplers they need.', outcome: 'Sample an unnormalized density with MCMC and train an energy without computing its normalizing constant.', topics: [
         noteTopic('Sampling unnormalized densities: MALA, Hamiltonian Monte Carlo and NUTS', 'generative-models/mcmc-samplers'),
         noteTopic('MALA', 'generative-models/mcmc-samplers', 'mala'),
         noteTopic('Hamiltonian Monte Carlo', 'generative-models/mcmc-samplers', 'hamiltonian-monte-carlo'),
@@ -494,7 +549,7 @@ export const courses: Record<CourseKey, Course> = {
         noteTopic('Noise-contrastive estimation', 'generative-models/energy-based-models', 'noise-contrastive-estimation-learning-z-by-classification'),
         noteTopic('JEM: a classifier as an EBM', 'generative-models/energy-based-models', 'jem-your-classifier-is-secretly-an-ebm'),
       ] },
-      { title: 'Diffusion Models', topics: [
+      { title: 'Diffusion Models', summary: 'Learning to reverse a gradual noising process.', outcome: 'Write the forward process, the training objective and the sampler, and tell a local score from a claim about the final distribution.', topics: [
         noteTopic('DDPM: the forward process', 'generative-models/ddpm-forward-process'),
         noteTopic('Noise schedules', 'generative-models/ddpm-forward-process', 'linear-quadratic-sigmoid-and-cosine-schedules'),
         noteTopic('DDPM: reverse process and training objective', 'generative-models/ddpm-training-objective'),
@@ -511,7 +566,7 @@ export const courses: Record<CourseKey, Course> = {
         noteTopic('DragGAN', 'generative-models/drag-editing', 'draggan-motion-supervision-and-point-tracking'),
         noteTopic('DragDiffusion', 'generative-models/drag-editing', 'dragdiffusion-the-same-loop-in-a-diffusion-latent'),
       ] },
-      { title: 'Autoregressive Models', topics: [
+      { title: 'Autoregressive Models', summary: 'Exact likelihood by the chain rule, one element at a time.', outcome: 'Factorize a distribution by the chain rule, sample it element by element and see why that is slow.', topics: [
         noteTopic('Autoregressive models', 'generative-models/autoregressive-models'),
         noteTopic('Factorization', 'generative-models/autoregressive-models', 'the-chain-rule-as-a-model'),
         noteTopic('PixelRNN / PixelCNN', 'generative-models/autoregressive-models', 'pixelrnn-and-pixelcnn'),
@@ -519,7 +574,7 @@ export const courses: Record<CourseKey, Course> = {
         noteTopic('VQGAN and image tokens', 'generative-models/autoregressive-transformers', 'vqgan'),
         noteTopic('Text-to-image: DALL·E and Parti', 'generative-models/autoregressive-transformers', 'text-to-image-dalle'),
       ] },
-      { title: 'Audio Generation', topics: [
+      { title: 'Audio Generation', summary: 'The same machinery applied to speech and music.', outcome: 'Say what is compressed, conditioned, sampled and evaluated in a speech or music model.', topics: [
         noteTopic('Audio generation: text-to-speech and music', 'generative-models/audio-generation'),
         noteTopic('Glow-TTS', 'generative-models/audio-generation', 'glow-tts-a-flow-with-a-text-conditioned-prior'),
         noteTopic('Residual vector quantization', 'generative-models/audio-generation', 'residual-vector-quantization'),
@@ -531,9 +586,12 @@ export const courses: Record<CourseKey, Course> = {
     title: 'Natural Language Processing',
     requires: ['ml'],
     shortTitle: 'NLP',
-    description: 'One path from raw text to modern LLM systems: each method is introduced by the problem the previous one could not solve.',
+    description: 'One path from raw text to modern LLM systems. Each note says what it adds: a fix for a limitation of the previous method, or a new task, objective or system component.',
+    entry: 'Before you start: Machine Learning up to neural networks (logistic regression, cross-entropy, backpropagation) and basic Python. Notebook sections describe the course\'s public notebooks; the notes read without them. Results from different notes are comparable only where a note says they share a protocol.',
+    guide: [{ label: 'The plan of the course', note: 'nlp/natural-language-processing', anchor: 'the-plan-of-the-course' }],
     progression: [
       { label: 'Text', section: 'Text Foundations' },
+      { label: 'Classical NLP', section: 'Classical NLP' },
       { label: 'Representations', section: 'Distributed Representations' },
       { label: 'Sequences', section: 'Neural Sequence Models' },
       { label: 'Transformers', section: 'Transformers' },
@@ -541,14 +599,28 @@ export const courses: Record<CourseKey, Course> = {
       { label: 'Adaptation', section: 'Adaptation and Efficient Models' },
       { label: 'Tasks', section: 'NLP Tasks' },
       { label: 'LLM Systems', section: 'Modern LLM Systems' },
+      { label: 'Beyond left to right', section: 'Advanced Generation' },
     ],
     // Russian labels for the course map, keyed by the English titles and summaries below.
     ru: {
       title: 'Обработка естественного языка',
       shortTitle: 'NLP',
-      description: 'Один путь от сырого текста к современным LLM-системам: каждый метод появляется как ответ на задачу, которую не решил предыдущий.',
-      progression: ['Текст', 'Представления', 'Последовательности', 'Трансформеры', 'Предобучение', 'Адаптация', 'Задачи', 'LLM-системы'],
+      description: 'Один путь от сырого текста к современным LLM-системам. Каждая заметка говорит, что она добавляет: исправление ограничения предыдущего метода или новую задачу, цель обучения или компонент системы.',
+      entry: 'Что нужно знать: машинное обучение до нейросетей (логистическая регрессия, кросс-энтропия, обратное распространение) и основы Python. Разделы «Ноутбук» описывают открытые ноутбуки курса; заметки читаются и без них. Результаты из разных заметок сравнимы, только если в заметке сказано, что протокол у них общий.',
+      progression: ['Текст', 'Классический NLP', 'Представления', 'Последовательности', 'Трансформеры', 'Предобучение', 'Адаптация', 'Задачи', 'LLM-системы', 'Не слева направо'],
       labels: {
+        'The plan of the course': 'План курса',
+        'Turn text into tokens and splits that keep Unicode, labels and evaluation intact, and say in what unit a loss or perplexity is measured.': 'Превращать текст в токены и разбиения, не ломая Unicode, метки и оценку, и говорить, в каких единицах измерены потери или перплексия.',
+        'Build a TF-IDF classifier and a smoothed n-gram model: two strong baselines for two different questions.': 'Строить классификатор на TF-IDF и сглаженную n-граммную модель: два сильных базовых решения для двух разных вопросов.',
+        'Explain which contexts and subwords update which vectors, and what a static vector cannot express.': 'Объяснять, какие контексты и подслова обновляют какие векторы и чего не может выразить статический вектор.',
+        'Separate local patterns, recurrent state and alignment, and teacher-forced training from decoding.': 'Различать локальные шаблоны, рекуррентное состояние и выравнивание, а обучение с teacher forcing — от декодирования.',
+        'Compute one attention row by hand and trace masks, shapes and the shifted target through a Transformer.': 'Вычислять вручную одну строку внимания и прослеживать маски, размерности и сдвинутую цель через трансформер.',
+        'Tell an architecture from a pretraining objective: masked, causal or both.': 'Отличать архитектуру от цели предобучения: маскированной, каузальной или обеих.',
+        'Choose between full fine-tuning, parameter-efficient methods, instruction tuning and quantization by what each changes and what it costs.': 'Выбирать между полным дообучением, параметрически эффективными методами, инструктивным дообучением и квантизацией по тому, что каждый меняет и сколько стоит.',
+        'Shared pretrained representations with a task-specific output: a classifier, tagger or span head, or a decoder that generates the answer.': 'Общие предобученные представления и выход под задачу: голова классификатора, разметчика или спанов либо декодер, который порождает ответ.',
+        'Pick the output structure each task needs, and compare models only on a shared protocol.': 'Выбирать структуру выхода под задачу и сравнивать модели только по общему протоколу.',
+        'Evaluate retrieval, generation and tool use separately, and then the whole system.': 'Оценивать поиск, генерацию и вызов инструментов по отдельности, а затем систему целиком.',
+        'A branch, not a remedy: generate text in an order other than left to right, and compare it with masked and causal models.': 'Ответвление, а не лекарство: порождать текст не слева направо и сравнивать такой подход с маскированными и каузальными моделями.',
         'Text Foundations': 'Основы работы с текстом',
         'What natural language processing is': 'Что такое обработка естественного языка',
         'Why language is hard for a computer': 'Почему язык труден для компьютера',
@@ -619,13 +691,12 @@ export const courses: Record<CourseKey, Course> = {
         'Attention as the only mixing operation, and what it takes to make that work.': 'Внимание как единственная операция смешивания и всё, что нужно, чтобы это работало.',
         'Training objectives that turn unlabeled text into reusable models.': 'Цели обучения, которые превращают неразмеченный текст в переиспользуемые модели.',
         'Changing a pretrained model without paying for it twice.': 'Как изменить предобученную модель, не платя за неё дважды.',
-        'The same pretrained encoder, a different head for each task.': 'Один и тот же предобученный энкодер и своя голова для каждой задачи.',
         'Systems built around a language model, and how to evaluate the whole system.': 'Системы вокруг языковой модели и оценка системы целиком.',
         'Generating text without a left-to-right order.': 'Генерация текста без порядка слева направо.',
       },
     },
     sections: [
-      { title: 'Text Foundations', summary: 'How text becomes model input, and how a result is measured.', topics: [
+      { title: 'Text Foundations', summary: 'How text becomes model input, and how a result is measured.', outcome: 'Turn text into tokens and splits that keep Unicode, labels and evaluation intact, and say in what unit a loss or perplexity is measured.', topics: [
         noteTopic('What natural language processing is', 'nlp/natural-language-processing'),
         noteTopic('Why language is hard for a computer', 'nlp/natural-language-processing', 'why-language-is-hard-for-a-computer'),
         noteTopic('Text as data', 'nlp/text-as-data'),
@@ -634,14 +705,14 @@ export const courses: Record<CourseKey, Course> = {
         noteTopic('WordPiece and SentencePiece', 'nlp/tokenization', 'wordpiece-and-sentencepiece'),
         noteTopic('Corpora and evaluation', 'nlp/corpora-and-evaluation'),
       ] },
-      { title: 'Classical NLP', summary: 'Counting words is a strong baseline; counting sequences gives the first language model.', topics: [
+      { title: 'Classical NLP', summary: 'Counting words is a strong baseline; counting sequences gives the first language model.', outcome: 'Build a TF-IDF classifier and a smoothed n-gram model: two strong baselines for two different questions.', topics: [
         noteTopic('Bag of words', 'nlp/bag-of-words-and-tf-idf'),
         noteTopic('TF-IDF', 'nlp/bag-of-words-and-tf-idf', 'tf-idf-reweighting-the-counts'),
         noteTopic('N-gram language models', 'nlp/n-gram-language-models'),
         noteTopic('Perplexity', 'nlp/n-gram-language-models', 'perplexity-from-probability-to-a-number'),
         noteTopic('Smoothing', 'nlp/n-gram-language-models', 'smoothing'),
       ] },
-      { title: 'Distributed Representations', summary: 'From one-hot vectors to dense vectors that carry meaning.', topics: [
+      { title: 'Distributed Representations', summary: 'From one-hot vectors to dense vectors that carry meaning.', outcome: 'Explain which contexts and subwords update which vectors, and what a static vector cannot express.', topics: [
         noteTopic('Word embeddings', 'nlp/word-embeddings'),
         noteTopic('Word2Vec', 'nlp/word2vec'),
         noteTopic('CBOW and skip-gram', 'nlp/word2vec', 'two-prediction-tasks-cbow-and-skip-gram'),
@@ -650,28 +721,28 @@ export const courses: Record<CourseKey, Course> = {
         noteTopic('FastText', 'nlp/fasttext'),
         noteTopic('From static to contextual embeddings', 'nlp/bert', 'from-static-to-contextual-embeddings'),
       ] },
-      { title: 'Neural Sequence Models', summary: 'Models that read a sequence, and the bottleneck that attention removes.', topics: [
+      { title: 'Neural Sequence Models', summary: 'Models that read a sequence, and the bottleneck that attention removes.', outcome: 'Separate local patterns, recurrent state and alignment, and teacher-forced training from decoding.', topics: [
         noteTopic('CNNs for text classification', 'nlp/cnn-text-classification'),
         noteTopic('Recurrent neural networks', 'nlp/recurrent-networks'),
         noteTopic('LSTM and GRU', 'nlp/lstm-and-gru'),
         noteTopic('Sequence-to-sequence models', 'nlp/seq2seq'),
         noteTopic('Attention before Transformers', 'nlp/attention-before-transformers'),
       ] },
-      { title: 'Transformers', summary: 'Attention as the only mixing operation, and what it takes to make that work.', topics: [
+      { title: 'Transformers', summary: 'Attention as the only mixing operation, and what it takes to make that work.', outcome: 'Compute one attention row by hand and trace masks, shapes and the shifted target through a Transformer.', topics: [
         noteTopic('Self-attention', 'nlp/attention'),
         noteTopic('Multi-head attention', 'nlp/attention', 'multi-head-attention'),
         noteTopic('Transformer architecture', 'nlp/transformers'),
         noteTopic('Positional representations', 'nlp/positional-encoding'),
         noteTopic('Transformer for machine translation', 'nlp/transformer-machine-translation'),
       ] },
-      { title: 'Pretrained Language Models', summary: 'Training objectives that turn unlabeled text into reusable models.', topics: [
+      { title: 'Pretrained Language Models', summary: 'Training objectives that turn unlabeled text into reusable models.', outcome: 'Tell an architecture from a pretraining objective: masked, causal or both.', topics: [
         noteTopic('BERT and masked language modeling', 'nlp/bert'),
         noteTopic('GPT and autoregressive language modeling', 'nlp/gpt'),
         noteTopic('Decoding strategies', 'nlp/gpt', 'decoding-turning-probabilities-into-text'),
         noteTopic('Encoder, decoder and encoder–decoder models', 'nlp/model-families'),
         noteTopic('Transfer learning in NLP', 'nlp/transfer-learning'),
       ] },
-      { title: 'Adaptation and Efficient Models', summary: 'Changing a pretrained model without paying for it twice.', topics: [
+      { title: 'Adaptation and Efficient Models', summary: 'Changing a pretrained model without paying for it twice.', outcome: 'Choose between full fine-tuning, parameter-efficient methods, instruction tuning and quantization by what each changes and what it costs.', topics: [
         noteTopic('Fine-tuning', 'nlp/fine-tuning'),
         noteTopic('Parameter-efficient fine-tuning', 'nlp/peft'),
         noteTopic('LoRA', 'nlp/peft', 'lora-a-low-rank-update'),
@@ -679,7 +750,7 @@ export const courses: Record<CourseKey, Course> = {
         noteTopic('Quantization', 'nlp/quantization'),
         noteTopic('GPTQ', 'nlp/quantization', 'gptq-quantizing-weights-with-calibration-data'),
       ] },
-      { title: 'NLP Tasks', summary: 'The same pretrained encoder, a different head for each task.', topics: [
+      { title: 'NLP Tasks', summary: 'Shared pretrained representations with a task-specific output: a classifier, tagger or span head, or a decoder that generates the answer.', outcome: 'Pick the output structure each task needs, and compare models only on a shared protocol.', topics: [
         noteTopic('Text classification', 'nlp/text-classification'),
         noteTopic('Semantic similarity and sentence pairs', 'nlp/sentence-similarity'),
         noteTopic('Cross-encoders and bi-encoders', 'nlp/sentence-similarity', 'bi-encoder-embed-each-text-once'),
@@ -688,21 +759,21 @@ export const courses: Record<CourseKey, Course> = {
         noteTopic('Summarization', 'nlp/summarization'),
         noteTopic('Machine translation', 'nlp/transformer-machine-translation', 'results'),
       ] },
-      { title: 'Modern LLM Systems', summary: 'Systems built around a language model, and how to evaluate the whole system.', topics: [
+      { title: 'Modern LLM Systems', summary: 'Systems built around a language model, and how to evaluate the whole system.', outcome: 'Evaluate retrieval, generation and tool use separately, and then the whole system.', topics: [
         noteTopic('Embeddings and semantic search', 'nlp/semantic-search'),
         noteTopic('Retrieval-augmented generation', 'nlp/rag'),
         noteTopic('Tool use', 'nlp/tools-and-agents'),
         noteTopic('Agents', 'nlp/tools-and-agents', 'agents-a-loop-around-tool-calls'),
         noteTopic('LLM evaluation', 'nlp/llm-evaluation'),
       ] },
-      { title: 'Advanced Generation', summary: 'Generating text without a left-to-right order.', topics: [
+      { title: 'Advanced Generation', summary: 'Generating text without a left-to-right order.', outcome: 'A branch, not a remedy: generate text in an order other than left to right, and compare it with masked and causal models.', topics: [
         noteTopic('Non-autoregressive generation and text diffusion', 'nlp/text-diffusion'),
       ] },
     ],
   },
 };
 
-/** Section title of a note, used to group the course tree. */
+/** Section title of a note, used to group the course tree: the section that lists the note itself, not one that only lists an anchored part of it. */
 export function sectionOf(course: CourseKey, noteId: string): string | undefined {
-  return courses[course].sections.find((section) => section.topics.some((topic) => typeof topic !== 'string' && topic.note === noteId))?.title;
+  return courses[course].sections.find((section) => section.topics.some((topic) => typeof topic !== 'string' && topic.note === noteId && !topic.anchor))?.title;
 }
