@@ -4,6 +4,15 @@ Notable changes to the site, newest first. Each entry gives the date, what chang
 
 ## 2026-10-16
 
+- **Generative Models: the main GAN variants.** Three new notes, in English and Russian, cover the GAN architectures the course had only mentioned in passing:
+  - *Scaling GANs: progressive growing, self-attention and BigGAN*: ProGAN, SAGAN with a step-through self-attention block, BigGAN with class conditioning, orthogonal regularization and the truncation trick.
+  - *StyleGAN: a style-based generator*: InfoGAN as the first attempt at control, then StyleGAN (mapping network, W space, AdaIN styles, noise, style mixing, perceptual path length), StyleGAN2 (weight demodulation, derived and computed; path-length regularization) and StyleGAN3.
+  - *Beyond CycleGAN: multimodal, contrastive and semantic image synthesis*: MUNIT, CUT, pix2pixHD and SPADE, and SRGAN and ESRGAN, with a proof that a perfect sampler has twice the squared error of the blurry mean.
+
+  The GAN section now reads WGAN → scaling → StyleGAN → α-GAN → CycleGAN → StarGAN → beyond CycleGAN. The figures in the papers cannot be republished (arXiv's default licence), so every GAN note gains a "Where to see the images" section. It lists the figure numbers in each paper and the official project pages, each checked against the paper. Two figures of the sampling section had labels running past the frame at some widths; fixed.
+
+  Why: a reader compared the course with a list of GAN variants and found StyleGAN, BigGAN and the newer image-translation models missing.
+
 - **Generative Models: how a computer samples, written out step by step.** The sampling section of *What generative modeling is* was too compressed: it did not say where the computer's random numbers come from, and the move from uniform numbers to other distributions skipped steps. Each of the five steps now gives the idea, the key formula in a frame, why it works, and the same step in a few lines of code that run as written.
   - **Where the numbers come from:** physical noise against pseudo-random generators, a 16-state toy generator worked through number by number, what real generators (PCG64, the Mersenne Twister, Philox) change, how a 64-bit integer becomes a number in [0, 1), and the seed.
   - **Inverse transform sampling:** built up from a discrete example (cutting [0, 1) into pieces) to the continuous case, with the three-line proof and the exponential distribution solved step by step.

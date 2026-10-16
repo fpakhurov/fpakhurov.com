@@ -63,6 +63,7 @@ const background: Record<string, PrerequisiteTarget> = {
   'Доверительные интервалы и бутстрэп': { note: 'probability/confidence-intervals-and-bootstrap' },
   'Markov chain Monte Carlo': { note: 'probability/markov-chain-monte-carlo' },
   'LoRA': { note: 'nlp/peft', anchor: 'lora-a-low-rank-update' },
+  'Self-attention': { note: 'nlp/attention' },
   'Марковские методы Монте-Карло (MCMC)': { note: 'probability/markov-chain-monte-carlo' },
   'Метод максимального правдоподобия': { note: 'probability/maximum-likelihood' },
   'Gradient descent': { note: 'ml/gradient-descent' },
