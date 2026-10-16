@@ -18,7 +18,7 @@ A trained model is a set of matrices of 32-bit floats, and serving it means hold
 
 ## Baseline: 32-bit floats everywhere
 
-Every weight is a float32: 4 bytes, about 7 significant digits, a range of $10^{\pm 38}$. Nothing in a trained network uses that precision; weights of a layer typically lie in a range of a few units and are not distinguishable at the third decimal. Half precision (float16 or bfloat16) halves the memory with no visible loss and is the default for serving. Going below 16 bits needs integers, because hardware has no 8-bit float arithmetic in general use, and integers need a map.
+Every weight is a float32: 4 bytes, about 7 significant digits, a range of $10^{\pm 38}$. Nothing in a trained network uses that precision; weights of a layer typically lie in a range of a few units and are not distinguishable at the third decimal. Half precision (float16 or bfloat16) halves the memory with no visible loss and is the default for serving. This note goes below 16 bits with integer codes, and integers need a map. Eight-bit floating-point formats are another route: FP8 tensor cores arrived with NVIDIA's Hopper (H100) GPUs in 2022, and which formats run fast depends on the hardware generation. The formats covered here are integer affine codes (int8, int4) and the NF4 codebook.
 
 ## The affine map
 
@@ -87,15 +87,23 @@ Generation with a large decoder is memory-bound: each token needs every weight r
 
 ## GPTQ: quantizing weights with calibration data
 
-Rounding every weight to its nearest level ignores that the weights of a layer act together: a rounding error in one weight can be compensated by adjusting the others. **GPTQ** ([Frantar et al., 2023](#references)) does this compensation layer by layer:
+Rounding every weight to its nearest level ignores that the weights of a layer act together: a rounding error in one weight can be compensated by adjusting the others. **GPTQ** ([Frantar et al., 2023](#references)) does this compensation layer by layer.
 
-1. Run a small calibration set (128 sequences is the usual recommendation) through the model and collect the layer's inputs $X$. The layer's output error for a weight change $\delta W$ is $\|\delta W^\top X\|^2$, a quadratic form with Hessian $H = 2 X X^\top$.
-2. Quantize the weight matrix one column at a time. After rounding a column, update all not-yet-quantized columns by the optimal correction $\delta = -\frac{w_q - w}{H^{-1}_{qq}}\, H^{-1}_{:,q}$, which is the Optimal Brain Surgeon step ([Hassibi and Stork, 1993](#references)) applied with the pre-computed inverse Hessian.
-3. Proceed through the columns in a fixed order, with a lazy batched update and a small dampening of $H$ for numerical stability.
+This section follows the paper's orientation. The layer computes $W X_{\text{cal}}$ with $W \in \mathbb R^{d_{\text{out}} \times d_{\text{in}}}$, the transpose of the $W$ above, and $X_{\text{cal}} = X^\top \in \mathbb R^{d_{\text{in}} \times N}$ holds the $N$ calibration token vectors as columns. A row $w \in \mathbb R^{1 \times d_{\text{in}}}$ of $W$ holds one output's weights, and $\operatorname{quant}(w_q)$ is the weight $w_q$ rounded to its nearest level.
+
+1. Run a small calibration set (128 sequences is the usual recommendation) through the model and collect $X_{\text{cal}}$. Changing a row by $\delta$ changes that output by $\delta X_{\text{cal}}$, so the squared output error is $\|\delta X_{\text{cal}}\|^2 = \tfrac12\, \delta H \delta^\top$ with Hessian $H = 2 X_{\text{cal}} X_{\text{cal}}^\top \in \mathbb R^{d_{\text{in}} \times d_{\text{in}}}$, the same for every row.
+2. Quantize the input coordinates (the columns of $W$) one at a time, all rows at once because they share $H$. Let $F$ be the set of coordinates not yet quantized and $H_F$ the Hessian restricted to them. Rounding coordinate $q$ moves it from $w_q$ to $\operatorname{quant}(w_q)$, and the update of the coordinates in $F$ that minimizes the output error with that coordinate fixed is the Optimal Brain Surgeon step ([Hassibi and Stork, 1993](#references); [Frantar et al., 2023](#references), Section 3, Eq. 2):
+   $$
+   \delta_F = -\frac{w_q - \operatorname{quant}(w_q)}{[H_F^{-1}]_{qq}}\, (H_F^{-1})_{:,q}.
+   $$
+   Its $q$-th entry is $-(w_q - \operatorname{quant}(w_q))$, which puts coordinate $q$ exactly on its level; then $q$ leaves $F$.
+3. Proceed through the coordinates in a fixed order, with a lazy batched update and a small dampening of $H$ for numerical stability.
+
+**Worked example (toy numbers).** Two strongly correlated inputs with $X_{\text{cal}} X_{\text{cal}}^\top = \begin{pmatrix} 1 & 0.9 \\ 0.9 & 1 \end{pmatrix}$, a row $w = (0.3, 0.4)$ and integer levels. Rounding each weight on its own gives $(0, 0)$, an error $\delta = (-0.3, -0.4)$ and $\|\delta X_{\text{cal}}\|^2 = 0.09 + 0.16 + 2 \cdot 0.9 \cdot 0.12 = 0.466$. GPTQ rounds $w_1$ to $0$. The inverse Hessian's first column divided by its first entry is $(1, -0.9)$, so $\delta = -0.3 \cdot (1, -0.9) = (-0.3, 0.27)$ and $w_2$ moves to $0.67$, which rounds to $1$. The result $(0, 1)$ has error $(-0.3, 0.6)$ and $\|\delta X_{\text{cal}}\|^2 = 0.09 + 0.36 - 2 \cdot 0.9 \cdot 0.18 = 0.126$, under a third of the independent rounding. With the sign of the update flipped, $w_2$ would move to $0.13$ and round back to $0$.
 
 The result is a 4-bit (or 3-bit) model whose layer outputs are as close as possible, in the least-squares sense on the calibration data, to the original's. Scales are stored per **group** of 128 weights along a row (`group_size=128`), a compromise between per-tensor (coarse) and per-weight (no saving). The quantized weights are packed eight 4-bit codes per int32 (`qweight`), with the zero points packed likewise (`qzeros`), and specialized kernels (ExLlama) read them.
 
-Calibration data matters. A 125 M-parameter model (OPT-125M) quantized to 4 bits with a few hundred WikiText-2 sequences as the calibration set generates fluent text ("Hello my name is Alex and I'm a 25 year old male…"); the same model calibrated on a single sentence generates `My name is "M""""""""`. The Hessian estimated from one sentence is nearly rank-one, and the compensation step then pushes the remaining weights in meaningless directions. A pre-quantized 7 B chat model from the Hub loads into 4-bit layers and generates normally.
+Calibration data matters. A 125 M-parameter model (OPT-125M) quantized to 4 bits with a few hundred WikiText-2 sequences as the calibration set generates fluent text ("Hello my name is Alex and I'm a 25 year old male…"); the same model calibrated on a single sentence generates `My name is "M""""""""`. One sentence of $n$ tokens gives $n$ token vectors, so its $H$ has rank at most $n$, far below the layers' input sizes (768 or 3,072 in OPT-125M); it is singular, and only the dampening makes it invertible. A plausible explanation is that the compensation then rests on a few poorly estimated directions and moves the remaining weights where the real inputs do not go. The run does not measure the spectrum of $H$, so this is a hypothesis, as is the general advice that calibration data should be sufficient and diverse. A pre-quantized 7 B chat model from the Hub loads into 4-bit layers and generates normally.
 
 ## Distillation and pruning
 
@@ -145,7 +153,7 @@ Throughput follows memory only when the kernel exists, and accuracy results on o
 - Affine map: $x_q = \operatorname{round}(x/s + z)$, $x \approx s(x_q - z)$, with $s = (b - a)/(b_q - a_q)$; error $\le s/2$ inside the range, clipping outside.
 - A quantized linear layer is an integer matrix product plus row/column sums, rescaled once by $s_X s_W$.
 - DistilBERT on IMDb: 0.249 → 0.085 GiB and 0.9313 → 0.9266 at 8 bits; on the GPU the 8-bit model was slower than float32, because speed depends entirely on the kernel and the model size.
-- LLMs are quantized weight-only (int8 with outlier columns, NF4, GPTQ 4-bit with group size 128); GPTQ compensates rounding errors column by column using a Hessian from calibration data, and a bad calibration set ruins the model.
+- LLMs are quantized weight-only (int8 with outlier columns, NF4, GPTQ 4-bit with group size 128); GPTQ compensates rounding errors one input coordinate at a time using a Hessian from calibration data, and in this run a one-sentence calibration set ruined the output.
 - Distillation trains a small model on a large model's soft outputs; pruning removes parameters; both change the architecture, quantization does not.
 
 ## Notebook
