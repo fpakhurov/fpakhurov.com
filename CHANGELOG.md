@@ -4,6 +4,17 @@ Notable changes to the site, newest first. Each entry gives the date, what chang
 
 ## 2026-10-17
 
+- **Figure labels that overlapped or ran past the frame.** A check of every label's box against its neighbours and the drawing's edge, in English and Russian at desktop and phone widths, found defects in nine older figures:
+  - **GANs:** the schematic, the saturating-loss plot and the least-squares pull;
+  - **Human evaluation:** the Elo curve;
+  - **VAE:** reparameterization, and the latent-space panel in Russian;
+  - **Transfer learning:** the three-routes bar chart;
+  - **Word2vec:** the noise distribution and negative sampling.
+
+  The fixes move or shorten labels, give axes a little more room and split one long Russian label. The GAN pointwise-maximum plot also gains a phone layout, so its tick labels no longer shrink below 9 px. The step badges in the LSTM and self-attention flows, which an audit had flagged as small, measure 9–9.3 px inside their circles and stay as they are.
+
+  Why: the audit-fix pass found these with its overlap check; they predate it.
+
 - **All four courses: corrections from an external audit.** An external review of the live site (16 October 2026) logged 295 findings across Probability Theory, Machine Learning, Generative Models and NLP: 28 of priority 1, 195 of priority 2 and 72 of priority 3. Each finding was checked against the current text before it was acted on:
   - 267 were fixed;
   - 18 were partly fixed (usually a reading route or an optional-depth mark where the audit proposed splitting a note);
