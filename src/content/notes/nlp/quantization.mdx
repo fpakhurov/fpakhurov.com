@@ -2,8 +2,8 @@
 title: Quantization
 description: "Store weights (and sometimes activations) as 8- or 4-bit integers with a scale and a zero point instead of 32-bit floats. The note derives the affine map and the integer matrix product, measures memory, accuracy and speed on a 67 M-parameter classifier through three implementations, explains GPTQ's calibration-based weight quantization, and places distillation and pruning next to it."
 course: nlp
-section: Adaptation and Efficient Models
-order: 26
+section: Efficient Inference
+order: 35
 status: published
 tags: [quantization, int8, int4, gptq, nf4, distillation, inference]
 prerequisites: [Instruction tuning and alignment, Transformer Architecture, Linear algebra]
@@ -11,6 +11,8 @@ prerequisites: [Instruction tuning and alignment, Transformer Architecture, Line
 
 import AffineMap from '../../../components/figures/quantization/AffineMap.astro';
 import IntMatmul from '../../../components/figures/quantization/IntMatmul.astro';
+
+The [instruction tuning note](/notes/nlp/instruction-tuning) ended with an assistant: a base model after SFT and preference optimization, with the architecture unchanged and billions of parameters. Training it was a one-time cost; serving it is paid on every request, and this section is about lowering that cost.
 
 A trained model is a set of matrices of 32-bit floats, and serving it means holding them in memory and multiplying by them for every token. A 7 B-parameter model is 28 GB in 32-bit and 14 GB in 16-bit; at generation time the cost is dominated by reading those bytes, once per token. Quantization stores the numbers in fewer bits. This note derives what that does to a matrix product, measures it on a small model, and explains how the method scales to large language models.
 
@@ -76,6 +78,51 @@ Reading the table:
 - **Speed** is where implementations differ. The hand-written int8 layer is 24× *slower* than float32 (1.23 ms against 51 μs for a $256 \times 128$ input on a $128 \times 128$ layer), because PyTorch has no optimized int8 matmul on that CPU path and the sums are done in generic int32 ops; the arithmetic is right (mean absolute error 0.0011 against the float output) and the kernel is missing. The built-in dynamic quantization is 17 % faster than float on CPU. On the GPU, comparing full passes over the test set on the same device, the 8-bit model is *slower*: 3 min 50 s against 2 min 4 s in float32. For a 67 M-parameter model that is not limited by memory traffic, the int8 kernels and the outlier handling of LLM.int8() cost more than they save. Quantization pays off only with a kernel that wins on the target hardware at the model's size; otherwise it is a memory tool.
 
 The `torch.ao` path also does not run on GPU at all (the dynamic int8 linear op is CPU-only), which is one reason practitioners use the `bitsandbytes`, GPTQ and AWQ ecosystems for Transformers rather than the framework's own quantization.
+
+## Memory, latency and throughput of generation
+
+The DistilBERT measurements say little about a large decoder, because generation uses memory differently. Three quantities decide what serving costs, and quantization acts on each one through the bytes it removes.
+
+**Memory.** Two things occupy the GPU. The weights take $P \cdot b / 8$ bytes for $P$ parameters at $b$ bits each, and they are fixed. The **KV cache** holds the keys and values of every earlier position, kept so that each new token needs only its own query, key and value ([GPT note](/notes/nlp/gpt#making-generation-faster)). With $L$ blocks, a key–value width $d_{kv}$ per block and $b_{kv}$ bits per cached number, a sequence of $n$ tokens holds
+
+$$
+M_{\text{KV}} = 2 \cdot L \cdot d_{kv} \cdot n \cdot \frac{b_{kv}}{8} \ \text{bytes},
+$$
+
+the factor 2 counting keys and values. The cache grows with every generated token and with every sequence in the batch.
+
+**Latency**, the time per generated token. Each decoding step reads every weight once and the cache of the sequence, and does about two arithmetic operations per weight. That is far too little arithmetic to keep the GPU's compute units busy at batch size one, so the step waits on memory bandwidth $B$ (bytes per second):
+
+$$
+t_{\text{token}} \ \ge\ \frac{M_{\text{weights}} + M_{\text{KV}}}{B}.
+$$
+
+Fewer bits per weight lower this bound directly, provided the kernel dequantizes inside the product. Processing the prompt (prefill) is different: all prompt positions pass through each weight at once, the step is limited by arithmetic, and weight-only quantization, which still multiplies in 16-bit, helps it little.
+
+**Throughput**, the tokens per second over all requests. A batch of $k$ sequences reads the weights once per step and produces $k$ tokens, so throughput grows with $k$ until a resource runs out. On one GPU that resource is usually the memory left for KV caches: serving a 13 B-parameter model on a 40 GB A100, about 65 % of the memory held the weights and close to 30 % the KV caches ([Kwon et al., 2023](#references), §1). Every byte taken from the weights is room for more sequences.
+
+### Worked example: a 7 B model on one GPU
+
+The model has the shape of Llama 2 7B: $P = 6.7 \times 10^9$, $L = 32$ blocks, width 4,096 with full multi-head attention, so $d_{kv} = 4096$, and a context of $n = 4096$ tokens ([Touvron et al., 2023a](#references), Table 2; [Touvron et al., 2023b](#references), §2.2 and Table 1). The hardware numbers are round values chosen for the arithmetic, not a particular product: 24 GB of memory and $B = 1$ TB/s.
+
+Weights: 13.4 GB in 16-bit, 6.7 GB in 8-bit, 3.35 GB in 4-bit. A 16-bit scale per group of 128 weights adds $16 / 128 = 0.125$ bit per weight, 3 % of 4 bits, so the 4-bit model with its scales is 3.45 GB. The cache, in 16-bit:
+
+$$
+\begin{aligned}
+\text{per token:}\quad & 2 \cdot 32 \cdot 4096 \cdot 2 \ \text{bytes} = 524{,}288 \ \text{bytes} \approx 0.52 \ \text{MB}, \\
+\text{per 4,096-token sequence:}\quad & 524{,}288 \cdot 4096 \ \text{bytes} \approx 2.15 \ \text{GB}.
+\end{aligned}
+$$
+
+Eight full-context sequences hold 17.2 GB of cache, more than the 16-bit weights. At batch size one, a token of a full-context sequence takes at least $(13.4 + 2.15)\ \text{GB} / 1\ \text{TB/s} = 15.5$ ms with 16-bit weights, at most 64 tokens per second, and $(3.45 + 2.15)\ \text{GB} / 1\ \text{TB/s} = 5.6$ ms with 4-bit weights, at most 178 tokens per second. For batches, fill the memory left after the weights with full-context sequences:
+
+| Weights | KV cache | Weights, GB | Sequences that fit | Step time, bound | Tokens/s, bound |
+| --- | --- | --- | --- | --- | --- |
+| 16-bit | 16-bit | 13.4 | 4 | 22.0 ms | 182 |
+| 4-bit, group 128 | 16-bit | 3.45 | 9 | 22.8 ms | 395 |
+| 4-bit, group 128 | 8-bit | 3.45 | 19 | 23.9 ms | 796 |
+
+The step time is $(M_{\text{weights}} + k \cdot M_{\text{KV}}) / B$ and the throughput $k$ tokens per step. At batch size one, quantizing the weights cuts latency almost threefold, because the weights are most of the bytes read. In a full batch the caches are most of the bytes, so the step time hardly changes, and quantization raises throughput by making room for more sequences: 182 to 395 tokens per second. The cached keys and values are activations, and the same affine map can store them in 8 bits, which halves their term and doubles the batch again. The numbers are upper bounds under the bandwidth model alone: they ignore activations, framework overhead, kernel efficiency and the compute limit, and show the shape of the trade-off, not a measured speed. Grouped-query attention reaches the same saving through the architecture by shrinking $d_{kv}$; Llama 2 uses it in its 34 B and 70 B models.
 
 ## Weight-only quantization for large language models
 
@@ -154,6 +201,7 @@ Throughput follows memory only when the kernel exists, and accuracy results on o
 - A quantized linear layer is an integer matrix product plus row/column sums, rescaled once by $s_X s_W$.
 - DistilBERT on IMDb: 0.249 → 0.085 GiB and 0.9313 → 0.9266 at 8 bits; on the GPU the 8-bit model was slower than float32, because speed depends entirely on the kernel and the model size.
 - LLMs are quantized weight-only (int8 with outlier columns, NF4, GPTQ 4-bit with group size 128); GPTQ compensates rounding errors one input coordinate at a time using a Hessian from calibration data, and in this run a one-sentence calibration set ruined the output.
+- Serving memory is weights plus KV cache, $2 L d_{kv} n$ numbers per sequence. Decoding is bound by the bytes read per token, so fewer bits per weight lower latency at small batch, and the memory they free holds more sequences, which raises throughput.
 - Distillation trains a small model on a large model's soft outputs; pruning removes parameters; both change the architecture, quantization does not.
 
 ## Notebook
@@ -178,7 +226,7 @@ Two notebooks. Cell numbers count every cell, markdown included, from 1. Quoted 
 
 ## Next
 
-The course has now built, pretrained, adapted and compressed models. The next section turns to the tasks those models are used for and asks, for each, what the input and output are, which metric measures it, what the classical baseline was, and what the Transformer-era approach changed. The [text classification note](/notes/nlp/text-classification) opens it with the task that has run through the whole course, and collects every AG News result in one table.
+The course has now built, pretrained, adapted, aligned and compressed a model. What remains is the system around it. A model knows only what its weights hold, and an application usually needs answers grounded in documents the model never saw. The next section assembles such systems, starting with the [semantic search note](/notes/nlp/semantic-search), where the contextual vectors of an encoder become an index that finds the relevant text for a query.
 
 ## References
 
@@ -187,6 +235,9 @@ The course has now built, pretrained, adapted and compressed models. The next se
 - T. Dettmers, A. Pagnoni, A. Holtzman, L. Zettlemoyer. [QLoRA: Efficient Finetuning of Quantized LLMs](https://arxiv.org/abs/2305.14314). NeurIPS, 2023. NF4 and double quantization.
 - E. Frantar, S. Ashkboos, T. Hoefler, D. Alistarh. [GPTQ: Accurate Post-Training Quantization for Generative Pre-trained Transformers](https://arxiv.org/abs/2210.17323). ICLR, 2023.
 - B. Hassibi, D. G. Stork. [Second order derivatives for network pruning: Optimal Brain Surgeon](https://proceedings.neurips.cc/paper/1992/hash/303ed4c69846ab36c2904d3ba8573050-Abstract.html). NeurIPS, 1993.
+- W. Kwon et al. [Efficient Memory Management for Large Language Model Serving with PagedAttention](https://arxiv.org/abs/2309.06180). SOSP, 2023. §1 and Figure 1: how weights and KV cache share GPU memory; §3: the KV cache per token.
+- H. Touvron et al. [LLaMA: Open and Efficient Foundation Language Models](https://arxiv.org/abs/2302.13971). arXiv, 2023a. Table 2: model shapes.
+- H. Touvron et al. [Llama 2: Open Foundation and Fine-Tuned Chat Models](https://arxiv.org/abs/2307.09288). arXiv, 2023b. §2.2 and Table 1: 4,096-token context, grouped-query attention for 34 B and 70 B.
 - J. Lin et al. [AWQ: Activation-aware Weight Quantization for LLM Compression and Acceleration](https://arxiv.org/abs/2306.00978). MLSys, 2024.
 - G. Hinton, O. Vinyals, J. Dean. [Distilling the Knowledge in a Neural Network](https://arxiv.org/abs/1503.02531). NeurIPS Deep Learning Workshop, 2015.
 - V. Sanh, L. Debut, J. Chaumond, T. Wolf. [DistilBERT, a distilled version of BERT: smaller, faster, cheaper and lighter](https://arxiv.org/abs/1910.01108). arXiv, 2019.
