@@ -2,7 +2,7 @@
 
 Notable changes to the site, newest first. Each entry gives the date, what changed and why.
 
-## 2026-10-19
+## 2026-10-21
 
 - **NLP: how a large language model is built, adapted and run.** The NLP course goes from 37 to 41 notes. Its second half is reordered, so that a reader first sees how an LLM is built, then how it is adapted and turned into an assistant, then how it is run cheaply.
   - **New notes**, in English and Russian:
@@ -38,6 +38,8 @@ Notable changes to the site, newest first. Each entry gives the date, what chang
       - *Transformer for translation*: the roles of encoder and decoder;
       - *NER*: token against sequence classification;
       - *Question answering*: extractive against generative QA.
+
+  Eight NLP figures had labels that overlapped or ran past the frame, among them the ELECTRA, iso-FLOP, mixture-of-experts, generation-loop, alignment and quantization figures; fixed and checked in both languages at desktop and phone widths.
 
   Why: the course jumped from GPT to fine-tuning, so how models grew, what their data is, and what makes them affordable to train and run were mentioned in passing or missing.
 
