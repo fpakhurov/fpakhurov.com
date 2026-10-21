@@ -2,6 +2,47 @@
 
 Notable changes to the site, newest first. Each entry gives the date, what changed and why.
 
+## 2026-10-21
+
+- **NLP: how a large language model is built, adapted and run.** The NLP course goes from 37 to 41 notes. Its second half is reordered, so that a reader first sees how an LLM is built, then how it is adapted and turned into an assistant, then how it is run cheaply.
+  - **New notes**, in English and Russian:
+    - *Evolution of pretrained models*: RoBERTa, ELECTRA, GPT-2 and ModernBERT, separating changes to the architecture, the objective, the training procedure and data, and the implementation.
+    - *Scaling laws and compute-optimal training*:
+      - Kaplan and Chinchilla, with a step-by-step budget split;
+      - Gopher and Chinchilla on the same budget;
+      - why compute-optimal is not inference-optimal;
+      - why there is no strict line between a language model and a large one.
+    - *Pretraining data for large language models*: the pipeline from crawl to batches, with filtering, exact and MinHash deduplication, decontamination against evaluation sets, safety filtering and data mixtures.
+    - *Efficient Transformers: FlashAttention and mixture of experts*:
+      - memory traffic and online softmax, with a check in code that tiled attention equals the standard one;
+      - routing, total against active parameters, load balancing;
+      - a table of the modern Transformer block.
+  - **New order of sections:** Pretrained Language Models → Scaling and LLM Pretraining → Modern Transformer Architectures → Adapting Pretrained Models → NLP Tasks → LLM Post-training → Efficient Inference → Modern LLM Systems → Advanced Generation. The tasks now come after the adaptation notes they build on. The hand-overs, the plan in the opening note, its course figure and the course page follow the new order.
+  - **Existing notes, extended without rewriting:**
+    - *Transformer Architecture*: RMSNorm and a table comparing the original and the modern Transformer.
+    - *Positional representations*: a figure and a worked example of why RoPE scores depend only on the offset.
+    - *GPT*: from GPT-1 to GPT-3, and temperature, top-k and top-p side by side.
+    - *Model families*: one central comparison table.
+    - *Transfer learning* and *Fine-tuning*: one backbone with different heads, and task fine-tuning against instruction tuning.
+    - *Instruction tuning*:
+      - the stages of LLM training;
+      - an SFT example with its loss mask;
+      - the sources, quality and diversity of SFT data;
+      - what preference optimization is for.
+    - *Quantization*: memory, latency and throughput of generation.
+    - Among the earlier notes:
+      - *Bag of words*: when TF-IDF with a linear model is the right final choice;
+      - *N-gram models*: when two perplexities can be compared;
+      - *Word embeddings*: intrinsic and extrinsic evaluation of embeddings;
+      - *Word2Vec*: why both Word2Vec tasks give useful vectors;
+      - *Transformer for translation*: the roles of encoder and decoder;
+      - *NER*: token against sequence classification;
+      - *Question answering*: extractive against generative QA.
+
+  Eight NLP figures had labels that overlapped or ran past the frame, among them the ELECTRA, iso-FLOP, mixture-of-experts, generation-loop, alignment and quantization figures; fixed and checked in both languages at desktop and phone widths.
+
+  Why: the course jumped from GPT to fine-tuning, so how models grew, what their data is, and what makes them affordable to train and run were mentioned in passing or missing.
+
 ## 2026-10-17
 
 - **Figure labels that overlapped or ran past the frame.** A check of every label's box against its neighbours and the drawing's edge, in English and Russian at desktop and phone widths, found defects in nine older figures:

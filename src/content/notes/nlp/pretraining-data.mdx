@@ -1,0 +1,382 @@
+---
+title: Pretraining data for large language models
+description: "How a web crawl becomes pretraining data: text extraction, language and quality filters, exact and near-duplicate removal with MinHash, decontamination against benchmarks, safety and personal-data filters, mixture weights and epochs, and packing into batches, with what each step changes in the model."
+course: nlp
+section: Scaling and LLM Pretraining
+order: 24
+status: published
+tags: [pretraining-data, common-crawl, quality-filtering, deduplication, minhash, decontamination, data-mixture]
+prerequisites: [Scaling laws and compute-optimal training, Corpora and evaluation, Tokenization]
+---
+
+import Pipeline from '../../../components/figures/pretraining-data/Pipeline.astro';
+import MinHash from '../../../components/figures/pretraining-data/MinHash.astro';
+import Mixture from '../../../components/figures/pretraining-data/Mixture.astro';
+
+The [scaling-laws note](/notes/nlp/scaling-laws) ended with a budget. A compute-optimal model wants about 20 training tokens per parameter, and a model meant to be cheap at inference is trained on more: LLaMA's 7B model read 1 trillion tokens, about 150 per parameter (6.7 billion parameters, [Touvron et al., 2023](#references), Table 2). The budget says how many tokens; it does not say where good tokens come from. The open web supplies the volume, but most of what a crawler stores is menus, spam, other languages, copies of other pages and, sometimes, the test sets the model will be evaluated on. This note follows the pipeline that turns a crawl into training data, step by step, and says for each step what goes wrong in the model without it.
+
+Everything here is a change of **training data**, part of the training procedure. The architecture and the objective, next-token prediction as in the [GPT note](/notes/nlp/gpt#the-objective), stay exactly as they were; implementation enters only where scale forces a different algorithm, as for finding near-duplicates among billions of documents.
+
+**Notation.** A document is reduced to its set of **shingles**, its word $n$-grams; $A$ and $B$ are the shingle sets of two documents. $J(A, B)$ is their Jaccard similarity. A MinHash signature has $k$ entries, cut into $b$ bands of $r$ rows, so $k = br$. A training run reads $D$ tokens; source $i$ holds $|S_i|$ tokens, is sampled with weight $w_i$ ($\sum_i w_i = 1$), and is read for $e_i$ epochs.
+
+## Baseline: train on the raw crawl
+
+Common Crawl, the public web archive behind most pretraining corpora, produced about 20 TB of extracted text per month when T5 was built, and most of that text is not natural language ([Raffel et al., 2020](#references), Section 2.2): it is boilerplate, error messages, lists of keywords, code fragments and duplicated text. The simplest plan, to tokenize all of it and train, was tested directly. The same T5 encoder–decoder model was pretrained on $2^{35} \approx 34$B tokens of either C4, the cleaned corpus (745 GB), or an unfiltered variant of the same crawl that kept only the English language filter (6.1 TB), and then fine-tuned on each task. The unfiltered variant was worse on every task: GLUE 81.46 against 83.28, SQuAD 78.78 against 80.88, SuperGLUE 68.04 against 71.36 (Table 8). The larger corpus lost because a fixed budget of 34B tokens spent on noise is a budget not spent on language.
+
+<aside class="callout"><strong>Key idea.</strong> Treat the corpus as an engineered artifact. A sequence of filters each removes one kind of bad token (non-text, wrong language, low quality, duplicates, benchmark text, unsafe or personal content), and a mixture decides how often each remaining source is read. Every choice is judged the way a model is: train identical small models on the data before and after the choice and compare them on the same benchmarks.</aside>
+
+That last sentence is the method of the field. FineWeb ([Penedo et al., 2024](#references), Section 3.1) decided every step of its pipeline with **data ablations**: models of 1.71B parameters with the same architecture, tokenizer and hyperparameters, trained on about 28B tokens sampled from each version of the data (two seeds each), and evaluated on a fixed set of benchmarks chosen because their scores were stable at that scale. A filter is kept if the ablation model improves. Numbers below that compare two versions of a dataset come from such paired runs, and each one states its setup.
+
+## The pipeline from crawl to batches
+
+<Pipeline />
+
+1. **Raw sources.** Web crawl for volume; books, code, encyclopedias, scientific papers and question-answer sites as smaller curated sources.
+2. **Extraction.** Turn each HTML page into its main text, after blocking URLs of unwanted sites.
+3. **Language identification.** Keep the languages the model is for.
+4. **Quality filtering.** Remove documents (and lines) that are not running text, with rules or with a classifier.
+5. **Deduplication.** Remove exact and near-duplicate documents and repeated long passages.
+6. **Decontamination.** Remove text that overlaps the evaluation sets.
+7. **Safety and personal data.** Remove unwanted content; mask identifiers such as e-mail addresses.
+8. **Mixture.** Choose how much of the training budget each source receives, and so how many epochs it is read for.
+9. **Tokenization and batches.** Tokenize, concatenate documents into fixed-length sequences, shuffle, batch.
+
+The bars give a sense of scale. In RefinedWeb ([Penedo et al., 2023](#references), Figure 2), the kept share after a stage is the product of the kept fractions of all stages up to it: after URL filtering (2.24 % removed), extraction (1.49 %) and language identification (50.66 %),
+
+$$
+100\,\% \times (1 - 0.0224)(1 - 0.0149)(1 - 0.5066) = 47.5\,\%
+$$
+
+of the documents remain, and after quality filtering and deduplication 11.7 % of the crawl is left. Language identification, quality filtering and deduplication each remove about half of what reaches them. The order of the steps differs between pipelines: FineWeb deduplicates before its C4-style and custom rules, RefinedWeb after all its quality filters; RefinedWeb filters URLs first, before any compute-heavy processing.
+
+## Extraction: from HTML to text
+
+A crawl stores each page as raw HTML (WARC files) and also as text extracted by the crawler (WET files). The WET text keeps navigation menus, footers and advertisements line by line. Running one's own extractor on the HTML, with a library that keeps the main content (trafilatura in RefinedWeb and FineWeb, jusText in the Pile), gives better data: in FineWeb's ablation, 28B tokens extracted from WARC with trafilatura trained a better model than 28B tokens of WET text, with only the English filter applied to either (Section 3.2, Figure 1).
+
+Curated sources need their own extraction. LLaMA's arXiv data drops everything before the first section and the bibliography and expands user-defined LaTeX macros; its GitHub data keeps only files under Apache, BSD and MIT licences and strips boilerplate headers ([Touvron et al., 2023](#references), Section 2.1).
+
+## Language identification and quality filtering
+
+### Language identification
+
+A small classifier on character $n$-grams, the fastText model used by CCNet ([Wenzek et al., 2020](#references)), trained on Wikipedia and two other multilingual collections and covering 176 languages, assigns each document a language and a confidence. RefinedWeb and FineWeb keep English documents whose top-language score is at least 0.65; low scores usually mean the page has no natural text at all. C4 used a different detector with a stricter cut, 0.99 ([Raffel et al., 2020](#references), Section 2.2). For an English model this step removes about half of the crawl (50.66 % in RefinedWeb).
+
+### Heuristic rules
+
+The C4 rules ([Raffel et al., 2020](#references), Section 2.2) are the classic example. Keep only lines that end in terminal punctuation; keep only lines of at least five words and pages of at least three sentences; drop any page containing a word from a list of obscene words, the phrase "lorem ipsum" or a curly bracket (a sign of code); drop lines mentioning JavaScript or cookie and privacy policies; remove citation markers; keep one copy of every three-sentence span that occurs more than once. Later pipelines add the repetition and quality heuristics of MassiveText ([Rae et al., 2021](#references)): documents with excessive repetition of lines, paragraphs or $n$-grams, or with outlying length or symbol-to-word ratio, are removed (as summarized by [Penedo et al., 2023](#references), Section 3.2).
+
+Each rule is a guess about what low-quality text looks like, and guesses cost data. FineWeb measured the C4 rules one at a time on the same ablation setup ([Penedo et al., 2024](#references), Section 3.5). The terminal-punctuation rule gave the largest improvement on its own but removed about 30 % of all tokens; all the other C4 rules together removed about 7 % and did better than terminal punctuation alone. FineWeb kept the others and dropped that one. It then derived its own rules by comparing statistics of a high- and a low-quality version of one crawl, choosing three: remove documents where at most 0.12 of the lines end in punctuation (10.14 % of tokens), where at least 0.1 of the characters are in duplicated lines (12.47 %), or where at least 0.67 of the lines are shorter than 30 characters (3.73 %). Together they removed about 22 % of the tokens and raised the aggregate benchmark score by about 1 % in the 28B-token ablations (Section 3.6).
+
+### Classifier-based filtering
+
+A rule tests one surface property. A classifier can learn what a reference corpus of good text looks like and score every page by its resemblance. GPT-3 trained a logistic regression on hashed word features, with WebText, Wikipedia and books as positives and raw Common Crawl as negatives ([Brown et al., 2020](#references), Appendix A). It did not keep the pages above a threshold. A page with classifier score $s \in [0, 1]$ was kept if a random draw $X$ from a Pareto distribution of shape $\alpha = 9$ (NumPy's `pareto`, the Lomax form, with $P(X > t) = (1 + t)^{-\alpha}$) exceeded $1 - s$:
+
+$$
+P(\text{keep} \mid s) = P(X > 1 - s) = (1 + 1 - s)^{-\alpha} = (2 - s)^{-9} .
+$$
+
+The first equality is the rule, the second the Lomax tail at $t = 1 - s$. A page scored 1 is always kept; at $s = 0.9$ the probability is $1.1^{-9} = 0.424$; at $s = 0.5$, $1.5^{-9} = 0.026$; at $s = 0.1$, $1.9^{-9} = 0.003$. The randomness is deliberate: the authors wanted mostly high-scoring pages but also some that the classifier considered out of distribution. A hard threshold would make the corpus a copy of the reference style.
+
+LLaMA used two learned filters on its CommonCrawl part: CCNet's $n$-gram language model trained on Wikipedia, which removes text that Wikipedia would find improbable, and a linear classifier separating pages cited as references by Wikipedia from random pages ([Touvron et al., 2023](#references), Section 2.1). FineWeb-Edu ([Penedo et al., 2024](#references), Section 4) went further: Llama-3-70B-Instruct rated 460,000 web pages for educational value on a scale of 0 to 5; a linear regressor on a small embedding model, trained on 410,000 of these ratings, then scored all 15 trillion FineWeb tokens; pages rated 3 or more were kept, 1.3 trillion tokens. With 1.71B-parameter models trained on 350B tokens of each corpus, MMLU rose from 33 % with FineWeb to 37 % with FineWeb-Edu and ARC from 46 % to 57 %. The threshold of 3 was chosen as a trade-off with benchmarks such as HellaSwag, which measure everyday text rather than school knowledge: a filter decides which abilities the model gets, not only how clean its data is.
+
+## Deduplication
+
+### Why duplicates hurt
+
+The web repeats itself: mirrors, aggregators, templated pages that differ in a product name or a date, licences and disclaimers on millions of pages. [Lee et al. (2022)](#references) measured this in four public corpora and trained 1.5B-parameter decoders for about two epochs on each version of C4, original and deduplicated by two methods, everything else equal.
+
+- **Memorization.** One 61-word sentence occurred 61,036 times in C4. When the model trained on the original C4 generated 100,000 samples without a prompt, 1.926 % of its tokens were part of a 50-token string copied from the training set; after deduplication, 0.189 % and 0.138 % for the two methods (Table 4). Repeated text is what a model learns to reproduce verbatim, including personal data that happens to be repeated.
+- **Wasted compute.** Each copy of a passage costs a training step that teaches nothing new. Deduplication made the datasets up to 19 % smaller, and the deduplicated models reached the same or better accuracy in fewer steps, with no worse perplexity (Section 1).
+- **Leakage.** 4.6 % of C4's validation examples had a near-duplicate in its training set (Table 2). A published model shows what this does: Transformer-XL trained on the One Billion Word benchmark has perplexity 10.11 on validation examples with a near-duplicate in training and 23.58 on the rest (Table 5). The evaluation measures recall for part of the set and generalization for the rest. This is the duplicates-across-splits leak of [Corpora and evaluation](/notes/nlp/corpora-and-evaluation#leakage-when-the-split-is-not-a-split), at the scale of a pretraining corpus.
+
+Repetition is not harmful in every dose. T5 trained the same model for $2^{35}$ tokens on truncated copies of C4, so that the data repeated 64, 256, 1,024 or 4,096 times. At 64 repeats GLUE was 82.87 against 83.28 with no repetition; at 4,096 it was 76.34, and the training loss fell well below that of the full run, a sign of memorization ([Raffel et al., 2020](#references), Table 9 and Figure 6). What deduplication removes is the skew: some passages repeated tens of thousands of times while most occur once.
+
+### Exact duplicates
+
+Hash each document, or each line or paragraph, and keep one copy per hash value. This is cheap and catches mirrors: C4 keeps one copy of each three-sentence span, and LLaMA deduplicates its GitHub data file by file with exact matches.
+
+*Optional depth: how repeated substrings are found without comparing all pairs. The rest of the note does not depend on it.*
+
+A document that repeats one paragraph of another is not an exact duplicate of it. Lee et al. remove every substring of at least 50 tokens that occurs more than once. They concatenate the whole corpus into one sequence and build its **suffix array**, the starting positions of all suffixes in lexicographic order: for "banana" the suffixes sorted are "a", "ana", "anana", "banana", "na", "nana", giving the array (6, 4, 2, 1, 5, 3). Suffixes that begin with the same string are neighbours in sorted order, so all occurrences of a repeated string fall in one contiguous block of the array, and one linear pass over adjacent entries finds every repeated string of 50 tokens or more. The array is built in time linear in the corpus length (Section 4.1).
+
+### Near duplicates: Jaccard similarity of shingles
+
+Templated pages defeat exact hashing because one changed word changes the hash. Compare instead the sets of word $n$-grams:
+
+$$
+J(A, B) = \frac{|A \cap B|}{|A \cup B|} \in [0, 1].
+$$
+
+**Worked example.** Two pages from one template: "Book a cheap flight from Halifax to Basel this spring and look forward to your trip with our friendly team, free cancellation on every booking", and the same with Maui and Dubrovnik. Each has 25 words, so 23 word 3-grams. A 3-gram changes if it contains one of the two replaced words: the 3-grams starting at words 4, 5 and 6 contain word 6 (Halifax), those starting at 6, 7 and 8 contain word 8 (Basel), five in all. So 18 shingles are shared and each page has 5 of its own:
+
+$$
+J = \frac{18}{5 + 18 + 5} = \frac{18}{28} = 0.643 .
+$$
+
+Computing $J$ exactly for every pair is out of reach: $N$ documents make $N(N-1)/2$ pairs, about $5 \times 10^{17}$ for a billion documents. The Pile's authors estimated that a direct pairwise MinHash comparison would have taken several hundred thousand years ([Gao et al., 2020](#references), Appendix D.2). Two ideas remove the quadratic cost: summarize each document by a short signature, and compare only documents whose signatures collide.
+
+### MinHash: a signature whose collisions estimate Jaccard
+
+Take a random order of all possible shingles; in practice, a random hash function $h$ whose values are distinct on the shingles at hand. The **min-hash** of a document is the smallest value of $h$ over its shingles, $m_h(A) = \min_{x \in A} h(x)$ ([Broder, 1997](#references)). Then
+
+$$
+\boxed{\;P\big(m_h(A) = m_h(B)\big) = J(A, B)\;}
+$$
+
+Why: let $x^*$ be the shingle of $A \cup B$ with the smallest value of $h$. Then
+
+$$
+\begin{aligned}
+P\big(m_h(A) = m_h(B)\big) &= P(x^* \in A \cap B) &&\text{(i)}\\
+&= \frac{|A \cap B|}{|A \cup B|} = J(A, B) . &&\text{(ii)}
+\end{aligned}
+$$
+
+(i) If $x^*$ is in both sets, it is the minimum over each of them, so the two min-hashes are equal. If $x^*$ is only in $A$, then $m_h(A) = h(x^*)$ is smaller than $h$ of every shingle of $B$, because $x^* \notin B$ and $h$ has no ties, so the min-hashes differ; the case $x^* \in B \setminus A$ is symmetric. (ii) A random order favours no shingle, so $x^*$ is equally likely to be any of the $|A \cup B|$ shingles of the union, and $|A \cap B|$ of them are shared.
+
+With $k$ independent hash functions the signature is the vector of $k$ min-hashes, and the fraction of positions where two signatures agree, $\hat J$, is an unbiased estimate of $J$ with standard deviation $\sqrt{J(1 - J)/k}$. For the flight pages and $k = 128$ that is $\sqrt{0.643 \times 0.357 / 128} = 0.042$; the code below gets $\hat J = 0.664$ against the exact 0.643. A document of any length is now 128 numbers.
+
+### Banding: which pairs to compare at all
+
+Signatures make one comparison cheap but still leave all pairs. **Locality-sensitive hashing** with bands ([Leskovec, Rajaraman and Ullman, 2020](#references), Section 3.4) avoids that: cut the $k$ min-hashes into $b$ bands of $r$ rows, hash each band into a bucket, and compare only pairs that share a bucket in at least one band. For two documents with similarity $s$,
+
+$$
+\begin{aligned}
+P(\text{a given band agrees}) &= s^r &&\text{(i)}\\
+P(\text{no band agrees}) &= (1 - s^r)^b &&\text{(ii)}\\
+P(\text{candidate}) &= 1 - (1 - s^r)^b . &&
+\end{aligned}
+$$
+
+(i) A band agrees when all its $r$ rows agree, and each row is a min-hash that agrees with probability $s$, independently of the others. (ii) The bands use disjoint rows, so they disagree independently, each with probability $1 - s^r$. The curve is an S whose steep part sits near $s \approx (1/b)^{1/r}$. FineWeb uses 5-grams and $k = 112$ hashes as $b = 14$ bands of $r = 8$ (threshold about 0.72): pairs with $s = 0.7, 0.75, 0.8, 0.85$ become candidates with probability 0.565, 0.772, 0.924 and 0.988 (Appendix E.1 rounds them to 56 %, 77 %, 92 % and 98.8 %). Lee et al. use $k = 9{,}000$ as 450 bands of 20 rows: a pair at $s = 0.8$ is caught with probability 0.9946 and a pair at $s = 0.5$ with probability 0.0004. More hashes buy a steeper step and cost more computation. Candidates are then checked (Lee et al. require an exact Jaccard above 0.8 and an edit similarity above 0.8), linked into clusters by their connected components, and one document per cluster is kept.
+
+<MinHash />
+
+1. Shingle each document into word 3-grams.
+2. Their Jaccard similarity is the shared fraction, here $18/28 = 0.643$.
+3. Each hash function contributes one min-hash; two documents agree on it with probability $J$. Ten is too few for a good estimate, which is why practice uses a hundred or more.
+4. Bands decide which pairs are compared at all. The same pair is almost certainly a candidate with $b = 32, r = 4$ (0.998) and a candidate only 38 % of the time with $b = 16, r = 8$ (0.377), whose threshold of about 0.71 lies above this pair's similarity.
+
+How much to deduplicate is itself an ablation result. FineWeb first deduplicated all 96 crawl snapshots against each other, which removed up to 90 % of the oldest snapshots and gave little improvement over no deduplication on its 350B-token ablations; on one old snapshot, the 10 % that survived trained a worse model than the 90 % that had been removed. Deduplicating each snapshot only against itself matched RefinedWeb's performance (Section 3.4). The paper's hypothesis is that the benefit comes from removing the huge clusters, hundreds of thousands of copies of one template, while removing the last few copies of ordinary pages removes useful data along with them.
+
+<aside class="callout"><strong>Check yourself.</strong> (1) With FineWeb's 14 bands of 8 rows, how likely is a pair with $J = 0.5$ to become a candidate? (2) A source of 10B tokens gets weight 5 % in a 1T-token run. How many epochs is it read for? (3) Why can MinHash with 5-gram shingles not find a page that copies another one word for word but in a different language?<details><summary>Answers</summary>(1) $0.5^8 = 0.0039$, $(1 - 0.0039)^{14} = 0.947$, so $P = 0.053$: such pairs are rarely even compared. (2) $e = wD/|S| = 0.05 \times 10^{12} / 10^{10} = 5$ epochs, twice LLaMA's most repeated source. (3) The shingles of a translation share almost no word 5-grams with the original, so $J \approx 0$ and the min-hashes almost never agree; similarity of meaning needs a different representation.</details></aside>
+
+## Decontamination against evaluation sets
+
+The [Corpora and evaluation note](/notes/nlp/corpora-and-evaluation#leakage-when-the-split-is-not-a-split) defines leakage within one dataset and its splits. A pretraining corpus adds a version that no split can prevent: the benchmark the model will be tested on was published on the web, and the crawler picked it up. Two cases differ in severity ([Dodge et al., 2021](#references), Section 4.2). With **input-and-label contamination** the test answers are in the corpus, and the model can recall rather than solve: 15.49 % of the reference summaries of the XSum test set occur in C4 verbatim, up to capitalization and punctuation. With **input contamination** only the inputs are present, for example 53.6 % of the sentences of the QNLI test set, which was built from Wikipedia; the model has read the passage but not the answer.
+
+Detection is by $n$-gram overlap. Let $G_n(x)$ be the set of word $n$-grams of a text $x$ after lower-casing and removing punctuation. A benchmark example $x$ is **dirty** if it shares at least one $n$-gram with the corpus:
+
+$$
+\text{dirty}(x) = \mathbb 1\Big[\, G_n(x) \cap \bigcup_{d \in \text{corpus}} G_n(d) \neq \varnothing \,\Big].
+$$
+
+GPT-3 ([Brown et al., 2020](#references), Appendix C) chose $n$ per benchmark as the 5th percentile of example length in words, clipped to between 8 and 13, so that most examples are long enough to be matched. To clean the training data it searched for 13-gram collisions with every benchmark, cut out the colliding 13-gram with 200 characters on each side, dropped fragments shorter than 200 characters and dropped documents split into more than 10 pieces; 13-grams occurring in more than 10 training documents were ignored as common phrases or boilerplate. In the code below the test question appears inside a quiz page and all 6 of its 13-grams are found; a paraphrase of the same fact shares none of them.
+
+Decontamination has to happen before training, and GPT-3 shows why. A bug left part of the detected overlap in the training data, and retraining was too expensive (Section 4). The authors measured the damage instead: for each benchmark they compared the score on all examples with the score on the clean ones. For most benchmarks the difference was negligible, and many flags were false positives: more than 90 % of the reading-comprehension examples of QuAC, SQuAD 2.0 and DROP were flagged because their source passages were in the corpus, while the question–answer pairs were not. Two results were marked with an asterisk: PIQA (29 % flagged, 3 points lower on the clean subset) and Winograd (45 % flagged, 2.6 % lower). Four Wikipedia language-modeling benchmarks and the Children's Book Test turned out to be almost entirely in the training data and were not reported at all. Contamination therefore inflates a score by an amount that has to be measured benchmark by benchmark, from nothing to making the number meaningless; the [LLM evaluation note](/notes/nlp/llm-evaluation#task-level-benchmarks) treats it as one of the things a benchmark score cannot tell.
+
+## Safety and personal data
+
+Two more filters remove content the model should not learn to produce. **Unsafe content** is filtered mostly by source: RefinedWeb blocks 4.6 million domains and scores each URL by a list of weighted words before any text is processed, noting that word-based rules such as C4's also block medical and legal pages ([Penedo et al., 2023](#references), Section 3.1). The cost of a crude filter is measurable. In C4 the word list removed documents classified as African American English and Hispanic-aligned English at rates of 42 % and 32 %, against 6.2 % and 7.2 % for White-aligned and other English; in a sample of removed documents mentioning "lesbian" or "gay", 22 % and 36 % were neither offensive nor sexual ([Dodge et al., 2021](#references), Sections 5.2–5.3).
+
+**Personal data** is handled by masking. FineWeb anonymizes e-mail addresses and public IP addresses, found with regular expressions ([Penedo et al., 2024](#references), Section 3.7 and its datasheet). Patterns catch identifiers with a fixed format; a name next to an address in running text passes through. Deduplication helps here too: the passages a model reproduces verbatim are mostly the ones it saw many times.
+
+## Mixture weights and epochs
+
+After filtering, the sources are not concatenated in proportion to their size. A run of $D$ tokens draws from source $i$ with weight $w_i$, so it reads $w_i D$ tokens of it, and
+
+$$
+e_i = \frac{w_i D}{|S_i|}
+$$
+
+is the number of epochs over that source. When the token budget $D$ is about the size of all sources together, weights above a source's natural share upsample it ($e_i > 1$ for a small, valuable source); weights below it leave part of a large source unread ($e_i < 1$).
+
+<Mixture />
+
+**Worked example (LLaMA).** $D = 1.4 \times 10^{12}$ tokens. Wikipedia has $w = 0.045$ and $e = 2.45$ ([Touvron et al., 2023](#references), Table 1), so the run reads $0.045 \times 1.4 \times 10^{12} = 63$B Wikipedia tokens from a source of $63\text{B} / 2.45 \approx 26$B tokens: every Wikipedia article is seen about two and a half times. GitHub has the same weight with $e = 0.64$: the same 63B tokens come from a source of about 98B tokens, a third of which is never read. CommonCrawl, at $w = 0.67$ and $e = 1.10$, is read once from about 853B tokens. The other mixtures follow the same logic. GPT-3 gave filtered Common Crawl 60 % of its 300B tokens (0.44 epochs) and Wikipedia 3 % (3.4 epochs), accepting "a small amount of overfitting in exchange for higher quality training data" ([Brown et al., 2020](#references), Section 2.2 and Table 2.2). The Pile reads Wikipedia 3 times, PubMed Central and arXiv twice, books 1.5 to 2.5 times and its Common Crawl part once, so its 825 GiB of raw data become 1,254 GiB per epoch of the whole ([Gao et al., 2020](#references), Table 1).
+
+Why not simply take everything once? Because the mixture decides what the model is good at. T5 pretrained the same model on corpora of different domains ([Raffel et al., 2020](#references), Section 3.4.1): Wikipedia plus a books corpus raised the MultiRC exact-match score, a reading-comprehension task built largely on fiction, from 25.78 with C4 to 50.93, and news-only data raised ReCoRD, built on news, from 68.16 to 73.72. In-domain text helps the tasks of that domain, and a narrow corpus leaves others behind; the same paper notes that single-domain corpora are also much smaller. A general model therefore needs diversity, broad web text, and deliberate weight on the sources that carry skills web text supplies too rarely: code, papers, reference text, long books. A model sees code only through the code share of its mixture.
+
+Weights can also be learned rather than set by hand. DoReMi ([Xie et al., 2023](#references)) trains a 280M-parameter proxy model with a robust objective that upweights the domains where it lags a reference model, and uses the resulting weights to sample data for an 8B model. On the Pile, against the same 8B model trained with the Pile's default weights, it improved average few-shot accuracy by 6.5 points and reached the baseline's accuracy with 2.6 times fewer training steps.
+
+## Tokenization and batches
+
+The tokenizer is trained on a sample of the mixture, so the mixture also decides how many tokens a byte of each language costs. T5 trained its SentencePiece vocabulary on ten parts English C4 to one part each of German, French and Romanian pages, because it was to be fine-tuned on translation into those languages ([Raffel et al., 2020](#references), Section 3.1.3). LLaMA's BPE splits numbers into single digits and falls back to bytes for characters it does not know (Section 2.1). The algorithms are those of the [tokenization note](/notes/nlp/tokenization#byte-pair-encoding).
+
+Tokenized documents are concatenated, separated by an end-of-text token, and cut into sequences of the context length; GPT-3 packs its training data into sequences of exactly 2,048 tokens without masking across document boundaries, leaving the model to learn that text after the separator is unrelated, and samples without replacement until an epoch boundary is reached ([Brown et al., 2020](#references), Appendix B). Sequences from all sources are shuffled together, so that every batch (4M tokens for LLaMA, Table 2) has roughly the mixture's proportions and the gradient never sees one source for long.
+
+## What changed
+
+| | Raw crawl | Curated pretraining data |
+| --- | --- | --- |
+| What the model reads | Whatever was crawled, menus and spam included | Main text of pages that pass language and quality filters |
+| Duplicates | Templates repeated tens of thousands of times | One copy per near-duplicate cluster |
+| Benchmarks | Present, unmeasured | Removed by $n$-gram matching, or measured on clean subsets |
+| Personal and unsafe content | Present | Blocked by URL, masked by pattern |
+| Sources | One | Several, with weights $w_i$ and epochs $e_i$ chosen on purpose |
+| Share of the crawl used | All of it | About 12 % in RefinedWeb |
+| Measured effect | T5 on unfiltered C4 | T5 on C4: better on every task at the same 34B tokens |
+| Kind of change | — | Data only: architecture, objective and optimizer unchanged |
+
+## Limitations
+
+- **"Quality" is a choice.** Rules and classifiers keep text that looks like their reference: Wikipedia, books, school material. They remove dialects and topics unevenly, and a classifier trained on one style narrows the corpus toward it; RefinedWeb used no learned filter apart from language identification for this reason.
+- **$n$-gram decontamination errs in both directions.** It misses paraphrases, translations and reformatted copies, and it flags shared background text that does not give away answers.
+- **Ablations are small.** Pipelines are tuned with models of about 1–2B parameters on tens to hundreds of billions of tokens. That a filter helps at that scale is evidence, not proof, that it helps a model fifty times larger.
+- **Thresholds depend on the judge.** The best quality threshold depends on the benchmarks chosen to judge it (FineWeb-Edu's threshold traded HellaSwag against MMLU), and more filtering is not always better (FineWeb's deduplication across all snapshots).
+- **Pattern-based privacy filtering is partial**, and documented for only some public corpora.
+- **The web is finite.** Repeating good data a few times costs little (64 repeats barely moved T5's scores), but a pipeline that keeps about a tenth of the crawl and models that want ever more tokens will run out of fresh text.
+
+## What you should remember
+
+- Pipeline: sources → extraction → language identification → quality filters → deduplication → decontamination → safety and personal data → mixture → tokenization and packing. RefinedWeb keeps about 12 % of the crawl; language identification, quality filtering and deduplication each halve what reaches them.
+- Quality filters are rules (punctuation, length, repetition, word lists) or classifiers trained on reference text; every one is judged by training the same small model with and without it.
+- Duplicates cause memorization (1.9 % of generated tokens copied versus about 0.2 % after deduplication in Lee et al.), waste training steps and leak validation data.
+- MinHash: $P(m_h(A) = m_h(B)) = J(A, B)$; banding makes a pair a candidate with probability $1 - (1 - s^r)^b$, a step near $(1/b)^{1/r}$.
+- Decontamination removes benchmark $n$-grams (13-grams in GPT-3) before training; afterwards one can only compare scores on clean and full subsets.
+- A mixture sets $w_i$ and therefore $e_i = w_i D / |S_i|$: small high-quality sources are read two or three times, large web sources about once, and the proportions shift which abilities the model has.
+
+## Code
+
+A MinHash near-duplicate detector with banding, and an $n$-gram contamination check, on toy documents. Python standard library only.
+
+```python
+import hashlib, random, re
+
+def words(text):
+    """Lowercase, turn punctuation into spaces, split on whitespace."""
+    return re.sub(r"[^\w\s]", " ", text.lower()).split()
+
+def shingles(text, n=3):
+    w = words(text)
+    return {" ".join(w[i:i + n]) for i in range(len(w) - n + 1)}
+
+def jaccard(a, b):
+    return len(a & b) / len(a | b)
+
+P = (1 << 61) - 1                                    # a prime above every 60-bit shingle id
+K = 128                                              # signature length k
+rnd = random.Random(0)
+HASHES = [(rnd.randrange(1, P), rnd.randrange(P)) for _ in range(K)]
+
+def shingle_id(s):                                   # a fixed 60-bit id per shingle
+    return int.from_bytes(hashlib.blake2b(s.encode(), digest_size=8).digest(), "big") >> 4
+
+def minhash(sh):
+    """Signature: for each h_i(x) = (a_i x + b_i) mod P, the minimum of h_i over the shingles."""
+    ids = [shingle_id(s) for s in sh]
+    return [min((a * x + b) % P for x in ids) for a, b in HASHES]
+
+docs = {
+    "halifax": "Book a cheap flight from Halifax to Basel this spring and look forward "
+               "to your trip with our friendly team, free cancellation on every booking.",
+    "maui":    "Book a cheap flight from Maui to Dubrovnik this spring and look forward "
+               "to your trip with our friendly team, free cancellation on every booking.",
+    "reword":  "Cheap flights from Halifax to Basel this spring: book now, cancel for free, "
+               "and travel with a friendly team.",
+    "physics": "The speed of sound in dry air at twenty degrees Celsius is about three "
+               "hundred and forty three metres per second.",
+}
+sh = {k: shingles(v) for k, v in docs.items()}
+sig = {k: minhash(v) for k, v in sh.items()}
+names = list(docs)
+for i, a in enumerate(names):
+    for b in names[i + 1:]:
+        est = sum(x == y for x, y in zip(sig[a], sig[b])) / K
+        print(f"{a:>7} vs {b:<7}  Jaccard {jaccard(sh[a], sh[b]):.3f}  MinHash {est:.3f}")
+# halifax vs maui     Jaccard 0.643  MinHash 0.664
+# halifax vs reword   Jaccard 0.111  MinHash 0.070
+# halifax vs physics  Jaccard 0.000  MinHash 0.000
+#    maui vs reword   Jaccard 0.000  MinHash 0.000
+#    maui vs physics  Jaccard 0.000  MinHash 0.000
+#  reword vs physics  Jaccard 0.000  MinHash 0.000
+
+def candidates(sig, b, r):
+    """Pairs whose signatures agree on all r rows of at least one of the b bands."""
+    pairs = set()
+    for band in range(b):
+        buckets = {}
+        for name, s in sig.items():
+            buckets.setdefault(tuple(s[band * r:(band + 1) * r]), []).append(name)
+        pairs |= {(x, y) for g in buckets.values() for x in g for y in g if x < y}
+    return sorted(pairs)
+
+s = jaccard(sh["halifax"], sh["maui"])
+for b, r in [(32, 4), (16, 8)]:
+    print(f"b={b:>2}, r={r}: threshold {(1 / b) ** (1 / r):.3f}, "
+          f"P(candidate | s={s:.3f}) = {1 - (1 - s ** r) ** b:.3f}, found {candidates(sig, b, r)}")
+# b=32, r=4: threshold 0.420, P(candidate | s=0.643) = 0.998, found [('halifax', 'maui')]
+# b=16, r=8: threshold 0.707, P(candidate | s=0.643) = 0.377, found []
+
+def ngrams(text, n=13):
+    w = words(text)
+    return {tuple(w[i:i + n]) for i in range(len(w) - n + 1)}
+
+test_item = ("Which gas do plants absorb from the atmosphere during photosynthesis "
+             "in order to make glucose? Answer: carbon dioxide")
+train = {
+    "quiz page":  "Science quiz, question 7: which gas do plants absorb from the atmosphere "
+                  "during photosynthesis in order to make glucose? Answer: carbon dioxide. Next question.",
+    "paraphrase": "During photosynthesis, plants take carbon dioxide from the air "
+                  "and use it to build glucose.",
+    "unrelated":  docs["physics"],
+}
+g_test = ngrams(test_item)
+for name, text in train.items():
+    hits = g_test & ngrams(text)
+    print(f"{name:>10}: {len(hits)} of {len(g_test)} test 13-grams found -> {'dirty' if hits else 'clean'}")
+#  quiz page: 6 of 6 test 13-grams found -> dirty
+# paraphrase: 0 of 6 test 13-grams found -> clean
+#  unrelated: 0 of 6 test 13-grams found -> clean
+```
+
+The templated pair is found: its MinHash estimate, 0.664, is within one standard deviation (0.042) of the exact 0.643, and the band setting with the lower threshold makes it a candidate while the stricter one, in this draw, does not. The reworded page shares only a few shingles with the original ($J = 0.111$) and is invisible to both, which is the intended behaviour for deduplication and the weakness of $n$-gram methods for contamination: the paraphrase of the test item carries the same fact and is reported clean.
+
+The numbers quoted in the text from the formulas:
+
+```python
+band = lambda s, b, r: 1 - (1 - s ** r) ** b
+print("FineWeb, 14 bands of 8:", [round(band(s, 14, 8), 3) for s in (0.7, 0.75, 0.8, 0.85)])
+print("Lee et al., 450 bands of 20:", [f"{band(s, 450, 20):.4f}" for s in (0.5, 0.8)])
+# FineWeb, 14 bands of 8: [0.565, 0.772, 0.924, 0.988]
+# Lee et al., 450 bands of 20: ['0.0004', '0.9946']
+
+keep = lambda score, alpha=9: (2 - score) ** -alpha          # P(Lomax(alpha) > 1 - score)
+print("GPT-3 keep probability:", [round(keep(s), 3) for s in (0.1, 0.5, 0.9, 1.0)])
+# GPT-3 keep probability: [0.003, 0.026, 0.424, 1.0]
+
+D = 1.4e12                                                    # LLaMA training tokens
+for name, w, e in [("CommonCrawl", 0.67, 1.10), ("GitHub", 0.045, 0.64),
+                   ("Wikipedia", 0.045, 2.45), ("Books", 0.045, 2.23)]:
+    print(f"{name:>11}: {w * D / 1e9:5.0f}B tokens drawn, source = {w * D / e / 1e9:4.0f}B tokens")
+# CommonCrawl:   938B tokens drawn, source =  853B tokens
+#      GitHub:    63B tokens drawn, source =   98B tokens
+#   Wikipedia:    63B tokens drawn, source =   26B tokens
+#       Books:    63B tokens drawn, source =   28B tokens
+
+kept = 100.0
+for removed in (2.24, 1.49, 50.66):                           # RefinedWeb: URL, extraction, language
+    kept *= 1 - removed / 100
+print(f"RefinedWeb kept after language identification: {kept:.2f} %")
+# RefinedWeb kept after language identification: 47.52 %
+```
+
+## Next
+
+The data is now fixed: trillions of filtered, deduplicated tokens in a chosen mixture, and a compute budget $C \approx 6ND$ to spend on them. What limits training at that scale is the cost of each token inside the model. Exact attention writes a $T \times T$ score matrix through slow GPU memory for every head and layer, and a dense feed-forward layer uses every one of its parameters for every token. The [next note](/notes/nlp/efficient-transformers) covers FlashAttention, which computes the same attention while moving far less data, and mixture-of-experts layers, which give a model more parameters without more computation per token.
+
+## References
+
+- T. B. Brown et al. [Language Models are Few-Shot Learners](https://arxiv.org/abs/2005.14165). NeurIPS, 2020. Section 2.2 and Table 2.2 (mixture), Section 4 (contamination), Appendix A (quality classifier, fuzzy deduplication), Appendix B (packing), Appendix C (13-gram decontamination).
+- C. Raffel et al. [Exploring the Limits of Transfer Learning with a Unified Text-to-Text Transformer](https://arxiv.org/abs/1910.10683). JMLR, 21, 2020. Section 2.2 (the C4 rules), Section 3.4 and Tables 8–9 (filtering, domains, repetition), Section 3.1.3 (vocabulary).
+- K. Lee, D. Ippolito, A. Nystrom, C. Zhang, D. Eck, C. Callison-Burch, N. Carlini. [Deduplicating Training Data Makes Language Models Better](https://arxiv.org/abs/2107.06499). ACL, 2022. Sections 4–6, Tables 2–5, Appendix A (MinHash parameters).
+- G. Penedo et al. [The RefinedWeb Dataset for Falcon LLM: Outperforming Curated Corpora with Web Data, and Web Data Only](https://arxiv.org/abs/2306.01116). NeurIPS Datasets and Benchmarks, 2023. Section 3 and Figure 2 (stage-by-stage removal rates).
+- G. Penedo et al. [The FineWeb Datasets: Decanting the Web for the Finest Text Data at Scale](https://arxiv.org/abs/2406.17557). NeurIPS Datasets and Benchmarks, 2024. Sections 3–4 (ablation method, extraction, filters, deduplication, FineWeb-Edu), Appendix E.1 (MinHash parameters).
+- L. Gao et al. [The Pile: An 800GB Dataset of Diverse Text for Language Modeling](https://arxiv.org/abs/2101.00027). arXiv, 2020. Table 1 (mixture and epochs), Appendices C.1 and D.2.
+- H. Touvron et al. [LLaMA: Open and Efficient Foundation Language Models](https://arxiv.org/abs/2302.13971). arXiv, 2023. Section 2.1 and Table 1 (data and mixture), Table 2.
+- J. Dodge et al. [Documenting Large Webtext Corpora: A Case Study on the Colossal Clean Crawled Corpus](https://arxiv.org/abs/2104.08758). EMNLP, 2021. Section 4.2 (benchmark contamination), Sections 5.2–5.3 (what the word list removes).
+- S. M. Xie et al. [DoReMi: Optimizing Data Mixtures Speeds Up Language Model Pretraining](https://arxiv.org/abs/2305.10429). NeurIPS, 2023.
+- J. W. Rae et al. [Scaling Language Models: Methods, Analysis & Insights from Training Gopher](https://arxiv.org/abs/2112.11446). arXiv, 2021. The MassiveText quality and repetition filters.
+- G. Wenzek et al. [CCNet: Extracting High Quality Monolingual Datasets from Web Crawl Data](https://arxiv.org/abs/1911.00359). LREC, 2020.
+- A. Z. Broder. [On the Resemblance and Containment of Documents](https://doi.org/10.1109/SEQUEN.1997.666900). Compression and Complexity of Sequences, 1997. MinHash.
+- J. Leskovec, A. Rajaraman, J. D. Ullman. [Mining of Massive Datasets](http://www.mmds.org/). Cambridge University Press, 3rd ed., 2020. Chapter 3: shingling, minhashing (Section 3.3) and banding (Section 3.4).

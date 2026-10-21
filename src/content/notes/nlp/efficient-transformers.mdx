@@ -1,0 +1,408 @@
+---
+title: "Efficient Transformers: FlashAttention and mixture of experts"
+description: "Two answers to the compute limits of scale: FlashAttention computes exact attention tile by tile in on-chip memory, with an online softmax and no stored score matrix, and mixture-of-experts layers add parameters without adding compute per token, at a price in memory and balance."
+course: nlp
+section: Modern Transformer Architectures
+order: 25
+status: published
+tags: [flashattention, online-softmax, gpu-memory, mixture-of-experts, routing, load-balancing, mixtral, efficient-transformers]
+prerequisites: [Self-Attention, Transformer Architecture, Scaling laws and compute-optimal training, Backpropagation]
+---
+
+import AttentionMemory from '../../../components/figures/efficient-transformers/AttentionMemory.astro';
+import TiledAttention from '../../../components/figures/efficient-transformers/TiledAttention.astro';
+import MoeRouting from '../../../components/figures/efficient-transformers/MoeRouting.astro';
+
+The [scaling-laws note](/notes/nlp/scaling-laws) chose how large a model should be and how many tokens it should see for a compute budget, and the [previous note](/notes/nlp/pretraining-data) chose what those tokens are. Both count compute in floating-point operations and assume that every operation is spent well. At scale two things break that assumption. Attention builds a $T \times T$ matrix for every head, and moving it in and out of GPU memory, not computing it, is what costs the time and the memory. And in a dense model every parameter takes part in every token, so the only way to add capacity is to add compute. This note covers the two standard answers. **FlashAttention** is an *implementation* change: the same attention, computed in tiles that never leave the fast on-chip memory. **Mixture of experts** is an *architecture* change, with an extra term in the training loss: many feed-forward networks per layer, of which each token uses only a few. The note ends with a table of the components of a modern Transformer block, what kind of change each one is, and where the course explains it.
+
+**Notation.** For one attention head, $Q, K, V \in \mathbb R^{T \times d}$ for sequence length $T$ and head width $d$; $S = QK^\top/\sqrt d$ are the scores, $P = \operatorname{softmax}(S)$ row by row, and $O = PV$ is the output. A row of scores is $x_1, \dots, x_T$ with values $v_1, \dots, v_T$. $B_r$ and $B_c$ are the numbers of query and key rows in one block; $M$ is the size of the on-chip memory, counted in numbers. For mixture of experts, $u \in \mathbb R^d$ is a token's input to the layer, $E_1, \dots, E_N$ are $N$ expert networks, $W_r \in \mathbb R^{d \times N}$ is the router, $k$ experts are chosen per token, and $g_i(u)$ is the gate of expert $i$.
+
+## Baseline: standard attention and a dense FFN
+
+The [attention note](/notes/nlp/attention#from-embeddings-to-q-k-and-v) computes one head in three steps, and a standard implementation runs each step as a separate GPU program, a *kernel*, that reads its inputs from the GPU's main memory and writes its result back:
+
+1. read $Q$ and $K$, compute $S = QK^\top/\sqrt d$, write $S$ ($T^2$ numbers);
+2. read $S$, compute $P = \operatorname{softmax}(S)$, write $P$ ($T^2$ numbers);
+3. read $P$ and $V$, compute $O = PV$, write $O$.
+
+$P$ is also kept until the backward pass, which needs it for the gradients. Masking and dropout on $S$ or $P$ add more reads and writes of the same size. The arithmetic is $O(T^2 d)$ and the memory $O(T^2)$ per head.
+
+The [Transformer block](/notes/nlp/transformers#position-wise-feed-forward-network) then applies its FFN to every token. All of its parameters multiply every token, so a forward pass costs about two operations (a multiply and an add) per parameter per token, the factor behind $C \approx 6ND$ in the [scaling-laws note](/notes/nlp/scaling-laws). Doubling the FFN doubles its compute.
+
+These are two different limits. The first is a limit of the *implementation*: nothing in the mathematics requires the $T \times T$ matrix to be written anywhere. The second is a limit of the *architecture*: a dense layer cannot hold more knowledge without costing more per token.
+
+## Where the time goes: memory traffic, not arithmetic
+
+A GPU has two kinds of memory. An A100 has 40–80 GB of high-bandwidth memory (**HBM**) with a bandwidth of 1.5–2.0 TB/s, and 192 KB of on-chip **SRAM** in each of its 108 streaming multiprocessors, with a bandwidth estimated at about 19 TB/s ([Dao et al., 2022](#references), §2.1). SRAM is an order of magnitude faster and many orders of magnitude smaller. The A100's matrix units reach 312 TFLOP/s in 16-bit arithmetic ([Dao, 2023](#references), §3.1), so to keep them busy an operation must do roughly $312 \times 10^{12} / (2 \times 10^{12}) \approx 150$ operations per byte it moves.
+
+A large matrix product does: each number it loads is reused across a whole row or column. A softmax does not: it reads a score, does a few operations on it, and writes a probability. Operations of the second kind are **memory-bound**: their running time is set by the bytes they move, and making their arithmetic cheaper changes nothing. In standard attention, steps 1–3 move $O(T^2)$ numbers through HBM, and step 2 does almost no arithmetic on them.
+
+**Worked example (measured).** For the attention layers of GPT-2 medium with sequence length 1,024, head width 64, 16 heads and batch size 64, forward and backward pass on an A100 ([Dao et al., 2022](#references), Fig. 2 left):
+
+| | Standard attention | FlashAttention |
+| --- | --- | --- |
+| Arithmetic | 66.6 GFLOP | 75.2 GFLOP |
+| HBM reads and writes | 40.3 GB | 4.4 GB |
+| Running time | 41.7 ms | 7.3 ms |
+
+FlashAttention does 13 % *more* arithmetic, moves 9 times fewer bytes, and runs 5.7 times faster. The score matrix alone is $64 \cdot 16 \cdot 1{,}024^2 \approx 1.07 \times 10^9$ numbers, 2.15 GB in 16-bit, and the standard kernels write it and read it back several times.
+
+<AttentionMemory />
+
+Memory grows the same way. Per head and per sequence the standard implementation holds $T^2$ numbers beside the $4Td$ of $Q, K, V, O$; the two terms are equal at $T = 4d$, and beyond that the quadratic one dominates. At $T = 32{,}768$, 32 heads of one layer need 68.7 GB for their scores alone, nearly the 80 GB of the largest A100, before any weights or activations.
+
+## FlashAttention
+
+<aside class="callout"><strong>Key idea.</strong> Never write the $T \times T$ matrix to HBM. Load a block of queries and a block of keys and values into SRAM, compute that tile of scores there, fold it into a running result, and discard it. The softmax needs the whole row, so carry three running statistics per row that let each new tile correct what was accumulated so far. The result is the exact attention output, with $O(T)$ extra memory instead of $O(T^2)$.</aside>
+
+### Online softmax: one pass instead of three
+
+A softmax is computed safely by subtracting the row maximum before exponentiating, so that no exponent is positive and nothing overflows:
+
+$$
+\operatorname{softmax}(x)_i = \frac{e^{x_i - m}}{\ell}, \qquad m = \max_j x_j, \qquad \ell = \sum_j e^{x_j - m}.
+$$
+
+Written this way it needs three passes over the row: one for $m$, one for $\ell$, one for the outputs. The maximum is not known until the last score has been seen. [Milakov and Gimelshein (2018)](#references) showed that $m$ and $\ell$ can be computed in one pass anyway, by rescaling the partial sum whenever the maximum changes. Attention needs one more running quantity, the weighted sum of values. Define, after the first $t$ scores,
+
+$$
+m_t = \max_{j \le t} x_j, \qquad \ell_t = \sum_{j \le t} e^{x_j - m_t}, \qquad \tilde o_t = \sum_{j \le t} e^{x_j - m_t}\, v_j ,
+$$
+
+with $m_0 = -\infty$, $\ell_0 = 0$, $\tilde o_0 = 0$. Each new score updates all three from their previous values alone:
+
+$$
+\boxed{\begin{gathered}
+m_t = \max(m_{t-1}, x_t), \\
+\ell_t = e^{m_{t-1} - m_t}\,\ell_{t-1} + e^{x_t - m_t}, \qquad
+\tilde o_t = e^{m_{t-1} - m_t}\,\tilde o_{t-1} + e^{x_t - m_t}\, v_t ,
+\end{gathered}}
+$$
+
+and the attention output is $o = \tilde o_T / \ell_T$. Why the update of $\ell$ is right:
+
+$$
+\begin{aligned}
+\ell_t &= \sum_{j < t} e^{x_j - m_t} + e^{x_t - m_t} && \text{split off the last term} \\
+&= \sum_{j < t} e^{x_j - m_{t-1}}\, e^{m_{t-1} - m_t} + e^{x_t - m_t} && e^{a - c} = e^{a - b}\, e^{b - c} \\
+&= e^{m_{t-1} - m_t}\,\ell_{t-1} + e^{x_t - m_t} && \text{definition of } \ell_{t-1}.
+\end{aligned}
+$$
+
+The update of $\tilde o_t$ is the same chain with $v_j$ inside the sums. At the end $m_T$ is the true maximum, so
+
+$$
+\frac{\tilde o_T}{\ell_T} = \frac{\sum_j e^{x_j - m_T}\, v_j}{\sum_j e^{x_j - m_T}} = \sum_j \operatorname{softmax}(x)_j\, v_j ,
+$$
+
+which is the attention output, computed in one pass and with no exponent ever above zero: the rescaling factor $e^{m_{t-1} - m_t}$ is at most 1. Nothing changes if $x_t$ is a whole block of scores instead of one: $m_t$ takes the maximum over the block, and the new terms become sums over the block.
+
+**Worked example.** Scores $x = (1, 3, 2, 5)$ and values $v = (1, 2, 3, 4)$, processed in two blocks of two.
+
+- Block 1, scores $(1, 3)$: $m = 3$; $\ell = e^{1-3} + e^{3-3} = 0.1353 + 1 = 1.1353$; $\tilde o = 0.1353 \cdot 1 + 1 \cdot 2 = 2.1353$.
+- Block 2, scores $(2, 5)$: $m' = \max(3, 5) = 5$, so everything accumulated so far is multiplied by $e^{3-5} = 0.1353$. Then $\ell = 0.1353 \cdot 1.1353 + e^{2-5} + e^{5-5} = 0.1537 + 0.0498 + 1 = 1.2034$ and $\tilde o = 0.1353 \cdot 2.1353 + 0.0498 \cdot 3 + 1 \cdot 4 = 0.2890 + 0.1494 + 4 = 4.4383$.
+- Output: $\tilde o / \ell = 4.4383 / 1.2034 = 3.6881$.
+
+Directly: the weights $e^{x_j - 5}$ are $(0.0183, 0.1353, 0.0498, 1)$ with sum 1.2034, the same $\ell$, and the probabilities $(0.0152, 0.1125, 0.0414, 0.8310)$ give $\sum_j \operatorname{softmax}(x)_j v_j = 3.6881$. The first block was accumulated against the wrong maximum, 3, and one multiplication by $e^{-2}$ corrected it when the true maximum arrived.
+
+### Tiling: attention one block at a time
+
+FlashAttention applies the block form of the update to a whole block of $B_r$ query rows at once ([Dao et al., 2022](#references), Algorithm 1). In the loop order of FlashAttention-2 ([Dao, 2023](#references), Algorithm 1), for each query block $Q_i$:
+
+<TiledAttention />
+
+1. $Q$, $K$, $V$ stay in HBM, split into blocks of rows.
+2. Load $Q_i$ into SRAM and set $m = -\infty$, $\ell = 0$, $\tilde O = 0$, one entry (one row for $\tilde O$) per query row.
+3. For each key–value block $j$: load $K_j$ and $V_j$ and compute the tile $S_{ij} = Q_i K_j^\top / \sqrt d$, a $B_r \times B_c$ matrix that exists only in SRAM.
+4. Update the statistics row by row: $m' = \max(m, \operatorname{rowmax} S_{ij})$, $\ell \leftarrow e^{m - m'}\ell + \operatorname{rowsum} e^{S_{ij} - m'}$, $\tilde O \leftarrow \operatorname{diag}(e^{m - m'})\,\tilde O + e^{S_{ij} - m'} V_j$, then $m \leftarrow m'$. The tile is discarded.
+5. Repeat for every $j$: the tiles of row $i$ pass through SRAM one at a time.
+6. Write $O_i = \operatorname{diag}(\ell)^{-1}\tilde O$ and, for each row, the single number $L = m + \log \ell$ to HBM.
+
+All steps run in one kernel, so $Q_i$ is read once, each $K_j$ and $V_j$ once per query block, and the only writes are $O$ and $L$. The query blocks are independent of each other and run in parallel. With a causal mask, a tile whose keys all come after its queries is skipped entirely; that is about half of the tiles for long sequences, and gives about 1.7–1.8 times the speed of the unmasked computation ([Dao, 2023](#references), §3.1.1).
+
+### The backward pass: recompute instead of store
+
+The gradients with respect to $Q$, $K$ and $V$ need $P$, the matrix the forward pass just avoided storing. FlashAttention recomputes it, tile by tile, from $Q$, $K$ and the stored $L$, because
+
+$$
+e^{S_{ij} - L_i} = \frac{e^{S_{ij} - m_i}}{\ell_i} = P_{ij}
+$$
+
+for the final $m_i$ and $\ell_i$ of row $i$: one stored number per row recovers every probability of that row exactly. This is selective gradient checkpointing ([Dao et al., 2022](#references), §3.1): the backward pass does extra matrix products, five instead of the forward pass's two ([Dao, 2023](#references), §4.1), and is still faster, because reading $P$ from HBM would cost more than recomputing it in SRAM. That is where the 13 % of extra arithmetic in the worked example comes from.
+
+### Exact, not approximate
+
+Every step above is an identity, so FlashAttention computes $\operatorname{softmax}(QK^\top/\sqrt d)\,V$, not an approximation of it ([Dao et al., 2022](#references), Theorem 1). Its output differs from a standard kernel's only by floating-point rounding, because the sums are taken in a different order and floating-point addition is not associative. On random $Q, K, V$ with $T = 256$, $d = 64$ and blocks of 16 rows, the largest absolute difference between the tiled and the naive computation is of order $10^{-16}$ in 64-bit and $10^{-7}$ in 32-bit arithmetic (the Code section checks both bounds; the exact digits depend on the linear-algebra library): the rounding error of each precision. Approximate attention methods, sparse or low-rank, compute a different function and trade quality for fewer operations; they often do not run faster in wall-clock time, because they reduce arithmetic, not memory traffic ([Dao et al., 2022](#references), §1). The paper's block-sparse variant is such an approximation built on the same kernel, and is the exception: it skips whole tiles.
+
+Measured on an A100, each against its own baseline: training BERT-large at sequence length 512 is 15 % faster than the MLPerf 1.1 record; GPT-2 at sequence length 1,024 trains up to 3 times faster than the HuggingFace implementation and 1.8 times faster than Megatron-LM; and the attention memory grows linearly with $T$, up to 20 times less than exact-attention baselines ([Dao et al., 2022](#references), §4.1, §4.3). The longer context this makes affordable is what improves quality: GPT-2 trained with context 4K instead of 1K, still faster than Megatron-LM at 1K, reaches a perplexity 0.7 lower (§4.2).
+
+### How many memory accesses
+
+*Optional depth: the count of HBM accesses behind the speed-up. The rest of the note does not depend on it.*
+
+With SRAM of size $M$ and $d \le M \le Td$, standard attention needs $\Theta(Td + T^2)$ HBM accesses and FlashAttention $\Theta(T^2 d^2 / M)$ ([Dao et al., 2022](#references), Theorem 2). The reason: a key–value block of $\Theta(M)$ numbers fits in SRAM, so there are $\Theta(Td/M)$ such blocks, and each of them requires a pass over all of $Q$, $\Theta(Td)$ numbers. The ratio of the two counts is about $M/d^2$: with $d = 64$ and $M \approx 10^5$, roughly 24. The measured ratio in the GPT-2 medium example, 40.3 GB against 4.4 GB, is 9; the $\Theta$ hides constants. No exact attention algorithm can do asymptotically better for all $M$ in that range (Proposition 3).
+
+### FlashAttention-2
+
+The first version reached only 25–40 % of the A100's peak arithmetic rate. FlashAttention-2 ([Dao, 2023](#references)) keeps the algorithm and changes how the work is split: it defers the division by $\ell$ to the end of the loop, as in step 6 above, and saves only $L$ instead of both $m$ and $\ell$, which removes operations that are not matrix products (on an A100 those run at 19.5 TFLOP/s against 312 for matrix products); it swaps the loops so that the outer loop runs over query blocks, which can then be spread across the GPU's processors even when batch size and head count are small; and it splits each block's work between groups of threads so that they exchange less through shared memory. The result is about 2 times the speed of FlashAttention, 50–73 % of the peak rate in the forward pass, and up to 225 TFLOP/s per A100 when training GPT-style models end to end. The output is unchanged.
+
+## Mixture of experts
+
+### Why not just make the FFN wider?
+
+The FFN holds two thirds of a block's parameters ($8d^2$ of $12d^2$ in the [parameter count](/notes/nlp/transformers#parameters-of-a-block)). A wider FFN can hold more, and costs proportionally more for every token. The idea of *conditional computation* is that different tokens need different parameters, so a token should pay only for the ones it uses. [Shazeer et al. (2017)](#references) made it work at scale with a sparsely gated mixture of up to thousands of experts, placed between stacked LSTM layers, with up to 137 B parameters. The Switch Transformer ([Fedus, Zoph and Shazeer, 2022](#references)) and Mixtral ([Jiang et al., 2024](#references)) put it in the place of a Transformer's FFN, in every block; the earlier GShard did so in every other block (Jiang et al., §2.1).
+
+<aside class="callout"><strong>Key idea.</strong> Replace the single FFN of a block by $N$ FFNs of the same shape, the experts, and a small router that picks $k$ of them for each token. Parameters grow with $N$; compute per token grows only with $k$.</aside>
+
+### The router and top-k gating
+
+For a token with input $u$, the router computes one score per expert, $u W_r \in \mathbb R^N$, and the layer outputs
+
+$$
+\boxed{\; y = \sum_{i \in \mathcal T(u)} g_i(u)\, E_i(u), \qquad \mathcal T(u) = \text{the } k \text{ experts with the largest scores in } u W_r . \;}
+$$
+
+$E_i(u)$ is the output of expert $i$, an ordinary FFN (in Mixtral a SwiGLU FFN, [Jiang et al., 2024](#references), §2.1); experts outside $\mathcal T(u)$ are not computed for this token. The gates $g_i$ are defined in one of two common ways:
+
+- **Softmax over the chosen scores** (Mixtral, $k = 2$): $g(u) = \operatorname{softmax}(\operatorname{TopK}(u W_r))$, where $\operatorname{TopK}$ keeps the $k$ largest scores and sets the rest to $-\infty$. The $k$ gates sum to 1.
+- **Softmax over all scores** (Switch, $k = 1$): $p(u) = \operatorname{softmax}(u W_r)$ over all $N$ experts, and the token's output is $p_i(u)\,E_i(u)$ for the most probable $i$.
+
+The choice of $\mathcal T(u)$ itself has no gradient. The router learns through the gate values that multiply the expert outputs: a gate that helped the loss is pushed up, and with it the score that selected the expert ([Fedus, Zoph and Shazeer, 2022](#references), §2.1). The original layer of [Shazeer et al. (2017)](#references) adds Gaussian noise with a learned scale to the scores before choosing, which helps balance the load.
+
+**Worked example (toy numbers).** Router scores for one token over $N = 8$ experts: $(1.2, -0.3, 2.0, 0.1, 0.5, 1.9, -1.0, 0.0)$. The two largest are expert 3 (2.0) and expert 6 (1.9). With Mixtral's gates, $g_3 = e^{2.0}/(e^{2.0} + e^{1.9}) = 1/(1 + e^{-0.1}) = 0.525$ and $g_6 = 0.475$, so $y = 0.525\, E_3(u) + 0.475\, E_6(u)$. The softmax over all eight is $(0.149, 0.033, 0.332, 0.050, 0.074, 0.300, 0.017, 0.045)$; a Switch layer would send the token to expert 3 alone with weight 0.332. Six of the eight experts do no work for this token.
+
+<MoeRouting />
+
+1. Each token arrives at the layer as its normalized hidden state $u$, as at the FFN of a [pre-norm block](/notes/nlp/transformers#the-block).
+2. The router multiplies $u$ by $W_r$: 8 scores, one per expert, and a softmax over them.
+3. The token is sent to the two experts with the highest scores; the gates are the softmax over those two scores.
+4. Only the chosen experts run. Different tokens choose different pairs, so all eight are stored, but each token pays for two.
+5. The output is the gate-weighted sum of the two expert outputs, added to the residual stream like the output of an FFN.
+
+### Total and active parameters
+
+A model with $L$ MoE layers has two parameter counts. The **total** (or sparse) count includes every expert; the **active** count includes only what one token uses ([Jiang et al., 2024](#references), §2.1). Ignoring normalization vectors, with $A$ attention parameters per layer, $P_e$ parameters per expert and $V$ parameters in the embedding and output matrices,
+
+$$
+N_{\text{total}} = L\,(A + N P_e + dN) + V, \qquad N_{\text{active}} = L\,(A + k P_e + dN) + V .
+$$
+
+**Worked example: Mixtral 8×7B.** The architecture ([Jiang et al., 2024](#references), Table 1): $d = 4{,}096$, $L = 32$ layers, 32 query heads and 8 key–value heads of width 128 (grouped-query attention), SwiGLU experts of width 14,336, $N = 8$, $k = 2$, a vocabulary of 32,000, and separate input and output embedding matrices in the released checkpoint.
+
+| Part | Count | Per layer | × 32 layers |
+| --- | --- | --- | --- |
+| Attention | $Q, O$: $4{,}096 \times 4{,}096$; $K, V$: $4{,}096 \times 1{,}024$ | 41.9 M | 1.34 B |
+| One expert | $3 \times 4{,}096 \times 14{,}336$ | 176.2 M | |
+| All 8 experts | | 1,409.3 M | 45.10 B |
+| Router | $4{,}096 \times 8$ | 32,768 | 1.0 M |
+| Embeddings and output | $2 \times 32{,}000 \times 4{,}096$ | | 0.26 B |
+| **Total** (norms included) | | | **46.70 B** |
+| **Active**: attention, 2 experts, router, embeddings | | | **12.88 B** |
+
+The paper rounds these to 47 B and 13 B. The active share is 27.6 %, not $2/8 = 25$ %, because attention, router and embeddings are shared by all tokens. The same count with one expert per layer gives 7.24 B, a dense model of the same shape: Mixtral has 6.5 times its parameters at 1.8 times its compute per token.
+
+### Load balancing
+
+Left alone, a router collapses. Early in training a few experts happen to receive more tokens, train faster, become better, and are chosen even more; the imbalance is self-reinforcing ([Shazeer et al., 2017](#references), §4). An idle expert is wasted memory, and an overloaded one is a bottleneck when experts sit on different devices. The fix is an auxiliary term in the training loss that is smallest when the load is even. [Shazeer et al. (2017)](#references) penalized the squared coefficient of variation of the experts' total gate values; the Switch Transformer uses one simpler term per MoE layer ([Fedus, Zoph and Shazeer, 2022](#references), §2.2):
+
+$$
+\mathcal L_{\text{aux}} = \alpha\, N \sum_{i=1}^{N} f_i\, P_i, \qquad
+f_i = \frac{1}{|\mathcal B|}\sum_{x \in \mathcal B} \mathbb 1\!\left[\arg\max_j p_j(x) = i\right], \qquad
+P_i = \frac{1}{|\mathcal B|}\sum_{x \in \mathcal B} p_i(x),
+$$
+
+over a batch $\mathcal B$ of tokens: $f_i$ is the fraction of tokens sent to expert $i$, $P_i$ the average probability the router gives it, and $\alpha = 10^{-2}$ in the paper. $f$ is a count and has no gradient; $P$ has one, and $\partial \mathcal L_{\text{aux}} / \partial P_i = \alpha N f_i$, so the push to lower an expert's probability is strongest for the experts that already receive the most tokens. Why the minimum is the uniform load: when the probabilities match the dispatch, $P_i \approx f_i$, the term is $\alpha N \sum_i f_i^2$, and
+
+$$
+\begin{aligned}
+1 = \Big(\sum_{i=1}^{N} 1 \cdot f_i\Big)^2 &\le \Big(\sum_{i=1}^{N} 1^2\Big)\Big(\sum_{i=1}^{N} f_i^2\Big) && \text{Cauchy–Schwarz} \\
+&= N \sum_{i=1}^{N} f_i^2 ,
+\end{aligned}
+$$
+
+with equality only when all $f_i$ are equal, $f_i = 1/N$. The factor $N$ makes the balanced value 1 for any number of experts.
+
+**Worked example (toy numbers).** $N = 8$. Balanced routing, $f_i = P_i = 1/8$: $N \sum_i f_i P_i = 8 \cdot 8 \cdot \tfrac{1}{64} = 1$, so $\mathcal L_{\text{aux}} = 0.01$. Collapsed routing, every token to expert 1 with $P_1 = 0.9$ and the remaining 0.1 spread evenly: $8 \cdot 1 \cdot 0.9 = 7.2$, so $\mathcal L_{\text{aux}} = 0.072$, and its gradient lowers $P_1$ alone.
+
+### Capacity factor and dropped tokens
+
+To run experts in parallel with fixed tensor shapes, each expert gets a fixed number of slots per batch, its **capacity** ([Fedus, Zoph and Shazeer, 2022](#references), eq. 3):
+
+$$
+\text{expert capacity} = \frac{\text{tokens per batch}}{\text{number of experts}} \times \text{capacity factor}.
+$$
+
+A capacity factor above 1 leaves room for imbalance. Tokens routed to an expert that is already full are **dropped**: the layer skips them, and their representation passes unchanged to the next layer through the residual connection. With top-$k$ routing every token makes $k$ assignments, so the expected load and the capacity scale by $k$.
+
+**Worked example (toy numbers).** 16 tokens, 4 experts, top-1, and the router sends $(7, 4, 3, 2)$ tokens to the four experts. With capacity factor 1.0 each expert has 4 slots: expert 1 drops 3 tokens, and 3 of the 16 slots stay empty. With capacity factor 1.5 each has 6 slots: 1 token is dropped, but 9 of the 24 slots are empty and still cost compute and memory. A larger factor drops fewer tokens and wastes more. In the Switch Transformer experiments the fraction of dropped tokens was typically below 1 %, and, at a fixed compute budget, low capacity factors (1.0, 1.25) worked best (§2.2, Table 1). Later implementations avoid dropping altogether: Megablocks, whose kernels the Mixtral authors integrated into the vLLM inference engine, computes the experts as block-sparse matrix products that accept any number of tokens per expert ([Jiang et al., 2024](#references), §1, §2.1).
+
+### Compute is saved, memory is not
+
+The active count sets the compute per token. The total count sets the memory, because every expert must be loaded: the memory cost of serving Mixtral is proportional to its 47 B parameters, not its 13 B ([Jiang et al., 2024](#references), §3). In 16-bit numbers that is 93.4 GB of weights, more than one 80 GB A100 holds, against 25.8 GB for a dense model with 12.9 B parameters. Routing adds its own costs: when experts sit on different GPUs (*expert parallelism*), tokens travel to their experts and back, and the GPUs must receive similar loads; and a small batch touches few tokens per expert, so the expert weights are loaded for little arithmetic. MoE layers are therefore better suited to batched workloads (§3).
+
+Measured gains, each against its own baseline: Switch Transformers based on T5-Base, with the same computation per token, reach the quality of the dense model up to 7 times faster in pre-training on C4 ([Fedus, Zoph and Shazeer, 2022](#references), abstract and §3). Mixtral, with 13 B active parameters, matches or outperforms Llama 2 70B on most of the benchmarks of its Table 2, with all models re-evaluated by the Mixtral authors in one pipeline. The experts do not become topic specialists: on subsets of The Pile, the distribution of chosen experts is very similar for ArXiv papers, biology abstracts and philosophy, and the choices follow syntax more than domain, such as indentation in code (§5).
+
+## The modern Transformer block
+
+The components that separate a current decoder from the 2017 block, what kind of change each one is, and where the course explains it:
+
+| Component | Replaces | Kind of change | What changes | Why | Explained in |
+| --- | --- | --- | --- | --- | --- |
+| Pre-norm | Post-norm | Architecture | The norm moves to the input of each sub-layer; the residual path becomes an unbroken identity | Deep stacks train stably without warm-up | [Transformer](/notes/nlp/transformers#pre-norm-versus-post-norm) |
+| RMSNorm | LayerNorm | Architecture | Divide by the root mean square; no mean subtraction, no bias | Cheaper and as good; a separate choice from *where* the norm sits | [Transformer](/notes/nlp/transformers#normalization) |
+| RoPE | Sinusoidal or learned absolute positions | Architecture | Queries and keys are rotated by angles proportional to position | Scores depend on the relative offset; no position table | [Positions](/notes/nlp/positional-encoding#relative-and-rotary-positions) |
+| SwiGLU | ReLU or GELU FFN with two matrices | Architecture | A gated FFN with three matrices and SiLU | Lower perplexity at matched parameters and compute | [Transformer](/notes/nlp/transformers#position-wise-feed-forward-network) |
+| GQA | Multi-head attention | Architecture | Groups of query heads share one key–value head | A smaller KV cache at generation, by the group size | [GPT](/notes/nlp/gpt#two-models-by-the-numbers), [KV cache](/notes/nlp/gpt#making-generation-faster) |
+| FlashAttention | Separate attention kernels | Implementation | The same attention in one tiled kernel | Less HBM traffic, $O(T)$ memory, faster | [above](#flashattention) |
+| MoE | Dense FFN | Architecture, plus an auxiliary loss | $N$ expert FFNs and a router, $k$ per token | More parameters at the same compute per token | [above](#mixture-of-experts) |
+
+For SwiGLU, the evidence is a T5-Base encoder–decoder with the FFN width reduced from 3,072 to 2,048 to keep parameters and operations equal: held-out log-perplexity 1.636 against 1.677 for ReLU after 524,288 steps on C4 ([Shazeer, 2020](#references), Table 1). Pre-norm and RMSNorm are two different axes: one is the place of the normalization relative to the residual sum, the other the formula it applies. Llama-style models use both, BERT neither. Only FlashAttention leaves the function the network computes unchanged; every other row changes the model, and a checkpoint trained with one choice cannot be run with the other.
+
+## What changed
+
+| | Standard attention | FlashAttention |
+| --- | --- | --- |
+| Function computed | $\operatorname{softmax}(QK^\top/\sqrt d)\,V$ | The same, up to rounding |
+| Extra memory per head | $T^2$ numbers | One number per row |
+| HBM accesses | $\Theta(Td + T^2)$ | $\Theta(T^2 d^2 / M)$ |
+| Arithmetic | $O(T^2 d)$ | $O(T^2 d)$, slightly more (recomputation) |
+| Kind of change | | Implementation: one fused, tiled kernel |
+
+| | Dense FFN | MoE layer |
+| --- | --- | --- |
+| Parameters per layer | $P_e$ | $N P_e + dN$ |
+| Used per token | All | $k$ experts and the router |
+| Memory for weights | $\propto P_e$ | $\propto N P_e$ |
+| Training | The language-model loss | Plus a load-balancing loss; capacity or dropless kernels |
+| Kind of change | | Architecture, plus a term in the training objective |
+
+## Limitations
+
+- **FlashAttention keeps quadratic arithmetic.** It removes the $T^2$ memory and most of the traffic, not the $T^2 d$ operations; very long contexts remain expensive.
+- **Kernels are written by hand.** Each attention variant needs its own low-level implementation, which may not carry over to another GPU architecture ([Dao et al., 2022](#references), §5).
+- **Exact up to rounding.** Outputs differ from a standard kernel's in the last bits, so a comparison of two runs needs a tolerance, not equality.
+- **MoE saves compute, not memory.** All experts are stored; a 47 B-parameter MoE needs the memory of a 47 B model.
+- **Routing is fragile.** It needs a balancing loss, a capacity policy or dropless kernels, and, across devices, all-to-all communication; sparse models have also been less stable in training and, with many more parameters than their compute suggests, more prone to overfitting when fine-tuned on small tasks ([Fedus, Zoph and Shazeer, 2022](#references), §2.4).
+- **Active parameters are not quality.** A 13 B-active MoE is not a 13 B dense model, nor a 47 B one; comparisons must say which count they hold fixed.
+
+## What you should remember
+
+- Standard attention is memory-bound: it writes and reads the $T \times T$ matrix through HBM. FlashAttention computes it in SRAM tiles and never stores it: in the measured GPT-2 medium setting, 13 % more arithmetic, 9 times less traffic, 5.7 times faster.
+- Online softmax: $m_t = \max(m_{t-1}, x_t)$, $\ell_t = e^{m_{t-1} - m_t}\ell_{t-1} + e^{x_t - m_t}$, and the same rescaling for the weighted sum of values; divide by $\ell$ at the end.
+- The backward pass recomputes $P_{ij} = e^{S_{ij} - L_i}$ from one stored number per row. The result is exact attention, not an approximation.
+- MoE: $y = \sum_{i \in \mathcal T(u)} g_i(u) E_i(u)$ with the top-$k$ experts of $u W_r$. Mixtral 8×7B: 46.7 B total, 12.9 B active per token.
+- Load balancing: $\alpha N \sum_i f_i P_i$, smallest for a uniform load. Capacity: tokens per expert × capacity factor; overflow tokens skip the layer through the residual.
+- MoE saves compute per token, not memory: every expert is stored and loaded.
+
+## Code
+
+Tiled attention with an online softmax against the naive computation, the memory of the score matrix, and the parameter counts of two MoE configurations:
+
+```python
+import numpy as np
+
+def naive_attention(Q, K, V):
+    S = Q @ K.T / np.sqrt(Q.shape[1])                 # T x T scores, materialized
+    P = np.exp(S - S.max(axis=1, keepdims=True))
+    return (P / P.sum(axis=1, keepdims=True)) @ V
+
+def tiled_attention(Q, K, V, Br=16, Bc=16):
+    T, d = Q.shape
+    O = np.empty_like(Q)
+    for i in range(0, T, Br):                         # outer loop: one block of queries
+        q = Q[i:i + Br] / np.sqrt(d)
+        m = np.full(len(q), -np.inf)                  # running row maximum
+        l = np.zeros(len(q))                          # running sum of exponentials
+        acc = np.zeros((len(q), d))                   # running unnormalized output
+        for j in range(0, T, Bc):                     # inner loop: one block of keys and values
+            s = q @ K[j:j + Bc].T                     # Br x Bc scores, never T x T
+            m_new = np.maximum(m, s.max(axis=1))
+            scale = np.exp(m - m_new)                 # rescales what was accumulated so far
+            p = np.exp(s - m_new[:, None])
+            l = scale * l + p.sum(axis=1)
+            acc = scale[:, None] * acc + p @ V[j:j + Bc]
+            m = m_new
+        O[i:i + Br] = acc / l[:, None]                # one division at the end
+    return O
+
+# the worked example: scores (1, 3, 2, 5) in two blocks, values (1, 2, 3, 4)
+x, v = np.array([1., 3., 2., 5.]), np.array([1., 2., 3., 4.])
+m, l, o = -np.inf, 0.0, 0.0
+for blk in (slice(0, 2), slice(2, 4)):
+    m_new = max(m, x[blk].max())
+    l = np.exp(m - m_new) * l + np.exp(x[blk] - m_new).sum()
+    o = np.exp(m - m_new) * o + (np.exp(x[blk] - m_new) * v[blk]).sum()
+    m = m_new
+    print(m, round(l, 4), round(o, 4))                # 3.0 1.1353 2.1353 | 5.0 1.2034 4.4383
+print(round(o / l, 4), round(float(np.exp(x - 5) @ v / np.exp(x - 5).sum()), 4))   # 3.6881 3.6881
+
+# tiled equals naive up to rounding, in 64-bit and in 32-bit arithmetic
+rng = np.random.default_rng(0)
+T, d = 256, 64
+Q, K, V = (rng.normal(size=(T, d)) for _ in range(3))
+print(np.abs(tiled_attention(Q, K, V) - naive_attention(Q, K, V)).max() < 1e-14)                 # True
+Q32, K32, V32 = (a.astype(np.float32) for a in (Q, K, V))
+print(np.abs(tiled_attention(Q32, K32, V32) - naive_attention(Q32, K32, V32)).max() < 1e-5)      # True
+
+# memory of one head for one sequence in 16-bit numbers, d = 64: the T x T scores next to Q, K, V, O,
+# against Q, K, V, O plus one 32-bit statistic per row
+for T in (1024, 4096, 32768, 131072):
+    standard, flash = (T * T + 4 * T * 64) * 2, 4 * T * 64 * 2 + 4 * T
+    print(T, f'{standard / 1e6:,.1f} MB', f'{flash / 1e6:.1f} MB', round(standard / flash))
+# 1024 2.6 MB 0.5 MB 5 | 4096 35.7 MB 2.1 MB 17 | 32768 2,164.3 MB 16.9 MB 128 | 131072 34,426.8 MB 67.6 MB 509
+print(f'{64 * 16 * 1024**2 * 2 / 1e9:.2f} GB')        # 2.15 GB: scores of GPT-2 medium attention, batch 64, 16 heads, T = 1024
+print(f'{32 * 32768**2 * 2 / 1e9:.1f} GB')             # 68.7 GB: scores of one layer with 32 heads, one sequence, T = 32768
+
+# total and active parameters of an MoE decoder: attention with grouped KV heads, SwiGLU experts, a router
+def moe_params(d, layers, heads, kv_heads, d_ff, vocab, experts, k, tied=False):
+    hd = d // heads
+    attn = d * heads * hd + 2 * d * kv_heads * hd + heads * hd * d
+    expert = 3 * d * d_ff
+    router = d * experts
+    norms = 2 * d
+    emb = vocab * d * (1 if tied else 2) + d          # embeddings, output matrix, final norm
+    total = layers * (attn + experts * expert + router + norms) + emb
+    active = layers * (attn + k * expert + router + norms) + emb
+    return total, active
+
+t, a = moe_params(d=4096, layers=32, heads=32, kv_heads=8, d_ff=14336, vocab=32000, experts=8, k=2)
+print(f'{t / 1e9:.2f}B total, {a / 1e9:.2f}B active, {a / t:.3f}, {t * 2 / 1e9:.1f} GB in 16-bit')   # 46.70B total, 12.88B active, 0.276, 93.4 GB in 16-bit
+t1, _ = moe_params(d=4096, layers=32, heads=32, kv_heads=8, d_ff=14336, vocab=32000, experts=1, k=1)
+print(f'{t1 / 1e9:.2f}B dense')                       # 7.24B dense
+t, a = moe_params(d=512, layers=8, heads=8, kv_heads=2, d_ff=1408, vocab=32000, experts=8, k=2)
+print(f'{t / 1e6:.1f}M total, {a / 1e6:.1f}M active')   # 176.5M total, 72.7M active
+
+# top-2 routing of one token over 8 experts
+logits = np.array([1.2, -0.3, 2.0, 0.1, 0.5, 1.9, -1.0, 0.0])
+top = np.argsort(logits)[::-1][:2]
+g = np.exp(logits[top] - logits[top].max()); g /= g.sum()
+print(top + 1, g.round(3))                            # [3 6] [0.525 0.475]
+
+# the Switch load-balancing term N * sum f_i P_i (alpha left out) for balanced and collapsed routing
+N = 8
+f_bal, P_bal = np.full(N, 1 / N), np.full(N, 1 / N)
+f_col, P_col = np.eye(N)[0], np.r_[0.9, np.full(N - 1, 0.1 / (N - 1))]
+print(N * f_bal @ P_bal, round(N * f_col @ P_col, 2))   # 1.0 7.2
+
+# capacity: 16 tokens, 4 experts, top-1 counts (7, 4, 3, 2): capacity, dropped tokens, empty slots
+counts = np.array([7, 4, 3, 2])
+for cf in (1.0, 1.5):
+    cap = int(16 / 4 * cf)
+    print(cf, cap, np.maximum(counts - cap, 0).sum(), 4 * cap - np.minimum(counts, cap).sum())   # 1.0 4 3 3 | 1.5 6 1 9
+```
+
+The small configuration, $d = 512$ and 8 layers with 8 experts of width 1,408, shows the other end of the scale: of its 72.7 M active parameters, 32.8 M are the two embedding matrices, so the active share, 72.7 M of 176.5 M, is 41 %, far from $2/8$.
+
+## Next
+
+The backbone is now complete: an architecture, an objective, a data recipe, a size chosen for the compute, and the kernels and sparse layers that make that compute go further. Everything so far produces one pretrained model. The [next note](/notes/nlp/transfer-learning) takes such a model as given and asks how to use it for a particular task: by prompting it, by reading its vectors as features, or by continuing to train it.
+
+## References
+
+- T. Dao, D. Y. Fu, S. Ermon, A. Rudra, C. Ré. [FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness](https://arxiv.org/abs/2205.14135). NeurIPS, 2022. §2.1 (GPU memory), Algorithm 1 and Theorem 1 (the algorithm, exactness), §3.1 (recomputation), Theorem 2 and Proposition 3 (HBM accesses), Fig. 2 (the GPT-2 medium measurement), §4.1 and §4.3 (training speed, memory).
+- T. Dao. [FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning](https://arxiv.org/abs/2307.08691). arXiv, 2023. §3.1 (deferred rescaling, logsumexp, causal masking), §3.2 (parallelism over sequence length), §4.
+- M. Milakov, N. Gimelshein. [Online normalizer calculation for softmax](https://arxiv.org/abs/1805.02867). arXiv, 2018. Algorithm 3 and Theorem 1.
+- N. Shazeer, A. Mirhoseini, K. Maziarz, A. Davis, Q. Le, G. Hinton, J. Dean. [Outrageously Large Neural Networks: The Sparsely-Gated Mixture-of-Experts Layer](https://arxiv.org/abs/1701.06538). ICLR, 2017. §2.1 (noisy top-k gating), §4 (balancing expert utilization).
+- W. Fedus, B. Zoph, N. Shazeer. [Switch Transformers: Scaling to Trillion Parameter Models with Simple and Efficient Sparsity](https://arxiv.org/abs/2101.03961). JMLR, 23, 2022. §2.1 (top-1 routing), §2.2 (expert capacity, dropped tokens, load-balancing loss), Table 1.
+- A. Q. Jiang et al. [Mixtral of Experts](https://arxiv.org/abs/2401.04088). arXiv, 2024. Table 1 (architecture), §2.1 (sparse MoE, total and active parameters), §3 (size and efficiency), §5 (routing analysis).
+- N. Shazeer. [GLU Variants Improve Transformer](https://arxiv.org/abs/2002.05202). arXiv, 2020. SwiGLU; Table 1.

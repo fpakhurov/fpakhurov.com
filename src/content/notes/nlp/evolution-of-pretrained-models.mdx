@@ -1,0 +1,384 @@
+---
+title: "Evolution of pretrained models: RoBERTa, ELECTRA, GPT-2 and ModernBERT"
+description: "Four successors of BERT and GPT changed different parts of the pretraining recipe: RoBERTa the procedure and data, ELECTRA the objective, GPT-2 the data and scale, ModernBERT the architecture, data and implementation. The note separates these kinds of change and shows what each bought."
+course: nlp
+section: Pretrained Language Models
+order: 21
+status: published
+tags: [roberta, electra, gpt-2, modernbert, pretraining, dynamic-masking, replaced-token-detection, zero-shot, encoder]
+prerequisites: [BERT and masked language modeling, GPT and autoregressive language modeling, Positional representations]
+---
+
+import ChangeMap from '../../../components/figures/evolution-of-pretrained-models/ChangeMap.astro';
+import DynamicMasking from '../../../components/figures/evolution-of-pretrained-models/DynamicMasking.astro';
+import ElectraFlow from '../../../components/figures/evolution-of-pretrained-models/ElectraFlow.astro';
+import Gpt2Scale from '../../../components/figures/evolution-of-pretrained-models/Gpt2Scale.astro';
+import ModernBertAttention from '../../../components/figures/evolution-of-pretrained-models/ModernBertAttention.astro';
+
+The [previous note](/notes/nlp/gpt) ended with a base model that continues text, and the [BERT note](/notes/nlp/bert) with an encoder that fills in blanks. Both were published as one recipe, run once: an architecture, an objective, a training procedure, a corpus and a size, all chosen together. When a later model beats them, the recipe alone does not say which of those choices made the difference. This note follows four successors that each changed mainly one or two parts of the recipe and kept the rest, which makes them close to controlled experiments: RoBERTa ([Liu et al., 2019](#references)) changed the procedure and the data, ELECTRA ([Clark et al., 2020](#references)) the objective, GPT-2 ([Radford et al., 2019](#references)) the data and the size, and ModernBERT ([Warner et al., 2024](#references)) the architecture, the data and the implementation.
+
+**Notation.** A training sequence $x = (x_1, \dots, x_n)$ of $n$ tokens. A masking rate $p$ (0.15 in BERT) selects a set $m$ of positions; $x^{\text{masked}}$ is $x$ with those positions replaced by `[MASK]`. In ELECTRA, a generator $G$ with output distribution $p_G$ and a discriminator $D$ with output $D(x, t) \in (0, 1)$, the probability that the token at position $t$ is the original one; $\lambda$ weights the two losses. $B$ is the batch size in sequences and $S$ the number of optimizer steps. In attention, $T$ is the sequence length and $w$ the half-width of a local window.
+
+## Baseline: the recipes of BERT and GPT
+
+| Part of the recipe | BERT | GPT |
+| --- | --- | --- |
+| Architecture | Post-norm encoder, learned positions up to 512 | Decoder, learned positions up to 512 |
+| Objective | Masked tokens (MLM) plus next-sentence prediction (NSP) | Next token |
+| Procedure | 1 M steps of $B = 256$ sequences; masks drawn once, data copied 10 times for 40 epochs | 100 epochs of $B = 64$ sequences of 512 tokens |
+| Data | Books and English Wikipedia, 16 GB of text | Books, over 7,000 of them |
+| Size | 110 M (base), 340 M (large) | 117 M |
+
+The BERT column is the setup that RoBERTa reports for the original model (§2.4–2.5 of Liu et al.); the GPT column comes from the GPT paper ([Radford et al., 2018](#references), §4.1). The table is the baseline of this note in a precise sense: every later model is described by the rows it changed.
+
+The problem with a single recipe is attribution. If a new model differs from BERT in its objective, its data and its training length at once, a better score says nothing about the objective. Reading the papers in this note as answers to "which row mattered, and by how much" is what makes them useful beyond their leaderboard numbers.
+
+## Five kinds of change
+
+The changes fall into five kinds, which this course keeps apart:
+
+- **Architecture**: what function the network can compute. Layers, attention pattern, normalization placement, activation, position scheme.
+- **Objective**: what the network is asked to predict. Masked tokens, next tokens, an auxiliary task, a label per position.
+- **Procedure and data**: how the parameters are fitted and on what. Masking schedule, batch size, number of steps, learning-rate schedule, optimizer, corpus, tokenizer.
+- **Size**: how many parameters, at a fixed architecture family.
+- **Implementation**: how fast the same function is computed. Kernels, padding, compilation. An implementation change leaves the mathematics untouched, up to floating-point rounding.
+
+<aside class="callout"><strong>Key idea.</strong> A pretrained model is the product of a recipe with separable parts. Changing one part while the others are held fixed is the only way to learn what that part is worth. RoBERTa showed that the procedure and data alone, with the network and the masked-token objective unchanged, moved BERT from behind its successors to level with or ahead of them; ELECTRA showed that the objective sets how much signal each sequence gives; GPT-2 showed that scale and data turn a text continuer into a model that does some tasks from a prompt; ModernBERT showed that an encoder gains from the architecture, data and implementation advances made for decoders.</aside>
+
+The figure places the four models of this note on these axes, with procedure and data in separate columns.
+
+<ChangeMap />
+
+## RoBERTa: the same network, trained differently
+
+RoBERTa keeps BERT's architecture and its masked-token objective and changes how the model is trained: dynamic masking, no next-sentence prediction, larger batches, ten times more text, more steps, and a byte-level BPE vocabulary of 50 K units instead of BERT's 30 K-entry one ([Liu et al., 2019](#references), §4–5). The first changes were measured one at a time at BERT-base size with everything else fixed, the data and training length at BERT-large size; that is what makes the paper an ablation study rather than only a new model.
+
+### Static versus dynamic masking
+
+BERT drew the masks once, when the data were prepared. To avoid showing the same mask in every epoch, the data were copied 10 times with different masks, so over 40 epochs each sequence was seen with each of its 10 masks four times. **Dynamic masking** draws a new mask every time a sequence is fed to the model.
+
+What changes is the number of different prediction tasks built from one sequence. If each position is selected independently with probability $p$ in each mask and the sequence is seen with $k$ different masks, the probability that a given position is never selected is
+
+$$
+\boxed{\;P(\text{position never selected}) = (1 - p)^{k}\;}
+$$
+
+Why, as one chain, writing $s_r$ for the event that the position is selected in mask $r$:
+
+$$
+\begin{aligned}
+P(\text{never selected}) &= P\big(\bar s_1 \cap \bar s_2 \cap \dots \cap \bar s_k\big) \\
+&= \prod_{r=1}^{k} P(\bar s_r) && \text{the masks are drawn independently} \\
+&= (1 - p)^{k} && P(\bar s_r) = 1 - p \text{ for every mask.}
+\end{aligned}
+$$
+
+Repeating a mask adds nothing to this count: a sequence seen 40 times with 10 masks has $k = 10$, not 40.
+
+**Worked example.** With $p = 0.15$: static masking with $k = 10$ masks leaves $0.85^{10} = 0.197$ of the positions never selected, so 80 % of the positions ever become a prediction target. Dynamic masking over 40 epochs has $k = 40$ and leaves $0.85^{40} = 0.0015$: practically every position is predicted at some point, each time from a different context of other masks. A simulation of one 128-token sequence in the [Code](#code) section finds 84 % and 100 %.
+
+<DynamicMasking />
+
+The measured effect is small. At BERT-base size, trained for the same time on the same data, static and dynamic masking give 78.3 and 78.7 F1 on SQuAD 2.0, 84.3 and 84.0 % on MNLI-m, 92.5 and 92.9 % on SST-2 (development sets, medians of five seeds; Table 1 of Liu et al.). The authors call dynamic masking comparable or slightly better and keep it because it needs no data copies and matters more when training is longer or the data larger.
+
+### Dropping next-sentence prediction
+
+BERT's input was a pair of segments, and NSP asked whether the second followed the first. RoBERTa compared four input formats at BERT-base size, all trained for 1 M steps with $B = 256$ on books and Wikipedia (Table 2 of Liu et al.):
+
+| Input format | NSP loss | SQuAD 1.1 / 2.0 F1 | MNLI-m | RACE |
+| --- | --- | --- | --- | --- |
+| Pair of segments (BERT's format) | Yes | 90.4 / 78.7 | 84.0 | 64.2 |
+| Pair of single sentences | Yes | 88.7 / 76.2 | 82.9 | 63.0 |
+| Full sentences, may cross documents | No | 90.4 / 79.1 | 84.7 | 64.8 |
+| Full sentences, one document | No | 90.6 / 79.7 | 84.7 | 65.6 |
+
+Two conclusions follow. Single sentences hurt, which the authors attribute to the model no longer seeing long-range context. Removing NSP and packing contiguous text up to 512 tokens matches or slightly improves every task in the table (SST-2, not shown, moves by less than half a point either way), contrary to the original BERT ablation. RoBERTa nevertheless uses the full-sentences format, because packing within one document makes the batch size vary.
+
+### Larger batches at the same compute
+
+Training cost is set by the number of sequences processed, $B \cdot S$. BERT's 1 M steps of 256 sequences cost the same as 125 K steps of 2 K sequences or 31 K steps of 8 K, since
+
+$$
+\begin{aligned}
+256 \times 1{,}000{,}000 &= 2{,}048 \times 125{,}000 = 256 \text{ M sequences}, \\
+8{,}192 \times 31{,}000 &= 254 \text{ M sequences} \approx 256 \text{ M}.
+\end{aligned}
+$$
+
+At equal cost and with the learning rate tuned for each batch size, $B = 2$ K gave a held-out MLM perplexity of 3.68 against 3.99 for $B = 256$, and 85.2 against 84.7 % on MNLI-m (Table 3 of Liu et al.). Large batches are also easier to spread over many accelerators. RoBERTa trains with $B = 8$ K.
+
+### More data and longer training
+
+The last two changes are the largest. Starting from the BERT-large architecture (355 M parameters with the larger vocabulary), Table 4 of Liu et al. adds them one at a time:
+
+| Setting | Data | Steps × batch | SQuAD 2.0 F1 | MNLI-m | SST-2 |
+| --- | --- | --- | --- | --- | --- |
+| RoBERTa recipe, BERT's data | 16 GB | 100 K × 8 K | 87.3 | 89.0 | 95.3 |
+| + three more corpora | 160 GB | 100 K × 8 K | 87.7 | 89.3 | 95.6 |
+| + longer training | 160 GB | 300 K × 8 K | 88.7 | 90.0 | 96.1 |
+| + longer still | 160 GB | 500 K × 8 K | 89.4 | 90.2 | 96.4 |
+
+All rows are development-set results of the same architecture and objective, trained by the same authors. The first row already beats the originally reported BERT-large on the same kind of data (81.8, 86.6 and 93.7 on the three tasks, BERT's numbers from its own paper). That gap is the effect of the procedure, which here includes about three times as many training sequences: $100{,}000 \times 8{,}192 = 819$ M against BERT's 256 M. The added corpora are news, an open recreation of GPT-2's WebText, and story-like web text; the authors note that their experiment conflates the size of the data with its diversity. The 500 K-step model processes $8{,}192 \times 500{,}000 \approx 4.1$ billion sequences, sixteen times BERT's 256 million, and still did not appear to overfit.
+
+The conclusion of the paper is in its abstract: BERT was significantly undertrained. Comparisons between architectures or objectives are only meaningful at an equal, and adequate, training procedure.
+
+## ELECTRA: a training signal at every position
+
+Two weaknesses of masked-token pretraining remain after RoBERTa. The loss is computed at the selected 15 % of positions only, so a 128-token sequence gives about 19 predictions; the [BERT note](/notes/nlp/bert#limitations) listed this as sample inefficiency. And `[MASK]` appears in pretraining but never in fine-tuning. ELECTRA ([Clark et al., 2020](#references)) changes the objective to remove both.
+
+### Replaced-token detection
+
+Two networks are trained together. The **generator** is a small masked language model: it sees $x^{\text{masked}}$ and predicts a distribution $p_G(\cdot \mid x^{\text{masked}})$ at each selected position. A token is *sampled* from that distribution at each selected position and put back in place of the mask, which gives a corrupted sequence $x^{\text{corrupt}}$ that contains plausible but sometimes wrong tokens. The **discriminator**, the network that is kept, reads $x^{\text{corrupt}}$ and predicts for every position whether its token is the original:
+
+$$
+D(x^{\text{corrupt}}, t) = \sigma\big(v^\top h_D(x^{\text{corrupt}})_t\big),
+$$
+
+where $h_D(\cdot)_t \in \mathbb R^d$ is the discriminator's contextual vector at position $t$, $v \in \mathbb R^d$ a learned vector and $\sigma$ the logistic function. The two losses are
+
+$$
+\begin{aligned}
+\mathcal L_{\text{MLM}} &= -\sum_{i \in m} \log p_G\big(x_i \mid x^{\text{masked}}\big), \\
+\mathcal L_{\text{Disc}} &= -\sum_{t=1}^{n} \Big[\mathbf 1\big(x^{\text{corrupt}}_t = x_t\big) \log D(x^{\text{corrupt}}, t) \\
+&\qquad\quad + \mathbf 1\big(x^{\text{corrupt}}_t \neq x_t\big) \log\big(1 - D(x^{\text{corrupt}}, t)\big)\Big],
+\end{aligned}
+$$
+
+and training minimizes their weighted sum over the corpus,
+
+$$
+\boxed{\;\min_{\theta_G,\, \theta_D}\; \sum_{x} \mathcal L_{\text{MLM}}(x; \theta_G) + \lambda\, \mathcal L_{\text{Disc}}(x; \theta_D), \qquad \lambda = 50.\;}
+$$
+
+Read term by term. $\mathcal L_{\text{MLM}}$ is the BERT loss, applied to the small generator, over the selected positions $m$ only. $\mathcal L_{\text{Disc}}$ is a binary cross-entropy whose sum runs over all $n$ positions: this is the change. The indicator $\mathbf 1(x^{\text{corrupt}}_t = x_t)$ compares tokens, not positions, so when the generator happens to sample the original token, that position is labelled original. $\lambda$ is large because a binary decision has a much smaller loss than a choice among 30,000 tokens; without it the generator's term would dominate (Appendix A of Clark et al.).
+
+<ElectraFlow />
+
+Step by step, in the order of the numbers in the figure:
+
+1. **Mask.** Positions are selected as in BERT (15 %; here two of seven) and replaced by `[MASK]`.
+2. **Sample.** The generator predicts a distribution at each masked position and a token is drawn from it: `dog` for `cat`, `mat` for `mat`.
+3. **Corrupt.** The samples take the place of the masks. The discriminator never sees `[MASK]`, which removes the pretraining–fine-tuning mismatch.
+4. **Label every position.** The discriminator predicts original or replaced at all seven positions. Only `dog` is replaced; `mat` is original even though it was masked, because the generator restored it.
+5. **Losses.** The generator learns by MLM at the two masked positions, the discriminator by binary cross-entropy at all seven. After pretraining the generator is discarded and the discriminator is fine-tuned like BERT.
+
+**Worked example (signals per sequence).** For $n = 128$ and $p = 0.15$, MLM scores $0.15 \times 128 = 19.2$ positions on average, and the discriminator scores all 128, which is $128 / 19.2 = 6.7$ times as many. Each of those signals is one binary label, so the gain is in how many positions shape the representation, not in how much information each label carries.
+
+### Why this is not a GAN
+
+The arrangement resembles the generator and discriminator of a [GAN](/notes/generative-models/gans), but the generator is not trained to fool the discriminator. It is trained by maximum likelihood on $\mathcal L_{\text{MLM}}$, and the discriminator's loss is not back-propagated into it; it could not be, because sampling a discrete token has no gradient. An adversarially trained generator, using reinforcement learning to get around the sampling step, did worse: its masked-token accuracy was 58 % against 65 %, and its output distribution put most of its mass on a single token, so the replacements lacked variety (§3.2 of Clark et al.).
+
+The generator must also be weaker than the discriminator. With equal sizes each step costs about twice as much, and the authors suggest that too strong a generator makes the replacements too hard to detect for the discriminator to learn well; GLUE scores were best with a generator 1/4 to 1/2 the width of the discriminator (Figure 3 of Clark et al.), and the paper's final models use 1/4 (small and large) and 1/3 (base) (Table 6). The two networks share their token and position embeddings.
+
+### Where the gain comes from
+
+At BERT-base size and on the same data, Table 5 of Clark et al. separates the two effects with three intermediate objectives (GLUE development score):
+
+| Objective | Loss at | Sees `[MASK]` in pretraining | GLUE |
+| --- | --- | --- | --- |
+| BERT (MLM) | 15 % of positions | Yes | 82.2 |
+| ELECTRA, loss only at the 15 % masked positions | 15 % | No | 82.4 |
+| MLM with generator samples instead of `[MASK]` | 15 % | No | 82.4 |
+| MLM predicting every token, generator samples as input | All | No | 84.3 |
+| ELECTRA | All | No | 85.0 |
+
+Rows 2 and 3 remove `[MASK]` but keep the loss at 15 % of the positions; they move the score by 0.2. Putting the loss on all positions (rows 4 and 5) moves it by 2 to 3 points. Most of ELECTRA's gain is the denser signal, and a smaller part the removed mismatch.
+
+The efficiency shows most at small sizes. A 14 M-parameter ELECTRA-Small trained for 4 days on one V100 GPU reaches 79.9 on GLUE dev, against 75.1 for a BERT-Small with the same architecture, data and training FLOPs, both trained by the ELECTRA authors (Table 1 of Clark et al.). ELECTRA-Base reaches 85.1 against 82.2 for BERT-Base at equal FLOPs. At BERT-large size, an ELECTRA trained with $7.1 \times 10^{20}$ FLOPs scores 89.0 on GLUE dev, close to RoBERTa's 88.9 at $3.2 \times 10^{21}$ FLOPs (Table 2); the two were pretrained on different corpora, so this is a comparison of compute budgets, not a controlled test.
+
+## GPT-2: the same objective at a larger scale
+
+GPT-2 keeps GPT's objective, next-token prediction, and nearly all of its architecture; the [GPT note](/notes/nlp/gpt#two-models-by-the-numbers) reads its smallest model by the numbers. The architectural edits are small: layer normalization moved to the input of each sub-block (pre-norm, see the [Transformer note](/notes/nlp/transformers#pre-norm-versus-post-norm)), one more normalization after the last block, residual weights initialized smaller by a factor $1/\sqrt N$ for $N$ residual layers, a context of 1,024 tokens instead of 512, a byte-level BPE vocabulary of 50,257 and batches of 512 ([Radford et al., 2019](#references), §2.2–2.3). What changed substantially is the data and the size.
+
+**Data.** GPT was trained on books. GPT-2's **WebText** is built for quality without hand-labelling: it takes every outbound link from Reddit that received at least 3 karma, a cheap signal that some reader found the page worth sharing, and extracts the text. From 45 million links, de-duplication and heuristic cleaning leave slightly over 8 million documents, 40 GB of text. All Wikipedia pages were removed, because Wikipedia is a common source of evaluation data (§2.1).
+
+**Size.** Four models with roughly log-uniform sizes, 117 M, 345 M, 762 M and 1,542 M parameters, with 12, 24, 36 and 48 layers and widths from 768 to 1,600 (Table 2 of Radford et al.). The paper's 117 M for the smallest model is lower than the 124 M counted for the released checkpoint in the [GPT note](/notes/nlp/gpt#two-models-by-the-numbers). The largest is the model usually called GPT-2. All four still underfit WebText: held-out perplexity was still improving when training stopped.
+
+### Tasks written as text
+
+A supervised model estimates $p(\text{output} \mid \text{input})$ for one task. A model meant for many tasks has to condition on the task too, $p(\text{output} \mid \text{input}, \text{task})$. GPT-2's premise is that natural language can express all three: a translation example is the text "translate to French, *English text*, *French text*", and a web corpus contains such demonstrations without anyone having labelled them (§2). A language model that predicts web text well must then, in part, learn to perform the tasks the text demonstrates.
+
+**Zero-shot** use follows: write the input and a task cue as a prompt $c$, and let the model continue,
+
+$$
+\hat y = \operatorname{decode}\big(P(y \mid c)\big), \qquad P(y \mid c) = \prod_{t} P(y_t \mid c, y_{<t}),
+$$
+
+with no parameter update and no task-specific training set; $\operatorname{decode}$ is one of the strategies of the [GPT note](/notes/nlp/gpt#decoding-turning-probabilities-into-text). The prompts used in the paper (§3.5–3.8):
+
+| Task | Prompt $c$ | Decoding | Result |
+| --- | --- | --- | --- |
+| Reading comprehension (CoQA) | document, dialogue history, `A:` | Greedy | 55 F1 on the dev set |
+| Summarization (CNN/Daily Mail) | article, `TL;DR:` | Top-$k$, $k = 2$; first 3 sentences | ROUGE average 21.40 |
+| Translation (WMT-14) | example pairs `english sentence = french sentence`, then the source sentence and `=` | Greedy | 5 BLEU English→French, 11.5 BLEU French→English |
+| Open-domain questions (Natural Questions) | example question–answer pairs, then the question | — | 4.1 % exact match |
+
+The translation and question-answering prompts contain a few solved examples in the context. The paper still calls this zero-shot because no parameters change; later work calls the same setup few-shot, or in-context learning.
+
+Read against their baselines, the results are mixed. The 55 F1 on CoQA matches or exceeds three of four baseline systems that were trained on its 127,000 question–answer pairs, while the best supervised system was near the 89 F1 of humans. The summaries score barely above three random sentences from the article (21.40 against 20.98 ROUGE average) and well below the first three sentences (31.55); removing `TL;DR:` drops the score by 6.4 points, which shows that the cue does select the behaviour. Translation from French reaches 11.5 BLEU against 33.5 for the best unsupervised system of the time, from a corpus whose French content a language detector put at 10 MB. Every number is far below a supervised model; what is new is that any of them is above chance without training on the task.
+
+### What scale buys
+
+The clearest result is the trend with size, at fixed data and procedure:
+
+<Gpt2Scale />
+
+On LAMBADA, which asks for the last word of a passage that needs broad context, zero-shot perplexity falls from 35.13 at 117 M to 8.63 at 1.5 B (Table 3 of Radford et al.). In the paper's words, increasing capacity improves zero-shot performance in a log-linear fashion across tasks, and GPT-2 sets the best published result on 7 of 8 language-modelling benchmarks without training on any of them. The exception is the One Billion Word benchmark, which the paper explains by its size and by its sentence-level shuffling, which removes all long-range structure.
+
+Two caveats from the paper itself. The test sets of common language-modelling benchmarks share between 1 and 6 % of their 8-grams with WebText's training split (3.2 % on average, §4; many share more with their own training splits, 5.9 % on average), so part of a zero-shot score could be memorization; the measured benefit of the overlap is small but consistent. And none of the zero-shot task results is close to a fine-tuned model. How the loss keeps falling as parameters, data and compute grow, and how to split a fixed budget between them, is the subject of the [scaling laws note](/notes/nlp/scaling-laws).
+
+## ModernBERT: an encoder rebuilt with a decoder's parts
+
+After GPT-2, most progress in architecture and training went into decoders. Encoders did not disappear: retrieval, classification and entity tagging need one vector per input or per token, an encoder computes all of them in one forward pass, and the retrievers of the [semantic search note](/notes/nlp/semantic-search) are encoders. Yet many production pipelines still run the original BERT, with its 512-token limit and its old training data. ModernBERT ([Warner et al., 2024](#references)) keeps the encoder-only design and the MLM objective and replaces almost everything else.
+
+### Architecture
+
+The changes are those the [Transformer note](/notes/nlp/transformers) and the [efficient Transformers note](/notes/nlp/efficient-transformers#the-modern-transformer-block) describe as modern defaults, applied to an encoder (§2.1 of Warner et al.):
+
+- **Rotary positions** instead of a learned table of 512 rows ([positional representations note](/notes/nlp/positional-encoding#relative-and-rotary-positions)), so the length limit comes from training, not from a table.
+- **Pre-norm blocks**, plus a LayerNorm after the embeddings; no bias terms in the norms or in the linear layers other than the output layer.
+- **GeGLU feed-forward layers**: the GELU of one projection gates another, $\operatorname{FFN}(h) = \big(\operatorname{GELU}(h W_g) \odot h W_u\big) W_o$ with $W_g, W_u \in \mathbb R^{d \times f}$ and $W_o \in \mathbb R^{f \times d}$, where $\odot$ is the element-wise product.
+- **Alternating attention**: every third layer, starting with the first, is global; the other layers attend only within a sliding window of 128 tokens, 64 on each side.
+- **Deep and narrow**: 22 layers of width $d = 768$ with $f = 1{,}152$ for the base model, 28 layers of width 1,024 for the large one, shaped to run efficiently on common GPUs.
+
+**Worked example (the parameter count).** Without biases, a block of ModernBERT-base has $4d^2 = 2{,}359{,}296$ attention weights (the fused query–key–value projection and the output projection) and $3 d f = 3 \times 768 \times 1{,}152 = 2{,}654{,}208$ feed-forward weights, 5,013,504 in all. Twenty-two blocks hold 110.3 M; the embedding matrix of the 50,368-token vocabulary holds $50{,}368 \times 768 = 38.7$ M; the sum, 149.0 M, is the size the paper reports. A BERT-base block holds $12 d^2 \approx 7.1$ M: ModernBERT-base spreads fewer weights per block over almost twice as many blocks.
+
+Alternating attention is what makes 8,192 tokens affordable. A global layer computes a score for every pair of positions, a local layer only for the $2w + 1$ positions around each query:
+
+$$
+\text{scores per head} = \begin{cases} T^2 & \text{global layer,} \\ T\,(2w + 1) & \text{local layer, ignoring the shorter windows at the edges.} \end{cases}
+$$
+
+At $T = 8{,}192$ and $w = 64$ a global layer computes $8{,}192^2 = 67.1$ M scores per head and a local layer $8{,}192 \times 129 = 1.06$ M, 63.5 times fewer. With 8 global and 14 local layers the model computes 552 M scores per head where 22 global layers would compute 1,476 M, 2.7 times fewer. Information still travels across the whole sequence, through the global layers and through local windows stacked over depth.
+
+<ModernBertAttention />
+
+### Implementation: unpadding and kernels
+
+*Optional depth: how ModernBERT avoids computing on padding tokens. The rest of the note does not depend on it.*
+
+A batch of texts of different lengths is normally padded to the longest one ([tokenization note](/notes/nlp/tokenization#special-tokens-padding-and-masks)), and the padding positions go through every layer for nothing. ModernBERT **unpads**: it removes the padding before the embedding layer, concatenates the sequences of the batch into one row, and runs attention with a variable-length kernel that keeps each sequence from attending to the others. For four sequences of 512, 320, 128 and 64 tokens, the padded batch has $4 \times 512 = 2{,}048$ positions of which $1{,}024$ are real, so half the computation is wasted; the unpadded row has exactly the 1,024 real tokens. The kernels are FlashAttention ([efficient Transformers note](/notes/nlp/efficient-transformers#flashattention)), and compiling the model with PyTorch's compiler adds about 10 % throughput (§2.1.2).
+
+None of this changes what the model computes on the real tokens, up to floating-point rounding. It changes speed and memory, which the results below measure.
+
+### Objective, procedure and data
+
+The objective is MLM without NSP, with 30 % of the positions masked instead of 15 %, a rate the authors take from later work showing 15 % to be suboptimal. The procedure and data are where the encoder catches up with decoder practice (§2.2):
+
+- **Data**: 2 trillion tokens, mostly English, from web documents, code and scientific articles. BERT's corpus held about 3.3 billion words, with no code.
+- **Tokenizer**: a BPE vocabulary of 50,368 entries (a multiple of 64, which suits GPU kernels), built from a recent decoder's tokenizer and better on code; BERT's special tokens are kept.
+- **Packing**: sequences are packed into batches with over 99 % efficiency, so the unpadded batches have a stable size.
+- **Optimizer and schedule**: StableAdamW, and a learning rate that warms up, stays constant for most of training and then decays, so training can be resumed from any checkpoint.
+- **Context**: 1.7 trillion tokens at 1,024 tokens per sequence, then 300 billion more at 8,192 with the global layers' RoPE base raised from 10,000 to 160,000.
+
+### Results
+
+Table 1 of Warner et al. compares base-size encoders that the authors fine-tuned with the same per-task hyperparameter search, and trained as retrievers with the same MS MARCO recipe:
+
+| Model (base size) | GLUE average | BEIR, single-vector retrieval (nDCG@10) | CodeSearchNet |
+| --- | --- | --- | --- |
+| BERT | 84.7 | 38.9 | 41.2 |
+| RoBERTa | 86.4 | 37.7 | 44.3 |
+| DeBERTaV3 | 88.1 | 20.2 | 17.5 |
+| ModernBERT | 88.4 | 41.6 | 56.4 |
+
+Speed was measured on one RTX 4090 GPU, averaging ten runs (Table 2 of Warner et al.). ModernBERT-base processes about 147 thousand tokens per second on inputs of variable length up to 512, against 90 thousand for BERT-base, and 124 thousand per second on 8,192-token inputs, which BERT cannot take at all. On inputs that are all exactly 512 tokens long, where unpadding saves nothing, the smaller BERT-base is faster, 180 against 148 thousand.
+
+The gains are largest where the old encoders had the largest gaps: code, which their data lacked (CodeSearchNet above), and long documents, which their position tables excluded (on the long-document retrieval set MLDR, after fine-tuning on it, 44.0 nDCG@10 against BERT's 32.2, which reads at most 512 tokens). DeBERTaV3, pretrained with ELECTRA's replaced-token detection ([He, Gao and Chen, 2023](#references)), is strong on GLUE and weak on retrieval; the ModernBERT authors list combining MLM with that objective as future work.
+
+## What changed
+
+| | Kept from the parent | Main change | Kind of change | What it bought |
+| --- | --- | --- | --- | --- |
+| RoBERTa (from BERT) | Architecture, MLM | Dynamic masks, no NSP, $B = 8$ K, 160 GB, 500 K steps | Procedure and data | BERT-large architecture level with or ahead of its successors |
+| ELECTRA (from BERT) | Encoder architecture, data, sizes | Replaced-token detection with a small generator | Objective | A loss at every position; better scores at equal compute, most at small sizes |
+| GPT-2 (from GPT) | Next-token objective, decoder | WebText, 40 GB; 117 M → 1.5 B parameters | Data and size | Zero-shot task performance that grows with size |
+| ModernBERT (from BERT) | Encoder-only, MLM | RoPE, GeGLU, local and global attention; 2 T tokens with code; unpadding | Architecture, data, implementation | 8,192-token context, code and retrieval quality, speed on variable-length inputs |
+
+## Limitations
+
+- **The ablations are not independent.** RoBERTa's larger batches needed a retuned learning rate, and its added corpora changed size and diversity at once; the authors say so. "One change at a time" is an approximation.
+- **Cross-paper comparisons mix protocols.** ELECTRA against RoBERTa, or any model against numbers copied from another paper, differs in data and fine-tuning as well as in the change of interest. Only comparisons run by the same authors in the same setup isolate a change.
+- **ELECTRA's discriminator does not fill in blanks.** It has no vocabulary head, so the zero-shot cloze use of the [BERT note](/notes/nlp/bert#what-the-pretrained-head-can-do) is not available, and the generator size is one more hyperparameter to tune.
+- **GPT-2's zero-shot results are far from supervised ones**, its summaries are barely better than random sentences, and some evaluation text overlaps its training data. It is still a text continuer, not an assistant.
+- **ModernBERT is English-only and was not scaled in parameters.** On short, fixed-length inputs the smaller original BERT is faster, and its MLM-only objective does not use replaced-token detection, which its authors suggest could help on classification.
+
+## What you should remember
+
+- A pretraining recipe has five separable parts: architecture, objective, procedure and data, size, implementation. Judge a new model by which parts it changed.
+- RoBERTa: same network and objective as BERT; dynamic masking, no NSP, large batches, 10× data and longer training. BERT was undertrained.
+- Dynamic masking: with $k$ distinct masks a position is never selected with probability $(1-p)^k$; repeating a mask does not increase $k$.
+- ELECTRA: a small MLM generator corrupts the input, the discriminator labels every position original or replaced, loss $\mathcal L_{\text{MLM}} + \lambda \mathcal L_{\text{Disc}}$ with $\lambda = 50$. Most of the gain comes from the loss at all positions.
+- GPT-2: GPT's objective and nearly its architecture, with WebText and up to 1.5 B parameters; tasks posed as text prompts, performance rising smoothly with size.
+- ModernBERT: an encoder with RoPE, pre-norm, GeGLU, alternating 128-token local and global attention, unpadding and FlashAttention, trained on 2 T tokens including code with an 8,192-token context.
+
+## Code
+
+The numbers quoted in the note, from the counting arguments above. Plain Python, no downloads; it runs in well under a second.
+
+```python
+import random
+
+n, p = 128, 0.15                      # tokens per sequence, share of positions selected for prediction
+
+# 1. Positions that carry a loss: MLM scores the selected ones, replaced-token detection all of them.
+print(f"MLM {p * n:.1f} positions, RTD {n}, ratio {n / (p * n):.1f}")
+# MLM 19.2 positions, RTD 128, ratio 6.7
+
+# 2. One sequence over 40 epochs: 10 static masks made once (each reused 4 times) vs a new mask every epoch.
+rng = random.Random(0)
+draw = lambda: frozenset(t for t in range(n) if rng.random() < p)   # the positions selected in one mask
+static = [draw() for _ in range(10)] * 4
+dynamic = [draw() for _ in range(40)]
+for name, masks in [("static", static), ("dynamic", dynamic)]:
+    distinct = len(set(masks))
+    seen = len(frozenset().union(*masks)) / n                       # positions selected at least once
+    print(f"{name:>7}: {distinct} distinct masks, {seen:.2f} of positions ever selected "
+          f"(expected {1 - (1 - p) ** distinct:.3f})")
+#  static: 10 distinct masks, 0.84 of positions ever selected (expected 0.803)
+# dynamic: 40 distinct masks, 1.00 of positions ever selected (expected 0.998)
+
+# 3. RoBERTa's batch sizes at equal compute: sequences processed = batch size x steps.
+for bsz, steps in [(256, 1_000_000), (2048, 125_000), (8192, 31_000)]:
+    print(f"batch {bsz:>4} x {steps:>9,} steps = {bsz * steps / 1e6:.0f} M sequences")
+# batch  256 x 1,000,000 steps = 256 M sequences
+# batch 2048 x   125,000 steps = 256 M sequences
+# batch 8192 x    31,000 steps = 254 M sequences
+
+# 4. ModernBERT-base parameters: 22 bias-free blocks, d = 768, GeGLU with two 1,152-wide halves.
+d, L, V, f = 768, 22, 50_368, 1_152
+attn, ffn = 4 * d * d, d * 2 * f + f * d                        # Wqkv and Wo; Wi (gate and up) and Wo
+print(f"per block {attn + ffn:,}; blocks {L * (attn + ffn) / 1e6:.1f} M + embeddings {V * d / 1e6:.1f} M"
+      f" = {(L * (attn + ffn) + V * d) / 1e6:.1f} M")
+# per block 5,013,504; blocks 110.3 M + embeddings 38.7 M = 149.0 M
+
+# 5. Attention scores per head at 8,192 tokens: every third layer global, the others a window of 64 on each side.
+T, keys_local = 8192, 2 * 64 + 1
+n_global = sum(1 for i in range(L) if i % 3 == 0)
+scores = n_global * T * T + (L - n_global) * T * keys_local
+print(f"{n_global} global + {L - n_global} local layers: {scores / 1e6:.0f} M scores "
+      f"vs {L * T * T / 1e6:.0f} M if all were global ({L * T * T / scores:.1f}x fewer)")
+# 8 global + 14 local layers: 552 M scores vs 1476 M if all were global (2.7x fewer)
+
+# 6. Unpadding: four sequences padded to the longest one, or concatenated into one row.
+lengths = [512, 320, 128, 64]
+padded, real = len(lengths) * max(lengths), sum(lengths)
+print(f"padded {padded} positions, real tokens {real}, wasted {1 - real / padded:.0%}")
+# padded 2048 positions, real tokens 1024, wasted 50%
+```
+
+The simulated share of positions ever selected under static masking, 0.84, differs from the expected 0.803 because one sequence of 128 tokens is a small sample.
+
+## Next
+
+Every model in this note stayed inside one of two arrangements: an encoder trained to fill in tokens, or a decoder trained to continue text. The translation model of the previous section was a third arrangement, an encoder–decoder, and it has a pretraining objective of its own. The [next note](/notes/nlp/model-families) puts the three side by side, with their masks and objectives, asks which to choose for which task, and explains why the decoder, the arrangement GPT-2 scaled, came to dominate.
+
+## References
+
+- Y. Liu, M. Ott, N. Goyal, J. Du, M. Joshi, D. Chen, O. Levy, M. Lewis, L. Zettlemoyer, V. Stoyanov. [RoBERTa: A Robustly Optimized BERT Pretraining Approach](https://arxiv.org/abs/1907.11692). arXiv, 2019. §4.1 and Table 1 (static and dynamic masking), §4.2 and Table 2 (NSP and input formats), §4.3 and Table 3 (batch size), §5 and Table 4 (data and training length).
+- K. Clark, M.-T. Luong, Q. V. Le, C. D. Manning. [ELECTRA: Pre-training Text Encoders as Discriminators Rather Than Generators](https://arxiv.org/abs/2003.10555). ICLR, 2020. §2 (the objective), §3.2 and Figure 3 (generator size, adversarial training), Tables 1–2 (small and large models), §3.5 and Table 5 (where the gain comes from), Appendix A ($\lambda = 50$, masking rates).
+- A. Radford, J. Wu, R. Child, D. Luan, D. Amodei, I. Sutskever. [Language Models are Unsupervised Multitask Learners](https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf). OpenAI, 2019. §2.1 (WebText), §2.3 and Table 2 (model sizes), §3 and Table 3 (zero-shot results), §4 (overlap with test sets).
+- B. Warner, A. Chaffin, B. Clavié, O. Weller, O. Hallström, S. Taghadouini, A. Gallagher, R. Biswas, F. Ladhak, T. Aarsen, N. Cooper, G. Adams, J. Howard, I. Poli. [Smarter, Better, Faster, Longer: A Modern Bidirectional Encoder for Fast, Memory Efficient, and Long Context Finetuning and Inference](https://arxiv.org/abs/2412.13663). arXiv, 2024. ModernBERT. §2.1 (architecture and efficiency), §2.2 (data and training), Table 1 (downstream results), Table 2 (speed and memory).
+- J. Devlin, M.-W. Chang, K. Lee, K. Toutanova. [BERT: Pre-training of Deep Bidirectional Transformers for Language Understanding](https://aclanthology.org/N19-1423/). NAACL, 2019.
+- P. He, J. Gao, W. Chen. [DeBERTaV3: Improving DeBERTa using ELECTRA-Style Pre-Training with Gradient-Disentangled Embedding Sharing](https://arxiv.org/abs/2111.09543). ICLR, 2023.
+- A. Radford, K. Narasimhan, T. Salimans, I. Sutskever. [Improving Language Understanding by Generative Pre-Training](https://cdn.openai.com/research-covers/language-unsupervised/language_understanding_paper.pdf). OpenAI, 2018. GPT; §4.1 (data and training setup).
