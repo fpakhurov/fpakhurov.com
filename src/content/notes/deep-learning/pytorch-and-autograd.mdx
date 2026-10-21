@@ -1,0 +1,392 @@
+---
+title: PyTorch and automatic differentiation
+description: "Tensors and broadcasting, the computational graph and reverse-mode differentiation built from scratch for scalars and checked against PyTorch, the training pipeline of datasets, modules and optimizers, and the bugs that break it silently."
+course: deep-learning
+section: Training Neural Networks
+order: 1
+status: published
+tags: [pytorch, tensors, broadcasting, autograd, computational-graph, reverse-mode, training-pipeline, debugging]
+prerequisites: [What deep learning is, Backpropagation, Python basics, Linear algebra]
+---
+
+import BroadcastTrap from '../../../components/figures/pytorch-and-autograd/BroadcastTrap.astro';
+import ScalarGraph from '../../../components/figures/pytorch-and-autograd/ScalarGraph.astro';
+import ZeroGradPaths from '../../../components/figures/pytorch-and-autograd/ZeroGradPaths.astro';
+
+The [previous note](/notes/deep-learning/deep-learning) reduced the training of any network to one loop: take a batch, run the model forward, compute the loss, run backward for the gradient, take a step. A library has to supply four things for that loop: arrays that hold batches and parameters, a forward pass that remembers what it computed, a backward pass that turns that memory into gradients, and optimizers that apply them. This note covers how PyTorch supplies each, starting from the tensor and its broadcasting rules. It then builds the backward pass from scratch for scalars, about forty lines of Python that agree with PyTorch to rounding error, and assembles the full training pipeline. It ends with the bugs that make a pipeline run without errors and still train badly.
+
+**Notation.** As in the [backpropagation note](/notes/ml/backpropagation), $L$ is a scalar loss and $\bar u = \partial L / \partial u$ is the **adjoint** of a quantity $u$, with the same shape as $u$. A tensor's **shape** is the tuple of its sizes along each dimension, written like `(64, 10)`; dimension 0 is the first. $\eta$ is the learning rate.
+
+## Baseline: gradients written by hand
+
+With NumPy alone, every layer needs two pieces of code: the forward computation and its backward formula. The backpropagation note wrote both for a two-layer network, $\bar W = \bar z\, h^\top$, $\bar z = \varphi'(z) \odot \bar h$ and so on. That works for one architecture. Every new layer, loss or connection means deriving and coding a new backward formula, and an error in it often does not crash: the loss still goes down, only more slowly, and only a [finite-difference check](/notes/ml/backpropagation#checking-gradients-by-finite-differences) reveals it.
+
+PyTorch removes the second piece. We write only the forward pass, in ordinary Python on tensors; the library records which operations ran and derives the backward pass from that record. Every operation brings its own local derivative, and the chain rule does the rest.
+
+## Tensors
+
+A **tensor** is an $n$-dimensional array with a shape, a data type (`dtype`) and a device. The default floating type is 32-bit (`torch.float32`), which takes half the memory of 64-bit numbers and runs much faster on GPUs, at about 7 significant digits of precision; gradient checks use `torch.float64`. The device is the CPU or a GPU, and `x.to('cuda')` moves a tensor to the GPU when one is present. Everything in this course runs on the CPU.
+
+A tensor is a view of a block of memory, described by a shape and **strides**: how many elements to skip to move one step along each dimension. Reshaping and transposing usually change only the description, not the data. **Worked example.** `x = torch.arange(6.0)` holds $0, 1, \dots, 5$; `v = x.view(2, 3)` is the same memory read as two rows of three, with strides $(3, 1)$. Setting `v[0, 0] = 100` changes `x[0]` as well. The transpose `v.t()` has strides $(1, 3)$: reading it row by row jumps through memory, so it is not **contiguous**, and `.view` refuses to reshape it. `.reshape` copies when it has to, and `.contiguous()` makes the copy explicit. Sharing memory is what makes views cheap; it is also why an in-place change can affect tensors that look unrelated.
+
+## Broadcasting
+
+Operations between tensors of different shapes do not need explicit copies. **Broadcasting** compares the two shapes from the last dimension backwards. Two sizes are compatible when they are equal, when one of them is 1, or when one tensor has run out of dimensions (a missing dimension counts as 1). The result has, along each dimension, the larger of the two sizes, and a size-1 dimension is used as if repeated:
+
+$$
+\text{result size}_k = \max(a_k, b_k), \qquad \text{allowed only if } a_k = b_k \text{ or } \min(a_k, b_k) = 1 .
+$$
+
+**Worked example: centring a batch.** A batch $X$ of shape `(2, 3)` with rows $(1, 2, 3)$ and $(3, 6, 9)$ has column means $(2, 4, 6)$ of shape `(3,)`. In `X - X.mean(0)` the mean is read as shape `(1, 3)` and repeated down both rows, giving $(-1, -2, -3)$ and $(1, 2, 3)$. No loop and no copy of the mean is written.
+
+The same rule produces one of the most common silent bugs. A regression network usually outputs predictions of shape `(n, 1)`, one column, while the targets are stored as shape `(n,)`. The difference `pred - target` then broadcasts to `(n, n)`: its entry $(i, j)$ is $\hat y_i - y_j$, every prediction against every target.
+
+<BroadcastTrap />
+
+For predictions $(1, 2, 3)$ that match the targets $(1, 2, 3)$ exactly, the intended mean squared error is 0. The broadcast one averages the nine squared differences $(i - j)^2$: $(0 + 1 + 4 + 1 + 0 + 1 + 4 + 1 + 0)/9 = 12/9 = 1.333$. Training on it pushes every prediction towards the mean of all targets. Nothing crashes; `F.mse_loss` only prints a warning that the target size differs from the input size. The cure is to make the shapes equal before the loss, here with `pred.squeeze(1)`, and to print shapes whenever a loss looks wrong.
+
+## The computational graph
+
+<aside class="callout"><strong>Key idea.</strong> Reverse-mode differentiation needs only two things from each operation: its local derivatives, computed from values seen in the forward pass, and its place in the graph. Visiting the nodes in reverse order of their computation, each node passes its adjoint times the local derivative to the nodes it was computed from, and a node used several times adds up what it receives.</aside>
+
+Every computation of $L$ is a directed acyclic graph whose nodes are intermediate values. The [backpropagation note](/notes/ml/backpropagation#the-computational-graph) states the rule that turns it into gradients: if $u$ is used by the nodes $v_1, \dots, v_k$, then
+
+$$
+\bar u = \sum_{c=1}^{k} \bar v_c\, \frac{\partial v_c}{\partial u} .
+$$
+
+**Worked example: a node used twice.** Take $L = (ab + a)^2$ at $a = 2$, $b = -3$, computed as $c = ab$, $d = c + a$, $L = d^2$. The value $a$ feeds two nodes, $c$ and $d$.
+
+- Forward: $c = 2 \cdot (-3) = -6$, $d = -6 + 2 = -4$, $L = 16$.
+- Backward from $\bar L = 1$: $\bar d = 2d \cdot \bar L = -8$; the addition passes it unchanged, so $\bar c = -8$ and $a$ receives $-8$ through $d$.
+- The product passes $\bar c$ times the other factor: $\bar b = \bar c \cdot a = -16$, and $a$ receives $\bar c \cdot b = 24$ through $c$.
+- $a$ adds what it received: $\bar a = 24 + (-8) = 16$.
+
+The check by hand: $L = a^2 (b + 1)^2$, so $\partial L / \partial a = 2a(b + 1)^2 = 16$ and $\partial L / \partial b = 2a^2 (b + 1) = -16$.
+
+<ScalarGraph />
+
+1. $c = ab = -6$; the product stores both factors, which are its local derivatives.
+2. $d = c + a = -4$; the sum has local derivative 1 for each input.
+3. $L = d^2 = 16$; the square stores $2d = -8$.
+4. The backward pass starts from $\bar L = 1$ and gives $\bar d = -8$.
+5. Through the sum: $\bar c = -8$, and the first contribution to $\bar a$ is $-8$.
+6. Through the product: $\bar b = \bar c\, a = -16$, and the second contribution to $\bar a$ is $\bar c\, b = 24$, so $\bar a = 16$.
+
+The order matters. $\bar a$ is complete only after both $c$ and $d$ have passed their contributions, and $\bar c$ only after $d$ has. Processing the nodes in reverse **topological order**, an order in which every node comes after all the nodes it was computed from, guarantees that each node has collected its full adjoint before it passes anything on.
+
+## A scalar autograd from scratch
+
+The rule fits into one small class. A `Value` holds a number, its adjoint `grad`, the nodes it was computed from, and the local derivative with respect to each of them, computed during the forward pass. Arithmetic on `Value`s builds the graph as a side effect, and `backward` orders the graph and applies the rule:
+
+```python
+import math
+
+class Value:
+    """A scalar that remembers how it was computed."""
+    def __init__(self, data, parents=(), local_grads=()):
+        self.data, self.grad = data, 0.0
+        self.parents = parents          # the nodes this one was computed from
+        self.local_grads = local_grads  # d(self)/d(parent) for each parent, at the forward values
+
+    def __add__(self, other):
+        other = other if isinstance(other, Value) else Value(other)
+        return Value(self.data + other.data, (self, other), (1.0, 1.0))
+
+    def __mul__(self, other):
+        other = other if isinstance(other, Value) else Value(other)
+        return Value(self.data * other.data, (self, other), (other.data, self.data))
+
+    def __pow__(self, k):               # k is a plain number
+        return Value(self.data ** k, (self,), (k * self.data ** (k - 1),))
+
+    def relu(self):
+        return Value(max(self.data, 0.0), (self,), (float(self.data > 0),))
+
+    def exp(self):
+        e = math.exp(self.data)
+        return Value(e, (self,), (e,))
+
+    def log(self):
+        return Value(math.log(self.data), (self,), (1.0 / self.data,))
+
+    __radd__, __rmul__ = __add__, __mul__
+    def __neg__(self): return self * -1.0
+    def __sub__(self, other): return self + (-other)
+
+    def backward(self):
+        # 1. order the graph so that every node comes after all the nodes it was computed from
+        order, seen = [], set()
+        def visit(v):
+            if id(v) not in seen:
+                seen.add(id(v))
+                for p in v.parents:
+                    visit(p)
+                order.append(v)
+        visit(self)
+        # 2. seed the output and walk backwards: each node passes grad * local derivative to its parents
+        self.grad = 1.0
+        for v in reversed(order):
+            for p, d in zip(v.parents, v.local_grads):
+                p.grad += v.grad * d    # += : a node used twice collects both contributions
+
+# the worked example: L = (a b + a)^2 at a = 2, b = -3
+a, b = Value(2.0), Value(-3.0)
+L = (a * b + a) ** 2
+L.backward()
+print(L.data, a.grad, b.grad)   # 16.0 16.0 -16.0
+
+# 100 random two-unit ReLU layers with a softmax cross-entropy, against torch.autograd in double precision
+import random, torch
+random.seed(0)
+worst = 0.0
+for trial in range(100):
+    x = [random.uniform(-2, 2) for _ in range(3)]
+    w = [[random.uniform(-1, 1) for _ in range(3)] for _ in range(2)]
+    y = random.randrange(2)
+    W = [[Value(v) for v in row] for row in w]
+    h = [sum((W[k][j] * x[j] for j in range(3)), Value(0.0)).relu() for k in range(2)]
+    loss = (h[0].exp() + h[1].exp()).log() - h[y]
+    loss.backward()
+    Wt = torch.tensor(w, dtype=torch.float64, requires_grad=True)
+    ht = torch.relu(Wt @ torch.tensor(x, dtype=torch.float64))
+    lt = torch.nn.functional.cross_entropy(ht[None], torch.tensor([y]))
+    lt.backward()
+    diffs = [abs(loss.data - lt.item())] + [abs(W[k][j].grad - Wt.grad[k, j].item()) for k in range(2) for j in range(3)]
+    worst = max(worst, *diffs)
+print(f"{worst:.1e}")   # 4.4e-16: the largest difference in a loss or a gradient, rounding only
+```
+
+The depth-first `visit` appends a node only after all of its parents, which is exactly a topological order, and walking it backwards visits each node after all of its users. Each operation stores numbers, not formulas: the product stores the other factor, the exponential stores its own value, the ReLU stores 0 or 1. On 100 random layers with a softmax cross-entropy, the losses and all six weight gradients agree with PyTorch to $4.4 \cdot 10^{-16}$, the rounding error of double precision.
+
+Two simplifications separate this class from PyTorch. It works on scalars, so a product of two $n \times n$ matrices becomes on the order of $n^3$ graph nodes, each a Python object. PyTorch's nodes are whole tensor operations, and each one implements a **vector–Jacobian product**: given the adjoint of its output, it returns the adjoints of its inputs without ever forming the Jacobian, as in $\bar h = W^\top \bar z$ for a linear layer. And the class keeps every graph forever, while PyTorch frees a graph's stored values as soon as `backward` has used them.
+
+## How PyTorch records the graph
+
+A tensor created with `requires_grad=True`, and every parameter of a module, is a **leaf** of the graph. Each operation on such tensors returns a result with a `grad_fn`, the node that knows how to pass adjoints back to its inputs, linked to the nodes of those inputs through `grad_fn.next_functions`. For $L = (ab + a)^2$ the result's `grad_fn` is a `PowBackward0`, whose input is an `AddBackward0`, whose inputs are a `MulBackward0` and the node that collects the gradient of the leaf $a$ (an `AccumulateGrad`). `L.backward()` walks this chain in reverse topological order, as `Value.backward` does, and adds each leaf's adjoint into its `.grad`: `a.grad` is 16 and `b.grad` is $-16$.
+
+| our `Value` | PyTorch | role |
+| --- | --- | --- |
+| `Value(2.0)` | `torch.tensor(2.0, requires_grad=True)` | a leaf |
+| `parents`, `local_grads` | `grad_fn`, `next_functions`, saved tensors | the recorded graph |
+| `p.grad += ...` | `.grad` is added to, never overwritten | hence `zero_grad()` |
+| graph kept forever | graph freed after `backward()` | a second `backward()` raises an error unless `retain_graph=True` |
+| no way to stop recording | `with torch.no_grad():` and `.detach()` | evaluation, and values treated as constants |
+
+`torch.no_grad()` turns recording off: evaluation inside it builds no graph and stores no activations, which saves memory. `.detach()` returns a tensor with the same data and no history, so that gradients do not flow through it.
+
+## The training pipeline
+
+The loop of the previous note becomes five PyTorch objects:
+
+- A **`Dataset`** says how many examples there are (`__len__`) and returns one example by index (`__getitem__`), here a pair of a 64-pixel image and its label.
+- A **`DataLoader`** draws indices, in a new random order each epoch when `shuffle=True`, and stacks the examples into batches. With 1437 training images and `batch_size=64` an epoch has $\lceil 1437 / 64 \rceil = 23$ batches; the last holds $1437 - 22 \cdot 64 = 29$ images, since `drop_last` is off by default.
+- An **`nn.Module`** holds the parameters and defines `forward`. Every `nn.Parameter` or submodule assigned as an attribute is registered, so `model.parameters()` finds them all: the network $64 \to 128 \to 10$ of the Code section has $64 \cdot 128 + 128 + 128 \cdot 10 + 10 = 9610$.
+- A **loss**, such as `F.cross_entropy`, which takes logits and integer labels; the [next note](/notes/deep-learning/losses-and-regularization) is about losses.
+- An **optimizer** holds references to the parameters. `opt.step()` updates each of them from its `.grad`, for plain SGD by subtracting $\eta$ times `.grad`, and `opt.zero_grad()` clears the gradients. Optimizers with memory, such as momentum and Adam, are the subject of [Optimizing deep networks](/notes/deep-learning/optimizing-deep-networks).
+
+One training step is then `opt.zero_grad()`, a forward pass, `loss.backward()` and `opt.step()`, in this order or with `zero_grad()` at the end of the previous step.
+
+Two switches change what a forward pass does. **`model.train()` and `model.eval()`** set the mode of layers that behave differently in training: dropout drops units only in training mode, and batch normalization (the subject of [Normalization and initialization](/notes/deep-learning/normalization-and-initialization)) uses batch statistics in training and stored averages in evaluation. In the Code section two forward passes of the same image differ in training mode and coincide in evaluation mode. **`torch.no_grad()`** is independent of the mode: it stops recording the graph. Evaluation needs both, `eval()` for the right behaviour and `no_grad()` for the memory. On the digits, this pipeline with SGD and momentum reaches a test accuracy of 0.864 after one epoch and 0.964 after five.
+
+## Common bugs
+
+The bugs worth knowing are the ones that raise no error. The pipeline runs, the loss moves, and the model is wrong.
+
+### Forgetting `zero_grad`
+
+`backward()` adds into `.grad`. Without `zero_grad()`, the gradient used at step $k$ is the sum of all gradients so far.
+
+Here is what that does. For one weight with gradients $g_0, g_1, \dots$, the update becomes
+
+$$
+\boxed{\; w_{k+1} = w_k - \eta \sum_{j=0}^{k} g_j \;}
+$$
+
+instead of $w_{k+1} = w_k - \eta\, g_k$: [momentum](/notes/ml/stochastic-and-adaptive-optimizers#momentum-remember-the-direction) with a memory that never decays. On the quadratic $L(w) = \tfrac12 (w - 3)^2$, whose gradient is $g = w - 3$, write $e_k = w_k - 3$ for the error and $S_k = \sum_{j \le k} e_j$ for the accumulated gradient. Then
+
+$$
+\begin{aligned}
+e_{k+1} &= e_k - \eta S_k, \\
+S_{k+1} &= S_k + e_{k+1} = e_k + (1 - \eta) S_k .
+\end{aligned}
+$$
+
+The first line is the update with the accumulated gradient; the second adds the new gradient $e_{k+1}$ to the sum and substitutes the first line. The pair $(e_k, S_k)$ is multiplied at every step by the matrix $\begin{pmatrix} 1 & -\eta \\ 1 & 1 - \eta \end{pmatrix}$, whose determinant is $(1 - \eta) + \eta = 1$ and whose trace is $2 - \eta$. For $0 < \eta < 4$ its eigenvalues are therefore a complex pair of modulus 1, $e^{\pm i\vartheta}$ with $\cos\vartheta = 1 - \eta/2$: every step rotates the pair without shrinking it. The weight oscillates around the minimum forever with a period of $2\pi/\vartheta$ steps.
+
+**Worked example.** With $\eta = 0.1$ and $w_0 = 0$, correct steps give $w = 0.3, 0.57, 0.813, \dots$ and $2.995$ after 60 steps. Without `zero_grad` the first step is the same, $0.3$, but the second uses $g_0 + g_1 = -3 - 2.7 = -5.7$ and gives $0.87$. From there the weight swings between $-0.04$ and $6.04$, with $\cos\vartheta = 0.95$, $\vartheta = 0.318$ and a period of $19.8$ steps.
+
+<ZeroGradPaths />
+
+On a real network the effect depends on the loss surface, but the symptom is the same: a loss that oscillates or diverges at a learning rate that should be safe. Accumulation is sometimes wanted, to simulate a batch too large for memory: sum the gradients of $k$ small batches, each loss divided by $k$, then step and zero.
+
+### In-place operations
+
+An operation whose name ends in an underscore, such as `x.mul_(2)`, and an augmented assignment such as `x += 1` overwrite a tensor's memory. Autograd may have saved that tensor for the backward pass: the derivative of the sigmoid is $\sigma(z)(1 - \sigma(z))$, so `torch.sigmoid` saves its output. Every tensor carries a version counter that each in-place operation increments, and `backward` compares it with the version it saved. Modifying the sigmoid's output in place therefore makes `backward` raise "one of the variables needed for gradient computation has been modified by an inplace operation". This bug at least announces itself. The silent version is an in-place change through a view, which alters the base tensor that other code still reads. Write `x = x * 2` instead of `x *= 2` unless memory is critical.
+
+### Softmax over the wrong dimension
+
+Logits for a batch have shape `(batch, classes)`, and the softmax must normalize each row, `dim=1` (or `dim=-1`). With `dim=0` it normalizes each column, across the examples of the batch. **Worked example.** For logits with rows $(2, 1, 0)$ and $(0, 0, 3)$, `softmax(dim=1)` gives the rows $(0.665, 0.245, 0.090)$ and $(0.045, 0.045, 0.909)$, each summing to 1. `softmax(dim=0)` gives $(0.881, 0.731, 0.047)$ and $(0.119, 0.269, 0.953)$, whose rows sum to $1.659$ and $1.341$. They are not distributions, and each example's "probabilities" now depend on which other examples share its batch. The losses in PyTorch avoid the question by taking logits, so the safest fix is not to apply a softmax before the loss at all.
+
+Three more that cost hours:
+
+- **Shapes that broadcast**, as in the `(n, 1)` against `(n,)` example above.
+- **Evaluating in training mode.** Forgetting `model.eval()` keeps dropout on at test time, and the reported accuracy is lower and noisy.
+- **Accumulating the loss tensor.** `total += loss` keeps every batch's graph alive until `total` is freed; `total += loss.item()` keeps a number.
+
+## What changed
+
+| | NumPy with hand-written gradients | PyTorch |
+| --- | --- | --- |
+| Backward pass | derived and coded for each layer | derived from the recorded forward pass |
+| Unit of the graph | none: one formula per layer | one tensor operation with its vector–Jacobian product |
+| New layer or loss | new derivative code | only the forward code |
+| Batching and shuffling | written by hand | `Dataset` and `DataLoader` |
+| Parameters and updates | kept in variables | registered in `nn.Module`, updated by an optimizer |
+| Typical silent bugs | a wrong derivative | broadcasting, missing `zero_grad`, wrong `dim`, wrong mode |
+
+## Limitations
+
+- **Autograd differentiates the program, not the mathematics.** Operations with kinks get a convention (the ReLU's derivative at 0 is 0), discrete operations such as `argmax` pass no gradient, and numerically unstable formulas give unstable gradients.
+- **Memory.** Reverse mode stores the activations of the forward pass until the backward pass uses them, so memory grows with depth and batch size.
+- **Python overhead.** Each operation is dispatched from Python; many tiny operations are slow, which is why work is batched into large tensor operations, and why our scalar class is only for learning.
+- **Silent errors stay silent.** The library checks shapes for compatibility, not for intent, and checks versions of saved tensors, not the logic of a training loop.
+
+## What you should remember
+
+- A tensor is a shape, strides, a dtype and a device over a block of memory; views share it.
+- Broadcasting aligns shapes from the right and stretches size-1 dimensions; `(n, 1)` against `(n,)` silently gives `(n, n)`.
+- Reverse mode needs each operation's local derivatives and a topological order; a node used twice sums its contributions. Forty lines of Python reproduce PyTorch's gradients to rounding error.
+- PyTorch records `grad_fn` nodes during the forward pass and adds gradients into `.grad`; hence `zero_grad()` before each step.
+- The pipeline: `Dataset`, `DataLoader`, `nn.Module`, loss on logits, optimizer; `model.eval()` and `torch.no_grad()` for evaluation.
+- Without `zero_grad` the update is momentum with $\beta = 1$: on a quadratic it oscillates forever.
+
+## Code
+
+Tensors and views, broadcasting, the graph of the worked example, a complete pipeline on the bundled digits, and the three bugs. The scalar autograd and its check against PyTorch are in the section above. Seeds are fixed; exact numbers can differ slightly across platforms and library versions. The script runs in a few seconds on a laptop CPU.
+
+```python
+import torch
+from torch import nn
+from sklearn.datasets import load_digits
+
+# 1. tensors: shape, dtype, and a view that shares memory with its base
+x = torch.arange(6.0)
+v = x.view(2, 3)
+v[0, 0] = 100.0
+print(x.dtype, v.shape, x[0].item(), v.t().is_contiguous())   # torch.float32 torch.Size([2, 3]) 100.0 False
+
+# 2. broadcasting: centring the columns of a batch, and the (3, 1) against (3,) trap
+X = torch.tensor([[1.0, 2.0, 3.0], [3.0, 6.0, 9.0]])
+print((X - X.mean(0)).tolist())                                 # [[-1.0, -2.0, -3.0], [1.0, 2.0, 3.0]]
+pred, target = torch.tensor([[1.0], [2.0], [3.0]]), torch.tensor([1.0, 2.0, 3.0])
+print((pred - target).shape, round(((pred - target) ** 2).mean().item(), 4), ((pred.squeeze(1) - target) ** 2).mean().item())
+# torch.Size([3, 3]) 1.3333 0.0
+
+# 3. the graph PyTorch records for L = (a b + a)^2 at a = 2, b = -3
+a, b = torch.tensor(2.0, requires_grad=True), torch.tensor(-3.0, requires_grad=True)
+L = (a * b + a) ** 2
+print(type(L.grad_fn).__name__, [type(f).__name__ for f, _ in L.grad_fn.next_functions])   # PowBackward0 ['AddBackward0']
+L.backward()
+print(a.grad.item(), b.grad.item())                             # 16.0 -16.0
+
+# 4. the pipeline: a Dataset, a DataLoader, a Module, a loss and an optimizer
+class Digits(torch.utils.data.Dataset):
+    def __init__(self, X, y):
+        self.X, self.y = torch.tensor(X / 16.0, dtype=torch.float32), torch.tensor(y)
+    def __len__(self):
+        return len(self.y)
+    def __getitem__(self, i):
+        return self.X[i], self.y[i]
+
+class MLP(nn.Module):
+    def __init__(self, d_in=64, d_hidden=128, k=10, p=0.2):
+        super().__init__()
+        self.body = nn.Sequential(nn.Linear(d_in, d_hidden), nn.ReLU(), nn.Dropout(p))
+        self.head = nn.Linear(d_hidden, k)
+    def forward(self, x):
+        return self.head(self.body(x))
+
+Xd, yd = load_digits(return_X_y=True)
+g = torch.Generator().manual_seed(0)
+train, test = torch.utils.data.random_split(Digits(Xd, yd), [1437, 360], generator=g)
+loader = torch.utils.data.DataLoader(train, batch_size=64, shuffle=True, generator=g)
+print(len(loader), [xb.shape for xb, _ in loader][-1])          # 23 torch.Size([29, 64])
+
+torch.manual_seed(0)
+model = MLP()
+print(sum(p.numel() for p in model.parameters()))               # 9610
+opt = torch.optim.SGD(model.parameters(), lr=0.1, momentum=0.9)
+Xte, yte = torch.stack([test[i][0] for i in range(len(test))]), torch.stack([test[i][1] for i in range(len(test))])
+
+def evaluate():
+    model.eval()                                                # dropout off
+    with torch.no_grad():                                       # no graph
+        acc = (model(Xte).argmax(1) == yte).float().mean().item()
+    model.train()
+    return acc
+
+for epoch in range(1, 11):
+    for xb, yb in loader:
+        opt.zero_grad()
+        loss = nn.functional.cross_entropy(model(xb), yb)
+        loss.backward()
+        opt.step()
+    if epoch in (1, 5, 10):
+        print(epoch, round(evaluate(), 3))
+# 1 0.864 | 5 0.964 | 10 0.964   (epoch, test accuracy)
+
+# train mode is random, eval mode is not
+model.train(); out1, out2 = model(Xte[:1]), model(Xte[:1])
+model.eval(); out3, out4 = model(Xte[:1]), model(Xte[:1])
+print(torch.equal(out1, out2), torch.equal(out3, out4))         # False True
+
+# 5. bug: no zero_grad. L(w) = (w - 3)^2 / 2, w0 = 0, lr 0.1; the .grad buffer keeps the sum of all past gradients
+for zero in (True, False):
+    w = torch.tensor(0.0, requires_grad=True)
+    opt = torch.optim.SGD([w], lr=0.1)
+    path = []
+    for step in range(60):
+        if zero:
+            opt.zero_grad()
+        ((w - 3) ** 2 / 2).backward()
+        opt.step()
+        path.append(w.item())
+    print(zero, [round(path[k], 3) for k in (0, 1, 2, 9, 29, 59)])
+# True [0.3, 0.57, 0.813, 1.954, 2.873, 2.995]
+# False [0.3, 0.87, 1.653, 5.982, 5.935, 0.16]
+
+# 6. bug: an in-place change to a tensor that backward still needs
+z = torch.tensor([0.5, -1.0], requires_grad=True)
+s = torch.sigmoid(z)        # sigmoid's backward reuses its output s
+s.mul_(2)
+try:
+    s.sum().backward()
+except RuntimeError as e:
+    print(str(e).split(':')[0])
+# one of the variables needed for gradient computation has been modified by an inplace operation
+
+# 7. bug: softmax over the wrong dimension. Logits for a batch of 2 examples and 3 classes
+logits = torch.tensor([[2.0, 1.0, 0.0], [0.0, 0.0, 3.0]])
+for dim in (1, 0):
+    p = torch.softmax(logits, dim=dim)
+    print(dim, [[round(v, 3) for v in row] for row in p.tolist()], [round(v, 3) for v in p.sum(1).tolist()])
+# 1 [[0.665, 0.245, 0.09], [0.045, 0.045, 0.909]] [1.0, 1.0]   rows are distributions
+# 0 [[0.881, 0.731, 0.047], [0.119, 0.269, 0.953]] [1.659, 1.341]   columns are, rows are not
+```
+
+## Next
+
+The pipeline is in place, and two of its parts were taken for granted: the loss, here always cross-entropy, and the gap between training and test accuracy. The [next note](/notes/deep-learning/losses-and-regularization) chooses losses for regression and classification, explains why cross-entropy must be computed from logits, and shows how weight decay, dropout, early stopping and augmentation keep a network that can memorize its training set from doing so.
+
+## References
+
+- A. Paszke et al. [PyTorch: an imperative style, high-performance deep learning library](https://arxiv.org/abs/1912.01703). NeurIPS, 2019. Section 4.3 (automatic differentiation by operator overloading).
+- A. G. Baydin, B. A. Pearlmutter, A. A. Radul, J. M. Siskind. [Automatic differentiation in machine learning: a survey](https://jmlr.org/papers/v18/17-468.html). *Journal of Machine Learning Research*, 18(153):1–43, 2018. Section 3 (forward and reverse mode).
+- A. Griewank, A. Walther. [*Evaluating Derivatives: Principles and Techniques of Algorithmic Differentiation*](https://doi.org/10.1137/1.9780898717761), 2nd ed. SIAM, 2008.
+- PyTorch documentation. [Broadcasting semantics](https://pytorch.org/docs/stable/notes/broadcasting.html), [Autograd mechanics](https://pytorch.org/docs/stable/notes/autograd.html) (saved tensors, in-place operations and version counters), [torch.utils.data](https://pytorch.org/docs/stable/data.html).
+- A. Karpathy. [micrograd](https://github.com/karpathy/micrograd), a scalar-valued autograd engine in Python. The `Value` class above follows the same idea with its own code.
+- I. Goodfellow, Y. Bengio, A. Courville. [*Deep Learning*](https://www.deeplearningbook.org/). MIT Press, 2016. Section 6.5 (back-propagation and computational graphs).
+- A. Zhang, Z. C. Lipton, M. Li, A. J. Smola. [*Dive into Deep Learning*](https://d2l.ai/). Cambridge University Press, 2023. Section 2.1 (tensors and broadcasting), section 2.5 (automatic differentiation), section 3.2 (an object-oriented training pipeline).
+- S. J. D. Prince. [*Understanding Deep Learning*](https://udlbook.github.io/udlbook/). MIT Press, 2023. Chapter 7 (gradients and backpropagation).
+- *Глубинное обучение 1* (Deep Learning 1), Faculty of Computer Science, HSE University. Course materials, [repository xiyori/intro-to-dl-hse, branch 2025-2026](https://github.com/xiyori/intro-to-dl-hse/tree/2025-2026): lecture 1 (backpropagation and the computational graph) and the first two practical sessions (PyTorch, autograd, the training pipeline).

@@ -1,0 +1,412 @@
+---
+title: Optimizing deep networks
+description: "What is specific to the loss of a deep network, why learning-rate warm-up rescues Adam, decoupled weight decay and its interplay with normalization, gradient clipping, how the learning rate should follow the batch size, sharpness-aware minimization and weight averaging, and mixed-precision training with loss scaling."
+course: deep-learning
+section: Training Neural Networks
+order: 4
+status: published
+tags: [optimization, non-convexity, saddle-points, flat-minima, learning-rate-schedules, warm-up, adamw, weight-decay, gradient-clipping, batch-size, sam, swa, mixed-precision, loss-scaling]
+prerequisites: [Normalization and initialization, Stochastic gradient descent]
+---
+
+import AdamEarlySteps from '../../../components/figures/optimizing-deep-networks/AdamEarlySteps.astro';
+import SharpFlatSam from '../../../components/figures/optimizing-deep-networks/SharpFlatSam.astro';
+import MixedPrecisionStep from '../../../components/figures/optimizing-deep-networks/MixedPrecisionStep.astro';
+
+The [previous note](/notes/deep-learning/normalization-and-initialization) made a deep network trainable: its signals and gradients keep their scale through depth. Whether training then goes fast and ends somewhere good is up to the optimizer. The Machine Learning course derived the optimizers themselves, SGD, momentum, RMSProp and Adam, on problems with one valley ([stochastic and adaptive optimizers](/notes/ml/stochastic-and-adaptive-optimizers)). This note is about what changes when they drive a deep network: a loss with many equivalent minima and flat saddles, a best learning rate that moves during training, weight decay that meets normalization layers, gradients that occasionally blow up, batches of thousands of examples, and numbers stored in 16 bits.
+
+**Notation.** $w$ are the parameters, $L(w)$ the training loss and $g$ a minibatch gradient; $\eta$ is the learning rate ($\eta_t$ at step $t$), $\lambda$ the weight-decay coefficient, $b$ the batch size and $T$ the number of steps. Adam's moving averages are $\hat m$ and $\hat v$ with decay rates $\beta_1 = 0.9$ and $\beta_2 = 0.999$, as in the [Adam section](/notes/ml/stochastic-and-adaptive-optimizers#adam) of the Machine Learning course. $\sigma^2$ is the variance of the gradient of one example, so a minibatch gradient has variance $\sigma^2/b$.
+
+## Baseline: an optimizer tuned on one valley
+
+On a convex problem the recipe from the Machine Learning course works: pick the largest learning rate that does not diverge, keep it, and decrease it at the end to leave the [noise ball](/notes/ml/stochastic-and-adaptive-optimizers#a-constant-step-stalls-in-a-noise-ball). On a deep network the same recipe can fail on the very first steps. Take a residual network of 16 post-norm blocks, each $x \mapsto \operatorname{LN}(x + W_2 \operatorname{ReLU}(W_1 x))$ of width 64, trained on the bundled digits with Adam and a cosine decay from a peak rate of $10^{-2}$ for 10 epochs. In all three seeds the training loss stays at $2.303$, the loss of a uniform guess, and validation accuracy at $0.102$. The same network with the same peak rate, reached by a linear warm-up over the first 200 of its 390 steps, ends at training losses $0.021$, $0.016$ and $0.034$ and validation accuracies $0.983$, $0.974$ and $0.976$. Nothing about the network changed; only the first steps did. Understanding why takes a look at the loss surface and at what Adam does at the start.
+
+<aside class="callout"><strong>Key idea.</strong> How large a step a deep network tolerates is set by the curvature and the gradient noise around the current point, and both change during training. Warm-up, decay, clipping and the batch-size rule all adjust the step to them. Weight decay and normalization set the scale the step is measured against, and mixed precision decides which steps can be represented at all.</aside>
+
+## What is different about the loss of a deep network
+
+### Many equivalent minima, so not convex
+
+Permuting the hidden units of a layer, together with their incoming and outgoing weights, leaves the network's function unchanged. A layer of width 256 has $256!$ orderings, and the network $64 \to 256 \to 256 \to 10$ of the previous notes has $256!^2 \approx 10^{1014}$ parameter vectors for every function it can compute, all with the same loss. A convex function cannot have such a set of separate minima without having the whole segment between them as minima too, and the segment between two permuted copies is not.
+
+**Worked example.** Two ReLU units fit $y = x$ exactly: $f(x) = v_1 \operatorname{ReLU}(w_1 x) + v_2 \operatorname{ReLU}(w_2 x)$ with $w = v = (1, -1)$, since $\operatorname{ReLU}(x) - \operatorname{ReLU}(-x) = x$. Swapping the units gives $w = v = (-1, 1)$, which also fits exactly. Their midpoint is $w = v = (0, 0)$, where $f = 0$ and the squared-error loss $\tfrac12 E[(f(x) - x)^2]$ is $\tfrac12 E[x^2] = 0.5$ for standard normal inputs ($0.5019$ on the 10,000 samples of the Code section). Convexity would require the loss at the midpoint to be at most the average of the ends, 0. So the loss is not convex, and the reason is a symmetry that every network with a hidden layer has.
+
+### Saddle points and plateaus
+
+The same midpoint has another property: the gradient there is exactly zero, since every unit outputs 0 and every weight multiplies a zero. It is a critical point that is not a minimum. In high dimensions such points are typical: [Dauphin et al. (2014)](#references) argue that critical points at high loss are mostly saddles, with some directions going down, and that the plateaus around them, not bad local minima, are what slows training. Gradient descent started exactly at a saddle stays there; stochastic gradients and random initialization almost never start there, but they can spend a long time near one, where the gradient is small in every direction. Symmetric starts are the worst case, which is one more reason initialization is random.
+
+### Sharp and flat minima
+
+Among the many minima, some sit in wide basins and some in narrow ones. The idea that wide, **flat** minima generalize better goes back to [Hochreiter and Schmidhuber (1997)](#references): a flat minimum is described by fewer bits, and a small shift between the training and test losses costs little there. [Keskar et al. (2017)](#references) found that training with very large batches tends to end in **sharper** minima, with larger eigenvalues of the Hessian, and to generalize worse than small-batch training.
+
+Sharpness is not a property of the function, though. [Dinh et al. (2017)](#references) show that for ReLU networks it can be changed arbitrarily without changing what the network computes. **Worked example.** Fit one input $x = 1$ to $y = 1$ with $f(x) = w_2 \operatorname{ReLU}(w_1 x)$ and the loss $L = \tfrac12 (w_1 w_2 - 1)^2$. Every point with $w_1 w_2 = 1$ is a minimum and computes the same function, $f(x) = x$ for $x > 0$. The Hessian there is
+
+$$
+H = \begin{pmatrix} w_2^2 & 1 \\ 1 & w_1^2 \end{pmatrix}, \qquad \text{eigenvalues } 0 \text{ and } w_1^2 + w_2^2 .
+$$
+
+At $(1, 1)$ the sharpness is 2, at $(10, 0.1)$ it is $100.01$. Statements about flat minima therefore need a measure that respects such rescalings, and the evidence for them is empirical rather than a theorem. They still motivate two of the methods below.
+
+## Learning-rate schedules and warm-up
+
+The standard schedules are defined in the Machine Learning course ([schedules, warm-up and early stopping](/notes/ml/training-deep-networks#learning-rate-schedules-warm-up-and-early-stopping)): step decay, which divides $\eta$ by 10 at fixed epochs (`MultiStepLR`); cosine decay (`CosineAnnealingLR`); and the original Transformer's inverse square root. Two more are common: `ReduceLROnPlateau` cuts the rate when a validation metric stops improving, and SGDR restarts the cosine several times ([Loshchilov and Hutter, 2017](#references)). Today's default for Transformers and many vision models combines a linear warm-up over $w$ steps with a cosine decay over the rest:
+
+$$
+\eta_t = \eta_{\max} \cdot \min\!\Big(1, \frac{t + 1}{w}\Big) \cdot \frac12\Big(1 + \cos\frac{\pi t}{T}\Big) .
+$$
+
+This is the form used in the experiments of this note. **Worked example.** With $\eta_{\max} = 10^{-2}$, $w = 200$ and $T = 390$: the first step uses $5 \cdot 10^{-5}$, step 99 uses $4.25 \cdot 10^{-3}$, step 199 uses $4.84 \cdot 10^{-3}$ (the warm-up is complete, but the cosine has already fallen to about half), and the last step is close to 0.
+
+### Why warm-up helps Adam
+
+Adam divides the averaged gradient $\hat m$ by the root of the averaged squared gradient $\hat v$. The Machine Learning course shows that, because of the bias correction, the first step is $\eta \operatorname{sign}(g_1)$ in every coordinate. What that means for training becomes clear when the gradient is mostly noise, as it is for many coordinates of a deep network at the start. Then:
+
+- **At the first step** every coordinate moves by exactly $\eta$, whatever its gradient.
+- **Once the averages have filled**, $\hat m$ averages about $(1 + \beta_1)/(1 - \beta_1) = 19$ noisy gradients, so its standard deviation is $\sqrt{(1 - \beta_1)/(1 + \beta_1)} = 0.229$ times that of one gradient, while $\sqrt{\hat v}$ is the gradient's root mean square. The typical step is then $0.229 \sqrt{2/\pi}\, \eta = 0.183\, \eta$ per coordinate, where $\sqrt{2/\pi}$ is the mean absolute value of a standard normal.
+
+<AdamEarlySteps />
+
+The first steps are thus about five times larger than the steady-state steps, and they are pure noise, in every coordinate at once; the excess fades over about 20 steps. Simulated with `torch.optim.Adam` on 20,000 coordinates of pure noise, the mean step is $1.0\,\eta$ at step 1, $0.271\,\eta$ at step 10 and about $0.184\,\eta$ from step 100 on. A linear warm-up multiplies these steps by $t/w$, so that no step is ever larger than the steady-state one. Three further explanations are in the literature and do not exclude each other:
+
+- **The variance of $\hat v$.** In the first steps $\hat v$ rests on few samples; [Liu et al. (2020)](#references) show that the variance of the adaptive rate $1/\sqrt{\hat v}$ is then very large and is not even finite for the first four steps, and propose RAdam, which rectifies it. [Ma and Yarats (2021)](#references) argue that the size of the update matters more and recommend an untuned linear warm-up over $2/(1 - \beta_2) = 2000$ steps as a default.
+- **Curvature.** At initialization the loss can be sharply curved; small first steps let the network move to regions that tolerate the full learning rate ([Gilmer et al., 2022](#references)).
+- **Architecture.** Post-norm Transformers have large gradients near the output at initialization and need warm-up even with SGD-like steps, as the [Transformer note](/notes/nlp/transformers#pre-norm-versus-post-norm) explains; the network of the baseline is a post-norm stack, and so is its failure. Large-batch SGD needs warm-up for a different reason, discussed with the [batch-size rule](#batch-size-and-the-learning-rate) below.
+
+## AdamW: decoupled weight decay
+
+Under SGD, adding $\tfrac\lambda2 \lVert w \rVert^2$ to the loss and shrinking the weights by $1 - \eta\lambda$ per step are the same thing. Under Adam they differ, because Adam divides everything in the gradient, the penalty's $\lambda w$ included, by $\sqrt{\hat v}$. Side by side, for one coordinate:
+
+$$
+\begin{aligned}
+\text{Adam with an L2 penalty:}\quad & w \leftarrow w - \eta\, \frac{\hat m}{\sqrt{\hat v} + \epsilon}, \quad \text{with } g = \nabla L + \lambda w \text{ inside } \hat m \text{ and } \hat v, \\
+\text{AdamW:}\quad & w \leftarrow (1 - \eta\lambda)\, w - \eta\, \frac{\hat m}{\sqrt{\hat v} + \epsilon}, \quad \text{with } g = \nabla L .
+\end{aligned}
+$$
+
+In the first line the decay is normalized like any other gradient, so it no longer shrinks a weight in proportion to its size: a weight with large data gradients is hardly decayed, and a weight with none is pushed towards 0 at a speed of up to $\eta$ per step, whatever $\lambda$ is. [Loshchilov and Hutter (2019)](#references) introduce the second line and find that it makes the best $\lambda$ much less dependent on the learning rate; the [Machine Learning course](/notes/ml/training-deep-networks#weight-decay-is-not-an-l2-penalty-under-adam) works out an example with gradients of different sizes.
+
+**Worked example: a weight with no data gradient.** Two weights, $1$ and $0.01$, with $\eta = 10^{-3}$, $\lambda = 10^{-2}$ and zero loss gradient, for 1000 steps. Under `AdamW` both are multiplied by $(1 - 10^{-5})^{1000} = 0.990$: they become $0.990$ and $0.0099$. Under `Adam(weight_decay=1e-2)` the only gradient is $\lambda w$, which Adam rescales to a step of order $\eta$: the small weight is driven through 0 in about ten steps and then oscillates around it, and the large one falls to $0.258$. The L2 version does not decay in proportion at all.
+
+In PyTorch's `AdamW` the decay is multiplied by the current learning rate, so it follows the schedule, and the shrinkage per step is $\eta_t \lambda$. A weight that the data do not support therefore decays on a time scale of about $1/(\eta\lambda)$ steps: $10^4$ steps for $\eta = 10^{-3}$ and $\lambda = 0.1$, a typical setting for Transformers.
+
+### Weight decay on normalized weights
+
+*Optional depth: what weight decay does to weights followed by a normalization layer. The rest of the note does not depend on it.*
+
+The [previous note](/notes/deep-learning/normalization-and-initialization#why-does-it-help-the-debated-explanations) showed that a weight vector $w$ followed by batch or layer normalization is **scale invariant**: the loss depends only on its direction, its gradient is orthogonal to $w$, and the gradient's size is inversely proportional to $\lVert w \rVert$. For such weights, weight decay cannot regularize the function, which ignores $\lVert w \rVert$; it changes only how fast the direction moves ([van Laarhoven, 2017](#references)). How fast follows from one SGD step $w' = (1 - \eta\lambda)\, w - \eta g$. The gradient is orthogonal to $w$, so the squared norms add:
+
+$$
+\begin{aligned}
+\lVert w' \rVert^2 &= (1 - \eta\lambda)^2 \lVert w \rVert^2 + \eta^2 \lVert g \rVert^2 , \qquad \lVert g \rVert = \frac{G}{\lVert w \rVert}, \\
+\text{equilibrium, } \lVert w' \rVert = \lVert w \rVert: \quad & \big(2\eta\lambda - \eta^2\lambda^2\big) \lVert w \rVert^2 = \frac{\eta^2 G^2}{\lVert w \rVert^2} \;\Rightarrow\; \lVert w \rVert^4 \approx \frac{\eta\, G^2}{2\lambda}, \\
+\text{angle per step:} \quad & \theta \approx \frac{\eta \lVert g \rVert}{\lVert w \rVert} = \frac{\eta\, G}{\lVert w \rVert^2} \approx \boxed{\;\sqrt{2\eta\lambda}\;}
+\end{aligned}
+$$
+
+Here $G$ is the gradient's size for a weight of unit norm, assumed constant, and the approximation drops the term $\eta^2\lambda^2$. Whatever the initial scale and whatever $G$, the norm settles where the decay balances the growth from the gradient steps, and from then on the direction turns by about $\sqrt{2\eta\lambda}$ radians per step. [Kosson, Messmer and Jaggi (2024)](#references), Table 1, derive this **rotational equilibrium** for several optimizers: $\sqrt{2\eta\lambda/(1 + \alpha)}$ for SGD with momentum $\alpha$, and $\sqrt{2\eta\lambda\,(1 - \beta_1)/(1 + \beta_1)}$ for AdamW. With normalization layers, the product $\eta\lambda$ acts as the effective learning rate of every normalized weight.
+
+**Worked example.** A linear layer of 256 units followed by batch norm, trained on digits by SGD with $\eta = 0.1$ and $\lambda = 0.05$ on that layer: the prediction is $\sqrt{2 \cdot 0.1 \cdot 0.05} = 0.1$ radian per step. Starting from the default weights (norm $9.25$) or from ten times them (norm $92.5$), after 2000 steps both have norm $1.20$, and the measured angle per step over the last 500 steps is $0.078$ and $0.076$. The initial scale is forgotten completely; the angle is about 20% below the prediction because the loss keeps falling, so $G$ is not constant.
+
+## Gradient clipping
+
+A single bad batch, or a region of very high curvature, can produce a gradient many times larger than usual, and one step with it can undo much of training. **Clipping by norm** rescales the whole gradient, over all parameters at once, when its norm exceeds a threshold $c$:
+
+$$
+g \leftarrow g \cdot \min\Big(1, \frac{c}{\lVert g \rVert}\Big) .
+$$
+
+The direction is kept and only the length is capped ([Pascanu, Mikolov and Bengio, 2013](#references), section 3.2). **Clipping by value** instead caps every coordinate separately and changes the direction. **Worked example.** For $g = (3, 4)$ and $c = 1$, clipping by norm gives $(0.6, 0.8)$, the same direction with length 1; clipping each value to $[-1, 1]$ gives $(1, 1)$, a direction $8.1°$ away.
+
+In PyTorch, `torch.nn.utils.clip_grad_norm_(model.parameters(), c)` goes between `backward()` and `step()`, and returns the norm before clipping, which is worth logging: frequent clipping signals a learning rate that is too high. Large language models are typically trained with $c = 1$; GPT-3 clipped the global norm at 1.0 ([Brown et al., 2020](#references), appendix B). Clipping interacts with Adam less than with SGD, since Adam rescales the step anyway, but it still bounds the effect of one outlier batch on the moving averages. With mixed precision, gradients must be unscaled before they are clipped (below).
+
+## Batch size and the learning rate
+
+A larger batch gives a less noisy gradient, and with many accelerators it is the way to use them all. How should the learning rate change? Compare $k$ steps with batches of $b$ examples and one step with a batch of $kb$:
+
+$$
+\begin{aligned}
+k \text{ small steps:}\quad & w_{t+k} = w_t - \eta \sum_{j=0}^{k-1} \frac1b \sum_{x \in B_j} \nabla \ell(x, w_{t+j}), \\
+\text{one large step:}\quad & w_{t+1} = w_t - \hat\eta\, \frac{1}{kb} \sum_{j=0}^{k-1} \sum_{x \in B_j} \nabla \ell(x, w_t) .
+\end{aligned}
+$$
+
+If the gradients barely change over $k$ steps, $\nabla\ell(x, w_{t+j}) \approx \nabla\ell(x, w_t)$, the two agree when $\hat\eta = k\eta$: the **linear scaling rule** ([Goyal et al., 2017](#references), section 2.1). The noise agrees too. Each small step adds noise with covariance $\eta^2 \Sigma/b$, where $\Sigma$ is the covariance of one example's gradient, so $k$ steps add $k\eta^2\Sigma/b$; one large step adds $\hat\eta^2\Sigma/(kb) = k\eta^2\Sigma/b$ for $\hat\eta = k\eta$. The rule fails where the assumption fails: early in training, when the gradient changes quickly, which is why Goyal et al. increase the rate gradually over the first 5 epochs, and for very large $k$. With $\eta = 0.1 \cdot b/256$ and that warm-up, a ResNet-50 trained on ImageNet with batches of 8192 reached a top-1 error of $23.74\% \pm 0.09$, against $23.60\% \pm 0.12$ with batches of 256, in one hour on 256 GPUs; beyond about 8k, accuracy degraded rapidly.
+
+**For Adam the rule is a square root.** When the gradient is mostly noise, $\sqrt{\hat v} \approx \sigma/\sqrt b$, so one Adam step is roughly $\eta\, g_B \sqrt b/\sigma$, with mean $\eta\, \mu\sqrt b/\sigma$ ($\mu$ the mean gradient) and variance $\eta^2$, independent of $b$. Then $k$ small steps have mean $k\eta\mu\sqrt b/\sigma$ and variance $k\eta^2$, and one step with batch $kb$ has mean $\hat\eta\mu\sqrt{kb}/\sigma$ and variance $\hat\eta^2$. Matching the variance gives $\hat\eta = \sqrt k\, \eta$, and then the means match as well. [Malladi et al. (2022)](#references) derive this **square-root scaling rule** for Adam and RMSProp rigorously from stochastic differential equations.
+
+**Worked example.** SGD with momentum 0.9 on the network $64 \to 256 \to 256 \to 10$, 1257 training digits, 20 epochs, means over three seeds:
+
+| batch | learning rate | steps | training loss | validation accuracy |
+| --- | --- | --- | --- | --- |
+| 16 | 0.01 | 1560 | 0.029 | 0.971 |
+| 256 | 0.01 | 80 | 1.702 | 0.788 |
+| 256 | 0.16 (linear rule, $k = 16$) | 80 | 0.046 | 0.965 |
+| 256 | 0.04 (square root) | 80 | 0.187 | 0.942 |
+
+With 16 times fewer steps at the same rate, the large batch has barely started. Multiplying the rate by 16 recovers almost all of the small-batch result in the same number of epochs; for SGD the square root is too timid. The rows compare learning rates for one setting and one budget of epochs.
+
+## Flat minima on purpose: SAM and SWA
+
+**Sharpness-aware minimization** (SAM, [Foret et al., 2021](#references)) minimizes the worst loss in a neighbourhood of radius $\rho$ instead of the loss at a point:
+
+$$
+\min_w \; L_\rho(w), \qquad L_\rho(w) = \max_{\lVert \varepsilon \rVert \le \rho} L(w + \varepsilon) .
+$$
+
+To first order the worst perturbation is $\hat\varepsilon = \rho\, \nabla L(w)/\lVert \nabla L(w) \rVert$, and a SAM step takes the gradient at the perturbed point, $w \leftarrow w - \eta\, \nabla L(w + \hat\varepsilon)$. Each step therefore costs two forward and backward passes. **Worked example.** At the bottom of a quadratic $L = \tfrac a2 w^2$, the SAM objective is $\tfrac a2 \rho^2$. With $\rho = 0.3$ it is $1.8$ for a sharp basin with $a = 40$ and $0.09$ for a flat one with $a = 2$: two minima with the same loss are twenty times apart under SAM, which prefers the flat one.
+
+<SharpFlatSam />
+
+**Stochastic weight averaging** (SWA, [Izmailov et al., 2018](#references)) gets a similar effect for free. Late in training, with a constant or cyclical learning rate, SGD keeps moving around a wide basin; SWA averages the weights visited, $\bar w = \tfrac1K \sum_{k=1}^{K} w_k$, sampled for example once per epoch. The average lies closer to the centre of the basin than any single iterate, which the authors find to be flatter and to generalize better. One detail ties back to the previous note: the running statistics of batch normalization belong to the individual iterates, not to their average, so they must be recomputed for $\bar w$ with one pass over the training data (`torch.optim.swa_utils.update_bn`).
+
+## Mixed precision: fp16, bf16 and loss scaling
+
+Matrix units of current accelerators multiply 16-bit numbers several times faster than 32-bit ones, and 16-bit activations take half the memory. The two 16-bit formats and their limits are described in the [floating-point note](/notes/acos/floating-point#narrow-formats-for-machine-learning): **fp16** has 10 fraction bits and a narrow range, from the smallest subnormal $2^{-24} \approx 6.0 \cdot 10^{-8}$ to 65,504; **bf16** has the range of fp32 but only 7 fraction bits. Training in them naively fails in three ways, and **mixed-precision training** ([Micikevicius et al., 2018](#references)) answers each.
+
+- **Small gradients underflow.** In fp16, $10^{-8}$ rounds to 0. Gradients of this size are common: for a speech-recognition model, about 5% of the weight-gradient values had exponents below $-24$ (section 3.1). **Loss scaling** multiplies the loss by a factor $S$ before the backward pass; by the chain rule every gradient is multiplied by $S$, and $10^{-8} \cdot 2^{16} = 6.55 \cdot 10^{-4}$ is an ordinary fp16 number. The gradients are divided by $S$ in fp32 before the update.
+- **Large values overflow.** $70{,}000$ becomes infinity in fp16. Too large an $S$ turns gradients into infinities, so **dynamic loss scaling** starts with a large $S$, skips the update and halves $S$ when any gradient is infinite or not a number, and doubles $S$ after a run of clean steps. PyTorch's `GradScaler` starts at $S = 2^{16}$ and doubles after 2000 clean steps.
+- **Small updates are lost.** Near 1, fp16 numbers are $2^{-10} \approx 9.8 \cdot 10^{-4}$ apart, so $1 + 10^{-4}$ rounds back to 1 and the update vanishes. The weights are therefore kept as an fp32 **master copy**; the forward and backward passes use an fp16 copy, and the update is applied to the fp32 one. In bf16 the spacing near 1 is $2^{-7}$, and even $1 + 10^{-3}$ rounds to 1, so the master copy is needed there too.
+
+<MixedPrecisionStep />
+
+1. Cast the fp32 master weights to an fp16 copy.
+2. Run the forward pass under autocast: matrix products and convolutions in fp16, reductions such as softmax, normalization statistics and the loss in fp32.
+3. Multiply the loss by the scale $S$.
+4. Run the backward pass: the gradients are those of $S \cdot L$, in fp16, and small values survive.
+5. Divide the gradients by $S$ in fp32 and check them for infinities; clip here if clipping is used.
+6. Update the fp32 master weights, or skip the step and halve $S$ if a gradient was not finite.
+
+How large $S$ must be depends on the network: the multibox SSD detector diverged without scaling and matched fp32 accuracy with $S = 8$, and the networks of the paper used constant factors from 8 to 32,768 (sections 3.2 and 4). With **bf16** the range is that of fp32, gradients do not underflow, and loss scaling is not needed; this is why bf16 is the usual choice on hardware that supports it ([Kalamkar et al., 2019](#references)). In PyTorch the whole recipe is `torch.autocast(device_type, dtype=torch.float16)` around the forward pass plus a `torch.amp.GradScaler`, as in the Code section. Lower-precision formats such as fp8, used for inference and increasingly for training, and integer quantization are covered in the [quantization note](/notes/nlp/quantization) of the NLP course.
+
+## What changed
+
+| | Optimizer as derived for one valley | For a deep network |
+| --- | --- | --- |
+| Loss surface | one minimum | $10^{1014}$ symmetric copies of each minimum, saddles, sharp and flat basins |
+| First steps of Adam | full learning rate: post-norm net stuck at 2.303 | linear warm-up: 0.97–0.98 validation accuracy |
+| Weight decay under Adam | L2 penalty, rescaled per coordinate | AdamW: every weight shrinks by $1 - \eta\lambda$; on normalized weights, rotation of $\sqrt{2\eta\lambda}$ per step |
+| Outlier gradients | taken in full | clipped by global norm |
+| Batch 16 to 256, same epochs | same rate: 0.788 validation accuracy | rate × 16 (SGD) or × 4 (Adam): 0.965 with SGD |
+| Number format | fp32 | fp16 or bf16 compute, fp32 master weights, loss scaling for fp16 |
+
+## Limitations
+
+- **Most rules are first-order heuristics.** The linear and square-root scaling rules assume gradients that change slowly and noise that dominates; both break for very large batches and early in training.
+- **Warm-up has several explanations.** Adam's first steps, the variance of $\hat v$, high initial curvature and post-norm gradients each explain part of it; the length of warm-up is still chosen by trial.
+- **Flatness is not well defined.** Sharpness depends on the parametrization, so arguments for flat minima are heuristic, and SAM doubles the cost of each step for gains that vary by task.
+- **Equilibria assume stationarity.** The rotational equilibrium of normalized weights holds only approximately while the loss is still falling.
+- **Mixed precision moves the failures.** Overflow and skipped steps replace underflow; operations that sum many terms must stay in fp32, and custom layers need care.
+
+## What you should remember
+
+- A deep network's loss has huge symmetric sets of minima and is therefore not convex; saddles and plateaus, not bad local minima, are the usual obstacle. Sharpness can be changed by reparametrization without changing the function.
+- Warm-up plus cosine decay is the default schedule. Adam's first step moves every coordinate by $\eta$, about $5.5$ times its steady-state step of $0.183\,\eta$ under noise; linear warm-up removes the excess.
+- AdamW decays every weight by $1 - \eta\lambda$ per step, outside the adaptive scaling; with L2 inside Adam the decay is normalized away. On weights followed by normalization, decay only sets the speed of rotation, $\sqrt{2\eta\lambda}$ per step for SGD.
+- Clip by global norm, between `backward()` and `step()`, after unscaling.
+- With $k$ times the batch, multiply the learning rate by $k$ for SGD and by $\sqrt k$ for Adam, with warm-up; both rules fail for very large batches.
+- SAM minimizes the worst loss within radius $\rho$ at twice the cost per step; SWA averages late iterates and needs batch-norm statistics recomputed.
+- Mixed precision: fp16 compute with fp32 master weights and dynamic loss scaling, or bf16 without scaling.
+
+## Code
+
+Permutation symmetry and a saddle, sharpness under reparametrization, Adam's step size on pure noise, warm-up on a post-norm network, AdamW against L2 in Adam, the rotational equilibrium of a normalized layer, clipping, the batch-size rule, the SAM objective, fp16 and bf16 arithmetic, and dynamic loss scaling with autocast. Seeds are fixed; exact numbers can differ slightly across platforms and library versions. The script runs in about 15 seconds on a laptop CPU.
+
+```python
+import math, numpy as np, torch
+from torch import nn
+import torch.nn.functional as F
+from sklearn.datasets import load_digits
+from sklearn.model_selection import train_test_split
+
+# 1. permutation symmetry: two exact fits of y = x by two ReLU units, and their midpoint
+torch.manual_seed(0)
+x = torch.randn(10_000)
+def loss_and_grad(w, v):
+    w, v = torch.tensor(w, requires_grad=True), torch.tensor(v, requires_grad=True)
+    f = (v[:, None] * torch.relu(w[:, None] * x)).sum(0)
+    loss = 0.5 * (f - x).pow(2).mean()
+    loss.backward()
+    return round(loss.item(), 4), round(torch.cat([w.grad, v.grad]).norm().item(), 4)
+print(loss_and_grad([1., -1.], [1., -1.]), loss_and_grad([-1., 1.], [-1., 1.]), loss_and_grad([0., 0.], [0., 0.]))
+# (0.0, 0.0) (0.0, 0.0) (0.5019, 0.0): both ends fit exactly; the midpoint has loss 0.5 mean(x^2) and zero gradient
+print(round(2 * sum(math.log10(k) for k in range(1, 257)), 1))   # 1013.9: log10 of 256!^2, the copies of a 64-256-256-10 minimum
+
+# 2. the same function at two sharpnesses: L(w1, w2) = (w1 w2 - 1)^2 / 2 on the minimum w1 w2 = 1
+L2 = lambda p: 0.5 * (p[0] * p[1] - 1) ** 2
+for p in ([1.0, 1.0], [10.0, 0.1]):
+    H = torch.autograd.functional.hessian(L2, torch.tensor(p))
+    print(p, [round(e, 2) for e in torch.linalg.eigvalsh(H).tolist()])
+# [1.0, 1.0] [0.0, 2.0] | [10.0, 0.1] [0.0, 100.01]
+
+# 3. Adam on pure-noise gradients: the mean size of a step, in units of the learning rate
+p = torch.zeros(20_000, requires_grad=True)
+opt = torch.optim.Adam([p], lr=1e-3)
+sizes = {}
+for t in range(1, 1001):
+    before = p.detach().clone()
+    p.grad = torch.randn(20_000)
+    opt.step()
+    if t in (1, 2, 5, 10, 20, 100, 1000):
+        sizes[t] = round(((p.detach() - before).abs().mean() / 1e-3).item(), 3)
+print(sizes, round(math.sqrt(0.1 / 1.9) * math.sqrt(2 / math.pi), 3))
+# {1: 1.0, 2: 0.631, 5: 0.379, 10: 0.271, 20: 0.209, 100: 0.184, 1000: 0.185} 0.183
+
+# 4. warm-up: a 16-block post-norm residual network on digits, Adam at 1e-2 with cosine decay, with and without 200 warm-up steps
+X, y = load_digits(return_X_y=True)
+Xtr, Xva, ytr, yva = train_test_split(X / 16.0, y, test_size=0.3, random_state=0, stratify=y)
+Xtr, Xva = torch.tensor(Xtr, dtype=torch.float32), torch.tensor(Xva, dtype=torch.float32)
+ytr, yva = torch.tensor(ytr), torch.tensor(yva)
+
+class PostNorm(nn.Module):
+    def __init__(self, width=64, depth=16):
+        super().__init__()
+        self.inp, self.out = nn.Linear(64, width), nn.Linear(width, 10)
+        self.blocks = nn.ModuleList([nn.Sequential(nn.Linear(width, 2 * width), nn.ReLU(), nn.Linear(2 * width, width)) for _ in range(depth)])
+        self.norms = nn.ModuleList([nn.LayerNorm(width) for _ in range(depth)])
+    def forward(self, x):
+        h = self.inp(x)
+        for block, norm in zip(self.blocks, self.norms):
+            h = norm(h + block(h))
+        return self.out(h)
+
+def train(model, opt, lr_at, epochs, batch_size, seed):
+    loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(Xtr, ytr), batch_size=batch_size, shuffle=True,
+                                         drop_last=True, generator=torch.Generator().manual_seed(seed))
+    total, t = epochs * len(loader), 0
+    for epoch in range(epochs):
+        for xb, yb in loader:
+            for group in opt.param_groups: group['lr'] = lr_at(t, total)
+            opt.zero_grad(); F.cross_entropy(model(xb), yb).backward(); opt.step(); t += 1
+    with torch.no_grad():
+        return F.cross_entropy(model(Xtr), ytr).item(), (model(Xva).argmax(1) == yva).float().mean().item()
+
+def warmup_cosine(peak, warm):
+    return lambda t, T: peak * min(1.0, (t + 1) / warm if warm else 1.0) * 0.5 * (1 + math.cos(math.pi * t / T))
+
+for warm in (0, 200):
+    runs = []
+    for seed in range(3):
+        torch.manual_seed(seed)
+        model = PostNorm()
+        runs.append(train(model, torch.optim.Adam(model.parameters()), warmup_cosine(1e-2, warm), 10, 32, seed))
+    print('warm-up', warm, 'train losses', [round(r[0], 3) for r in runs], 'val acc', [round(r[1], 3) for r in runs])
+# warm-up 0 train losses [2.303, 2.303, 2.303] val acc [0.102, 0.102, 0.102]
+# warm-up 200 train losses [0.021, 0.016, 0.034] val acc [0.983, 0.974, 0.976]
+
+# 5. weight decay inside Adam versus AdamW, for weights whose only gradient is the decay itself
+for name, make in [('Adam + L2', lambda q: torch.optim.Adam([q], lr=1e-3, weight_decay=1e-2)),
+                   ('AdamW', lambda q: torch.optim.AdamW([q], lr=1e-3, weight_decay=1e-2))]:
+    q = nn.Parameter(torch.tensor([1.0, 0.01]))
+    opt = make(q)
+    for _ in range(1000):
+        opt.zero_grad(); (q * 0).sum().backward(); opt.step()
+    print(name, [round(v, 4) for v in q.tolist()])
+# Adam + L2 [0.2577, 0.0] | AdamW [0.99, 0.0099]
+
+# 6. weight decay on a weight followed by batch norm: the norm forgets its start, the angle per step approaches sqrt(2 lr wd)
+Xall, yall = torch.tensor(X / 16.0, dtype=torch.float32), torch.tensor(y)
+def rotation(scale, lr=0.1, wd=0.05, steps=2000):
+    torch.manual_seed(0)
+    lin = nn.Linear(64, 256, bias=False)
+    with torch.no_grad(): lin.weight.mul_(scale)
+    net = nn.Sequential(lin, nn.BatchNorm1d(256), nn.ReLU(), nn.Linear(256, 10))
+    opt = torch.optim.SGD([{'params': [lin.weight], 'weight_decay': wd},
+                           {'params': [*net[1].parameters(), *net[3].parameters()], 'weight_decay': 0.0}], lr=lr)
+    g, angles = torch.Generator().manual_seed(0), []
+    start = lin.weight.norm().item()
+    for t in range(steps):
+        idx = torch.randint(0, len(Xall), (64,), generator=g)
+        before = lin.weight.detach().clone()
+        opt.zero_grad(); F.cross_entropy(net(Xall[idx]), yall[idx]).backward(); opt.step()
+        angles.append(torch.arccos(F.cosine_similarity(before.flatten(), lin.weight.detach().flatten(), dim=0).clamp(-1, 1)).item())
+    return round(start, 2), round(lin.weight.norm().item(), 2), round(float(np.mean(angles[-500:])), 4)
+print(rotation(1.0), rotation(10.0), round(math.sqrt(2 * 0.1 * 0.05), 4))
+# (9.25, 1.2, 0.0778) (92.46, 1.2, 0.0758) 0.1
+
+# 7. clipping by norm keeps the direction, clipping by value does not
+g1, g2 = nn.Parameter(torch.zeros(2)), nn.Parameter(torch.zeros(2))
+g1.grad, g2.grad = torch.tensor([3.0, 4.0]), torch.tensor([3.0, 4.0])
+total = nn.utils.clip_grad_norm_([g1], max_norm=1.0)
+nn.utils.clip_grad_value_([g2], clip_value=1.0)
+print(total.item(), [round(v, 4) for v in g1.grad.tolist()], g2.grad.tolist())
+# 5.0 [0.6, 0.8] [1.0, 1.0]
+
+# 8. batch size and learning rate: SGD with momentum 0.9 on a 64-256-256-10 network, 20 epochs, 3 seeds
+def mlp():
+    return nn.Sequential(nn.Linear(64, 256), nn.ReLU(), nn.Linear(256, 256), nn.ReLU(), nn.Linear(256, 10))
+for bs, lr in [(16, 0.01), (256, 0.01), (256, 0.16), (256, 0.04)]:
+    runs = []
+    for seed in range(3):
+        torch.manual_seed(seed)
+        model = mlp()
+        runs.append(train(model, torch.optim.SGD(model.parameters(), momentum=0.9), lambda t, T: lr, 20, bs, seed))
+    m = np.mean(runs, axis=0)
+    print(f'batch {bs:3d}  lr {lr:.2f}  train loss {m[0]:.3f}  val acc {m[1]:.3f}')
+# batch  16  lr 0.01  train loss 0.029  val acc 0.971
+# batch 256  lr 0.01  train loss 1.702  val acc 0.788
+# batch 256  lr 0.16  train loss 0.046  val acc 0.965
+# batch 256  lr 0.04  train loss 0.187  val acc 0.942
+
+# 9. SAM's objective, max over |e| <= rho of L(w + e), at the bottom of a sharp and a flat quadratic, rho = 0.3
+for a in (40.0, 2.0):
+    print(a, round(max(0.5 * a * e ** 2 for e in np.linspace(-0.3, 0.3, 601)), 3))
+# 40.0 1.8 | 2.0 0.09
+
+# 10. float16 and bfloat16: underflow, loss scaling, overflow, lost updates
+h, b = torch.float16, torch.bfloat16
+print(torch.tensor(1e-8).to(h).item(), torch.tensor(1e-8 * 2**16).to(h).item(), torch.tensor(7e4).to(h).item(), torch.tensor(1e-8).to(b).item())
+# 0.0 0.0006551742553710938 inf 1.0011717677116394e-08
+print((torch.tensor(1.0, dtype=h) + 1e-4).item(), (torch.tensor(1.0) + 1e-4).item(), (torch.tensor(1.0, dtype=b) + 1e-3).item())
+# 1.0 1.000100016593933 1.0: an update below half the spacing near 1 is lost in fp16 and bf16, kept in fp32
+
+# 11. dynamic loss scaling with autocast on the CPU: an overflowing step is skipped and the scale halved
+torch.manual_seed(0)
+model = nn.Linear(8, 1)
+opt = torch.optim.SGD(model.parameters(), lr=0.1)
+scaler = torch.amp.GradScaler('cpu', init_scale=2.0**16)
+xs = torch.randn(4, 8)
+for big in (1.0, 1e4, 1.0):
+    opt.zero_grad()
+    with torch.autocast('cpu', dtype=torch.float16):
+        out = model(xs * big)                            # the matrix product runs in float16
+    loss = out.float().pow(2).mean()                     # the loss in float32
+    before = model.weight.detach().clone()
+    scaler.scale(loss).backward()                        # gradients of S * loss
+    scaler.unscale_(opt)                                 # divide by S; clip after this, never before
+    nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    scaler.step(opt); scaler.update()                    # skip the step if anything is inf or nan
+    print(out.dtype, scaler.get_scale(), bool((model.weight != before).any()))
+# torch.float16 65536.0 True
+# torch.float16 32768.0 False
+# torch.float16 32768.0 True
+```
+
+## Next
+
+The networks of this section were stacks of fully connected layers, which treat an image as a list of 64 unrelated numbers. Images have structure: nearby pixels belong together, and the same pattern can appear anywhere. The [next note](/notes/deep-learning/convolution) builds that structure into the layer itself, with weights shared across positions, and starts the part of the course on convolutional networks.
+
+## References
+
+- Y. N. Dauphin, R. Pascanu, C. Gulcehre, K. Cho, S. Ganguli, Y. Bengio. [Identifying and attacking the saddle point problem in high-dimensional non-convex optimization](https://arxiv.org/abs/1406.2572). NeurIPS, 2014.
+- S. Hochreiter, J. Schmidhuber. [Flat minima](https://doi.org/10.1162/neco.1997.9.1.1). *Neural Computation*, 9(1):1–42, 1997.
+- N. S. Keskar, D. Mudigere, J. Nocedal, M. Smelyanskiy, P. T. P. Tang. [On large-batch training for deep learning: generalization gap and sharp minima](https://arxiv.org/abs/1609.04836). ICLR, 2017.
+- L. Dinh, R. Pascanu, S. Bengio, Y. Bengio. [Sharp minima can generalize for deep nets](https://arxiv.org/abs/1703.04933). ICML, 2017.
+- I. Loshchilov, F. Hutter. [SGDR: stochastic gradient descent with warm restarts](https://arxiv.org/abs/1608.03983). ICLR, 2017.
+- I. Loshchilov, F. Hutter. [Decoupled weight decay regularization](https://arxiv.org/abs/1711.05101). ICLR, 2019.
+- L. Liu, H. Jiang, P. He, W. Chen, X. Liu, J. Gao, J. Han. [On the variance of the adaptive learning rate and beyond](https://arxiv.org/abs/1908.03265). ICLR, 2020.
+- J. Ma, D. Yarats. [On the adequacy of untuned warmup for adaptive optimization](https://arxiv.org/abs/1910.04209). AAAI, 2021.
+- J. Gilmer, B. Ghorbani, A. Garg, S. Kudugunta, B. Neyshabur, D. Cardoze, G. Dahl, Z. Nado, O. Firat. [A loss curvature perspective on training instability in deep learning](https://arxiv.org/abs/2110.04369). ICLR, 2022.
+- T. van Laarhoven. [L2 regularization versus batch and weight normalization](https://arxiv.org/abs/1706.05350). arXiv, 2017.
+- A. Kosson, B. Messmer, M. Jaggi. [Rotational equilibrium: how weight decay balances learning across neural networks](https://arxiv.org/abs/2305.17212). ICML, 2024. Table 1 (equilibrium angular updates).
+- R. Pascanu, T. Mikolov, Y. Bengio. [On the difficulty of training recurrent neural networks](https://arxiv.org/abs/1211.5063). ICML, 2013. Section 3.2 (clipping by norm).
+- T. B. Brown et al. [Language models are few-shot learners](https://arxiv.org/abs/2005.14165). NeurIPS, 2020. Appendix B (training details).
+- P. Goyal, P. Dollár, R. Girshick, P. Noordhuis, L. Wesolowski, A. Kyrola, A. Tulloch, Y. Jia, K. He. [Accurate, large minibatch SGD: training ImageNet in 1 hour](https://arxiv.org/abs/1706.02677). arXiv, 2017. Section 2 (linear scaling rule, warm-up), Table 1.
+- S. Malladi, K. Lyu, A. Panigrahi, S. Arora. [On the SDEs and scaling rules for adaptive gradient algorithms](https://arxiv.org/abs/2205.10287). NeurIPS, 2022.
+- P. Foret, A. Kleiner, H. Mobahi, B. Neyshabur. [Sharpness-aware minimization for efficiently improving generalization](https://arxiv.org/abs/2010.01412). ICLR, 2021.
+- P. Izmailov, D. Podoprikhin, T. Garipov, D. Vetrov, A. G. Wilson. [Averaging weights leads to wider optima and better generalization](https://arxiv.org/abs/1803.05407). UAI, 2018.
+- P. Micikevicius et al. [Mixed precision training](https://arxiv.org/abs/1710.03740). ICLR, 2018. Section 3.1 (master weights), section 3.2 (loss scaling).
+- D. Kalamkar et al. [A study of BFLOAT16 for deep learning training](https://arxiv.org/abs/1905.12322). arXiv, 2019.
+- I. Goodfellow, Y. Bengio, A. Courville. [*Deep Learning*](https://www.deeplearningbook.org/). MIT Press, 2016. Section 8.2 (challenges in neural network optimization: local minima, saddle points, cliffs and exploding gradients).
+- A. Zhang, Z. C. Lipton, M. Li, A. J. Smola. [*Dive into Deep Learning*](https://d2l.ai/). Cambridge University Press, 2023. Chapter 12 (optimization algorithms), section 12.11 (learning-rate scheduling).
+- S. J. D. Prince. [*Understanding Deep Learning*](https://udlbook.github.io/udlbook/). MIT Press, 2023. Chapter 6 (fitting models), chapter 20 (why does deep learning work: loss surfaces, flat minima).
+- *Глубинное обучение 1* (Deep Learning 1), Faculty of Computer Science, HSE University. Course materials, [repository xiyori/intro-to-dl-hse, branch 2025-2026](https://github.com/xiyori/intro-to-dl-hse/tree/2025-2026): lecture 3 (optimization: momentum, Adam, AdamW, learning-rate schedules and warm-up, SAM).

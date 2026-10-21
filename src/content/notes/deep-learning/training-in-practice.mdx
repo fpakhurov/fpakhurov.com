@@ -1,0 +1,352 @@
+---
+title: Training networks in practice
+description: "A recipe for training a network from scratch: checking the loss at initialization, overfitting one batch, a learning-rate range test, reading training and validation curves, reproducible runs, experiment tracking and a compute budget, closing with the course in one paragraph."
+course: deep-learning
+section: Robustness and Deployment
+order: 13
+status: published
+tags: [training-recipe, debugging, sanity-checks, initial-loss, overfit-one-batch, learning-rate-range-test, learning-curves, underfitting, overfitting, reproducibility, experiment-tracking, compute-budget, hyperparameter-search]
+prerequisites: [Optimizing deep networks, Losses and regularization, Normalization and initialization]
+---
+
+import TrainingRecipe from '../../../components/figures/training-in-practice/TrainingRecipe.astro';
+import LrRangeTest from '../../../components/figures/training-in-practice/LrRangeTest.astro';
+import LearningCurves from '../../../components/figures/training-in-practice/LearningCurves.astro';
+
+The [previous note](/notes/deep-learning/model-compression) ended the course's catalogue of methods. Each note's Code section trained a network that worked, because its settings had been chosen and checked. On a new problem nobody has done that yet, and the hard part is not the method but the process: a bug in the labels, a learning rate ten times too large or a forgotten `model.eval()` all give a network that trains, just worse, and no error message says so. This last note is a recipe for training a network from scratch, after [Karpathy (2019)](#references): a sequence of checks, each with a number to expect, that catch such failures before they cost a week of experiments. It ends with the course in one paragraph.
+
+**Notation.** $C$ is the number of classes, $L_0$ the loss at initialization, $\eta$ the learning rate, $B$ the batch size and $E$ the number of epochs. A network has $N$ weights in its matrix products and is trained on $D$ examples. "Training" and "validation" loss are the mean cross-entropy on the respective sets, measured in evaluation mode.
+
+## Baseline: write the whole pipeline and press run
+
+The tempting way to start is to write the data loading, the model, the loss, the optimizer and the evaluation in one go, launch a long run and look at the final accuracy. When the number is disappointing, there is no way to tell why. Training a network "fails silently" ([Karpathy, 2019](#references)): almost every mistake still produces a decreasing loss. Labels shuffled out of alignment with their inputs, a softmax applied twice, inputs that are not normalized, data augmentation that also flips the digits it should not, an evaluation done with dropout switched on: each of these runs without an error and gives a worse model.
+
+The remedy is to build the pipeline in small steps and to check each step against a prediction. It starts with the data: look at many raw examples and their labels, count the classes, look for duplicates and for examples that leak between the splits ([data and leakage](/notes/ml/data-features-and-leakage)). It continues with baselines whose result is known: a model that ignores its input must do worse than the real one; a linear model gives a number any network has to beat.
+
+<aside class="callout"><strong>Key idea.</strong> Before each step, predict what you should see, run the smallest experiment that tests the prediction, and move on only when it holds: the loss at initialization, a single batch fitted to zero, a learning rate where the loss falls fastest, curves that say whether the model under- or overfits. Make every run reproducible and recorded, and spend the compute budget on many cheap experiments before one expensive one.</aside>
+
+<TrainingRecipe />
+
+1. Look at the data and set up baselines.
+2. Check the loss at initialization against $\ln C$.
+3. Overfit one small batch: the loss must reach about zero.
+4. Find the learning rate with a range test.
+5. Train fully and read the training and validation curves.
+6. Regularize or enlarge the model, one change at a time, with every run recorded and seeded.
+
+## Check the loss at initialization
+
+At initialization the logits are small, so the softmax is close to uniform and every class gets probability about $1/C$. The cross-entropy of the true class is then
+
+$$
+\boxed{\; L_0 \approx -\log \frac1C = \ln C \;}
+$$
+
+How close, and what makes it larger: write the loss of one example as $-z_y + \log \sum_j e^{z_j}$ and suppose the $C$ logits are independent with mean 0 and a small variance $\sigma^2$. Expanding the log-sum-exp to second order around the mean logit $\bar z$,
+
+$$
+\begin{aligned}
+\log \sum_{j=1}^C e^{z_j} &= \ln C + \log \Big( \frac1C \sum_j e^{z_j} \Big) \\
+&\approx \ln C + \bar z + \frac{1}{2C} \sum_j (z_j - \bar z)^2 , \\
+\mathbb E\, L_0 &\approx \ln C + \tfrac12\, \sigma^2 \Big(1 - \frac1C\Big) .
+\end{aligned}
+$$
+
+The first line factors out $C$. The second uses $\frac1C \sum_j e^{z_j} \approx e^{\bar z}\big(1 + \frac{1}{2C}\sum_j (z_j - \bar z)^2\big)$ and $\log(1 + u) \approx u$. The third takes expectations: $-z_y + \bar z$ has mean 0, and the sample variance of $C$ independent values has mean $\sigma^2 (C - 1)/C$. So the initial loss exceeds $\ln C$ by about half the variance of the logits. A much larger value means the logits are too large: the last layer is initialized too large, or the inputs are not normalized.
+
+**Worked example.** For $C = 10$, $\ln 10 = 2.303$. The network $64 \to 256 \to 256 \to 10$ of the Code section, with PyTorch's default initialization, starts at $2.310$ on the training digits. With its last layer drawn from $\mathcal N(0, 1)$ instead, a common slip, it starts at $3.044$: the network is confidently wrong before it has seen a label, and the first steps are spent undoing that rather than learning.
+
+The same reasoning sets the bias of the last layer. With class frequencies $\pi_k$, initializing the bias to $b_k = \log \pi_k$ (up to a constant, which a softmax ignores) makes the initial prediction equal to $\pi$ and the expected initial loss equal to the entropy of the labels, $-\sum_k \pi_k \log \pi_k$. For a binary problem with 10% positives, a zero bias starts at $\ln 2 = 0.693$ and the bias $\log(0.1/0.9) = -2.197$ on the positive logit at $-0.1 \ln 0.1 - 0.9 \ln 0.9 = 0.325$. For regression, the last bias is set to the mean of the targets. Initialization of the hidden layers is the subject of [Normalization and initialization](/notes/deep-learning/normalization-and-initialization#initialization-that-keeps-the-factor-at-one).
+
+## Overfit one batch
+
+A network with enough capacity, trained on a single fixed batch, must drive the training loss to about zero: it has far more parameters than the batch has labels. If it cannot, something between the data and the gradient is broken, and no amount of tuning will help. The test takes seconds, so it is run before every serious experiment, with augmentation and regularization switched off.
+
+**Worked example.** The Code section trains the network on the same 32 images for 300 Adam steps with $\eta = 10^{-3}$. Correctly wired, the loss falls to $0.001$. Two common bugs fail the test, each in its own way:
+
+- **A softmax applied twice.** The model outputs probabilities and the loss, `F.cross_entropy`, applies a softmax to them again ([why the loss takes logits](/notes/deep-learning/losses-and-regularization#why-log-softmax-is-numerically-stable)). The loss then has a floor. Its inputs $u$ are probabilities, so the best the network can do is $u = e_y$, the one-hot vector of the label, and the loss there is $-1 + \log\big(e^1 + (C - 1)\, e^0\big)$, which is $\log(e + 9) - 1 = 1.461$ for $C = 10$. The run stalls at $1.551$, on its way to that floor and never below it.
+- **Labels out of alignment with their inputs**, for example when inputs and labels are shuffled separately. Here each step pairs the images with a fresh random permutation of the labels; the loss stays at $2.082$, about the entropy of the batch's 32 labels, $2.091$ (below $\ln 10$ because the classes are unevenly represented): with nothing consistent to learn, the network can only learn how often each label occurs.
+
+A third classic, forgetting to reset the gradients between steps, is shown in [PyTorch and automatic differentiation](/notes/deep-learning/pytorch-and-autograd#forgetting-zero_grad).
+
+## Find the learning rate with a range test
+
+The learning rate is the hyperparameter that matters most, and its good values span a narrow band on a logarithmic scale. A **learning-rate range test** ([Smith, 2017](#references), section 3.3) finds the band in one short run: start with a tiny rate, increase it at every step, and record the training loss. In the common form, used by the fastai library's learning-rate finder ([Howard and Gugger, 2020](#references)), the rate grows geometrically over $K$ steps from $\eta_{\min}$ to $\eta_{\max}$,
+
+$$
+\eta_k = \eta_{\min} \Big( \frac{\eta_{\max}}{\eta_{\min}} \Big)^{k / (K - 1)}, \qquad k = 0, 1, \dots, K - 1,
+$$
+
+and the loss is smoothed with a bias-corrected moving average, since a single batch is noisy. The run stops once the smoothed loss exceeds a few times its minimum. The loss stays flat while the rate is too small to move the weights, falls fastest in the useful band, and turns up when the steps become too large. A good learning rate lies below the minimum of the curve, by a factor of about 3 to 10: the minimum is reached late in a rising schedule, where the loss is already about to diverge.
+
+**Worked example.** With $K = 300$, $\eta_{\min} = 10^{-5}$ and $\eta_{\max} = 10$, each step multiplies the rate by $(10^6)^{1/299} = 1.047$, and step 150 uses $10^{-5} \cdot 10^{6 \cdot 150 / 299} = 0.0102$. For the network on the digits with SGD and momentum 0.9 and batches of 64, the smoothed loss stays at $2.29$–$2.31$ up to $\eta \approx 10^{-3}$, falls through $1.87$ at $\eta \approx 0.04$, reaches its minimum $0.433$ at $\eta = 0.31$, and the test stops at $\eta = 0.86$. The recipe suggests 0.03 to 0.1. Ten epochs at fixed rates confirm it:
+
+| $\eta$ | 0.001 | 0.01 | 0.1 | 0.3 | 1.0 |
+| --- | --- | --- | --- | --- | --- |
+| validation accuracy after 10 epochs | 0.596 | 0.933 | 0.978 | 0.961 | 0.098 |
+| validation loss | 2.220 | 0.329 | 0.085 | 0.147 | 2.320 |
+
+At $\eta = 1$ the network does not explode to infinity; it collapses to predicting the same class for everything, with the loss stuck at $\ln 10$. The range test stopped after fewer than 250 steps, a quarter of the 1000 steps of those five runs together, and needs to be redone when the batch size or the optimizer changes ([batch size and the learning rate](/notes/deep-learning/optimizing-deep-networks#batch-size-and-the-learning-rate)). Schedules and warm-up are then built around the rate it finds ([schedules and warm-up](/notes/deep-learning/optimizing-deep-networks#learning-rate-schedules-and-warm-up)).
+
+<LrRangeTest />
+
+## Read the curves: underfitting or overfitting
+
+Once single batches fit and the rate is set, the full run is judged by two curves, the training loss and the validation loss against the epoch ([overfitting and underfitting](/notes/ml/validation-and-overfitting#overfitting-and-underfitting)). Their shapes point to the next step:
+
+| what the curves show | diagnosis | what to try |
+| --- | --- | --- |
+| both losses high and close to each other | underfitting | a larger model, longer training, a higher rate; check for bugs |
+| training loss near 0, validation loss much higher | overfitting | more data, augmentation, weight decay, dropout, early stopping |
+| validation loss rises while validation accuracy holds | overconfidence on a few examples | early stopping on the loss, label smoothing |
+| loss flat at $\ln C$ | not learning | the learning rate, the initialization, the labels |
+| spikes or NaN | unstable steps | a lower rate, warm-up, [gradient clipping](/notes/deep-learning/optimizing-deep-networks#gradient-clipping), loss scaling in fp16 |
+
+Karpathy's order of work follows from the table: first make the model large enough to overfit the training set, which shows the pipeline can fit, then regularize it to trade some training loss for validation loss.
+
+**Worked example.** Three runs of the Code section, SGD with momentum 0.9 at $\eta = 0.1$ for 60 epochs:
+
+- **A network too small**, $64 \to 2 \to 2 \to 10$: after 60 epochs the training loss is $1.278$ and the validation loss $1.367$, both high and close; validation accuracy $0.331$. Underfitting.
+- **The large network on 100 training images**: the training loss falls to $0.001$ while the validation loss bottoms out at about $0.48$ from epoch 40 on; validation accuracy $0.906$. Overfitting: the gap, not the training loss, is the signal.
+- **The large network on all 1257 images**: training loss $0.000$, validation loss lowest of the recorded epochs at $0.073$ at epoch 20, then slowly rising to $0.084$, while validation accuracy ends at $0.983$. A mild case of the third row: early stopping on the validation loss would stop near epoch 20.
+
+<LearningCurves />
+
+## Make runs reproducible
+
+A difference between two runs means something only if the same run gives the same result twice. Randomness enters a training run in many places: the initial weights, the order of the batches, dropout masks, augmentations, the data split. Seeding every generator makes a run repeatable on one machine: `torch.manual_seed` (which also seeds the GPUs), `random.seed` and `numpy.random.seed`, and a seeded `torch.Generator` for each `DataLoader`. Two pitfalls:
+
+- **Seed before the model is built.** A seed set after the model is constructed fixes the batch order but not the initial weights, and the run changes every time it is started.
+- **Some kernels are nondeterministic.** On a GPU, operations that sum with atomic additions, and the choice of convolution algorithm by benchmarking, can change the last bits of a result from run to run; floating-point addition is [not associative](/notes/acos/floating-point#order-matters-floating-point-addition-is-not-associative), so the order of a sum matters. `torch.use_deterministic_algorithms(True)` and `torch.backends.cudnn.benchmark = False` make PyTorch use deterministic algorithms or raise an error where none exists, at some cost in speed. Even then, results are not guaranteed to be identical across PyTorch releases or hardware ([PyTorch documentation](#references)).
+
+Repeatability is not the same as reliability. A single run is one draw from the distribution of results over seeds, and comparisons must take that spread into account ([Bouthillier et al., 2021](#references)).
+
+**Worked example.** In the Code section, two runs with seed 0 give bit-identical weights. Five seeds, 10 epochs each, give validation accuracies $0.978$, $0.974$, $0.970$, $0.978$ and $0.972$: mean $0.9744$, standard deviation $0.0033$. One validation image is worth $0.0019$ of accuracy here, so the seeds differ by up to four images. A change that improves one run by half a point has not been shown to help; it needs several seeds on each side, and a larger validation set, before it counts.
+
+## Track every experiment
+
+After a few dozen runs, nobody remembers which settings produced which curve. Every run should be recorded automatically, with enough information to rerun it:
+
+- **code**: the commit hash, and the uncommitted changes if there are any;
+- **configuration**: every hyperparameter, defaults included, and the seed;
+- **data**: the dataset version and the split;
+- **environment**: library versions and hardware;
+- **metrics**: training and validation losses and metrics at every epoch, not only the final ones;
+- **checkpoints**: model, optimizer and scheduler state and the epoch, so that a run can resume or return to its best point ([a default recipe](/notes/ml/training-deep-networks#a-default-recipe));
+- **purpose**: one sentence on why the run was made and what was concluded.
+
+Tools such as TensorBoard, MLflow or Weights & Biases store and plot these records; a file with one JSON line per epoch, as in the Code section, is the minimal version. The discipline that makes the record useful is to change one thing at a time: when two settings change between runs, their effects cannot be separated.
+
+## Budget the compute
+
+The compute a run needs can be estimated before it starts. A matrix product uses each weight once per example for a multiplication and an addition, so a forward pass costs about $2N$ floating-point operations (FLOPs) per example, and the backward pass about twice that: training costs about
+
+$$
+6\, N\, D\, E \ \text{FLOPs},
+$$
+
+the count derived in the NLP course's [scaling-laws note](/notes/nlp/scaling-laws#what-is-counted-parameters-tokens-and-compute) and used by [Kaplan et al. (2020)](#references). For convolutions, $N$ is replaced by the number of multiply-adds per example, since each weight is reused at every position.
+
+**Worked example.** The Code section counts the FLOPs of the digit network with PyTorch's FLOP counter. It has $N = 84{,}480$ weights; the forward pass costs exactly $2N$ per example, and a full training step $5.61N$, a little under $6N$ because the first layer does not need the gradient with respect to its input. Sixty epochs over 1257 images cost about $6 \cdot 84{,}480 \cdot 1257 \cdot 60 = 3.8 \cdot 10^{10}$ FLOPs: seconds on a laptop. A ResNet-50 needs about 4.1 billion multiply-adds per $224 \times 224$ image, listed as 4.09 GFLOPS ([Convolutional architectures](/notes/deep-learning/cnn-architectures#sizes-and-accuracies-side-by-side)), about $2.5 \cdot 10^{10}$ FLOPs per training example; 90 epochs over 1.28 million ImageNet images come to $2.8 \cdot 10^{18}$ FLOPs, about 8 hours on hardware that sustains $10^{14}$ FLOP/s.
+
+The final run is only part of the budget. Most of it goes into the runs that decide its settings, and they should be as cheap as possible:
+
+- **Debug small.** The checks above run on one batch or a small subset in seconds.
+- **Search on a log scale, at random.** For the learning rate, weight decay and similar scales, sample values log-uniformly. Random search covers each important hyperparameter with more distinct values than a grid of the same size, because usually only a few of them matter ([Bergstra and Bengio, 2012](#references)).
+- **Stop bad runs early.** Methods such as successive halving give many configurations a short budget and continue only the best ones ([Zhang et al.](#references), chapter 19).
+- **Keep budget for seeds.** The final comparison between the best candidates needs several seeds each.
+
+## What changed
+
+| | Pipeline written in one go | With the recipe |
+| --- | --- | --- |
+| Bugs | found, if ever, by a disappointing final number | caught in seconds: initial loss, one-batch overfit |
+| Learning rate | guessed, or a grid over decades | a range test, then a few short runs near its suggestion |
+| Diagnosis | final accuracy only | training and validation curves at every epoch |
+| Comparisons | single runs | seeded runs, several seeds per setting |
+| Records | memory and file names | code version, configuration, data, metrics and checkpoints per run |
+| Compute | spent on long runs | estimated in advance, mostly spent on cheap experiments |
+
+## Limitations
+
+- **A recipe is not a proof.** Passing every check rules out many bugs, not all of them; a model can fit one batch, train smoothly and still learn a shortcut in the data.
+- **The numbers are those of a small problem.** The range test, the curves and the seed spread here come from digits on a CPU; on large models, the curves are noisier, the good learning rate depends on the schedule and the batch size, and a single run can cost more than the whole search here.
+- **Validation sets wear out.** Each decision made on the validation set fits it a little; the final number must come from a test set that was used once ([reusing a test set](/notes/ml/validation-and-overfitting#reusing-a-test-set)).
+- **Determinism has limits.** Bit-for-bit reproducibility holds on one machine with one library version at best; across them, only statistical reproducibility over seeds is realistic.
+- **FLOP counts are estimates.** They ignore memory traffic, communication and idle time, which often dominate the real duration of a run.
+
+## What you should remember
+
+- Training fails silently; build the pipeline in steps and check each against a prediction.
+- The loss at initialization should be about $\ln C$ (2.303 for ten classes); a larger value means logits too large. Set the last bias to the log class frequencies or the mean target.
+- A correct model overfits one batch to a loss near zero; a softmax applied twice stalls above $\log(e + C - 1) - 1$, misaligned labels near the entropy of the labels, at most $\ln C$.
+- A learning-rate range test grows $\eta$ geometrically and picks a rate 3 to 10 times below the minimum of the loss curve.
+- Read the curves: both losses high means underfitting, a large gap means overfitting, a flat loss at $\ln C$ means not learning.
+- Seed every generator, before the model is built; compare over several seeds, since one seed is one draw (here a spread of 0.8 points).
+- Record code, configuration, data, environment, metrics and checkpoints for every run; change one thing at a time.
+- Training costs about $6NDE$ FLOPs; most of the budget goes to the cheap experiments before the final run.
+
+## Code
+
+The checks of the recipe on the bundled digits: the loss at initialization, the one-batch test with two bugs, a learning-rate range test and its confirmation, three pairs of learning curves, reproducibility over seeds, a JSON-lines record and a FLOP count. Seeds are fixed; exact numbers can differ slightly across platforms and library versions. The script runs in about 10 seconds on a laptop CPU.
+
+```python
+import io, json, math, torch
+from torch import nn
+import torch.nn.functional as F
+from torch.utils.flop_counter import FlopCounterMode
+from sklearn.datasets import load_digits
+from sklearn.model_selection import train_test_split
+
+X, y = load_digits(return_X_y=True)
+Xtr, Xva, ytr, yva = train_test_split(X / 16.0, y, test_size=0.3, random_state=0, stratify=y)
+Xtr, Xva = torch.tensor(Xtr, dtype=torch.float32), torch.tensor(Xva, dtype=torch.float32)
+ytr, yva = torch.tensor(ytr), torch.tensor(yva)
+def mlp(width=256, p=0.0):
+    return nn.Sequential(nn.Linear(64, width), nn.ReLU(), nn.Dropout(p), nn.Linear(width, width), nn.ReLU(),
+                         nn.Dropout(p), nn.Linear(width, 10))
+
+# 1. the loss at initialization should be ln C
+torch.manual_seed(0)
+net = mlp()
+with torch.no_grad():
+    print(round(math.log(10), 3), round(F.cross_entropy(net(Xtr), ytr).item(), 3))   # 2.303 2.31
+    nn.init.normal_(net[-1].weight)                             # the last layer drawn from N(0, 1) instead of the default
+    print(round(F.cross_entropy(net(Xtr), ytr).item(), 3))       # 3.044
+# a 90/10 binary problem: a zero bias starts at ln 2, the bias log(pi / (1 - pi)) at the entropy of the labels
+pi = 0.1
+print(round(math.log(2), 3), round(-(pi * math.log(pi) + (1 - pi) * math.log(1 - pi)), 3))   # 0.693 0.325
+
+# 2. overfit one batch of 32 images: the loss should reach about 0; two bugs that cannot
+def overfit(model, steps=300, bug=None):
+    torch.manual_seed(0)
+    xb, yb = Xtr[:32], ytr[:32]
+    opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+    for _ in range(steps):
+        out = model(xb)
+        if bug == 'softmax twice':
+            out = F.softmax(out, dim=1)                         # probabilities passed where logits are expected
+        target = yb[torch.randperm(32)] if bug == 'shuffled labels' else yb
+        loss = F.cross_entropy(out, target)
+        opt.zero_grad(); loss.backward(); opt.step()
+    return round(loss.item(), 3)
+for bug in (None, 'softmax twice', 'shuffled labels'):
+    torch.manual_seed(0)
+    print(bug, overfit(mlp(), bug=bug))
+# None 0.001 | softmax twice 1.551 | shuffled labels 2.082
+print(round(math.log(math.e + 9) - 1, 3))                       # 1.461: the floor of the softmax-twice bug
+
+# 3. learning-rate range test: SGD with momentum, the rate grows geometrically from 1e-5 to 10 over 300 steps
+torch.manual_seed(0)
+net = mlp()
+opt = torch.optim.SGD(net.parameters(), lr=1e-5, momentum=0.9)
+lrs, losses, avg, best = [], [], 0.0, float('inf')
+for k in range(300):
+    lr = 1e-5 * (10 / 1e-5) ** (k / 299)
+    for g in opt.param_groups:
+        g['lr'] = lr
+    idx = torch.randint(0, len(Xtr), (64,))
+    loss = F.cross_entropy(net(Xtr[idx]), ytr[idx])
+    opt.zero_grad(); loss.backward(); opt.step()
+    avg = 0.9 * avg + 0.1 * loss.item()
+    smooth = avg / (1 - 0.9 ** (k + 1))                         # bias-corrected moving average
+    lrs.append(lr); losses.append(smooth)
+    best = min(best, smooth)
+    if smooth > 4 * best or not math.isfinite(smooth):
+        break
+i_min = min(range(len(losses)), key=losses.__getitem__)
+print(f'min loss {losses[i_min]:.3f} at lr {lrs[i_min]:.3g}; stopped at lr {lrs[-1]:.3g}')
+print([round(losses[k], 3) for k in range(0, len(lrs), 15)])   # the smoothed loss every 15 steps
+# min loss 0.433 at lr 0.313; stopped at lr 0.864
+# [2.294, 2.311, 2.312, 2.311, 2.309, 2.308, 2.307, 2.303, 2.291, 2.277, 2.238, 2.158, 1.872, 1.034, 0.554, 0.441, 0.657]
+
+def run(model, lr, epochs, n=None, wd=0.0, seed=0, log=None):
+    torch.manual_seed(seed)
+    rows = torch.arange(len(Xtr) if n is None else n)
+    opt = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=wd)
+    hist = []
+    for ep in range(epochs):
+        model.train()
+        for idx in rows[torch.randperm(len(rows))].split(64):
+            opt.zero_grad(); F.cross_entropy(model(Xtr[idx]), ytr[idx]).backward(); opt.step()
+        model.eval()
+        with torch.no_grad():
+            tr = F.cross_entropy(model(Xtr[rows]), ytr[rows]).item()
+            va = F.cross_entropy(model(Xva), yva).item()
+            acc = (model(Xva).argmax(1) == yva).float().mean().item()
+        hist.append((tr, va, acc))
+        if log is not None:
+            log.write(json.dumps({'epoch': ep + 1, 'train_loss': round(tr, 4), 'val_loss': round(va, 4), 'val_acc': round(acc, 4)}) + '\n')
+    return hist
+
+for lr in (1e-3, 1e-2, 0.1, 0.3, 1.0):
+    torch.manual_seed(0)
+    h = run(mlp(), lr, 10)
+    print(lr, [round(v, 3) for v in h[-1]])                     # training loss, validation loss, validation accuracy
+# 0.001 [2.219, 2.22, 0.596] | 0.01 [0.31, 0.329, 0.933] | 0.1 [0.022, 0.085, 0.978]
+# 0.3 [0.053, 0.147, 0.961] | 1.0 [2.32, 2.32, 0.098]
+
+# 4. reading the curves: a network too small, the same large network on 100 and on 1257 images
+EP = (1, 2, 5, 10, 20, 40, 60)
+for name, make, n in (('too small', lambda: mlp(width=2), None), ('100 images', mlp, 100), ('1257 images', mlp, None)):
+    torch.manual_seed(0)
+    h = run(make(), 0.1, 60, n=n)
+    print(name, [round(h[e - 1][0], 3) for e in EP], [round(h[e - 1][1], 3) for e in EP], round(h[-1][2], 3))
+# too small [2.18, 1.873, 1.657, 1.547, 1.47, 1.37, 1.278] [2.183, 1.883, 1.691, 1.584, 1.501, 1.403, 1.367] 0.331
+# 100 images [2.289, 2.252, 2.083, 1.1, 0.099, 0.002, 0.001] [2.297, 2.271, 2.152, 1.243, 0.535, 0.48, 0.482] 0.906
+# 1257 images [1.306, 0.355, 0.067, 0.022, 0.002, 0.001, 0.0] [1.318, 0.398, 0.103, 0.085, 0.073, 0.08, 0.084] 0.983
+#   (training losses, validation losses at epochs 1, 2, 5, 10, 20, 40, 60; final validation accuracy)
+
+# 5. reproducibility: the same seed gives the same weights, bit for bit; seeds differ by more than you think
+def trained(seed):
+    torch.manual_seed(seed)                                     # seed before the model is built
+    model = mlp()
+    return model, run(model, 0.1, 10, seed=seed)[-1][2]
+(a, acc_a), (b, acc_b) = trained(0), trained(0)
+print(all(torch.equal(p, q) for p, q in zip(a.parameters(), b.parameters())), acc_a == acc_b)   # True True
+accs = torch.tensor([trained(s)[1] for s in range(5)])
+print([round(v, 3) for v in accs.tolist()], round(accs.mean().item(), 4), round(accs.std().item(), 4))
+# [0.978, 0.974, 0.97, 0.978, 0.972] 0.9744 0.0033
+
+# 6. experiment tracking: one record per epoch, plus the configuration, written as JSON lines
+log = io.StringIO()
+config = {'model': '64-256-256-10', 'optimizer': 'SGD', 'momentum': 0.9, 'lr': 0.1, 'batch': 64, 'epochs': 3, 'seed': 0,
+          'torch': torch.__version__}
+log.write(json.dumps(config) + '\n')
+torch.manual_seed(0)
+run(mlp(), 0.1, 3, log=log)
+print(log.getvalue().splitlines()[-1])
+# {"epoch": 3, "train_loss": 0.191, "val_loss": 0.2266, "val_acc": 0.9315}
+
+# 7. the compute budget: FLOPs of one batch of 64, counted by PyTorch, against 2N and 6N per example
+torch.manual_seed(0)
+net = mlp()
+N = sum(p.numel() for p in net.parameters() if p.dim() > 1)      # weights of the matrix products
+xb, yb = Xtr[:64], ytr[:64]
+with FlopCounterMode(display=False) as fc:
+    net(xb)
+forward = fc.get_total_flops()
+with FlopCounterMode(display=False) as fc:
+    F.cross_entropy(net(xb), yb).backward()
+step = fc.get_total_flops()
+print(N, forward / (64 * N), round(step / (64 * N), 3), f'{6 * N * len(Xtr) * 60:.3g}')   # FLOPs of 60 epochs by 6NDE
+# 84480 2.0 5.612 3.82e+10
+```
+
+## The course in one paragraph
+
+Deep learning trains one loop, batch, forward, loss, backward, step, on networks that learn their own features ([What deep learning is](/notes/deep-learning/deep-learning)), and the course was about making that loop work at scale. The first section made it trainable: [automatic differentiation](/notes/deep-learning/pytorch-and-autograd) computes every gradient, [losses](/notes/deep-learning/losses-and-regularization) computed from logits say what is wanted and regularizers keep a network that can memorize everything from doing so, [initialization and normalization](/notes/deep-learning/normalization-and-initialization) keep signals at a usable scale through many layers, and [optimizers with schedules](/notes/deep-learning/optimizing-deep-networks) take the steps. The second section built the architecture of vision: a [convolution](/notes/deep-learning/convolution) shares its weights across positions, [residual connections](/notes/deep-learning/cnn-architectures) made depth trainable, and the same backbones [find objects](/notes/deep-learning/object-detection) and [label every pixel](/notes/deep-learning/semantic-segmentation). The third learned features [without labels](/notes/deep-learning/self-supervised-learning) and replaced convolution by attention over [image patches](/notes/deep-learning/vision-transformers). The fourth looked at trained networks from outside: they are fragile against [adversarial inputs](/notes/deep-learning/adversarial-examples) and robust only at a price, they can be made [much smaller](/notes/deep-learning/model-compression) once trained, and this note's recipe makes training them a controlled process rather than luck. The two courses that build on this one use the same loop on other data. The [NLP course](/notes/nlp/natural-language-processing) develops the [attention](/notes/nlp/attention) and the [Transformer](/notes/nlp/transformers) that Vision Transformers borrowed, on text, up to large language models. The [Generative Models course](/notes/generative-models/generative-modeling) trains networks that produce images, sound and text instead of labels, from [autoencoders](/notes/generative-models/autoencoders) and [GANs](/notes/generative-models/gans) to [diffusion in a latent space](/notes/generative-models/latent-diffusion).
+
+## References
+
+- A. Karpathy. [A recipe for training neural networks](https://karpathy.github.io/2019/04/25/recipe/). Blog post, 2019.
+- L. N. Smith. [Cyclical learning rates for training neural networks](https://arxiv.org/abs/1506.01186). WACV, 2017. Section 3.3 (the learning-rate range test).
+- J. Howard, S. Gugger. [Fastai: a layered API for deep learning](https://arxiv.org/abs/2002.04688). *Information*, 11(2):108, 2020. The learning-rate finder.
+- J. Bergstra, Y. Bengio. [Random search for hyper-parameter optimization](https://jmlr.org/papers/v13/bergstra12a.html). *Journal of Machine Learning Research*, 13:281–305, 2012.
+- X. Bouthillier et al. [Accounting for variance in machine learning benchmarks](https://arxiv.org/abs/2103.03098). MLSys, 2021.
+- J. Kaplan et al. [Scaling laws for neural language models](https://arxiv.org/abs/2001.08361). arXiv, 2020. Sections 1.3 and 2.1 (the compute estimates $C \approx 6NBS$ and $6N$ per token).
+- PyTorch documentation. [Reproducibility](https://docs.pytorch.org/docs/stable/notes/randomness.html).
+- I. Goodfellow, Y. Bengio, A. Courville. [*Deep Learning*](https://www.deeplearningbook.org/). MIT Press, 2016. Chapter 11 (practical methodology: baselines, hyperparameter selection, debugging strategies).
+- A. Zhang, Z. C. Lipton, M. Li, A. J. Smola. [*Dive into Deep Learning*](https://d2l.ai/). Cambridge University Press, 2023. Chapter 19 (hyperparameter optimization: random search, successive halving).
+- S. J. D. Prince. [*Understanding Deep Learning*](https://udlbook.github.io/udlbook/). MIT Press, 2023. Chapter 8 (measuring performance), section 8.5 (choosing hyperparameters).
+- *Глубинное обучение 1* (Deep Learning 1), Faculty of Computer Science, HSE University. Course materials, [repository xiyori/intro-to-dl-hse, branch 2025-2026](https://github.com/xiyori/intro-to-dl-hse/tree/2025-2026). The scope and order of this course follow it; the text here is independent.

@@ -1,0 +1,352 @@
+---
+title: Losses and regularization
+description: "Which loss to train with and how its gradient behaves, why cross-entropy must be computed from logits through a stable log-softmax, label smoothing, how deep networks memorize, and how weight decay, dropout, early stopping and augmentation narrow the gap between training and validation."
+course: deep-learning
+section: Training Neural Networks
+order: 2
+status: published
+tags: [loss-functions, cross-entropy, log-softmax, numerical-stability, huber-loss, label-smoothing, overfitting, weight-decay, dropout, early-stopping, data-augmentation]
+prerequisites: [PyTorch and automatic differentiation, Logistic regression, Regularization]
+---
+
+import RegressionLosses from '../../../components/figures/losses-and-regularization/RegressionLosses.astro';
+import LogSoftmaxStability from '../../../components/figures/losses-and-regularization/LogSoftmaxStability.astro';
+import LabelSmoothingLoss from '../../../components/figures/losses-and-regularization/LabelSmoothingLoss.astro';
+import InvertedDropout from '../../../components/figures/losses-and-regularization/InvertedDropout.astro';
+import RegularizationGap from '../../../components/figures/losses-and-regularization/RegularizationGap.astro';
+
+The [previous note](/notes/deep-learning/pytorch-and-autograd) built a training pipeline and used cross-entropy in it without asking why. Two parts of that pipeline decide what the network actually learns. The **loss** says what counts as a good prediction, and through its gradient it decides how hard each example pulls on the weights. **Regularization** decides what happens once the network can fit its training set exactly, which a deep network almost always can: whether it then fits the signal or memorizes the noise. This note covers both: losses for regression and classification and how their gradients behave, the numerically stable way to compute cross-entropy, label smoothing, and the four standard regularizers of deep networks, ending with an experiment in which they close the gap between training and validation accuracy.
+
+**Notation.** For one example, $f(x)$ is the network's output; for regression the residual is $r = f(x) - y$. For classification into $K$ classes the network outputs **logits** $z \in \mathbb R^K$, the softmax turns them into probabilities $p_k = e^{z_k} / \sum_j e^{z_j}$, and $e_y$ is the one-hot vector of the true class $y$. $\theta$ are the parameters, $\eta$ the learning rate, $\lambda$ a weight-decay coefficient, $p$ the dropout probability and $\varepsilon$ the label-smoothing coefficient.
+
+## Baseline: the loss is a negative log-likelihood
+
+The choice of loss was made in the Machine Learning course, and it carries over unchanged. The network outputs the parameters of a distribution for $y$, and the loss is the negative log-likelihood of the observed $y$ under it ([output layers and losses](/notes/ml/neural-networks#output-layers-and-losses)): a Gaussian mean gives the squared error, a Bernoulli logit the [binary cross-entropy of logistic regression](/notes/ml/logistic-regression#maximum-likelihood-gives-the-log-loss), $K$ logits the softmax cross-entropy. Why a smooth surrogate replaces the error count is in the [linear classifiers note](/notes/ml/linear-classifiers#surrogate-losses-upper-bounds-that-can-be-minimized). This note does not repeat those derivations. It asks the questions that matter once the loss drives a deep network through millions of gradient steps: how the gradient of each loss behaves, how to compute it without overflow, and how to keep the network from fitting its training set too well.
+
+## Regression: what a large residual costs
+
+Three losses are common, written per example in terms of the residual $r$:
+
+$$
+\ell_{\text{sq}}(r) = r^2, \qquad
+\ell_{\text{abs}}(r) = \lvert r \rvert, \qquad
+\ell_{\delta}(r) = \begin{cases} \tfrac12 r^2, & \lvert r \rvert \le \delta, \\ \delta\big(\lvert r \rvert - \tfrac12\delta\big), & \lvert r \rvert > \delta . \end{cases}
+$$
+
+The last is the **Huber loss** with threshold $\delta$. Backpropagation starts from their derivatives with respect to the prediction:
+
+$$
+\ell_{\text{sq}}'(r) = 2r, \qquad
+\ell_{\text{abs}}'(r) = \operatorname{sign}(r), \qquad
+\ell_{\delta}'(r) = \operatorname{clip}(r, -\delta, \delta) .
+$$
+
+The squared error pulls in proportion to the residual, the absolute error with a constant force, and the Huber loss like the squared error near zero and like the absolute error beyond $\delta$. In a deep network the size of this first factor matters twice: it decides how much each example contributes to the step, and a single huge residual can produce a gradient large enough to throw every layer off at once.
+
+**Worked example.** A batch with residuals $r = (0.5, -2, 10)$, the last one an outlier. Averaged over the batch, the squared error is $(0.25 + 4 + 100)/3 = 34.75$, the absolute error $(0.5 + 2 + 10)/3 = 4.167$ and the Huber loss with $\delta = 1$ is $(0.125 + 1.5 + 9.5)/3 = 3.708$. The per-example derivatives are $(1, -4, 20)$, $(1, -1, 1)$ and $(0.5, -1, 1)$. Under the squared error the outlier supplies $20$ of the total $25$ in absolute value, 80% of the push on the weights; under Huber it supplies $1$ of $2.5$.
+
+<RegressionLosses />
+
+Which loss is right depends on the noise, as the [least-squares note](/notes/ml/least-squares#squared-error-and-outliers) explains: squared error estimates a conditional mean and is optimal for Gaussian noise, absolute error a median, and Huber is a compromise that stays efficient on clean data and caps the influence of outliers in $y$. In PyTorch they are `nn.MSELoss`, `nn.L1Loss` and `nn.HuberLoss(delta)`; `nn.SmoothL1Loss(beta)` is the Huber loss divided by $\delta = \beta$, the form used for box coordinates in [Object detection](/notes/deep-learning/object-detection).
+
+## Classification: cross-entropy from logits
+
+For $K$ classes the loss is the negative log-probability of the true class,
+
+$$
+\ell(z, y) = -\log p_y = -z_y + \log \sum_{j=1}^K e^{z_j}, \qquad \frac{\partial \ell}{\partial z} = p - e_y ,
+$$
+
+with the gradient derived in the [backpropagation note](/notes/ml/backpropagation#a-two-layer-network-forward-and-backward). Each logit's gradient lies between $-1$ and $1$, whatever the logits are: unlike the squared error, cross-entropy cannot produce an exploding first factor. What it can produce is an overflow, if it is computed in the obvious way.
+
+### Why log-softmax is numerically stable
+
+The obvious way computes the probabilities first, $p = \exp(z) / \sum_j \exp(z_j)$, and then takes $-\log p_y$. Both steps fail in floating point. The exponential overflows: in 32-bit arithmetic the largest number is about $3.4 \cdot 10^{38} = e^{88.72}$, so any logit above $88.7$ gives $e^{z} = \infty$ and the ratio $\infty / \infty$ is not a number. And the probability underflows: a class whose logit lies far below the largest one gets $p_k = 0$, and $\log 0 = -\infty$.
+
+The trick is to never form $p$. Subtract the largest logit $m = \max_j z_j$ before exponentiating, and stay in log space:
+
+$$
+\boxed{\; \log p_k = z_k - m - \log \sum_{j=1}^K e^{z_j - m} \;}
+$$
+
+Why this is the same quantity, and why it is safe:
+
+$$
+\begin{aligned}
+\log p_k &= z_k - \log \sum_j e^{z_j} \\
+&= z_k - \log \Big( e^{m} \sum_j e^{z_j - m} \Big) \\
+&= z_k - m - \log \sum_j e^{z_j - m} .
+\end{aligned}
+$$
+
+The first line is the definition of the softmax with the logarithm taken. The second factors $e^m$ out of every term of the sum, which changes nothing. The third uses $\log(e^m s) = m + \log s$. Now every exponent $z_j - m$ is at most 0, so no exponential overflows; the term with $z_j = m$ contributes exactly 1, so the sum lies between 1 and $K$ and its logarithm between 0 and $\log K$, never $\log 0$. Very negative exponents may still underflow to 0, but they are added to a sum that is at least 1, where they would not have counted anyway. This is `F.log_softmax`, and `F.cross_entropy` and `nn.CrossEntropyLoss` apply it to raw logits internally.
+
+**Worked example in 32-bit arithmetic.** Take the logits $z = (100, 0, -20)$ with true class 3. The exact loss is $-\log p_3 = 20 + 100 + \log(1 + e^{-100} + e^{-120}) = 120$ to many digits.
+
+- **Exponentiate, normalize, log.** $e^{100} \approx 2.7 \cdot 10^{43}$ overflows to $\infty$, and $p = (\text{nan}, 0, 0)$.
+- **Shift, then normalize, then log.** $z - m = (0, -100, -120)$. Now $e^{-100} \approx 3.7 \cdot 10^{-44}$ is below the smallest normal 32-bit number ($2^{-126} = e^{-87.34}$) and survives only as a **subnormal** number with a few significant bits, and $e^{-120}$ is below even the smallest subnormal, $2^{-149} = e^{-103.28}$, so it becomes 0. The logarithms of the probabilities come out as $(0, -99.983, -\infty)$: the middle one is off by $0.017$, and the loss for class 3 is infinite. Its gradient is not a number in all three coordinates.
+- **Log-softmax.** $(0, -100, -120)$ exactly as printed in 32-bit, loss $120$, gradient $p - e_3 = (1, 0, -1)$.
+
+<LogSoftmaxStability />
+
+The rule that follows: pass logits, not probabilities, to the loss. A model that ends with `nn.Softmax` followed by `torch.log` and `nn.NLLLoss` is correct in exact arithmetic and fails on confident predictions. The same holds for two classes, where `BCEWithLogitsLoss` is the stable form of a sigmoid followed by `BCELoss`.
+
+## Label smoothing
+
+Cross-entropy with a one-hot target is never satisfied. Its minimum, 0, is reached only at $p_y = 1$, that is, at an infinite gap between the true logit and the others, so on a training set the network can fit perfectly it keeps growing its logits for as long as it trains. **Label smoothing** ([Szegedy et al., 2016](#references), section 7) replaces the one-hot target by a mixture with the uniform distribution,
+
+$$
+q = (1 - \varepsilon)\, e_y + \frac{\varepsilon}{K}\, \mathbf 1, \qquad
+\ell_\varepsilon(z, y) = -\sum_{k=1}^K q_k \log p_k = (1 - \varepsilon)\, \ell(z, y) + \varepsilon \cdot \frac1K \sum_{k=1}^K \big(-\log p_k\big) .
+$$
+
+The second form reads as the usual loss plus a penalty, with weight $\varepsilon$, on the average negative log-probability over all classes, which grows when any class is pushed to probability 0. The gradient becomes $p - q$, which vanishes at $p = q$: the target is now reachable, at a finite gap.
+
+**Worked example.** With $K = 10$ and $\varepsilon = 0.1$ the target puts $q_y = 0.9 + 0.01 = 0.91$ on the true class and $0.01$ on each of the other nine. If the true logit is $g$ and the others are 0, then $p_y = e^g/(e^g + 9)$, each other $p_k = 1/(e^g + 9)$, and the loss is
+
+$$
+\ell_\varepsilon(g) = \log\big(e^g + 9\big) - 0.91\, g .
+$$
+
+Its derivative $e^g/(e^g + 9) - 0.91$ vanishes at $e^g = 91$, so the best gap is $g^* = \log 91 = 4.511$, where $p = q$ and the loss equals the entropy of $q$, $0.500$. Past the optimum the loss grows again, with slope approaching $1 - 0.91 = 0.09$: at $g = 8$ it is $0.723$ and at $g = 16$ it is $1.44$, while the plain cross-entropy at those gaps is $0.003$ and $0.000$.
+
+<LabelSmoothingLoss />
+
+With $\varepsilon = 0.1$ on ImageNet's 1000 classes, label smoothing lowered the top-1 and top-5 errors of an Inception network by about 0.2 percentage points each ([Szegedy et al., 2016](#references), section 7 and Table 3), and the original Transformer used it with $\varepsilon = 0.1$ ([Vaswani et al., 2017](#references), section 5.4). It also tends to make predicted probabilities better calibrated, but a teacher network trained with it transfers less to a student by distillation ([Müller, Kornblith and Hinton, 2019](#references)), which matters in [Model compression](/notes/deep-learning/model-compression). In PyTorch it is the `label_smoothing` argument of `nn.CrossEntropyLoss`, with the same $q$ as above.
+
+## Overfitting in deep networks
+
+The Machine Learning course defined [overfitting](/notes/ml/validation-and-overfitting#overfitting-and-underfitting) as a model fitting its training data, noise included, at the expense of new data. Deep networks push this to the extreme. [Zhang et al. (2017)](#references) trained standard image classifiers with the labels replaced by random ones. On CIFAR-10 the networks reached zero training error anyway, with training slowed only by a small constant factor, and on ImageNet an Inception network fitted a million random labels to 95.2% training accuracy; test accuracy was, of course, at chance (section 2.1). With only part of the labels corrupted, the networks still fitted the training set perfectly, and the test error grew with the fraction of corrupted labels. Their capacity is enough to memorize a whole dataset, so the training error alone says nothing about what a network has learned. Explicit regularization helped generalization in their experiments but was "neither necessary nor by itself sufficient" to control it (sections 1.1 and 3).
+
+**Worked example.** The network $64 \to 256 \to 256 \to 10$ of the Code section, trained on 300 bundled digit images whose labels are all drawn at random, reaches training accuracy $1.000$ and validation accuracy $0.124$, close to the $0.1$ of guessing. With the true labels, except that 58 of the 300 were redrawn at random so that 55 are now wrong, the same network again fits all 300 training labels, including all 55 wrong ones, and classifies $0.807$ of 1497 clean validation images correctly. The difference between training and validation accuracy, the **generalization gap**, is $0.193$, and the validation loss, $0.914$, is far above the training loss, $0.005$.
+
+## Regularization
+
+<aside class="callout"><strong>Key idea.</strong> A regularizer makes the training set harder to fit exactly: it penalizes large weights, adds noise to the forward pass, stops training early, or multiplies the data by transformations that do not change the label. It accepts a worse training loss in exchange for a smaller gap, and its strength is chosen on validation data, never on the training loss.</aside>
+
+The [Training deep networks](/notes/ml/training-deep-networks) note of the Machine Learning course derives the main regularizers; here they are as they appear in a PyTorch training loop, with what each one does to the step.
+
+### Weight decay
+
+Adding $\tfrac\lambda2 \lVert\theta\rVert^2$ to the loss adds $\lambda\theta$ to the gradient, and a gradient step becomes
+
+$$
+\theta \leftarrow (1 - \eta\lambda)\, \theta - \eta\, \nabla_\theta L .
+$$
+
+Before the usual step, every weight is multiplied by $1 - \eta\lambda$, hence the name **weight decay**. A weight that the data do not support shrinks geometrically towards 0; one the data need is held up by its gradient. This is the [ridge penalty](/notes/ml/regularization) of linear models, applied to every layer. **Worked example.** With $\eta = 0.1$ and $\lambda = 0.01$, each step multiplies a weight by $0.999$; a weight with zero gradient falls from 1 to $0.999^{1000} = 0.368$ in 1000 steps. AlexNet used $\lambda = 0.0005$ with momentum 0.9, and its authors found that this small decay lowered even the training error ([Krizhevsky, Sutskever and Hinton, 2012](#references), section 5).
+
+In PyTorch it is the `weight_decay` argument of the optimizer. For SGD it adds $\lambda\theta$ to the gradient, which is the formula above. For Adam it does the same, but Adam then divides the whole gradient by a per-weight scale, so weights with large gradients are decayed less; `AdamW` applies the decay outside the adaptive step instead, so that every weight shrinks by the same factor $1 - \eta\lambda$ ([Loshchilov and Hutter, 2019](#references)). The [Machine Learning course](/notes/ml/training-deep-networks#weight-decay-is-not-an-l2-penalty-under-adam) works out the difference, and [Optimizing deep networks](/notes/deep-learning/optimizing-deep-networks) returns to it with the other optimizers. Biases and the scales of normalization layers are usually excluded from decay.
+
+### Dropout
+
+**Dropout** ([Srivastava et al., 2014](#references)) adds noise to the forward pass during training. Each unit of a layer is zeroed with probability $p$, independently for every example and every step, and the survivors are scaled up:
+
+$$
+\tilde h_j = \frac{m_j}{1 - p}\, h_j, \qquad m_j \sim \operatorname{Bernoulli}(1 - p) .
+$$
+
+The scaling, called **inverted** dropout, keeps the expectation: $E[\tilde h_j] = \frac{(1 - p)\, h_j}{1 - p} = h_j$. At test time dropout is switched off and the layer passes $h$ unchanged, so the next layer sees inputs of the same average size in training and at test. The original paper instead kept units with probability $p$, did not scale during training, and multiplied the weights by $p$ at test time; the two forms are equivalent in expectation, and PyTorch's `nn.Dropout(p)` uses the inverted form with $p$ the probability of dropping.
+
+**Worked example.** For $h = (2, 0.5, 1, 3)$ and $p = 0.5$, the mask $m = (1, 0, 1, 0)$ gives $\tilde h = (4, 0, 2, 0)$: the surviving units are doubled. Averaged over 100,000 masks, $\tilde h$ comes out as $(2.00, 0.50, 1.00, 2.99)$, equal to $h$ up to sampling noise. In evaluation mode the layer returns $(2, 0.5, 1, 3)$.
+
+<InvertedDropout />
+
+1. Draw a mask: each unit is kept with probability $1 - p = 0.5$, independently.
+2. Multiply: dropped units become 0.
+3. Rescale the survivors by $1/(1 - p) = 2$, so that each unit keeps its expected value.
+4. At test time (`model.eval()`), skip all three: the layer is the identity.
+
+Why the noise helps: a unit cannot rely on any particular other unit being present, so the network cannot build fragile co-adaptations that only fit the training set. The Machine Learning course shows two exact readings of it, as training an ensemble of $2^N$ thinned networks that share weights and, for a linear model, as an L2 penalty scaled by the size of each input ([dropout](/notes/ml/training-deep-networks#dropout)). Typical rates are $p = 0.5$ on large fully connected layers, as in AlexNet, and $p = 0.1$ in Transformers.
+
+### Early stopping
+
+Training longer lowers the training loss but, once the network starts fitting noise, raises the validation loss. **Early stopping** evaluates on validation data after each epoch, keeps the parameters with the lowest validation loss, and stops when it has not improved for a set number of epochs. It costs nothing but the evaluation, and the number of steps acts like an L2 penalty that weakens as training goes on; the [Machine Learning course](/notes/ml/training-deep-networks#learning-rate-schedules-warm-up-and-early-stopping) states the correspondence and shows it on noisy digits. Since the validation set is then used to choose, the final accuracy must be measured on a separate test set.
+
+### Data augmentation
+
+When some transformations $\tau$ of the input do not change its label, such as small shifts, crops, flips and colour changes of a photograph, train on transformed copies. Each epoch the network sees a fresh random $\tau(x_i)$, and the training loss becomes an average over transformations,
+
+$$
+\frac1n \sum_{i=1}^n E_{\tau}\, \ell\big(f_\theta(\tau(x_i)), y_i\big),
+$$
+
+which the network cannot drive to zero by memorizing $n$ fixed inputs. Augmentation is regularization by prior knowledge: the transformations encode what the label does not depend on, and a wrong transformation, such as a flip that turns a "b" into a "d", teaches the wrong invariance. AlexNet trained on random $224 \times 224$ crops of $256 \times 256$ images and their mirror images ([Krizhevsky, Sutskever and Hinton, 2012](#references), section 4.1); the [Machine Learning course](/notes/ml/training-deep-networks#data-augmentation) measures what one-pixel shifts do for digits, and [Self-supervised learning](/notes/deep-learning/self-supervised-learning) turns augmentations into the training signal itself.
+
+## An experiment: narrowing the gap
+
+The setting is the one of the worked example: 300 training digits with 58 labels redrawn at random (55 of them now wrong), 1497 validation digits with clean labels, a network $64 \to 256 \to 256 \to 10$ trained with AdamW at learning rate $10^{-3}$, batches of 32, for 200 epochs, and four configurations. Weight decay uses $\lambda = 1$ in AdamW, a shrinkage of $\eta\lambda = 10^{-3}$ per step, and dropout uses $p = 0.5$ after both hidden layers. Each row averages three seeds:
+
+| configuration | training accuracy | validation accuracy | gap | training loss | validation loss | wrong labels fitted |
+| --- | --- | --- | --- | --- | --- | --- |
+| none | 1.000 | 0.807 | 0.193 | 0.005 | 0.914 | 1.000 |
+| weight decay | 0.979 | 0.842 | 0.137 | 0.161 | 0.570 | 0.885 |
+| dropout | 0.989 | 0.843 | 0.146 | 0.049 | 0.579 | 0.939 |
+| both | 0.887 | 0.881 | 0.006 | 0.384 | 0.501 | 0.400 |
+
+Training accuracy is measured against the noisy labels the network was trained on, and "wrong labels fitted" is the fraction of the 55 wrong training labels that the network reproduces. Without regularization it reproduces all of them. Each regularizer alone lowers the training accuracy a little, memorizes fewer wrong labels and raises the validation accuracy by about 3.5 points. Together they stop most of the memorization: the network reproduces only 40% of the wrong labels, the gap all but closes, and validation accuracy rises to $0.881$. The validation loss falls from $0.914$ to $0.501$.
+
+<RegularizationGap />
+
+Two cautions on reading the table. The strengths were chosen from a coarse grid ($\lambda \in \{0.1, 1\}$, $p = 0.5$) on this same validation set, so the validation numbers are slightly optimistic; an unbiased estimate would need a separate test set. And a closed gap is not the goal in itself: the goal is the validation accuracy, and a heavily regularized model can have no gap and be poor on both sets.
+
+## What changed
+
+| | Plain training | With the tools of this note |
+| --- | --- | --- |
+| Regression loss | squared error, gradient grows with the residual | Huber when outliers are expected, gradient capped at $\delta$ |
+| Classification loss | softmax, then log | log-softmax on logits: no overflow, finite gradients |
+| Target | one-hot, logits grow without bound | smoothed, optimal gap $\log\frac{1 - \varepsilon + \varepsilon/K}{\varepsilon/K}$ |
+| Noisy labels | memorized (55 of 55 here) | 40% memorized with weight decay and dropout |
+| Validation accuracy here | 0.807 | 0.881 |
+
+## Limitations
+
+- **Losses encode assumptions.** Squared error assumes light-tailed noise; cross-entropy assumes the labels are right. With systematically wrong labels, no loss recovers the truth.
+- **Stable formulas only where they are used.** Log-softmax protects the loss; a softmax computed elsewhere in the model, for example for attention weights, needs the same max-subtraction, which library functions do but hand-written code may not.
+- **Label smoothing changes the logits.** Smoothed models are less useful as teachers for distillation, and their probabilities are shrunk towards uniform by design.
+- **Regularization strengths are hyperparameters.** They are chosen on validation data, they interact (weight decay with the learning rate and the optimizer, dropout with batch normalization), and the best values change with the size of the data.
+- **Memorization is not explained by these tools.** Networks trained without any explicit regularization often generalize well; why is still an open question, and the experiment above shows only that the tools help when labels are noisy and data are few.
+
+## What you should remember
+
+- The loss is the negative log-likelihood of an output distribution; its derivative with respect to the prediction is the first factor of every gradient: $2r$, $\operatorname{sign}(r)$ or $\operatorname{clip}(r, -\delta, \delta)$ for regression, $p - e_y$ for cross-entropy.
+- Compute cross-entropy from logits: $\log p_k = z_k - m - \log\sum_j e^{z_j - m}$. In 32-bit arithmetic $e^{z}$ overflows above $z \approx 88.7$ and $p$ rounds to 0 below $e^{-103.97}$.
+- Label smoothing with $\varepsilon$ replaces $e_y$ by $(1 - \varepsilon) e_y + \varepsilon/K$; the optimal logit gap becomes finite, $\log 91 = 4.51$ for $K = 10$, $\varepsilon = 0.1$.
+- Deep networks can memorize random labels; training accuracy alone says nothing.
+- Weight decay multiplies weights by $1 - \eta\lambda$ per step (use AdamW with Adam); dropout zeroes units with probability $p$ and scales survivors by $1/(1 - p)$, only in training mode; early stopping and augmentation regularize through time and data.
+- On noisy digits, weight decay and dropout together cut memorized wrong labels from 100% to 40% and raise validation accuracy from 0.807 to 0.881.
+
+## Code
+
+Regression losses and their gradients, cross-entropy in 32-bit arithmetic, label smoothing, inverted dropout, weight decay as shrinkage, and the experiment of the last section. Seeds are fixed; exact numbers can differ slightly across platforms and library versions. The script runs in about 20 seconds on a laptop CPU, almost all of it in the experiment.
+
+```python
+import math, numpy as np, torch
+from torch import nn
+import torch.nn.functional as F
+from sklearn.datasets import load_digits
+from sklearn.model_selection import train_test_split
+
+# 1. regression losses on the residuals (0.5, -2, 10): value and gradient with respect to each prediction
+r = torch.tensor([0.5, -2.0, 10.0], requires_grad=True)
+for name, loss_fn in [('squared', nn.MSELoss()), ('absolute', nn.L1Loss()), ('Huber', nn.HuberLoss(delta=1.0))]:
+    r.grad = None
+    loss = loss_fn(r, torch.zeros(3))
+    loss.backward()
+    print(name, round(loss.item(), 4), (r.grad * 3).tolist())   # gradient times n = 3: per example
+# squared 34.75 [1.0, -4.0, 20.0] | absolute 4.1667 [1.0, -1.0, 1.0] | Huber 3.7083 [0.5, -1.0, 1.0]
+
+# 2. cross-entropy from logits in float32: z = (100, 0, -20)
+z = torch.tensor([100.0, 0.0, -20.0])
+naive = torch.exp(z) / torch.exp(z).sum()
+shifted = torch.exp(z - z.max()) / torch.exp(z - z.max()).sum()
+r3 = lambda v: [round(x, 3) for x in v.tolist()]
+print(r3(naive), r3(torch.log(shifted)), r3(F.log_softmax(z, dim=0)))
+# [nan, 0.0, 0.0] [0.0, -99.983, -inf] [0.0, -100.0, -120.0]
+for name, f in [('log of softmax', lambda t: -torch.log(torch.softmax(t, 0))[2]),
+                ('cross_entropy', lambda t: F.cross_entropy(t[None], torch.tensor([2])))]:
+    t = z.clone().requires_grad_()
+    loss = f(t)
+    loss.backward()
+    print(name, loss.item(), r3(t.grad))
+# log of softmax inf [nan, nan, nan] | cross_entropy 120.0 [1.0, 0.0, -1.0]
+
+# 3. label smoothing, K = 10, eps = 0.1: the best logit gap is log(0.91 / 0.01) = log 91, and the loss there is H(q)
+K, eps = 10, 0.1
+q = torch.full((K,), eps / K); q[0] += 1 - eps
+gap = math.log(q[0].item() / q[1].item())
+best = torch.zeros(K); best[0] = gap
+best.requires_grad_()
+loss = F.cross_entropy(best[None], torch.tensor([0]), label_smoothing=eps)
+loss.backward()
+print(round(gap, 3), round(loss.item(), 4), round(-(q * q.log()).sum().item(), 4), round(best.grad.abs().max().item(), 6))
+# 4.511 0.5003 0.5003 0.0
+for g in (2.0, 4.511, 8.0, 16.0):
+    zz = torch.zeros(1, K); zz[0, 0] = g
+    print(g, round(F.cross_entropy(zz, torch.tensor([0])).item(), 4), round(F.cross_entropy(zz, torch.tensor([0]), label_smoothing=eps).item(), 4))
+# 2.0 0.7966 0.9766 | 4.511 0.0943 0.5003 | 8.0 0.003 0.723 | 16.0 0.0 1.44   (gap, plain, smoothed)
+
+# 4. inverted dropout on h = (2, 0.5, 1, 3) with p = 0.5: one mask, then the average of 100,000 masks
+torch.manual_seed(4)
+h = torch.tensor([2.0, 0.5, 1.0, 3.0])
+drop = nn.Dropout(p=0.5)
+print(drop(h).tolist(), [round(v, 2) for v in drop(h.repeat(100_000, 1)).mean(0).tolist()])
+# [4.0, 0.0, 2.0, 0.0] [2.0, 0.5, 1.0, 2.99]
+drop.eval()
+print(drop(h).tolist())                                            # [2.0, 0.5, 1.0, 3.0]
+
+# 5. weight decay as shrinkage: SGD with weight_decay multiplies a weight with zero loss gradient by (1 - lr * wd) per step
+w = nn.Parameter(torch.tensor([1.0]))
+opt = torch.optim.SGD([w], lr=0.1, weight_decay=0.01)
+for _ in range(1000):
+    opt.zero_grad()
+    (w * 0).sum().backward()
+    opt.step()
+print(round(w.item(), 4), round(0.999 ** 1000, 4))               # 0.3677 0.3677
+
+# 6. overfitting and regularization on digits: 300 training images, 20% of their labels replaced at random,
+#    1497 validation images with clean labels; a 64 -> 256 -> 256 -> 10 network, AdamW, 200 epochs, 3 seeds
+X, y = load_digits(return_X_y=True)
+Xtr, Xva, ytr, yva = train_test_split(X / 16.0, y, train_size=300, random_state=0, stratify=y)
+Xtr, Xva, ytr, yva = (torch.tensor(Xtr, dtype=torch.float32), torch.tensor(Xva, dtype=torch.float32),
+                      torch.tensor(ytr), torch.tensor(yva))
+rng = np.random.default_rng(0)
+noisy = ytr.clone()
+flip = torch.tensor(rng.random(300) < 0.2)
+noisy[flip] = torch.tensor(rng.integers(0, 10, int(flip.sum())))
+wrong = noisy != ytr
+print(int(flip.sum()), int(wrong.sum()))   # 58 55: 58 labels redrawn, 55 of them now wrong
+
+def run(labels, p, wd, seed):
+    torch.manual_seed(seed)
+    model = nn.Sequential(nn.Linear(64, 256), nn.ReLU(), nn.Dropout(p),
+                          nn.Linear(256, 256), nn.ReLU(), nn.Dropout(p), nn.Linear(256, 10))
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=wd)
+    loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(Xtr, labels), batch_size=32, shuffle=True)
+    model.train()
+    for epoch in range(200):
+        for xb, yb in loader:
+            opt.zero_grad()
+            F.cross_entropy(model(xb), yb).backward()
+            opt.step()
+    model.eval()
+    with torch.no_grad():
+        ztr, zva = model(Xtr), model(Xva)
+    return np.array([(ztr.argmax(1) == labels).float().mean(), (zva.argmax(1) == yva).float().mean(),
+                     F.cross_entropy(ztr, labels), F.cross_entropy(zva, yva),
+                     (ztr.argmax(1)[wrong] == noisy[wrong]).float().mean()])
+
+# random labels: memorized all the same
+rand = torch.tensor(rng.integers(0, 10, 300))
+print(run(rand, 0.0, 0.0, 0)[:2].round(3))   # [1.    0.124]: training and validation accuracy
+print('             train acc  val acc  gap   train loss  val loss  wrong labels fitted')
+for name, p, wd in [('none', 0.0, 0.0), ('weight decay', 0.0, 1.0), ('dropout', 0.5, 0.0), ('both', 0.5, 1.0)]:
+    m = np.mean([run(noisy, p, wd, s) for s in range(3)], axis=0)
+    print(f'{name:12} {m[0]:9.3f} {m[1]:8.3f} {m[0] - m[1]:5.3f} {m[2]:11.3f} {m[3]:9.3f} {m[4]:9.3f}')
+#              train acc  val acc  gap   train loss  val loss  wrong labels fitted
+# none             1.000    0.807 0.193       0.005     0.914     1.000
+# weight decay     0.979    0.842 0.137       0.161     0.570     0.885
+# dropout          0.989    0.843 0.146       0.049     0.579     0.939
+# both             0.887    0.881 0.006       0.384     0.501     0.400
+```
+
+## Next
+
+The experiment trained a network of three layers. Deeper networks run into a problem that no loss or regularizer fixes: the scale of the signals and of the gradients changes from layer to layer, so that after a few dozen layers activations explode or vanish before training even starts. The [next note](/notes/deep-learning/normalization-and-initialization) shows how to choose the initial weights so that the scale is preserved, and how normalization layers keep it under control during training.
+
+## References
+
+- C. Szegedy, V. Vanhoucke, S. Ioffe, J. Shlens, Z. Wojna. [Rethinking the Inception architecture for computer vision](https://arxiv.org/abs/1512.00567). CVPR, 2016. Section 7 (label smoothing), Table 3.
+- R. Müller, S. Kornblith, G. Hinton. [When does label smoothing help?](https://arxiv.org/abs/1906.02629) NeurIPS, 2019.
+- A. Vaswani et al. [Attention is all you need](https://arxiv.org/abs/1706.03762). NeurIPS, 2017. Section 5.4 (label smoothing).
+- N. Srivastava, G. Hinton, A. Krizhevsky, I. Sutskever, R. Salakhutdinov. [Dropout: a simple way to prevent neural networks from overfitting](https://jmlr.org/papers/v15/srivastava14a.html). *Journal of Machine Learning Research*, 15:1929–1958, 2014.
+- A. Krizhevsky, I. Sutskever, G. E. Hinton. [ImageNet classification with deep convolutional neural networks](https://proceedings.neurips.cc/paper/2012/hash/c399862d3b9d6b76c8436e924a68c45b-Abstract.html). NeurIPS, 2012. Section 4.1 (augmentation), section 4.2 (dropout), section 5 (weight decay).
+- I. Loshchilov, F. Hutter. [Decoupled weight decay regularization](https://arxiv.org/abs/1711.05101). ICLR, 2019.
+- C. Zhang, S. Bengio, M. Hardt, B. Recht, O. Vinyals. [Understanding deep learning requires rethinking generalization](https://arxiv.org/abs/1611.03530). ICLR, 2017. Section 2 (fitting random labels), section 3 (explicit regularization).
+- P. J. Huber. [Robust estimation of a location parameter](https://doi.org/10.1214/aoms/1177703732). *Annals of Mathematical Statistics*, 35(1):73–101, 1964.
+- IEEE. [IEEE standard for floating-point arithmetic](https://doi.org/10.1109/IEEESTD.2019.8766229), IEEE 754-2019. The binary32 format: largest finite number, smallest normal and subnormal numbers.
+- I. Goodfellow, Y. Bengio, A. Courville. [*Deep Learning*](https://www.deeplearningbook.org/). MIT Press, 2016. Section 4.1 (overflow and underflow, the stable softmax), section 6.2.2.3 (softmax units), sections 7.1, 7.4, 7.8 and 7.12 (weight decay, augmentation, early stopping, dropout).
+- A. Zhang, Z. C. Lipton, M. Li, A. J. Smola. [*Dive into Deep Learning*](https://d2l.ai/). Cambridge University Press, 2023. Section 3.7 (weight decay), section 4.5 (softmax revisited: the log-sum-exp trick), section 5.6 (dropout).
+- S. J. D. Prince. [*Understanding Deep Learning*](https://udlbook.github.io/udlbook/). MIT Press, 2023. Chapter 5 (loss functions), chapter 9 (regularization).
+- *Глубинное обучение 1* (Deep Learning 1), Faculty of Computer Science, HSE University. Course materials, [repository xiyori/intro-to-dl-hse, branch 2025-2026](https://github.com/xiyori/intro-to-dl-hse/tree/2025-2026): lecture 2 (the cross-entropy loss, label smoothing, dropout).

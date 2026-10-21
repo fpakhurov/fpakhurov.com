@@ -35,6 +35,8 @@ const background: Record<string, PrerequisiteTarget> = {
   // Neural networks and other machine-learning background: the notes of the ML course.
   'Neural networks': { note: 'ml/neural-networks' },
   'Нейронные сети': { note: 'ml/neural-networks' },
+  'Classification metrics': { note: 'ml/classification-metrics' },
+  'Метрики классификации': { note: 'ml/classification-metrics' },
   'Backpropagation': { note: 'ml/backpropagation' },
   'Обратное распространение ошибки': { note: 'ml/backpropagation' },
   'Python basics': { href: 'https://docs.python.org/3/tutorial/' },
@@ -64,6 +66,8 @@ const background: Record<string, PrerequisiteTarget> = {
   'Markov chain Monte Carlo': { note: 'probability/markov-chain-monte-carlo' },
   'LoRA': { note: 'nlp/peft', anchor: 'lora-a-low-rank-update' },
   'Self-attention': { note: 'nlp/attention' },
+  'Transformer architecture': { note: 'nlp/transformers' },
+  'Архитектура трансформера': { note: 'nlp/transformers' },
   'Марковские методы Монте-Карло (MCMC)': { note: 'probability/markov-chain-monte-carlo' },
   'Метод максимального правдоподобия': { note: 'probability/maximum-likelihood' },
   'Gradient descent': { note: 'ml/gradient-descent' },

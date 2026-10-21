@@ -1,4 +1,4 @@
-export type CourseKey = 'probability' | 'ml' | 'generative-models' | 'nlp' | 'acos';
+export type CourseKey = 'probability' | 'ml' | 'deep-learning' | 'generative-models' | 'nlp' | 'acos';
 
 export type CourseTopic = string | { title: string; note: string; anchor?: string };
 
@@ -321,12 +321,87 @@ export const courses: Record<CourseKey, Course> = {
       ] },
     ],
   },
+  'deep-learning': {
+    title: 'Deep Learning',
+    requires: ['ml'],
+    shortTitle: 'DL',
+    description: 'How to train deep networks that work: automatic differentiation, losses, normalization and optimizers, convolutional networks for vision, self-supervised features and Vision Transformers, robustness and compression. The course the Generative Models and NLP courses build on.',
+    entry: 'Before you start: Machine Learning up to neural networks and backpropagation, and basic Python. Every note ends with a Code section in PyTorch that runs on a laptop CPU in seconds, on synthetic data or small bundled datasets. Sequences, attention and Transformers for text are developed in the NLP course, and GANs, VAEs and diffusion in the Generative Models course; this course links to them instead of repeating them.',
+    guide: [{ label: 'The plan of the course', note: 'deep-learning/deep-learning', anchor: 'the-plan-of-the-course' }, { label: 'The course in one paragraph', note: 'deep-learning/training-in-practice', anchor: 'the-course-in-one-paragraph' }],
+    progression: [
+      { label: 'Training', section: 'Training Neural Networks' },
+      { label: 'CNNs', section: 'Convolutional Networks' },
+      { label: 'Representations', section: 'Representations and Vision Transformers' },
+      { label: 'Robustness', section: 'Robustness and Deployment' },
+    ],
+    ru: {
+      title: 'Глубинное обучение',
+      shortTitle: 'ГО',
+      description: 'Как обучать глубокие сети, которые работают: автоматическое дифференцирование, функции потерь, нормализация и оптимизаторы, свёрточные сети для зрения, обучение с самоконтролем признаков и Vision Transformer, устойчивость и сжатие. Курс, на котором строятся курсы по генеративным моделям и NLP.',
+      entry: 'Что нужно знать: машинное обучение до нейросетей и обратного распространения и основы Python. Каждая заметка заканчивается разделом «Код» на PyTorch, который за секунды запускается на процессоре ноутбука, на синтетических данных или небольших встроенных наборах. Последовательности, внимание и трансформеры для текста разобраны в курсе NLP, а GAN, VAE и диффузия — в курсе по генеративным моделям; этот курс ссылается на них, а не повторяет.',
+      progression: ['Обучение', 'Свёртки', 'Представления', 'Устойчивость'],
+      labels: {
+        'Training Neural Networks': 'Обучение нейронных сетей',
+        'What it takes to train a deep network reliably, from autograd to the optimizer.': 'Что нужно, чтобы надёжно обучить глубокую сеть, от автодифференцирования до оптимизатора.',
+        'Write a PyTorch training loop, choose a loss and regularization, and stabilize training with normalization, initialization and a learning-rate schedule.': 'Писать цикл обучения на PyTorch, выбирать функцию потерь и регуляризацию и стабилизировать обучение нормализацией, инициализацией и расписанием шага.',
+        'What deep learning is': 'Что такое глубинное обучение',
+        'PyTorch and automatic differentiation': 'PyTorch и автоматическое дифференцирование',
+        'Losses and regularization': 'Функции потерь и регуляризация',
+        'Normalization and initialization': 'Нормализация и инициализация',
+        'Optimizing deep networks': 'Оптимизация глубоких сетей',
+        'Convolutional Networks': 'Свёрточные сети',
+        'Networks that share weights across space, and the vision tasks they solve.': 'Сети, которые разделяют веса по пространству, и задачи зрения, которые они решают.',
+        'Compute the shapes, parameters and receptive field of a CNN, explain why residual connections let it go deep, and set up detection and segmentation outputs and metrics.': 'Считать размеры, параметры и рецептивное поле CNN, объяснять, почему остаточные связи позволяют делать её глубокой, и задавать выходы и метрики детекции и сегментации.',
+        'Convolution': 'Свёртка',
+        'Convolutional architectures': 'Свёрточные архитектуры',
+        'Object detection': 'Детекция объектов',
+        'Semantic segmentation': 'Семантическая сегментация',
+        'Representations and Vision Transformers': 'Представления и трансформеры для зрения',
+        'Learning features without labels, and attention applied to images.': 'Обучение признаков без разметки и внимание в применении к изображениям.',
+        'Explain how a contrastive objective learns features without labels and how a Vision Transformer turns an image into tokens.': 'Объяснять, как контрастивная цель учит признаки без разметки и как Vision Transformer превращает изображение в токены.',
+        'Self-supervised learning': 'Обучение с самоконтролем',
+        'Vision Transformers': 'Трансформеры для изображений (ViT)',
+        'Robustness and Deployment': 'Устойчивость и применение',
+        'Where trained networks fail, and how to make them small and fast.': 'Где обученные сети ошибаются и как сделать их маленькими и быстрыми.',
+        'Craft an adversarial example, and shrink a network by pruning and distillation while measuring what it costs in accuracy.': 'Строить состязательный пример и уменьшать сеть прунингом и дистилляцией, измеряя, сколько это стоит в качестве.',
+        'Adversarial examples': 'Состязательные примеры',
+        'Model compression': 'Сжатие моделей',
+        'Training networks in practice': 'Обучение сетей на практике',
+        'The plan of the course': 'План курса',
+        'The course in one paragraph': 'Курс в одном абзаце',
+      },
+    },
+    sections: [
+      { title: 'Training Neural Networks', summary: 'What it takes to train a deep network reliably, from autograd to the optimizer.', outcome: 'Write a PyTorch training loop, choose a loss and regularization, and stabilize training with normalization, initialization and a learning-rate schedule.', topics: [
+        noteTopic('What deep learning is', 'deep-learning/deep-learning'),
+        noteTopic('PyTorch and automatic differentiation', 'deep-learning/pytorch-and-autograd'),
+        noteTopic('Losses and regularization', 'deep-learning/losses-and-regularization'),
+        noteTopic('Normalization and initialization', 'deep-learning/normalization-and-initialization'),
+        noteTopic('Optimizing deep networks', 'deep-learning/optimizing-deep-networks'),
+      ] },
+      { title: 'Convolutional Networks', summary: 'Networks that share weights across space, and the vision tasks they solve.', outcome: 'Compute the shapes, parameters and receptive field of a CNN, explain why residual connections let it go deep, and set up detection and segmentation outputs and metrics.', topics: [
+        noteTopic('Convolution', 'deep-learning/convolution'),
+        noteTopic('Convolutional architectures', 'deep-learning/cnn-architectures'),
+        noteTopic('Object detection', 'deep-learning/object-detection'),
+        noteTopic('Semantic segmentation', 'deep-learning/semantic-segmentation'),
+      ] },
+      { title: 'Representations and Vision Transformers', summary: 'Learning features without labels, and attention applied to images.', outcome: 'Explain how a contrastive objective learns features without labels and how a Vision Transformer turns an image into tokens.', topics: [
+        noteTopic('Self-supervised learning', 'deep-learning/self-supervised-learning'),
+        noteTopic('Vision Transformers', 'deep-learning/vision-transformers'),
+      ] },
+      { title: 'Robustness and Deployment', summary: 'Where trained networks fail, and how to make them small and fast.', outcome: 'Craft an adversarial example, and shrink a network by pruning and distillation while measuring what it costs in accuracy.', topics: [
+        noteTopic('Adversarial examples', 'deep-learning/adversarial-examples'),
+        noteTopic('Model compression', 'deep-learning/model-compression'),
+        noteTopic('Training networks in practice', 'deep-learning/training-in-practice'),
+      ] },
+    ],
+  },
   'generative-models': {
     title: 'Generative Models',
-    requires: ['probability', 'ml'],
+    requires: ['deep-learning'],
     shortTitle: 'Generative Models',
     description: 'How to learn a distribution from data, draw new samples from it and decide whether the model captured the data. Six families of models, each a different trade-off between exact likelihood, fast sampling and a useful latent representation.',
-    entry: 'Before you start: Probability Theory (distributions, expectation, maximum likelihood) and Machine Learning up to neural networks and backpropagation; some PyTorch helps with the Notebook sections. Flows, energy-based models, diffusion and autoregressive models are parallel routes, not a ladder. Notes marked Extension are architecture and application branches; the main route reads without them.',
+    entry: 'Before you start: Probability Theory (distributions, expectation, maximum likelihood), and Deep Learning (training networks, convolutions, U-Net), which builds on Machine Learning; some PyTorch helps with the Notebook sections. Flows, energy-based models, diffusion and autoregressive models are parallel routes, not a ladder. Notes marked Extension are architecture and application branches; the main route reads without them.',
     guide: [{ label: 'The plan of the course', note: 'generative-models/generative-modeling', anchor: 'the-plan-of-the-course' }, { label: 'The course in one paragraph', note: 'generative-models/audio-generation', anchor: 'the-course-in-one-paragraph' }],
     extensions: ['generative-models/gan-scaling', 'generative-models/stylegan', 'generative-models/alpha-gan', 'generative-models/cyclegan', 'generative-models/stargan', 'generative-models/image-translation', 'generative-models/flow-architectures', 'generative-models/mcmc-samplers#nuts', 'generative-models/drag-editing', 'generative-models/audio-generation'],
     progression: [
@@ -347,7 +422,7 @@ export const courses: Record<CourseKey, Course> = {
       title: 'Генеративные модели',
       shortTitle: 'Генеративные модели',
       description: 'Как выучить распределение по данным, сэмплировать из него новые объекты и решить, уловила ли модель данные. Шесть семейств моделей, и каждое по-своему выбирает между точным правдоподобием, быстрым сэмплированием и полезным латентным представлением.',
-      entry: 'Что нужно знать: теорию вероятностей (распределения, математическое ожидание, метод максимального правдоподобия) и машинное обучение до нейросетей и обратного распространения; для разделов «Ноутбук» пригодится немного PyTorch. Потоки, энергетические модели, диффузия и авторегрессионные модели — параллельные пути, а не лестница. Заметки с пометкой «Ответвление» — архитектурные и прикладные ветви; основной маршрут читается без них.',
+      entry: 'Что нужно знать: теорию вероятностей (распределения, математическое ожидание, метод максимального правдоподобия) и глубинное обучение (обучение сетей, свёртки, U-Net), которое опирается на машинное обучение; для разделов «Ноутбук» пригодится немного PyTorch. Потоки, энергетические модели, диффузия и авторегрессионные модели — параллельные пути, а не лестница. Заметки с пометкой «Ответвление» — архитектурные и прикладные ветви; основной маршрут читается без них.',
       progression: ['Вероятность', 'Дивергенции', 'Автоэнкодеры', 'VAE', 'GAN', 'Оценка', 'Потоки', 'EBM', 'Диффузия', 'Авторегрессия', 'Звук'],
       labels: {
         'The plan of the course': 'План курса',
@@ -584,10 +659,10 @@ export const courses: Record<CourseKey, Course> = {
   },
   nlp: {
     title: 'Natural Language Processing',
-    requires: ['ml'],
+    requires: ['deep-learning'],
     shortTitle: 'NLP',
     description: 'One path from raw text to modern LLM systems. Each note says what it adds: a fix for a limitation of the previous method, or a new task, objective or system component.',
-    entry: 'Before you start: Machine Learning up to neural networks (logistic regression, cross-entropy, backpropagation) and basic Python. Notebook sections describe the course\'s public notebooks; the notes read without them. Results from different notes are comparable only where a note says they share a protocol.',
+    entry: 'Before you start: Deep Learning (training networks, normalization, optimizers), which builds on Machine Learning (logistic regression, cross-entropy, backpropagation), and basic Python. Notebook sections describe the course\'s public notebooks; the notes read without them. Results from different notes are comparable only where a note says they share a protocol.',
     guide: [{ label: 'The plan of the course', note: 'nlp/natural-language-processing', anchor: 'the-plan-of-the-course' }],
     progression: [
       { label: 'Text', section: 'Text Foundations' },
@@ -610,7 +685,7 @@ export const courses: Record<CourseKey, Course> = {
       title: 'Обработка естественного языка',
       shortTitle: 'NLP',
       description: 'Один путь от сырого текста к современным LLM-системам. Каждая заметка говорит, что она добавляет: исправление ограничения предыдущего метода или новую задачу, цель обучения или компонент системы.',
-      entry: 'Что нужно знать: машинное обучение до нейросетей (логистическая регрессия, кросс-энтропия, обратное распространение) и основы Python. Разделы «Ноутбук» описывают открытые ноутбуки курса; заметки читаются и без них. Результаты из разных заметок сравнимы, только если в заметке сказано, что протокол у них общий.',
+      entry: 'Что нужно знать: глубинное обучение (обучение сетей, нормализация, оптимизаторы), которое опирается на машинное обучение (логистическая регрессия, кросс-энтропия, обратное распространение), и основы Python. Разделы «Ноутбук» описывают открытые ноутбуки курса; заметки читаются и без них. Результаты из разных заметок сравнимы, только если в заметке сказано, что протокол у них общий.',
       progression: ['Текст', 'Классический NLP', 'Представления', 'Последовательности', 'Трансформеры', 'Предобучение', 'Масштабирование', 'Современные архитектуры', 'Адаптация', 'Задачи', 'Постобучение', 'Инференс', 'LLM-системы', 'Не слева направо'],
       labels: {
         'Scaling and LLM Pretraining': 'Масштабирование и предобучение LLM',

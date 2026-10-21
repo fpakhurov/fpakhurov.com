@@ -1,0 +1,450 @@
+---
+title: Normalization and initialization
+description: "Why the scale of activations and gradients is multiplied at every layer, how Glorot and He initialization follow from keeping that factor at one, what batch, layer, group and RMS normalization compute and why they help, and how residual connections carry signals through depth."
+course: deep-learning
+section: Training Neural Networks
+order: 3
+status: published
+tags: [initialization, glorot-initialization, he-initialization, batch-normalization, layer-normalization, group-normalization, rmsnorm, residual-connections, vanishing-gradients, exploding-gradients]
+prerequisites: [Losses and regularization, Backpropagation, Expectation]
+---
+
+import DepthSignals from '../../../components/figures/normalization-and-initialization/DepthSignals.astro';
+import BatchNormFlow from '../../../components/figures/normalization-and-initialization/BatchNormFlow.astro';
+import NormAxes from '../../../components/figures/normalization-and-initialization/NormAxes.astro';
+
+The [previous note](/notes/deep-learning/losses-and-regularization) trained a network of three layers and asked how to keep it from fitting its training set too well. A network of thirty layers has the opposite problem first: with the default initialization it does not fit its training set at all. The signal that reaches the top of the stack and the gradient that reaches the bottom are each multiplied by a factor at every layer, and over thirty layers any factor other than one grows or shrinks geometrically. This note derives the initializations that set that factor to one, shows what the normalization layers compute and what is still debated about why they work, and explains how a residual connection carries the signal and its gradient through depth. It ends with one experiment that puts the three tools side by side.
+
+**Notation.** A layer computes the pre-activation $z_l = W_l h_{l-1}$ and the activation $h_l = \varphi(z_l)$; biases are zero at initialization and left out. $n_{l-1}$ and $n_l$ are the layer's **fan-in** and **fan-out**, its input and output widths. The weights start as independent draws with mean 0 and variance $v_l$. The **adjoint** $\delta_l = \partial L / \partial z_l$ is the gradient of the loss with respect to the pre-activation. For a normalization layer, $B$ is the batch size, $\mu$ and $\sigma^2$ are a mean and a variance, $\hat x$ the standardized value, and $\gamma, \beta$ the learned scale and shift.
+
+## Baseline: a deep stack at its default initialization
+
+Take a plain stack of 50 bias-free ReLU layers of width 256 and feed it 512 standard normal inputs. The table gives the mean square of the pre-activations $z_l$ at four depths, for weights with four variances: unscaled, $1/n$, the variance $1/(3n)$ that PyTorch's `nn.Linear` uses by default, and $2/n$. The last column is the mean square of the adjoint at the first layer divided by that at the last, for a loss that is a fixed random projection of $z_{50}$.
+
+| weight variance $v$ | layer 1 | layer 10 | layer 25 | layer 50 | gradient, layer 1 / layer 50 |
+| --- | --- | --- | --- | --- | --- |
+| $1$ | $258$ | $2.4 \cdot 10^{21}$ | overflow | overflow | not a number |
+| $1/n$ | $1.01$ | $2.0 \cdot 10^{-3}$ | $2.5 \cdot 10^{-8}$ | $2.2 \cdot 10^{-15}$ | $2.9 \cdot 10^{-15}$ |
+| $1/(3n)$, PyTorch default | $0.336$ | $3.4 \cdot 10^{-8}$ | $2.9 \cdot 10^{-20}$ | $3.1 \cdot 10^{-39}$ | $1.2 \cdot 10^{-38}$ |
+| $2/n$ | $2.02$ | $2.04$ | $0.833$ | $2.46$ | $1.66$ |
+
+With unscaled weights the signal overflows 32-bit arithmetic before layer 25. With the default it shrinks by about a factor of 6 per layer, and the gradient that reaches the first layer is $10^{-38}$ of the one at the top: the first layers never move. Only the variance $2/n$ keeps both the signal and the gradient at their scale. On real data the effect is the same: the thirty-layer network of the [experiment](#an-experiment-thirty-layers-on-digits), at its default initialization, stays at the loss $\ln 10 = 2.303$ of a uniform guess over 10 classes for all of training. The Machine Learning course draws the same picture for 30 layers ([initialization that preserves the scale](/notes/ml/training-deep-networks#initialization-that-preserves-the-scale)), and the Generative Models course traces the mechanism for one unit per layer ([vanishing and exploding gradients](/notes/generative-models/training-background#vanishing-and-exploding-gradients)). Here we derive the factor for both directions at once and then see what initialization cannot fix.
+
+## Why the scale is multiplied at every layer
+
+**Forward.** One pre-activation is $z_{l,i} = \sum_{j=1}^{n_{l-1}} W_{l,ij}\, h_{l-1,j}$. The weights have mean 0 and are independent of each other and of $h_{l-1}$, so the terms are uncorrelated and their variances add:
+
+$$
+\begin{aligned}
+\operatorname{Var}(z_{l,i}) &= \sum_{j=1}^{n_{l-1}} E\big[W_{l,ij}^2\big]\, E\big[h_{l-1,j}^2\big] \\
+&= n_{l-1}\, v_l\, E\big[\varphi(z_{l-1})^2\big] \\
+&= n_{l-1}\, v_l\, \kappa \operatorname{Var}(z_{l-1}), \qquad \kappa = \frac{E[\varphi(z)^2]}{\operatorname{Var}(z)} .
+\end{aligned}
+$$
+
+The first line uses independence, the second that all inputs of a layer have the same distribution, the third only names the ratio $\kappa$: the fraction of the second moment that the activation lets through. For the identity $\kappa = 1$. For a ReLU and a $z$ symmetric around 0, half of the distribution is set to zero and the other half kept, so $E[\operatorname{ReLU}(z)^2] = \tfrac12 E[z^2]$ and $\kappa = \tfrac12$.
+
+**Backward.** The chain rule gives $\delta_{l-1} = \varphi'(z_{l-1}) \odot \big(W_l^\top \delta_l\big)$. The $j$-th entry is a sum over the $n_l$ outputs of the layer, and the same argument, with the usual assumption that $W_l$ is independent of $\delta_l$ at initialization, gives
+
+$$
+\operatorname{Var}(\delta_{l-1}) = n_l\, v_l\, \kappa' \operatorname{Var}(\delta_l), \qquad \kappa' = E\big[\varphi'(z)^2\big] .
+$$
+
+For the identity $\kappa' = 1$; for a ReLU the slope is 1 or 0 with probability $\tfrac12$ each, so $\kappa' = \tfrac12$.
+
+Over $L$ layers the two recursions multiply:
+
+$$
+\boxed{\;\operatorname{Var}(z_L) = \operatorname{Var}(z_1) \prod_{l=2}^{L} n_{l-1} v_l \kappa, \qquad \operatorname{Var}(\delta_1) = \operatorname{Var}(\delta_L) \prod_{l=2}^{L} n_l v_l \kappa' \;}
+$$
+
+Any constant factor other than 1 per layer is raised to the power $L - 1$. **Worked example.** For ReLU and square layers of width $n = 256$: unscaled weights give the forward factor $256 \cdot 1 \cdot \tfrac12 = 128$, and $258 \cdot 128^{9} = 2.4 \cdot 10^{21}$ at layer 10, as in the table; the largest 32-bit number, $3.4 \cdot 10^{38}$, is passed at about layer 19. $v = 1/n$ gives the factor $\tfrac12$ and $2^{-49} = 1.8 \cdot 10^{-15}$ at layer 50; PyTorch's default gives $\tfrac16$ and $6^{-49} = 7.4 \cdot 10^{-39}$. The table's measured values follow these powers up to random fluctuation.
+
+The gradient of a weight matrix is $\partial L / \partial W_l = \delta_l\, h_{l-1}^\top$, a product of a backward and a forward quantity. Its size at layer $l$ carries both products, so a network can learn evenly across its layers only when both factors stay near 1.
+
+<aside class="callout"><strong>Key idea.</strong> Three things must survive depth: the scale of the activations, the scale of the gradients, and the differences between examples. Initialization sets the first two at the start of training. Normalization layers hold the scale during training and, depending on which axis they normalize, may or may not keep the examples apart. A residual connection carries all three, because it passes its input through unchanged.</aside>
+
+## Initialization that keeps the factor at one
+
+### Glorot (Xavier) initialization
+
+For a symmetric activation that is linear near zero, such as tanh at small inputs, $\kappa = \kappa' = 1$. Setting each factor to 1:
+
+$$
+\begin{aligned}
+\text{forward:}\quad n_{l-1} v_l = 1 &\;\Rightarrow\; v_l = \frac{1}{n_{l-1}}, \\
+\text{backward:}\quad n_l v_l = 1 &\;\Rightarrow\; v_l = \frac{1}{n_l}, \\
+\text{compromise:}\quad \frac{n_{l-1} + n_l}{2}\, v_l = 1 &\;\Rightarrow\; \boxed{\; v_l = \frac{2}{n_{l-1} + n_l} \;}
+\end{aligned}
+$$
+
+The two conditions agree only for a square layer, so [Glorot and Bengio (2010)](#references), eq. 12, require the average of fan-in and fan-out to give 1. Drawn from a uniform distribution on $[-a, a]$, whose variance is $a^2/3$, this means $a = \sqrt{6/(n_{l-1} + n_l)}$ (their eq. 16). In PyTorch: `nn.init.xavier_uniform_` and `xavier_normal_`.
+
+### He (Kaiming) initialization
+
+For a ReLU, $\kappa = \kappa' = \tfrac12$:
+
+$$
+\begin{aligned}
+\text{forward:}\quad \tfrac12\, n_{l-1} v_l = 1 &\;\Rightarrow\; \boxed{\; v_l = \frac{2}{n_{l-1}} \;} \quad \text{(fan-in mode)}, \\
+\text{backward:}\quad \tfrac12\, n_l v_l = 1 &\;\Rightarrow\; v_l = \frac{2}{n_l} \quad \text{(fan-out mode)} .
+\end{aligned}
+$$
+
+Instead of a compromise, [He et al. (2015)](#references), section 2.2, observe that one direction is enough. With the fan-in choice the backward factor of layer $l$ is $\tfrac12 n_l \cdot 2/n_{l-1} = n_l/n_{l-1}$, and the product over the stack telescopes:
+
+$$
+\prod_{l=2}^{L} \frac{n_l}{n_{l-1}} = \frac{n_L}{n_1} .
+$$
+
+The gradient is rescaled by the ratio of the last and the first width, a constant that does not grow with depth. In PyTorch: `nn.init.kaiming_normal_(w, mode='fan_in', nonlinearity='relu')`.
+
+**Worked example.** For a $256 \times 256$ layer, Glorot gives standard deviation $\sqrt{2/512} = 0.0625$ and He $\sqrt{2/256} = 0.0884$; drawn in the Code section they come out as $0.0624$ and $0.0887$. PyTorch writes both through a **gain** $g$, with variance $g^2/n_{\text{in}}$ for He's form: $g = \sqrt2$ for ReLU, $g = \sqrt{2/(1 + a^2)}$ for a leaky ReLU with negative slope $a$ (so $1.387$ for $a = 0.2$), and $g = 5/3$ for tanh. The default of `nn.Linear` is a uniform draw with variance $1/(3 n_{\text{in}})$, which is He's form with $g^2 = 1/3$, six times too small for a plain ReLU stack; it relies on normalization layers to restore the scale, as the [convolution section](/notes/generative-models/training-background#a-convolution-layer) of the Generative Models course explains.
+
+### What the formulas do not promise
+
+*Optional depth: the gain of tanh, and fluctuations around the average. The rest of the note does not depend on it.*
+
+The derivation controls an average over random weights. Two things fall outside it.
+
+**Saturating activations have no exact answer.** The factor $\kappa$ of tanh depends on the variance itself: at small inputs $\kappa \approx 1$, but $E[\tanh(z)^2] = 0.394$ for a standard normal $z$. Iterate $q_l = g^2\, E[\tanh(\sqrt{q_{l-1}}\, \xi)^2]$ with $\xi$ standard normal. With $g = 1$ the variance decays like $1/(2l)$: $0.0101$ after 50 layers. With PyTorch's $g = 5/3$ it settles at a fixed point $q^* = 1.178$, but there the backward factor $g^2\, E[\tanh'(\sqrt{q^*}\, \xi)^2]$ is $1.211$, so gradients grow by about 21% per layer. This is the order-to-chaos picture of [Schoenholz et al. (2017)](#references): a deep tanh stack either loses its forward signal slowly or amplifies its gradients, and no gain makes both factors exactly 1 away from zero.
+
+**Averages are not single networks.** In the table above, the He stack has mean squares $2.02$, $2.04$, $0.833$ and $2.46$ at layers 1, 10, 25 and 50: the logarithm of the scale performs a random walk around its average. [Hanin and Rolnick (2018)](#references) show that for fully connected ReLU networks the variance of this walk grows with the sum of the reciprocals of the widths, $\sum_l 1/n_l$, so a deep and narrow network fluctuates more than a shallow and wide one, and that residual networks, correctly weighted, avoid the problem.
+
+### What initialization cannot fix
+
+He initialization keeps the scale. It does not keep the examples apart. For two inputs whose pre-activations have correlation $c$, the correlation after a He-initialized ReLU layer is
+
+$$
+f(c) = \frac{\sqrt{1 - c^2} + (\pi - \arccos c)\, c}{\pi},
+$$
+
+the normalized arc-cosine kernel of the ReLU. Its only fixed point is $c = 1$, and from two orthogonal inputs the correlation climbs to $f(0) = 1/\pi = 0.318$ after one layer, $0.872$ after 10, $0.972$ after 30 and $0.988$ after 50. Every input is mapped close to the same direction, and the last layer sees nearly the same vector for every example. This is the **rank collapse** of deep unnormalized networks ([Daneshmand et al., 2020](#references)). In the experiment at the end, the thirty-layer network with He initialization starts with an average cosine of $0.993$ between the outputs of 256 different digits, and after 12 epochs its validation accuracy ranges from $0.79$ to $0.91$ over three seeds.
+
+## Batch normalization in training and in evaluation
+
+Initialization fixes the scale once; during training the weights change, and so does the scale. **Batch normalization** ([Ioffe and Szegedy, 2015](#references)) standardizes each feature over the batch at every step. The definition, the running averages, the scale invariance and the use with convolutions are written out in the [Generative Models course](/notes/generative-models/training-background#batch-normalization). The figure shows the two modes of the layer on that course's example batch.
+
+<BatchNormFlow />
+
+1. Training mode: compute the mean and variance of the feature over the batch, $\mu_B = 3$ and $\sigma_B^2 = 3.5$.
+2. Standardize every value: $\hat x_i = (x_i - \mu_B)/\sqrt{\sigma_B^2 + \epsilon}$.
+3. Scale and shift by the learned $\gamma = 2$ and $\beta = 0.5$.
+4. Update the running averages with momentum $0.1$: $\mu_{\text{run}} \leftarrow 0.9 \cdot 0 + 0.1 \cdot 3 = 0.3$, and the running variance from 1 to $0.9 + 0.1 \cdot \tfrac43 \cdot 3.5 = 1.367$, with the unbiased batch variance.
+5. Evaluation mode (`model.eval()`): standardize with the running averages instead. After one step they are far from the batch statistics, and the input 6 becomes $10.25$ instead of $3.71$.
+
+### The gradient through the batch statistics
+
+*Optional depth: the backward pass of the layer. The rest of the note uses only its two consequences.*
+
+In training mode $\mu_B$ and $\sigma_B$ depend on every example of the batch, so the gradient does too. Write $s = \sqrt{\sigma_B^2 + \epsilon}$ and $g_i = \partial L / \partial \hat x_i$ (the upstream gradient times $\gamma$). From $\partial \mu_B / \partial x_j = 1/B$ and $\partial \sigma_B^2 / \partial x_j = 2(x_j - \mu_B)/B$ we get $\partial s / \partial x_j = \hat x_j / B$, and then
+
+$$
+\begin{aligned}
+\frac{\partial \hat x_i}{\partial x_j} &= \frac{\delta_{ij} - 1/B}{s} - \frac{x_i - \mu_B}{s^2} \cdot \frac{\hat x_j}{B} = \frac1s\Big(\delta_{ij} - \frac1B - \frac{\hat x_i \hat x_j}{B}\Big), \\
+\frac{\partial L}{\partial x_j} &= \sum_{i=1}^{B} g_i \frac{\partial \hat x_i}{\partial x_j} = \frac1s\Big(g_j - \bar g - \hat x_j\, \overline{g \hat x}\Big),
+\end{aligned}
+$$
+
+where $\delta_{ij}$ is 1 for $i = j$ and 0 otherwise, and the bars are averages over the batch. The first line is the quotient rule; the second sums it against $g$. The result is the upstream gradient with its mean removed and its component along $\hat x$ removed, divided by $s$. Two consequences: the gradients of a batch always sum to 0 and are orthogonal to $\hat x$, and each example's gradient depends on all the others. **Worked example.** For the batch $(1, 2, 3, 6)$ and $g = (1, 0, 0, 0)$: $s = 1.871$, $\bar g = 0.25$, $\overline{g \hat x} = -0.267$, and the gradient is $(0.248, -0.210, -0.134, 0.095)$. Only the first output was pushed, yet all four inputs receive a gradient, and they sum to 0. Autograd in the Code section gives the same numbers.
+
+### Small batches and the gap between training and evaluation
+
+The batch statistics are estimates from $B$ values, and two failures follow from that.
+
+**Very small batches.** With $B = 2$ the standardized values are always $\pm 1$: for any two different numbers $a < b$, the mean is their midpoint and the standard deviation half their distance. The layer outputs $\beta \mp \gamma$ whatever the inputs were; in the Code section the batch $(4, 10)$ becomes $(-1.5, 2.5)$ for $\gamma = 2$, $\beta = 0.5$. With $B = 1$ the variance is 0 and PyTorch refuses to normalize in training mode. Statistics from a handful of examples are noisy, and the noise grows as the batch shrinks; on ImageNet, a ResNet-50 with 2 images per GPU had a top-1 error 10.6 points higher with batch normalization than with group normalization, introduced below ([Wu and He, 2018](#references)).
+
+**Running averages lag behind.** With momentum $0.1$, the running average weights the batch from $k$ steps ago by $0.1 \cdot 0.9^{k}$, an average over roughly the last 10 to 20 batches. They estimate the statistics of weights that have changed since, and a model evaluated early, or right after a large step, sees a mismatch between the two modes, as in step 5 of the figure. Forgetting `model.eval()` causes the opposite error: predictions that depend on the other examples of the evaluation batch.
+
+### Why does it help? The debated explanations
+
+Batch normalization allows larger learning rates and makes deep convolutional networks train much faster; why is still argued.
+
+- **Internal covariate shift.** The original motivation: each layer's input distribution keeps changing as the layers below learn, and standardizing it stabilizes learning ([Ioffe and Szegedy, 2015](#references), section 2). [Santurkar et al. (2018)](#references) injected random noise with changing mean and variance after the normalization layers, which recreates the shift, and the networks still trained about as well as with plain batch normalization (section 2.1). They argue instead that it makes the loss and its gradients smoother along the training path (section 3).
+- **Scale invariance.** A weight vector $w$ followed by batch normalization can be multiplied by any $c > 0$ without changing the output. Differentiating $L(cw) = L(w)$ in $c$ at $c = 1$ gives $w^\top \nabla L(w) = 0$, and differentiating in $w$ gives $\nabla L(cw) = \nabla L(w)/c$. A gradient step therefore turns the direction of $w$ by about $\eta \lVert\nabla L(w)\rVert / \lVert w \rVert$, an **effective learning rate** $\eta/\lVert w \rVert^2$ for the direction, and since the step is orthogonal to $w$ it can only grow $\lVert w\rVert$ and shrink that rate. [Arora, Li and Lyu (2019)](#references) show that this tunes the effective rate automatically. In the Code section, multiplying the weights before a batch-norm layer by 10 leaves the output unchanged and divides the gradient by 10. How weight decay interacts with this is in [Optimizing deep networks](/notes/deep-learning/optimizing-deep-networks).
+- **Residual blocks close to the identity.** In a residual network, batch normalization on the branch scales it down relative to the skip path by a factor of about the square root of the depth, so that at initialization each block is close to the identity ([De and Smith, 2020](#references)). This is the mechanism of the [residual section](#residual-connections-an-identity-path-and-the-variance-it-adds) below.
+- **Noise as regularization.** Each example is normalized with statistics of a random batch, a form of noise; the original paper found that it reduced the need for dropout (section 4.2.1).
+
+Not every effect is good. Batch normalization keeps the examples apart, since subtracting the batch mean removes the direction they share: in the experiment below, the average cosine between outputs is $0.335$ with it against $0.993$ without. But in a deep stack without residual connections it makes the gradients explode at initialization, by a factor that grows exponentially with depth whatever the weight variance ([Yang et al., 2019](#references)): in the experiment, the first layer's weight gradient is 168 times the last one's.
+
+## Normalizing over other axes
+
+Every normalization layer computes the same thing, $y = \gamma \odot (x - \mu_S)/\sqrt{\sigma_S^2 + \epsilon} + \beta$, with the mean and variance taken over a set $S$ of values. They differ only in $S$. For a batch of feature maps with $N$ examples, $C$ channels and $H \times W$ positions:
+
+<NormAxes />
+
+- **Batch norm**: one channel, all examples and positions. Depends on the batch.
+- **Layer norm** ([Ba, Kiros and Hinton, 2016](#references)): one example, all channels and positions. In a Transformer, one token's $d$ features.
+- **Instance norm** ([Ulyanov, Vedaldi and Lempitsky, 2016](#references)): one example and one channel, its $H \times W$ positions; used for style transfer and in [CycleGAN](/notes/generative-models/training-background#instance-normalization).
+- **Group norm** ([Wu and He, 2018](#references)): one example and a group of $C/G$ channels. With $G = 1$ it is layer norm, with $G = C$ instance norm; the paper's default is $G = 32$. It does not depend on the batch, which is why detection and segmentation networks, trained with one or two images per GPU, use it.
+
+**Worked example.** For $N = 32$ images, $C = 256$ channels of $14 \times 14$: batch norm averages over $32 \cdot 196 = 6272$ values per statistic, layer norm over $256 \cdot 196 = 50{,}176$, instance norm over 196, and group norm with 32 groups over $8 \cdot 196 = 1568$. Only batch norm's count depends on $N$; at $N = 2$ it falls to 392.
+
+**RMSNorm** ([Zhang and Sennrich, 2019](#references)) uses layer norm's set but divides by the root mean square without subtracting the mean; the formula and an example are in the [Transformer note](/notes/nlp/transformers#normalization). What it gives up is an invariance: layer norm returns the same output when a constant is added to every feature, RMSNorm only when all features are multiplied by a positive constant (both checked in the Code section). The authors' hypothesis is that the invariance to re-scaling does the work, and they report running times 7% to 64% lower than with layer norm on different models. Where the normalization sits in a Transformer block, before or after the residual sum, is a separate choice discussed in [pre-norm versus post-norm](/notes/nlp/transformers#pre-norm-versus-post-norm).
+
+**What normalizing one example cannot do.** Layer norm and RMSNorm restore the scale of each example, but they never compare examples, so they cannot undo the rank collapse of the previous section. In the experiment below a plain thirty-layer stack with layer norm after every linear layer starts with an average cosine of $0.995$ between examples and never leaves the loss $2.303$, exactly like the stack without normalization. In Transformers layer norm works because the residual stream carries the input past every block.
+
+## Residual connections: an identity path, and the variance it adds
+
+A residual block computes $x_{l+1} = x_l + F_l(x_l)$. Its Jacobian is $I + \partial F_l/\partial x_l$, so the gradient reaches every block through a term that passes through no weight matrix; the [Machine Learning course](/notes/ml/training-deep-networks#residual-connections) derives this and the [Transformer note](/notes/nlp/transformers#residual-connections) expands the product of such Jacobians. What the identity path does to the forward scale is the other half of the story.
+
+At initialization, the last weight matrix of the branch has mean 0 and is independent of everything else, so $E[x_l F_l(x_l)] = 0$ and the variances add:
+
+$$
+E\big[x_{l+1}^2\big] = E\big[x_l^2\big] + E\big[F_l(x_l)^2\big] .
+$$
+
+Take a branch $F(u) = W_2 \operatorname{ReLU}(W_1 u)$ with He variance $2/n$ for $W_1$ and $1/n$ for $W_2$, which returns the mean square of its input. Three choices give three growth laws over $L = 50$ blocks, starting from mean square 1:
+
+- **No normalization**, $F(x_l)$: each block doubles the mean square, $2^{l}$, so $2^{50} = 1.1 \cdot 10^{15}$ at the top. Measured: $867$, $2.9 \cdot 10^7$ and $4.1 \cdot 10^{14}$ after 10, 25 and 50 blocks.
+- **Pre-norm**, $F(\operatorname{LN}(x_l))$: the branch sees an input of mean square 1 and adds 1 per block, $1 + l$, so 51 at the top. Measured: $11.3$, $26$ and $52.7$.
+- **Scaled branch**, $F(x_l)/\sqrt L$: each block multiplies the mean square by $1 + 1/L$, and $(1 + 1/50)^{50} = 2.69$, below $e$ for any depth. Measured: $1.2$, $1.66$ and $2.73$.
+
+The backward pass has the same structure, $\delta_l = (I + \partial F_l/\partial x_l)^\top \delta_{l+1}$, and the same additive accounting. This is why every deep residual network does one of these things. Pre-norm Transformers normalize the branch input. ResNets with batch normalization get the down-scaling from the normalization on the branch ([De and Smith, 2020](#references)) and often go further by setting the scale $\gamma$ of the last batch-norm layer of each block to 0, so that every block starts as the exact identity ([Goyal et al., 2017](#references), section 5.1). Fixup trains residual networks without any normalization by zeroing the last layer of each branch and scaling the others down with depth ([Zhang, Dauphin and Ma, 2019](#references)).
+
+The identity path also keeps examples apart. Since $x_{l+1}$ contains $x_l$ unchanged, the differences between two inputs are carried up the stack, and the correlation grows much more slowly than in a plain stack: for the pre-norm network the theory gives $0.44$ after 10 blocks and $0.59$ after 50, against $0.87$ and $0.99$ for the plain He stack.
+
+<DepthSignals />
+
+## An experiment: thirty layers on digits
+
+The setting: the 1797 bundled digit images, 70% for training and 30% for validation, a linear input layer to width 64, thirty hidden layers of width 64 and a linear output layer, trained with Adam at learning rate $10^{-3}$, batches of 32, for 12 epochs. Plain layers compute $\operatorname{ReLU}(\operatorname{Norm}(W h))$; residual blocks compute $h + W \operatorname{ReLU}(\operatorname{Norm}(h))$, the pre-norm form. The first two columns are measured at initialization on 256 training images: the average cosine between the network's final hidden vectors for different images, and the norm of the first hidden layer's weight gradient divided by the last one's. The last two are means over three seeds.
+
+| configuration | cosine at init | gradient, first / last | training loss | validation accuracy |
+| --- | --- | --- | --- | --- |
+| plain, default init | 1.000 | $2.0 \cdot 10^{-11}$ | 2.303 | 0.102 |
+| plain, He init | 0.993 | 1.14 | 0.425 | 0.834 |
+| plain, batch norm | 0.335 | 168 | 1.274 | 0.556 |
+| plain, layer norm | 0.995 | 0.246 | 2.303 | 0.100 |
+| residual, default init | 0.850 | 0.813 | 0.021 | 0.966 |
+| residual, pre-norm with layer norm | 0.758 | 5.06 | 0.036 | 0.961 |
+
+Each row matches one mechanism of the note. The default stack loses both the scale and the differences between examples, and learns nothing. He initialization restores the gradient but not the differences, and trains unevenly. Batch norm keeps the examples apart but its gradients explode, and in 12 epochs it gets only part of the way. Layer norm restores the scale of each example but cannot separate them. Both residual networks train to a training loss near 0 and above 96% validation accuracy; with PyTorch's default initialization the plain residual branch is small enough that the stack works without normalization at this depth. These are three seeds of one small setting; with more epochs the plain configurations improve, but the order between failing and training does not change.
+
+## What changed
+
+| | Plain deep stack | With the tools of this note |
+| --- | --- | --- |
+| Scale of activations | multiplied by $n v \kappa$ per layer | factor 1 at init (Glorot, He); held during training by normalization |
+| Scale of gradients | multiplied by $n v \kappa'$ per layer | factor 1 at init; identity path in residual blocks |
+| Differences between examples | collapse towards one direction | kept by batch norm and by residual connections |
+| Dependence on the batch | none | batch norm only: noisy for small batches, two modes |
+| Residual stack scale | $2^l$ without control | $1 + l$ with pre-norm, below $e$ with scaled branches |
+| Thirty layers on digits | stuck at loss 2.303 | 0.96–0.97 validation accuracy |
+
+## Limitations
+
+- **Initialization is a statement about averages at step 0.** Once training starts, weights and inputs are no longer independent, and the derivations no longer hold; single networks fluctuate around the average, more so when they are narrow.
+- **Batch norm couples examples.** It needs batches large enough for stable statistics, behaves differently in training and evaluation, and its running averages must be recomputed whenever the weights change without training steps, for example after averaging weights.
+- **The explanations are partial.** Why batch norm helps is still debated, and the arguments above (smoothness, scale invariance, identity bias, noise) are each supported in some settings and not a complete account.
+- **Normalizing one example does not separate examples.** Layer norm, group norm and RMSNorm work in practice inside residual architectures; in a plain deep stack they do not prevent rank collapse.
+- **Saturating activations have no exact fix.** For tanh no gain keeps both the forward and the backward factor at 1 away from zero.
+
+## What you should remember
+
+- Per layer, the forward variance is multiplied by $n_{\text{in}} v \kappa$ and the backward variance by $n_{\text{out}} v \kappa'$, with $\kappa = \kappa' = \tfrac12$ for ReLU and 1 for a linear activation; over $L$ layers the factors are raised to the power $L - 1$.
+- Glorot: $v = 2/(n_{\text{in}} + n_{\text{out}})$. He: $v = 2/n_{\text{in}}$, with the backward product telescoping to $n_L/n_1$. PyTorch's default $1/(3 n_{\text{in}})$ shrinks a plain ReLU stack by 6 per layer.
+- Deep unnormalized ReLU stacks map every input towards one direction; initialization cannot prevent it.
+- Batch norm standardizes each feature over the batch; its gradient removes the batch mean and the component along $\hat x$; it uses batch statistics in training and running averages in evaluation, and fails for very small batches.
+- Batch, layer, instance and group norm differ only in the set of values that share a mean and a variance; RMSNorm drops the mean and the invariance to shifts.
+- A residual block adds variances: $2^l$ without normalization, $1 + l$ with pre-norm, below $e$ with branches scaled by $1/\sqrt L$ or zero-initialized; it keeps both the gradient path and the differences between examples.
+
+## Code
+
+The scale of 50 layers under four initializations, Glorot and He, the gain of tanh, the backward pass of batch norm checked against autograd, its two modes and its scale invariance, the axes of the normalization layers, residual stacks with three growth laws, and the experiment of the last section. Seeds are fixed; exact numbers can differ slightly across platforms and library versions. The script runs in about 40 seconds on a laptop CPU, almost all of it in the experiment.
+
+```python
+import math, numpy as np, torch
+from torch import nn
+import torch.nn.functional as F
+from sklearn.datasets import load_digits
+from sklearn.model_selection import train_test_split
+
+# 1. the scale of z_l in a stack of 50 bias-free ReLU layers of width 256, for four weight variances v
+n, L = 256, 50
+torch.manual_seed(0)
+x0 = torch.randn(512, n, requires_grad=True)
+r = torch.randn(512, n)                       # a fixed random direction for the loss at the top
+for name, v in [('N(0,1)', 1.0), ('1/n', 1 / n), ('default', 1 / (3 * n)), ('He', 2 / n)]:
+    torch.manual_seed(1)
+    h, zs = x0, []
+    for l in range(L):
+        z = h @ (torch.randn(n, n) * math.sqrt(v)).T
+        z.retain_grad(); zs.append(z); h = torch.relu(z)
+    (zs[-1] * r).sum().backward()
+    ms = ['%.3g' % zs[i].pow(2).mean().item() for i in (0, 9, 24, 49)]
+    print(name, ms, 'gradient ratio z_1 / z_50: %.3g' % (zs[0].grad.pow(2).mean() / zs[-1].grad.pow(2).mean()).item())
+# N(0,1) ['258', '2.41e+21', 'inf', 'nan'] gradient ratio z_1 / z_50: nan
+# 1/n ['1.01', '0.00199', '2.48e-08', '2.19e-15'] gradient ratio z_1 / z_50: 2.94e-15
+# default ['0.336', '3.37e-08', '2.93e-20', '3.05e-39'] gradient ratio z_1 / z_50: 1.23e-38
+# He ['2.02', '2.04', '0.833', '2.46'] gradient ratio z_1 / z_50: 1.66
+
+# 2. Glorot and He for a 256 x 256 layer, and the gain of tanh: the variance a deep tanh stack settles at
+torch.manual_seed(0); W = torch.empty(256, 256)
+print(round(nn.init.xavier_normal_(W).std().item(), 4), round(nn.init.kaiming_normal_(W, nonlinearity='relu').std().item(), 4))
+# 0.0624 0.0887   (theory 0.0625 and 0.0884)
+xi = np.random.default_rng(0).standard_normal(2_000_000)
+for g in (1.0, 5 / 3):
+    q, qs = 1.0, []
+    for l in range(200):
+        q = g * g * np.mean(np.tanh(math.sqrt(q) * xi) ** 2); qs.append(q)
+    chi = g * g * np.mean((1 - np.tanh(math.sqrt(q) * xi) ** 2) ** 2)   # backward factor per layer at that variance
+    print('gain %.3f' % g, [round(float(qs[i]), 4) for i in (9, 49, 199)], 'backward factor %.3f' % chi)
+# gain 1.000 [0.0521, 0.0101, 0.0024] backward factor 0.995
+# gain 1.667 [1.1776, 1.1776, 1.1776] backward factor 1.211
+
+# 3. batch norm: the gradient through the batch statistics, checked against autograd
+x = torch.tensor([1.0, 2.0, 3.0, 6.0], requires_grad=True)
+g = torch.tensor([1.0, 0.0, 0.0, 0.0])          # upstream gradient dL/dxhat
+mu, var = x.mean(), x.var(unbiased=False)
+xhat = (x - mu) / torch.sqrt(var + 1e-5)
+(xhat * g).sum().backward()
+by_hand = (g - g.mean() - xhat * (g * xhat).mean()) / torch.sqrt(var + 1e-5)
+print([round(v, 4) for v in x.grad.tolist()], [round(v, 4) for v in by_hand.tolist()], round(x.grad.sum().item(), 6))
+# [0.2482, -0.21, -0.1336, 0.0954] [0.2482, -0.21, -0.1336, 0.0954] 0.0
+
+# 4. train and eval statistics: one training step of BatchNorm1d, then the same inputs in eval mode
+bn = nn.BatchNorm1d(1)
+with torch.no_grad(): bn.weight.fill_(2.0); bn.bias.fill_(0.5)
+xb = torch.tensor([[1.0], [2.0], [3.0], [6.0]])
+print([round(v, 3) for v in bn(xb).flatten().tolist()], round(bn.running_mean.item(), 3), round(bn.running_var.item(), 3))
+bn.eval()
+print([round(v, 3) for v in bn(xb).flatten().tolist()])
+bn.train()
+print([round(v, 3) for v in bn(torch.tensor([[4.0], [10.0]])).flatten().tolist()])   # a batch of two: always beta -/+ gamma
+# [-1.638, -0.569, 0.5, 3.707] 0.3 1.367
+# [1.698, 3.408, 5.119, 10.252]
+# [-1.5, 2.5]
+
+# 5. scale invariance: multiplying the weights before batch norm by 10 leaves the output and divides the gradient by 10
+torch.manual_seed(0)
+Wa = torch.randn(8, 4, requires_grad=True); Wb = (10 * Wa.detach()).requires_grad_()
+xs, bn2 = torch.randn(16, 4), nn.BatchNorm1d(8, eps=1e-12)
+ya, yb = bn2(xs @ Wa.T), bn2(xs @ Wb.T)
+ya.pow(3).sum().backward(); yb.pow(3).sum().backward()
+print(round((ya - yb).abs().max().item(), 6), round((Wa.grad.norm() / Wb.grad.norm()).item(), 3), abs(round((Wa.detach() * Wa.grad).sum().item(), 4)))
+# 0.0 10.0 0.0   (the last number: the gradient is orthogonal to the weights)
+
+# 6. which values share a statistic, for a batch of 32 feature maps with 256 channels of 14 x 14
+N, C, HW, G = 32, 256, 14 * 14, 32
+print({'batch': N * HW, 'layer': C * HW, 'instance': HW, 'group': C // G * HW})
+# {'batch': 6272, 'layer': 50176, 'instance': 196, 'group': 1568}
+t = torch.randn(2, 4, 3, 3)
+print(torch.allclose(nn.GroupNorm(1, 4, affine=False)(t), F.layer_norm(t, t.shape[1:]), atol=1e-5),
+      torch.allclose(nn.GroupNorm(4, 4, affine=False)(t), F.instance_norm(t), atol=1e-5))
+# True True: one group is layer norm, one channel per group is instance norm
+v = torch.tensor([1.0, 2.0, 3.0, 6.0]); rms = nn.RMSNorm(4, elementwise_affine=False)
+print(torch.allclose(F.layer_norm(v + 5, (4,)), F.layer_norm(v, (4,)), atol=1e-5), torch.allclose(rms(v + 5), rms(v), atol=1e-5))
+# True False: layer norm ignores a shift of all features, RMSNorm does not
+
+# 7. stacks of 50 blocks: plain He layers, and residual blocks x + F(x) with F = W2 relu(W1 u), Var W1 = 2/n, Var W2 = 1/n
+def stack(mode, x, L=50):
+    torch.manual_seed(1)
+    out = []
+    for l in range(L):
+        W1, W2 = torch.randn(n, n) * math.sqrt(2 / n), torch.randn(n, n) * math.sqrt(1 / n)
+        if mode == 'plain':
+            x = torch.relu(x @ (torch.randn(n, n) * math.sqrt(2 / n)).T)
+        else:
+            u = F.layer_norm(x, (n,)) if mode == 'pre-norm' else x
+            branch = torch.relu(u @ W1.T) @ W2.T
+            x = x + (branch / math.sqrt(L) if mode == 'scaled' else branch)
+        out.append(x)
+    return out
+a, b = torch.randn(n), torch.randn(n)
+xx = torch.stack([a, b - (a @ b) / (a @ a) * a])              # two orthogonal inputs
+xx = xx / xx.pow(2).mean(1, keepdim=True).sqrt()              # each with mean square 1
+for mode in ('plain', 'none', 'pre-norm', 'scaled'):
+    hs = stack(mode, xx)
+    ms = ['%.3g' % hs[i].pow(2).mean().item() for i in (9, 24, 49)]
+    cos = [round(F.cosine_similarity(hs[i][0], hs[i][1], dim=0).item(), 3) for i in (9, 29, 49)]
+    print(mode, ms, cos)
+# plain ['0.765', '1.85', '2.93'] [0.887, 0.984, 0.996]      theory: cosine 0.872, 0.972, 0.988
+# none ['867', '2.9e+07', '4.14e+14'] [0.71, 0.92, 0.94]    theory: 2^l; cosine 0.708, 0.915, 0.960
+# pre-norm ['11.3', '26', '52.7'] [0.499, 0.553, 0.546]     theory: 1 + l; cosine 0.441, 0.553, 0.595
+# scaled ['1.2', '1.66', '2.73'] [0.067, 0.125, 0.22]       theory: 1.02^l; cosine 0.060, 0.164, 0.251
+
+# 8. thirty layers of width 64 on digits: initialization, normalization and residual connections
+X, y = load_digits(return_X_y=True)
+Xtr, Xva, ytr, yva = train_test_split(X / 16.0, y, test_size=0.3, random_state=0, stratify=y)
+Xtr, Xva = torch.tensor(Xtr, dtype=torch.float32), torch.tensor(Xva, dtype=torch.float32)
+ytr, yva = torch.tensor(ytr), torch.tensor(yva)
+
+class Net(nn.Module):
+    def __init__(self, norm, he, res, width=64, depth=30):
+        super().__init__()
+        self.inp, self.out, self.res = nn.Linear(64, width), nn.Linear(width, 10), res
+        self.lins = nn.ModuleList([nn.Linear(width, width) for _ in range(depth)])
+        make = {'none': nn.Identity, 'batch': lambda: nn.BatchNorm1d(width), 'layer': lambda: nn.LayerNorm(width)}[norm]
+        self.norms = nn.ModuleList([make() for _ in range(depth)])
+        if he:
+            for lin in self.lins: nn.init.kaiming_normal_(lin.weight, nonlinearity='relu'); nn.init.zeros_(lin.bias)
+    def forward(self, x):
+        h = self.inp(x)
+        for lin, norm in zip(self.lins, self.norms):
+            h = h + lin(F.relu(norm(h))) if self.res else F.relu(norm(lin(h)))   # residual blocks are pre-norm
+        return self.out(h)
+
+configs = [('plain, default init', 'none', False, False), ('plain, He', 'none', True, False),
+           ('plain, batch norm', 'batch', False, False), ('plain, layer norm', 'layer', False, False),
+           ('residual', 'none', False, True), ('residual, layer norm', 'layer', False, True)]
+print('                       cos at init  grad first/last   train loss  val acc')
+for name, norm, he, res in configs:
+    torch.manual_seed(0)
+    model = Net(norm, he, res)
+    h = model.inp(Xtr[:256])                                   # diagnostics at initialization, 256 training images
+    for lin, nm in zip(model.lins, model.norms):
+        h = h + lin(F.relu(nm(h))) if res else F.relu(nm(lin(h)))
+    z = F.normalize(h, dim=1); cos = ((z @ z.T).sum() - 256) / (256 * 255)
+    F.cross_entropy(model.out(h), ytr[:256]).backward()
+    ratio = model.lins[0].weight.grad.norm() / model.lins[-1].weight.grad.norm()
+    runs = []
+    for seed in range(3):
+        torch.manual_seed(seed)
+        model = Net(norm, he, res)
+        opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+        loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(Xtr, ytr), batch_size=32, shuffle=True, drop_last=True)
+        for epoch in range(12):
+            model.train()
+            for xb, yb in loader:
+                opt.zero_grad(); F.cross_entropy(model(xb), yb).backward(); opt.step()
+        model.eval()
+        with torch.no_grad():
+            runs.append([F.cross_entropy(model(Xtr), ytr).item(), (model(Xva).argmax(1) == yva).float().mean().item()])
+    m = np.mean(runs, axis=0)
+    print(f'{name:22} {cos.item():10.3f} {ratio.item():14.3g} {m[0]:12.3f} {m[1]:8.3f}')
+#                        cos at init  grad first/last   train loss  val acc
+# plain, default init         1.000       1.97e-11        2.303    0.102
+# plain, He                   0.993           1.14        0.425    0.834
+# plain, batch norm           0.335            168        1.274    0.556
+# plain, layer norm           0.995          0.246        2.303    0.100
+# residual                    0.850          0.813        0.021    0.966
+# residual, layer norm        0.758           5.06        0.036    0.961
+```
+
+## Next
+
+With the scale under control, a deep network can be trained; how fast and how well depends on the optimizer. Its loss surface is not convex, its best learning rate changes during training, its weight decay interacts with the normalization layers of this note, and its numbers may be stored in 16 bits. The [next note](/notes/deep-learning/optimizing-deep-networks) takes up the learning-rate schedule and warm-up, AdamW, gradient clipping, the link between batch size and learning rate, flat minima, and mixed precision.
+
+## References
+
+- X. Glorot, Y. Bengio. [Understanding the difficulty of training deep feedforward neural networks](https://proceedings.mlr.press/v9/glorot10a.html). AISTATS, 2010. Section 4.2 (variance of activations and gradients), eqs. 12 and 16.
+- K. He, X. Zhang, S. Ren, J. Sun. [Delving deep into rectifiers: surpassing human-level performance on ImageNet classification](https://arxiv.org/abs/1502.01852). ICCV, 2015. Section 2.2 (initialization of rectifier networks).
+- S. S. Schoenholz, J. Gilmer, S. Ganguli, J. Sohl-Dickstein. [Deep information propagation](https://arxiv.org/abs/1611.01232). ICLR, 2017.
+- B. Hanin, D. Rolnick. [How to start training: the effect of initialization and architecture](https://arxiv.org/abs/1803.01719). NeurIPS, 2018.
+- H. Daneshmand, J. Kohler, F. Bach, T. Hofmann, A. Lucchi. [Batch normalization provably avoids rank collapse for randomly initialised deep networks](https://arxiv.org/abs/2003.01652). NeurIPS, 2020.
+- S. Ioffe, C. Szegedy. [Batch normalization: accelerating deep network training by reducing internal covariate shift](https://arxiv.org/abs/1502.03167). ICML, 2015. Sections 2 and 3, section 4.2.1 (fewer dropout layers).
+- S. Santurkar, D. Tsipras, A. Ilyas, A. Madry. [How does batch normalization help optimization?](https://arxiv.org/abs/1805.11604) NeurIPS, 2018. Section 2.1 (noisy batch norm), section 3 (smoothness).
+- S. Arora, Z. Li, K. Lyu. [Theoretical analysis of auto rate-tuning by batch normalization](https://arxiv.org/abs/1812.03981). ICLR, 2019.
+- G. Yang, J. Pennington, V. Rao, J. Sohl-Dickstein, S. S. Schoenholz. [A mean field theory of batch normalization](https://arxiv.org/abs/1902.08129). ICLR, 2019.
+- S. De, S. L. Smith. [Batch normalization biases residual blocks towards the identity function in deep networks](https://arxiv.org/abs/2002.10444). NeurIPS, 2020.
+- J. L. Ba, J. R. Kiros, G. E. Hinton. [Layer normalization](https://arxiv.org/abs/1607.06450). arXiv, 2016.
+- D. Ulyanov, A. Vedaldi, V. Lempitsky. [Instance normalization: the missing ingredient for fast stylization](https://arxiv.org/abs/1607.08022). arXiv, 2016.
+- Y. Wu, K. He. [Group normalization](https://arxiv.org/abs/1803.08494). ECCV, 2018.
+- B. Zhang, R. Sennrich. [Root mean square layer normalization](https://arxiv.org/abs/1910.07467). NeurIPS, 2019.
+- P. Goyal et al. [Accurate, large minibatch SGD: training ImageNet in 1 hour](https://arxiv.org/abs/1706.02677). arXiv, 2017. Section 5.1 (zero γ in the last batch-norm layer of each residual block).
+- H. Zhang, Y. N. Dauphin, T. Ma. [Fixup initialization: residual learning without normalization](https://arxiv.org/abs/1901.09321). ICLR, 2019.
+- I. Goodfellow, Y. Bengio, A. Courville. [*Deep Learning*](https://www.deeplearningbook.org/). MIT Press, 2016. Section 8.4 (parameter initialization), section 8.7.1 (batch normalization).
+- A. Zhang, Z. C. Lipton, M. Li, A. J. Smola. [*Dive into Deep Learning*](https://d2l.ai/). Cambridge University Press, 2023. Section 5.4 (numerical stability and initialization), section 8.5 (batch normalization), section 8.6 (residual networks).
+- S. J. D. Prince. [*Understanding Deep Learning*](https://udlbook.github.io/udlbook/). MIT Press, 2023. Section 7.5 (initialization), chapter 11 (residual networks and batch normalization).
+- *Глубинное обучение 1* (Deep Learning 1), Faculty of Computer Science, HSE University. Course materials, [repository xiyori/intro-to-dl-hse, branch 2025-2026](https://github.com/xiyori/intro-to-dl-hse/tree/2025-2026): lecture 2 (batch normalization in training and evaluation mode).

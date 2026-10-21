@@ -1,0 +1,421 @@
+---
+title: Object detection
+description: "How a convolutional network finds every object in an image and draws a box around it: intersection over union, the two-stage R-CNN family with anchors, one-stage YOLO, SSD and RetinaNet with the focal loss, non-maximum suppression, mean average precision and DETR."
+course: deep-learning
+section: Convolutional Networks
+order: 7
+status: published
+tags: [object-detection, iou, r-cnn, faster-r-cnn, anchors, region-proposal-network, yolo, ssd, focal-loss, retinanet, non-maximum-suppression, mean-average-precision, detr]
+prerequisites: [Convolutional architectures, Losses and regularization, Classification metrics]
+---
+
+import IouGeometry from '../../../components/figures/object-detection/IouGeometry.astro';
+import FasterRcnn from '../../../components/figures/object-detection/FasterRcnn.astro';
+import FocalLoss from '../../../components/figures/object-detection/FocalLoss.astro';
+import NmsSteps from '../../../components/figures/object-detection/NmsSteps.astro';
+import ApCurve from '../../../components/figures/object-detection/ApCurve.astro';
+
+The [previous note](/notes/deep-learning/cnn-architectures) built backbones that turn an image into one label. A photograph of a street holds many objects, and a self-driving car, a shop-shelf counter or a photo search engine needs all of them: which objects there are, how many, and where each one is. **Object detection** answers with a list of boxes, each with a class and a confidence. The list has a different length for every image, which a classifier with a fixed output cannot produce. Detectors keep the backbones and change the head. This note shows how they reduce the problem to many small classification and regression problems over a fixed set of candidate boxes, how they remove the duplicates this creates, and how the result is scored.
+
+**Notation.** A box is $b = (x_1, y_1, x_2, y_2)$, its top-left and bottom-right corners in pixels, with $y$ pointing down as in an image; $\lvert b \rvert$ is its area. Anchors and proposals are written by centre and size, $a = (x_a, y_a, w_a, h_a)$. There are $K$ object classes and a background class 0. A detector outputs boxes $\hat b$ with class scores $s$; $p_t$ is the probability a classifier gives the true class of an example, and $\tau$ is an IoU threshold.
+
+## The task: boxes and classes
+
+A ground-truth annotation of an image is a set $\{(b_j, c_j)\}_{j=1}^{m}$ of boxes with classes, where $m$ varies from image to image and is often zero for a class. A detector returns its own set $\{(\hat b_i, \hat c_i, s_i)\}$. Three things make this harder than classification:
+
+- **The output is a set of unknown size.** A network has outputs of fixed shape, so it must predict many candidates and decide which to keep.
+- **Localization is continuous.** A box can be almost right, so "correct" needs a tolerance, which the next sections build from the overlap of two boxes.
+- **Scale and crowding.** The same class appears at 20 pixels and at 500, objects overlap, and most of an image is background.
+
+The standard benchmarks are PASCAL VOC, with 20 classes ([Everingham et al., 2010](#references)), and MS COCO, with more classes, more and smaller objects per image, and a stricter metric ([Lin et al., 2014](#references)).
+
+## Baseline: a classifier slid over windows
+
+The direct approach runs an image classifier on every window of the image: every position, several sizes, several aspect ratios, plus a "background" class. It is correct in principle and hopeless in cost. For a $1000 \times 600$ image, windows every 8 pixels at 3 sizes and 3 aspect ratios give $125 \cdot 75 \cdot 9 \approx 84{,}000$ crops, each a full forward pass of a network such as the ones of the previous note. Two observations rescue the idea. Most windows are obviously background, so a cheap step can **propose** a few thousand plausible regions instead. And neighbouring windows share almost all their pixels, so their convolutional features can be **computed once** for the whole image and cropped afterwards. The history of detectors is largely the story of these two observations.
+
+<aside class="callout"><strong>Key idea.</strong> Replace "find the objects" by many fixed questions about reference boxes: proposals or anchors laid over the image. Each reference is labelled by its overlap with the ground truth; a classifier says whether it holds an object and of which class, a regressor shifts and stretches it onto the object, and non-maximum suppression removes the duplicates of one object. Everything is computed from one shared feature map.</aside>
+
+## Intersection over union
+
+Whether a predicted box matches a true one is measured by their **intersection over union**,
+
+$$
+\operatorname{IoU}(b, b') = \frac{\lvert b \cap b' \rvert}{\lvert b \cup b' \rvert} = \frac{\lvert b \cap b' \rvert}{\lvert b \rvert + \lvert b' \rvert - \lvert b \cap b' \rvert} ,
+$$
+
+where the intersection of two axis-aligned boxes is again a box, with corners $\big(\max(x_1, x_1'), \max(y_1, y_1'), \min(x_2, x_2'), \min(y_2, y_2')\big)$, and has area zero when that box is empty. IoU is 1 for identical boxes and 0 for disjoint ones, and it does not change when both boxes are scaled together, so a large and a small object are judged by the same standard. A detection is usually called correct when its IoU with an unmatched object of the same class is at least 0.5.
+
+**Worked example.** $A = (1, 1, 5, 5)$ and $B = (3, 2, 7, 6)$ are both $4 \times 4$, area 16. Their intersection runs from $x = 3$ to $5$ and from $y = 2$ to $5$, a $2 \times 3$ box of area 6. The union is $16 + 16 - 6 = 26$, and $\operatorname{IoU} = 6/26 = 0.231$: well below 0.5, although the boxes share a corner region.
+
+How far can a box of the right size be off? Shifted by a fraction $u$ of its side along one axis, the intersection is $(1 - u)$ of each box and the union $(1 + u)$, so
+
+$$
+\operatorname{IoU} = \frac{1 - u}{1 + u}, \qquad \operatorname{IoU} \ge \tau \iff u \le \frac{1 - \tau}{1 + \tau} .
+$$
+
+The threshold 0.5 tolerates a shift of a third of the side, the threshold 0.75 only a seventh. The same 2-pixel error leaves a $10 \times 10$ box at IoU $8/12 = 0.667$ and a $100 \times 100$ box at $98/102 = 0.961$: small objects are much harder to localize to a given IoU.
+
+<IouGeometry />
+
+## Two-stage detectors
+
+The R-CNN line follows the two observations of the baseline one at a time: first propose regions and classify them, then share the convolutions, then learn the proposals too.
+
+### R-CNN: classify proposed regions
+
+**R-CNN** ([Girshick et al., 2014](#references)) takes about 2000 region proposals per image from **selective search**, a hand-designed algorithm that greedily merges similar neighbouring superpixels into candidate regions ([Uijlings et al., 2013](#references)). Each proposal is cropped with a little context, warped to $227 \times 227$ pixels, and passed through a convolutional network pretrained on ImageNet and [fine-tuned](/notes/deep-learning/cnn-architectures#transfer-learning-from-imagenet-backbones) on warped regions. Its features feed one linear SVM per class, and a linear regressor refines the box. Duplicates are removed per class by non-maximum suppression. With this pipeline R-CNN reached 53.7% mAP on VOC 2010, against 35.1% for the UVA system, which used the same selective-search proposals with hand-engineered features, and 40.4% for the strongest baseline of the comparison, SegDPM (section 2.4 and Table 1).
+
+Its weakness is cost: every proposal is a separate forward pass, about 13 seconds per image on a GPU (section 2.2), and training happens in three separate stages (network, SVMs, regressors).
+
+### Box regression
+
+Both R-CNN and its successors predict a box as a correction to a reference box $a = (x_a, y_a, w_a, h_a)$, a proposal or an anchor. The target for a true box $(x, y, w, h)$ in centre-size form is
+
+$$
+\boxed{\; t_x = \frac{x - x_a}{w_a}, \qquad t_y = \frac{y - y_a}{h_a}, \qquad t_w = \log \frac{w}{w_a}, \qquad t_h = \log \frac{h}{h_a} \;}
+$$
+
+([Girshick et al., 2014](#references), Appendix C). The shifts are measured in units of the reference size, so the same $t$ means the same relative correction for a small and a large box. The logarithm makes the size targets symmetric (doubling and halving are $\pm 0.693$) and keeps the decoded width $w = w_a e^{t_w}$ positive whatever the network predicts. Fast R-CNN trains the four outputs with the **smooth L1** loss, $\tfrac12 t^2$ for $\lvert t \rvert < 1$ and $\lvert t \rvert - \tfrac12$ beyond, per coordinate ([Girshick, 2015](#references), eq. 3): the [Huber loss with $\delta = 1$](/notes/deep-learning/losses-and-regularization#regression-what-a-large-residual-costs), which keeps a badly matched box from producing a huge gradient.
+
+**Worked example.** The anchor $(50, 50, 40, 40)$ and the true box $(56, 47, 60, 32)$ give $t = (6/40, -3/40, \log 1.5, \log 0.8) = (0.15, -0.075, 0.405, -0.223)$. Decoding reverses it: $x = 50 + 0.15 \cdot 40 = 56$ and $w = 40 \, e^{0.405} = 60$.
+
+### Fast R-CNN: share the convolutions
+
+**Fast R-CNN** ([Girshick, 2015](#references)) runs the backbone once on the whole image and crops each proposal from the feature map instead of from the pixels. **RoI pooling** turns a crop of any size into a fixed grid: the region of $h \times w$ feature cells is divided into an $H \times W$ grid of sub-windows of about $h/H \times w/W$ cells, and each sub-window is max-pooled, giving $H \times W = 7 \times 7$ for VGG-16 (section 2.1). The pooled grid feeds fully connected layers with two outputs, a softmax over $K + 1$ classes and box offsets $t^u$ for each class $u$, trained together with one **multi-task loss**
+
+$$
+L(p, u, t^u, v) = -\log p_u + \lambda\, [u \ge 1] \sum_{i \in \{x, y, w, h\}} \operatorname{smooth}_{L_1}\!\big(t^u_i - v_i\big) ,
+$$
+
+where $u$ is the true class of the proposal, $v$ its regression target, and the indicator $[u \ge 1]$ turns the box term off for background proposals, which have no box to regress to; $\lambda = 1$. Each mini-batch takes 64 proposals from each of 2 images: 25% with IoU at least 0.5 with a true box, labelled with its class, and the rest with IoU in $[0.1, 0.5)$, labelled background (section 2.3).
+
+With VGG-16 on VOC 2007, the shared computation cut the test time from 47 s to 0.32 s per image, proposals excluded, and the training time from 84 to 9.5 hours, while mAP rose from 66.0% to 66.9% (section 4.4 and Table 4). The proposals, still from selective search on a CPU, now took longer than the detector.
+
+### Faster R-CNN: anchors and the region proposal network
+
+**Faster R-CNN** ([Ren et al., 2015](#references)) learns the proposals with a **region proposal network** (RPN) that shares the backbone. A $3 \times 3$ convolution runs over the feature map, and at each position a small head looks at $k$ **anchors**, reference boxes centred there: 3 areas, $128^2$, $256^2$ and $512^2$ pixels, times 3 aspect ratios, 1:1, 1:2 and 2:1, so $k = 9$ (sections 3.1.1 and 3.3). For each anchor the head outputs an objectness score and four offsets $t$ in the parametrization above. The backbone has stride 16, so a $1000 \times 600$ image gives roughly $60 \times 40$ positions and about 20,000 anchors.
+
+Anchors are labelled by IoU with the true boxes: an anchor is **positive** if its IoU with some true box exceeds 0.7, or if it is the anchor with the highest IoU for some true box (so that every object gets at least one); it is **negative** if its IoU is below 0.3 for every true box; anchors in between are ignored (section 3.1.2). Each image contributes 256 sampled anchors, up to half of them positive, to the loss
+
+$$
+L = \frac{1}{N_{\text{cls}}} \sum_i \ell_{\text{cls}}(p_i, p_i^*) + \lambda\, \frac{1}{N_{\text{reg}}} \sum_i p_i^*\, \operatorname{smooth}_{L_1}\!\big(t_i - t_i^*\big) ,
+$$
+
+with $p_i^* \in \{0, 1\}$ the label of anchor $i$, $\ell_{\text{cls}}$ the binary cross-entropy, $N_{\text{cls}} = 256$, $N_{\text{reg}} \approx 2400$ the number of anchor positions, and $\lambda = 10$ so that the two terms weigh about the same. **Worked example.** An anchor of area $128^2$ with height twice its width has $w = 128/\sqrt2 = 90.5$ and $h = 128\sqrt2 = 181$. A true box that this anchor overlaps with IoU 0.82 makes it a positive with regression targets toward that box; one with IoU 0.45 leaves it ignored; with every IoU at 0.12 or less it is a negative.
+
+The RPN's boxes are proposals for the second stage, which is Fast R-CNN on the same feature map.
+
+<FasterRcnn />
+
+1. The backbone computes one feature map for the whole image, with stride 16.
+2. At every position the RPN scores 9 anchors for "object or not" and regresses their boxes.
+3. NMS at IoU 0.7 removes overlapping proposals, leaving about 2000 for training; 300 are used at test time.
+4. RoI pooling cuts a $7 \times 7$ grid from the shared map for each proposal.
+5. The head assigns each proposal one of $K$ classes or background and refines its box once more.
+6. Per-class NMS removes duplicate detections.
+
+With VGG-16, the whole system ran in 198 ms per image on a GPU, about 5 frames per second, against 1830 ms for selective search with Fast R-CNN, and reached 73.2% mAP on VOC 2007 when trained on VOC 2007 and 2012 (section 4.1, Tables 3 and 5). Adding a **feature pyramid**, which gives the RPN and the head feature maps at several strides with top-down connections between them, improved small objects in particular and became the standard backbone of later two-stage detectors ([Lin et al., 2017a](#references)).
+
+## One-stage detectors
+
+A two-stage detector classifies each proposal twice, coarsely and finely. A **one-stage** detector predicts the final classes and boxes directly from the feature map, for every location at once, trading some accuracy for speed and simplicity.
+
+### YOLO: one grid, one pass
+
+**YOLO** ([Redmon et al., 2016](#references)) resizes the image to $448 \times 448$ and divides it into an $S \times S$ grid. Each cell predicts $B$ boxes, each as $(x, y, w, h)$ and a confidence that should equal $P(\text{object}) \cdot \operatorname{IoU}$ with the true box, plus one set of $C$ class probabilities for the cell; the cell that contains an object's centre is responsible for it. For VOC, $S = 7$, $B = 2$ and $C = 20$, so the network ends in a $7 \times 7 \times (2 \cdot 5 + 20) = 7 \times 7 \times 30$ tensor: 1470 numbers and 98 boxes per image (section 2). The loss is a sum of squared errors, with weights $\lambda_{\text{coord}} = 5$ on box coordinates and $\lambda_{\text{noobj}} = 0.5$ on the confidence of boxes without objects, and with $\sqrt w$ and $\sqrt h$ in place of $w$ and $h$ so that an error of a few pixels counts more on a small box than on a large one (section 2.2).
+
+YOLO ran at 45 frames per second with 63.4% mAP on VOC 2007, and a smaller version at 155 frames per second with 52.7%, trained on VOC 2007 and 2012 (Table 1). Its errors were mostly localization errors, and a cell that holds the centres of several small objects can report only one class (sections 2.4 and 4.2).
+
+### SSD: default boxes at several scales
+
+**SSD** ([Liu et al., 2016](#references)) keeps the single pass but predicts from several feature maps of decreasing resolution, each with **default boxes** (anchors) of a few aspect ratios at every position, and a $3 \times 3$ convolution outputs class scores and offsets for each. Fine maps handle small objects and coarse maps large ones. For a $300 \times 300$ input the maps are $38^2, 19^2, 10^2, 5^2, 3^2$ and $1^2$ with 4, 6, 6, 6, 4 and 4 default boxes per position, which makes $5776 + 2166 + 600 + 150 + 36 + 4 = 8732$ boxes per class. A default box is positive when its IoU with a true box exceeds 0.5, and since almost all are negative, only the negatives with the highest loss are kept, at most three per positive (**hard negative mining**, section 2.2). SSD300 reached 74.3% mAP on VOC 2007 at 59 frames per second on a Titan X (abstract and Table 7).
+
+### Focal loss and RetinaNet
+
+Hard negative mining hints at the real obstacle of one-stage detectors. They score $10^4$ to $10^5$ candidate locations per image, and only a handful hold objects ([Lin et al., 2017b](#references), section 1). The **easy negatives**, clear background that the classifier already gets right with $p_t$ close to 1, each contribute a small loss, but there are so many of them that together they dominate the gradient. Two-stage detectors avoid this with the proposal stage and with fixed foreground-to-background ratios in sampling.
+
+The **focal loss** ([Lin et al., 2017b](#references)) fixes it inside the loss. With $p_t$ the probability of the true class (that is $p$ for a positive and $1 - p$ for a negative of a sigmoid output $p$),
+
+$$
+\boxed{\; \operatorname{FL}(p_t) = -\alpha_t\, (1 - p_t)^{\gamma} \log p_t \;}
+$$
+
+The factor $(1 - p_t)^\gamma$ is close to 1 for a misclassified example and close to 0 for an easy one; $\gamma = 0$ gives the cross-entropy, and the paper uses $\gamma = 2$. The weight $\alpha_t$ is $\alpha$ for positives and $1 - \alpha$ for negatives, with $\alpha = 0.25$ working best together with $\gamma = 2$ (sections 3.1–3.2 and 5.1).
+
+**Worked example.** At $p_t = 0.9$ the cross-entropy is $-\log 0.9 = 0.105$ and the focal loss with $\gamma = 2$ is $0.01 \cdot 0.105 = 0.00105$, 100 times smaller; at $p_t = 0.968$ the ratio is $1/0.032^2 \approx 1000$; at $p_t = 0.5$ it is only 4, and at $p_t = 0.1$ the factor is $0.81$. Take 100,000 easy negatives at $p_t = 0.99$ and 10 positives at $p_t = 0.5$. Under cross-entropy the negatives contribute $10^5 \cdot 0.01005 = 1005$ and the positives $10 \cdot 0.693 = 6.9$: the objects make up 0.7% of the loss. Under the focal loss with $\gamma = 2$ the negatives contribute $10^5 \cdot 10^{-4} \cdot 0.01005 = 0.10$ and the positives $10 \cdot 0.25 \cdot 0.693 = 1.73$: 94.5%. With $\alpha = 0.25$ as well, the share is 85.2%.
+
+<FocalLoss />
+
+**RetinaNet** is the one-stage detector built to test the loss: a ResNet with a feature pyramid, 9 anchors per position at each pyramid level, positives at IoU at least 0.5 and negatives below 0.4, and two small convolutional subnetworks for classes and boxes. The focal loss is applied to all of roughly 100,000 anchors per image, with no sampling, and normalized by the number of positive anchors. The bias of the final classification layer is initialized so that every anchor starts at foreground probability $\pi = 0.01$, so that the many background anchors do not produce a large, destabilizing loss in the first iterations (sections 3.3 and 4.1). With a ResNet-101 pyramid, RetinaNet reached 39.1 AP on COCO test-dev, above the two-stage detectors of its time (Table 2).
+
+## Non-maximum suppression
+
+Every detector above predicts many overlapping boxes for one object: neighbouring anchors, overlapping proposals, adjacent grid cells. **Non-maximum suppression** (NMS) keeps the best of each cluster. For each class separately:
+
+1. Sort the boxes by score.
+2. Take the highest-scoring box and keep it.
+3. Remove every remaining box whose IoU with it exceeds the threshold $\tau$.
+4. Repeat from step 2 with the boxes that are left.
+
+A box is compared only with boxes that have been kept, never with ones already removed. The algorithm is greedy and costs $O(n^2)$ IoU computations in the worst case for $n$ boxes; detectors apply it to a few hundred or thousand boxes per class after discarding low scores.
+
+**Worked example.** Six boxes of one class: $A = (10, 10, 50, 50)$ with score 0.95, $B = (14, 12, 54, 52)$ with 0.80, $C = (8, 14, 46, 54)$ with 0.60, $D = (60, 20, 100, 60)$ with 0.90, $E = (64, 24, 104, 64)$ with 0.55 and $F = (40, 30, 80, 70)$ with 0.50, and $\tau = 0.5$. Sorted: $A, D, B, C, E, F$. $A$ is kept, and $B$ and $C$ go: their IoUs with $A$ are 0.75 and 0.71. $D$ has IoU 0 with $A$ and is kept; $E$ goes, with IoU 0.68 with $D$. $F$ overlaps $A$ by 0.07 and $D$ by 0.23, so it stays. The output is $A$, $D$, $F$.
+
+<NmsSteps />
+
+The threshold is a trade-off between duplicates and crowds. At $\tau = 0.7$ in this example $E$ also survives, a duplicate of $D$; at $\tau = 0.2$, $F$ disappears as well, and if $F$ was a real object partly hidden behind the other two, it is lost. No single threshold handles both a crowd of overlapping people and a cluster of duplicates of one person, which is one motivation for detectors without NMS (below).
+
+## Evaluation: precision, recall and mAP
+
+A detector is scored per class by the precision–recall curve of its detections, ranked by score across the whole test set. The [classification metrics note](/notes/ml/classification-metrics#when-roc-flatters-the-precisionrecall-curve) defines the curve and average precision for ranked binary predictions; detection adds one step, deciding which detections are true positives.
+
+1. Go through the detections of a class in order of decreasing score.
+2. A detection is a **true positive** if its IoU with a true box of that class in the same image is at least $\tau$ and that box has not been matched by a higher-scoring detection; otherwise it is a **false positive**. A second detection of an already matched object is a false positive: duplicates are penalized.
+3. After the $k$-th detection, precision is the fraction of the $k$ that are true positives, and recall the fraction of all $n_+$ true boxes that have been matched. True boxes never matched are the misses.
+4. Replace each precision by the **interpolated** precision, the best precision at the same or higher recall, $p_{\text{interp}}(r) = \max_{r' \ge r} p(r')$, which removes the zigzag and makes the curve non-increasing. **Average precision** (AP) is the area under the interpolated curve.
+
+The **mean average precision** (mAP) averages AP over the classes. Conventions differ in the threshold and the sampling of the curve. PASCAL VOC uses $\tau = 0.5$; its 2007 edition averaged the interpolated precision at the 11 recalls $0, 0.1, \dots, 1$ ([Everingham et al., 2010](#references)), and later editions use the area under the whole interpolated curve. COCO averages over ten thresholds, $\tau = 0.50, 0.55, \dots, 0.95$, samples the interpolated curve at 101 recalls $0, 0.01, \dots, 1$, and calls the result simply **AP**; AP50 and AP75 are the single-threshold versions, and $\mathrm{AP}_S$, $\mathrm{AP}_M$ and $\mathrm{AP}_L$ restrict to objects smaller than $32^2$ pixels, between $32^2$ and $96^2$, and larger ([Lin et al., 2014](#references); the official COCO evaluation code). Averaging over thresholds rewards tight boxes: a detector whose boxes are all at IoU 0.6 scores well at AP50 and poorly at AP.
+
+**Worked example.** One class, four true $40 \times 40$ boxes, seven detections. Shifting a $40 \times 40$ box sideways by $d$ pixels gives IoU $(40 - d)/(40 + d)$, and the detections are such shifted copies:
+
+| rank | score | best match, IoU | at $\tau = 0.5$ | precision | recall | at $\tau = 0.75$ |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | 0.95 | object 1, 0.905 | TP | 1.000 | 0.25 | TP |
+| 2 | 0.90 | object 2, 0.633 | TP | 1.000 | 0.50 | FP |
+| 3 | 0.80 | object 3, 0.333 | FP | 0.667 | 0.50 | FP |
+| 4 | 0.70 | object 1, 0.667 | FP (duplicate) | 0.500 | 0.50 | FP |
+| 5 | 0.60 | object 3, 0.818 | TP | 0.600 | 0.75 | TP |
+| 6 | 0.50 | object 4, 0.538 | TP | 0.667 | 1.00 | FP |
+| 7 | 0.40 | none | FP | 0.571 | 1.00 | FP |
+
+At $\tau = 0.5$ the true positives come at ranks 1, 2, 5 and 6, each adding $1/4$ of recall. Their interpolated precisions are 1, 1, 0.667 and 0.667 (at rank 5 the precision is 0.600, but rank 6 reaches 0.667 at a higher recall), so
+
+$$
+\mathrm{AP}_{0.5} = \tfrac14 (1 + 1 + 0.667 + 0.667) = 0.833 .
+$$
+
+Without interpolation the sum would use 0.600 at rank 5 and give 0.817. At $\tau = 0.75$ only ranks 1 and 5 are true positives, with precisions 1 and $2/5$, so $\mathrm{AP}_{0.75} = \tfrac14(1 + 0.4) = 0.350$: the ranking is the same, but two of the boxes are not tight enough. Over the ten COCO thresholds the AP is 0.833, 0.65, 0.65, 0.35, 0.35, 0.35, 0.35, 0.25, 0.25 and 0, with mean 0.403.
+
+<ApCurve />
+
+**Results across papers are comparable only under the same protocol.** VOC mAP at 0.5 and COCO AP over ten thresholds are different numbers on different data: the 73.2% of Faster R-CNN on VOC 2007 and the 39.1 AP of RetinaNet on COCO do not rank the two methods.
+
+<aside class="callout"><strong>Check yourself.</strong> (1) What is the IoU of $(0, 0, 10, 10)$ and $(5, 0, 15, 10)$? (2) A box of the right size is shifted by the same fraction $u$ of its side along both axes. Up to which $u$ does it still count as a hit at $\tau = 0.5$? (3) Four objects; five detections ranked TP, FP, TP, TP, FP. What is the AP?<details><summary>Answers</summary>(1) The intersection is $5 \times 10 = 50$, the union $100 + 100 - 50 = 150$, so $1/3$. (2) The intersection is $(1 - u)^2$ of a box and the IoU $(1 - u)^2 / \big(2 - (1 - u)^2\big)$; it equals $0.5$ when $(1 - u)^2 = 2/3$, at $u = 0.184$, less than the third allowed along one axis. (3) The precisions after each rank are $1, 0.5, 0.667, 0.75, 0.6$. The true positives at ranks 1, 3 and 4 have interpolated precisions $1, 0.75, 0.75$, and the fourth object is never found, so $\mathrm{AP} = (1 + 0.75 + 0.75)/4 = 0.625$.</details></aside>
+
+## DETR: detection as set prediction
+
+*Optional depth: a detector built on the Transformer, which this course reaches in [Vision Transformers](/notes/deep-learning/vision-transformers). The rest of the note does not depend on it.*
+
+Anchors, IoU-based labelling and NMS are hand-designed parts that every detector above needs. **DETR** ([Carion et al., 2020](#references)) removes them by treating detection as the prediction of a set. A CNN backbone produces a feature map, which is flattened into a sequence of $HW$ feature vectors with positional encodings and passed through a [Transformer](/notes/nlp/transformers#three-arrangements) encoder, whose [self-attention](/notes/nlp/attention) lets every location see the whole image. A decoder takes $N = 100$ learned **object queries**, vectors that each attend to the encoded image and are each turned into one prediction: a class among $K$ plus "no object" $\varnothing$, and a box.
+
+The loss compares the set of $N$ predictions with the set of true objects, padded with $\varnothing$ to size $N$. First, the **Hungarian algorithm** finds the one-to-one assignment $\hat\sigma$ of predictions to objects with the lowest total matching cost, which combines the predicted probability of the right class with the box error. Then each prediction is trained toward its assigned object: cross-entropy on the class, and for real objects an L1 loss on the box coordinates (weight 5) plus the generalized IoU loss (weight 2) ([Rezatofighi et al., 2019](#references)), which stays informative when two boxes do not overlap (section 3.1 and Appendix A.4). Because each object is matched to exactly one prediction, a second prediction of the same object is trained toward "no object": the network learns to suppress its own duplicates, and NMS is not needed.
+
+With a ResNet-50 backbone and 500 training epochs, DETR reached 42.0 AP on COCO val, the same as a well-tuned Faster R-CNN with a feature pyramid; it was better on large objects ($\mathrm{AP}_L$ 61.1 against 53.4) and worse on small ones ($\mathrm{AP}_S$ 20.5 against 26.6) (section 4.1, Table 1). It also trains much longer than anchor-based detectors. Later variants address both, and the set-prediction view returns in [Vision Transformers](/notes/deep-learning/vision-transformers).
+
+## What changed
+
+| | Classifier slid over windows | Modern detector |
+| --- | --- | --- |
+| Candidates | every window, scale, ratio | proposals or anchors, about $10^3$ to $10^5$ |
+| Features | one network pass per window | one backbone pass per image, cropped by RoI pooling or read at each position |
+| Boxes | the windows themselves | regressed offsets $(t_x, t_y, t_w, t_h)$ from each reference box |
+| Background | as frequent as it is | sampled at fixed ratios, mined, or turned down by the focal loss |
+| Duplicates | many per object | removed by NMS, or never produced (DETR) |
+| Score | accuracy | AP per class at an IoU threshold, averaged into mAP |
+
+## Limitations
+
+- **Hand-tuned thresholds everywhere.** Anchor IoU thresholds, NMS thresholds and anchor shapes are chosen per dataset; bad anchors for unusual aspect ratios mean missed objects.
+- **NMS cannot tell crowds from duplicates.** Heavily overlapping objects of the same class suppress each other.
+- **Small objects.** At stride 16 or 32 a 10-pixel object covers less than one feature cell, and IoU punishes a few pixels of error severely.
+- **Boxes are a coarse description.** A diagonal pole or a person with outstretched arms fills a small part of its box; the shape itself is what [segmentation](/notes/deep-learning/semantic-segmentation) predicts.
+- **The metric shapes the method.** AP at 0.5 ignores box tightness, AP over ten thresholds rewards it, and neither measures the cost of a missed object against a false alarm in a given application.
+
+## What you should remember
+
+- $\operatorname{IoU} = \lvert b \cap b' \rvert / \lvert b \cup b' \rvert$; a box of the right size shifted by a fraction $u$ along one axis has IoU $(1 - u)/(1 + u)$, so the threshold 0.5 allows a third of a side and 0.75 a seventh.
+- Boxes are regressed as offsets from a reference box: $t_x = (x - x_a)/w_a$, $t_w = \log(w/w_a)$, trained with smooth L1.
+- R-CNN classifies about 2000 warped proposals; Fast R-CNN shares the backbone and pools each proposal to $7 \times 7$; Faster R-CNN learns the proposals with an RPN over 9 anchors per position, positives at IoU above 0.7 and negatives below 0.3.
+- One-stage detectors (YOLO, SSD, RetinaNet) predict classes and boxes at every location; the focal loss $-\alpha_t (1 - p_t)^\gamma \log p_t$ with $\gamma = 2$ cuts the loss of an example at $p_t = 0.9$ a hundredfold, so that background no longer dominates.
+- NMS keeps the best box and removes those overlapping it above $\tau$, then repeats; the threshold trades duplicates against crowds.
+- AP is the area under the interpolated precision–recall curve of a class, with true positives defined by IoU at least $\tau$ and one match per object; mAP averages over classes, COCO AP also over $\tau = 0.5, \dots, 0.95$.
+- DETR predicts a set with object queries and a Hungarian-matched loss, and needs neither anchors nor NMS.
+
+## Code
+
+IoU, box encoding, the focal loss, NMS and average precision on synthetic boxes, with the worked examples of the note. NMS is compared with `torchvision.ops.nms` when torchvision is installed and otherwise checked against its defining property: kept boxes overlap each other by at most $\tau$, and every removed box overlaps a higher-scoring kept one by more than $\tau$, which by induction over the score order determines the result uniquely. The last part simulates a detector whose boxes are true boxes with jittered corners and measures what the jitter does to AP at different thresholds. Exact numbers can differ slightly across platforms and library versions; the script runs in about a second.
+
+```python
+import math, torch
+
+def box_iou(a, b):
+    """Pairwise IoU of boxes a (N, 4) and b (M, 4), each row (x1, y1, x2, y2)."""
+    area_a = (a[:, 2] - a[:, 0]) * (a[:, 3] - a[:, 1])
+    area_b = (b[:, 2] - b[:, 0]) * (b[:, 3] - b[:, 1])
+    lt = torch.max(a[:, None, :2], b[None, :, :2])   # (N, M, 2): top-left corner of each intersection
+    rb = torch.min(a[:, None, 2:], b[None, :, 2:])   # bottom-right corner
+    wh = (rb - lt).clamp(min=0)                      # empty intersections get width or height 0
+    inter = wh[..., 0] * wh[..., 1]
+    return inter / (area_a[:, None] + area_b[None, :] - inter)
+
+# 1. IoU: the worked example, and what a 2-pixel shift costs a small and a large box
+A, B = torch.tensor([[1., 1, 5, 5]]), torch.tensor([[3., 2, 7, 6]])
+print(round(box_iou(A, B).item(), 4))                                          # 0.2308 = 6 / 26
+print([round(box_iou(torch.tensor([[0., 0, s, s]]), torch.tensor([[2., 0, s + 2, s]])).item(), 3) for s in (10, 100)])
+# [0.667, 0.961]
+
+# 2. regression targets of a box relative to an anchor, both as (centre x, centre y, width, height)
+def encode(anchor, box):
+    xa, ya, wa, ha = anchor
+    x, y, w, h = box
+    return [(x - xa) / wa, (y - ya) / ha, math.log(w / wa), math.log(h / ha)]
+print([round(t, 3) for t in encode((50, 50, 40, 40), (56, 47, 60, 32))])     # [0.15, -0.075, 0.405, -0.223]
+
+# 3. focal loss against cross-entropy, as a function of the probability p_t of the true class
+for pt in (0.1, 0.5, 0.9, 0.968):
+    ce = -math.log(pt)
+    print(pt, round(ce, 4), round((1 - pt) ** 2 * ce, 6), round(1 / (1 - pt) ** 2, 1))
+# 0.1 2.3026 1.865094 1.2 | 0.5 0.6931 0.173287 4.0 | 0.9 0.1054 0.001054 100.0 | 0.968 0.0325 3.3e-05 976.6
+# 100,000 easy negatives (p_t = 0.99) against 10 positives (p_t = 0.5): the positives' share of the loss
+for gamma, alpha in ((0, 0.5), (2, 0.5), (2, 0.25)):
+    neg = 1e5 * (1 - alpha) * 0.01 ** gamma * -math.log(0.99)
+    pos = 10 * alpha * 0.5 ** gamma * -math.log(0.5)
+    print(gamma, alpha, round(pos / (pos + neg), 4))
+# 0 0.5 0.0068 | 2 0.5 0.9452 | 2 0.25 0.8518
+
+# 4. greedy non-maximum suppression
+def nms(boxes, scores, thr):
+    order = scores.argsort(descending=True)
+    keep = []
+    while order.numel() > 0:
+        i = order[0]
+        keep.append(i.item())
+        ious = box_iou(boxes[i][None], boxes[order[1:]])[0]
+        order = order[1:][ious <= thr]               # drop every box that overlaps the kept one by more than thr
+    return torch.tensor(keep)
+
+names = 'ABCDEF'
+boxes = torch.tensor([[10., 10, 50, 50], [14, 12, 54, 52], [8, 14, 46, 54],
+                      [60, 20, 100, 60], [64, 24, 104, 64], [40, 30, 80, 70]])
+scores = torch.tensor([0.95, 0.80, 0.60, 0.90, 0.55, 0.50])
+print(box_iou(boxes, boxes).numpy().round(3))
+# [[1.    0.747 0.711 0.    0.    0.067]
+#  [0.747 1.    0.639 0.    0.    0.107]
+#  [0.711 0.639 1.    0.    0.    0.048]
+#  [0.    0.    0.    1.    0.681 0.231]
+#  [0.    0.    0.    0.681 1.    0.205]
+#  [0.067 0.107 0.048 0.231 0.205 1.   ]]
+for thr in (0.5, 0.7, 0.2):
+    print(thr, ''.join(names[i] for i in nms(boxes, scores, thr)))
+# 0.5 ADF | 0.7 ADEF | 0.2 AD
+
+# check on 300 random boxes: against torchvision if it is installed, otherwise by the defining property
+torch.manual_seed(0)
+xy = torch.rand(300, 2) * 200
+rnd = torch.cat([xy, xy + 10 + torch.rand(300, 2) * 40], 1)
+s = torch.rand(300)
+mine = nms(rnd, s, 0.5)
+try:
+    import torchvision
+    print('matches torchvision:', torch.equal(mine, torchvision.ops.nms(rnd, s, 0.5)))
+except ImportError:
+    kept = torch.zeros(300, dtype=torch.bool); kept[mine] = True
+    iou = box_iou(rnd, rnd)
+    higher = s[None, :] > s[:, None]                 # higher[i, j]: box j scores above box i
+    ok_kept = (iou[kept][:, kept] - torch.eye(int(kept.sum()))).max() <= 0.5
+    ok_dropped = ((iou[~kept] > 0.5) & higher[~kept] & kept[None, :]).any(1).all()
+    print(len(mine), 'kept; kept boxes overlap at most 0.5:', bool(ok_kept),
+          '| each dropped box overlaps a higher-scoring kept one:', bool(ok_dropped))
+# 245 kept; kept boxes overlap at most 0.5: True | each dropped box overlaps a higher-scoring kept one: True
+
+# 5. average precision with all-point interpolation
+def average_precision(det_boxes, det_scores, gt_boxes, thr):
+    order = det_scores.argsort(descending=True)
+    iou = box_iou(det_boxes[order], gt_boxes)
+    taken = torch.zeros(len(gt_boxes), dtype=torch.bool)
+    tp = torch.zeros(len(order))
+    for k in range(len(order)):                      # each detection, best score first, takes the best free match
+        cand = iou[k].clone()
+        cand[taken] = -1
+        j = cand.argmax()
+        if cand[j] >= thr:
+            taken[j] = True
+            tp[k] = 1
+    hits = tp.cumsum(0)
+    precision = hits / torch.arange(1, len(tp) + 1)
+    recall = hits / len(gt_boxes)
+    envelope = precision.flip(0).cummax(0).values.flip(0)   # best precision at this recall or beyond
+    return (envelope * tp).sum().item() / len(gt_boxes), tp, precision
+
+# the worked example: four 40 x 40 objects; detections shifted sideways by d pixels have IoU (40 - d) / (40 + d)
+gt = torch.tensor([[x, 0., x + 40, 40] for x in (0, 100, 200, 300)])
+shift = lambda g, d: [g[0] + d, g[1], g[2] + d, g[3]]
+dets = torch.tensor([shift(gt[0], 2), shift(gt[1], 9), shift(gt[2], 20), shift(gt[0], 8),
+                     shift(gt[2], 4), shift(gt[3], 12), [0, 200, 40, 240]])
+conf = torch.tensor([0.95, 0.90, 0.80, 0.70, 0.60, 0.50, 0.40])
+print(box_iou(dets, gt).max(1).values.numpy().round(3))       # [0.905 0.633 0.333 0.667 0.818 0.538 0.   ]
+ap50, tp, prec = average_precision(dets, conf, gt, 0.5)
+print(tp.tolist(), prec.numpy().round(3), round(ap50, 4))
+# [1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0] [1.    1.    0.667 0.5   0.6   0.667 0.571] 0.8333
+thresholds = [0.5 + 0.05 * i for i in range(10)]
+aps = [average_precision(dets, conf, gt, t)[0] for t in thresholds]
+print([round(a, 3) for a in aps], round(sum(aps) / 10, 4))
+# [0.833, 0.65, 0.65, 0.35, 0.35, 0.35, 0.35, 0.25, 0.25, 0.0] 0.4033
+
+# 6. synthetic detector: 200 images with 1 to 4 objects, corners jittered by sigma times the box size,
+#    10% of objects missed, one low-scoring false positive per image on average
+def synthetic(sigma, seed=0):
+    g = torch.Generator().manual_seed(seed)
+    gts, dets, confs, img_ids = [], [], [], []
+    for img in range(200):
+        n = int(torch.randint(1, 5, (1,), generator=g))
+        xy = torch.rand(n, 2, generator=g) * 300
+        wh = 20 + torch.rand(n, 2, generator=g) * 80
+        box = torch.cat([xy, xy + wh], 1)
+        gts.append(box)
+        found = torch.rand(n, generator=g) > 0.1
+        noisy = box + sigma * wh.repeat(1, 2) * torch.randn(n, 4, generator=g)
+        dets.append(noisy[found]); confs.append(0.5 + 0.5 * torch.rand(int(found.sum()), generator=g))
+        m = int(torch.poisson(torch.tensor([1.0]), generator=g))
+        fxy = torch.rand(m, 2, generator=g) * 300
+        dets.append(torch.cat([fxy, fxy + 20 + torch.rand(m, 2, generator=g) * 80], 1))
+        confs.append(0.7 * torch.rand(m, generator=g))
+        img_ids += [img] * (int(found.sum()) + m)
+    # boxes of different images must never match: shift each image far apart before pooling
+    off = lambda b, i: b + 1000 * i
+    G = torch.cat([off(b, i) for i, b in enumerate(gts)])
+    D = torch.cat([off(b, i) for i, b in zip(img_ids, torch.cat(dets).split(1))])
+    return [average_precision(D, torch.cat(confs), G, t)[0] for t in thresholds]
+
+for sigma in (0.02, 0.05, 0.1):
+    a = synthetic(sigma)
+    print(sigma, round(a[0], 3), round(a[5], 3), round(sum(a) / 10, 3))   # sigma, AP50, AP75, AP over 0.5:0.95
+# 0.02 0.837 0.837 0.757
+# 0.05 0.837 0.806 0.593
+# 0.1 0.824 0.154 0.362
+```
+
+In the simulation, 10% of the objects are never detected and some false positives score above true detections, so even perfect boxes would not reach AP 1. Corners jittered by 2% of the box size cost nothing at AP50 and AP75 and lower the ten-threshold AP to 0.757; at 10% jitter AP50 is almost unchanged, 0.824, while AP75 collapses to 0.154 and the ten-threshold AP to 0.362. This is the sense in which COCO's AP measures localization quality and VOC's mAP at 0.5 mostly does not.
+
+## Next
+
+A box says where an object is but not which pixels belong to it. The [next note](/notes/deep-learning/semantic-segmentation) labels every pixel: it needs a network whose output has the resolution of its input, which the encoder–decoder with skip connections provides, and its own losses and metrics, which reuse the IoU of this note at the level of pixels. Mask R-CNN, at its end, adds exactly this to the Faster R-CNN of this note.
+
+## References
+
+- R. Girshick, J. Donahue, T. Darrell, J. Malik. [Rich feature hierarchies for accurate object detection and semantic segmentation](https://arxiv.org/abs/1311.2524). CVPR, 2014. Sections 2.1–2.4 (R-CNN, timing, VOC 2010 results), Appendix C (box regression).
+- J. R. R. Uijlings, K. E. A. van de Sande, T. Gevers, A. W. M. Smeulders. [Selective search for object recognition](https://doi.org/10.1007/s11263-013-0620-5). *International Journal of Computer Vision*, 104(2):154–171, 2013.
+- R. Girshick. [Fast R-CNN](https://arxiv.org/abs/1504.08083). ICCV, 2015. Sections 2.1–2.3 (RoI pooling, multi-task loss, sampling), section 4.4 and Table 4 (timing).
+- S. Ren, K. He, R. Girshick, J. Sun. [Faster R-CNN: towards real-time object detection with region proposal networks](https://arxiv.org/abs/1506.01497). NeurIPS, 2015. Section 3.1 (anchors, labelling, loss), section 4 (results and timing).
+- T.-Y. Lin, P. Dollár, R. Girshick, K. He, B. Hariharan, S. Belongie. [Feature pyramid networks for object detection](https://arxiv.org/abs/1612.03144). CVPR, 2017 (Lin et al., 2017a).
+- J. Redmon, S. Divvala, R. Girshick, A. Farhadi. [You only look once: unified, real-time object detection](https://arxiv.org/abs/1506.02640). CVPR, 2016. Section 2 (the grid and the loss), Table 1.
+- W. Liu, D. Anguelov, D. Erhan, C. Szegedy, S. Reed, C.-Y. Fu, A. C. Berg. [SSD: single shot multibox detector](https://arxiv.org/abs/1512.02325). ECCV, 2016. Section 2 (default boxes, matching, hard negative mining).
+- T.-Y. Lin, P. Goyal, R. Girshick, K. He, P. Dollár. [Focal loss for dense object detection](https://arxiv.org/abs/1708.02002). ICCV, 2017 (Lin et al., 2017b). Section 3 (the focal loss), section 4 (RetinaNet), Table 2.
+- N. Carion, F. Massa, G. Synnaeve, N. Usunier, A. Kirillov, S. Zagoruyko. [End-to-end object detection with transformers](https://arxiv.org/abs/2005.12872). ECCV, 2020. Section 3 (set prediction loss, architecture), Table 1, Appendix A.4.
+- H. Rezatofighi, N. Tsoi, J. Gwak, A. Sadeghian, I. Reid, S. Savarese. [Generalized intersection over union: a metric and a loss for bounding box regression](https://arxiv.org/abs/1902.09630). CVPR, 2019.
+- M. Everingham, L. Van Gool, C. K. I. Williams, J. Winn, A. Zisserman. [The PASCAL Visual Object Classes (VOC) challenge](https://doi.org/10.1007/s11263-009-0275-4). *International Journal of Computer Vision*, 88(2):303–338, 2010. The 11-point average precision of VOC 2007.
+- T.-Y. Lin, M. Maire, S. Belongie, J. Hays, P. Perona, D. Ramanan, P. Dollár, C. L. Zitnick. [Microsoft COCO: common objects in context](https://arxiv.org/abs/1405.0312). ECCV, 2014. The evaluation protocol (IoU thresholds 0.50:0.05:0.95, 101 recall points, object sizes) is defined in the [official evaluation code](https://github.com/cocodataset/cocoapi/blob/master/PythonAPI/pycocotools/cocoeval.py).
+- A. Zhang, Z. C. Lipton, M. Li, A. J. Smola. [*Dive into Deep Learning*](https://d2l.ai/). Cambridge University Press, 2023. Sections 14.3–14.8 (bounding boxes, anchor boxes, multiscale detection, SSD, R-CNNs).
+- S. J. D. Prince. [*Understanding Deep Learning*](https://udlbook.github.io/udlbook/). MIT Press, 2023. Section 10.5.2 (object detection with YOLO).
+- I. Goodfellow, Y. Bengio, A. Courville. [*Deep Learning*](https://www.deeplearningbook.org/). MIT Press, 2016. Chapter 9 (convolutional networks).
+- *Глубинное обучение 1* (Deep Learning 1), Faculty of Computer Science, HSE University. Course materials, [repository xiyori/intro-to-dl-hse, branch 2025-2026](https://github.com/xiyori/intro-to-dl-hse/tree/2025-2026): the lecture on computer vision tasks (R-CNN, Fast and Faster R-CNN, YOLO, NMS, mAP).

@@ -1,0 +1,384 @@
+---
+title: Convolutional architectures
+description: "How image classifiers grew from LeNet and AlexNet through VGG and Inception to residual networks, why residual connections made depth trainable, DenseNet, MobileNet's depthwise-separable convolutions, EfficientNet's compound scaling, and reusing pretrained ImageNet backbones."
+course: deep-learning
+section: Convolutional Networks
+order: 6
+status: published
+tags: [cnn, lenet, alexnet, vgg, inception, resnet, residual-connections, densenet, mobilenet, depthwise-separable, efficientnet, transfer-learning]
+prerequisites: [Convolution, Normalization and initialization, Optimizing deep networks]
+---
+
+import InceptionModule from '../../../components/figures/cnn-architectures/InceptionModule.astro';
+import ResidualBlocks from '../../../components/figures/cnn-architectures/ResidualBlocks.astro';
+import DepthExperiment from '../../../components/figures/cnn-architectures/DepthExperiment.astro';
+import DepthwiseSeparable from '../../../components/figures/cnn-architectures/DepthwiseSeparable.astro';
+
+The [previous note](/notes/deep-learning/convolution) took one convolution layer apart: its weights, its cost, its receptive field. A classifier stacks dozens of them, and how to stack them is a design question with many answers. This note follows the answers that shaped the field, each fixing a problem the previous one left: LeNet's pattern of convolutions and pooling; AlexNet, which scaled it to ImageNet; VGG's uniform stacks of $3 \times 3$ layers; Inception's parallel branches and $1 \times 1$ bottlenecks; residual networks, which made depth trainable; DenseNet; MobileNet and EfficientNet, which spend a fixed budget of computation well; and the practice of reusing a network trained on ImageNet for a new task. It ends with an experiment in which a deeper plain network trains worse than a shallower one, and residual connections reverse that.
+
+**Notation.** As in the previous note, a feature map has $C$ channels on an $H \times W$ grid and a convolution has $k \times k$ kernels. Parameter counts are of weights, with biases left out unless stated. **FLOPs** count multiply-adds, as the papers do. A residual block computes $x + F(x)$, with $F$ its **residual branch**. In the efficiency sections, $M$ and $N$ are the input and output channels of a layer.
+
+## Baseline: LeNet's pattern
+
+LeNet-5 ([LeCun et al., 1998](#references), section II.B) read $32 \times 32$ images of handwritten characters. Its layers, with sizes from the output-size formula of the previous note:
+
+- a $5 \times 5$ convolution to 6 maps, $32 \to 28$;
+- a $2 \times 2$ subsampling, $28 \to 14$;
+- a $5 \times 5$ convolution to 16 maps, $14 \to 10$;
+- a $2 \times 2$ subsampling, $10 \to 5$;
+- fully connected layers $16 \cdot 5 \cdot 5 = 400 \to 120 \to 84 \to 10$, with a squashing nonlinearity throughout.
+
+In the original, each of the 16 maps of the second convolution read only some of the 6 maps below it; with full connections, as modern reimplementations do, the network has 61,706 parameters. The pattern has survived in every network since: convolutions extract local features, downsampling trades resolution for channels (here $6 \times 28 \times 28$ becomes $16 \times 5 \times 5$), and a classifier reads the final map. Two limits are visible already. The fully connected head expects exactly 400 inputs, so the input size is fixed. And the network is shallow: a unit of the last convolution sees a $14 \times 14$ window of the input, by the receptive-field recursion of the previous note.
+
+## Scaling up: AlexNet
+
+AlexNet ([Krizhevsky, Sutskever and Hinton, 2012](#references)) kept the pattern and made everything larger: $224 \times 224$ colour images, five convolutional layers (the first with $11 \times 11$ kernels and stride 4) and three fully connected ones, 60 million parameters. What made it trainable on 1.2 million images, ReLUs, dropout, augmentation and two GPUs, and what it won, is in the [first note of the course](/notes/deep-learning/deep-learning#why-deep-networks-took-off-around-2012). One architectural fact matters here: where its parameters sit. In the single-tower version that torchvision ships, the five convolutions have 2.5 million parameters and the three fully connected layers 58.6 million, **96%** of the total. The convolutions do most of the computation; the dense head holds most of the memory.
+
+## VGG: stacks of small kernels
+
+VGG ([Simonyan and Zisserman, 2015](#references)) asked what depth alone does, and fixed everything else. Every convolution is $3 \times 3$ with stride 1 and padding 1, every downsampling is a $2 \times 2$ max pool with stride 2, and the number of channels doubles after each pooling, from 64 to 512. The configurations with 16 and 19 weight layers became VGG-16 and VGG-19.
+
+**Why $3 \times 3$.** By the receptive-field recursion, a stack of $n$ layers of $3 \times 3$ with stride 1 sees $(2n + 1) \times (2n + 1)$ pixels: two layers see $5 \times 5$, three see $7 \times 7$. For $C$ channels in and out:
+
+$$
+\text{three } 3 \times 3 \text{ layers: } 3 \cdot 9\, C^2 = 27\, C^2 \text{ weights}, \qquad
+\text{one } 7 \times 7 \text{ layer: } 49\, C^2 ,
+$$
+
+so the single layer has 81% more weights for the same receptive field, and the stack applies three nonlinearities instead of one (section 2.3). At $C = 256$ that is 1,769,472 weights against 3,211,264.
+
+**The price.** VGG-16 has 138 million parameters (Table 2), 89% of them in its fully connected head by the count of the Code section. Training one network took two to three weeks on four GPUs (section 3.3). The deepest configurations were initialized from shallower trained ones; after publication the authors found that Glorot initialization, the scale-preserving initialization of [Normalization and initialization](/notes/deep-learning/normalization-and-initialization), made this unnecessary (section 3.1). An ensemble of seven VGG networks reached 7.3% top-5 error on the ILSVRC-2014 test set, and two of them 6.8% after the competition (section 4.5). Each $224 \times 224$ image costs VGG-16 15.3 billion FLOPs ([He et al., 2016](#references), section 4.1), more than twenty times AlexNet.
+
+## Inception: several kernel sizes and cheap bottlenecks
+
+GoogLeNet ([Szegedy et al., 2015](#references)), the first Inception network, was built under a computational budget. Its 22 layers use 12 times fewer parameters than AlexNet, and it won ILSVRC-2014 with a top-5 error of 6.67%.
+
+Its building block, the **Inception module**, does not choose a kernel size. It runs four branches side by side on the same input, $1 \times 1$, $3 \times 3$ and $5 \times 5$ convolutions and a $3 \times 3$ max pooling, and concatenates their outputs along the channel dimension; all branches keep the spatial size, so the outputs can be stacked. Run on all input channels, the $5 \times 5$ branch would dominate the cost. The fix is to shrink the channels first with a $1 \times 1$ convolution, the **bottleneck** or reduction, from the previous note's [pointwise convolutions](/notes/deep-learning/convolution#pointwise-convolutions-mixing-channels).
+
+**Worked example.** The module called inception (3a) reads a $28 \times 28 \times 192$ map (Table 1). Its branches are: a $1 \times 1$ convolution to 64 channels; a $1 \times 1$ reduction to 96 channels, then a $3 \times 3$ convolution to 128; a $1 \times 1$ reduction to 16, then a $5 \times 5$ convolution to 32; a $3 \times 3$ max pool, then a $1 \times 1$ projection to 32. The output has $64 + 128 + 32 + 32 = 256$ channels. The weights:
+
+$$
+\begin{aligned}
+&192 \cdot 64 + (192 \cdot 96 + 96 \cdot 128 \cdot 9) + (192 \cdot 16 + 16 \cdot 32 \cdot 25) + 192 \cdot 32 \\
+&= 12{,}288 + 129{,}024 + 15{,}872 + 6{,}144 = 163{,}328 ,
+\end{aligned}
+$$
+
+the "159K" of Table 1, which counts thousands of 1024, and $163{,}328 \cdot 28 \cdot 28 = 128$ million multiply-adds. Without the two reductions, a $3 \times 3$ convolution from 192 to 128 channels and a $5 \times 5$ from 192 to 32 would need $221{,}184 + 153{,}600 = 374{,}784$ weights, against $144{,}896$ for the two middle branches with their reductions: 2.6 times more.
+
+<InceptionModule />
+
+1. All four branches read the same $28 \times 28 \times 192$ input.
+2. $1 \times 1$ convolutions reduce 192 channels to 96 and 16 before the expensive layers.
+3. The $3 \times 3$ and $5 \times 5$ convolutions run on the reduced input; the pooling branch gets a $1 \times 1$ projection.
+4. The branch outputs are concatenated: 256 channels.
+
+Two more choices of GoogLeNet became standard or were dropped. It replaced the fully connected head by **global average pooling**, removing most of the parameters that dominate AlexNet and VGG, which also raised top-1 accuracy by about 0.6%. And, to help the gradient reach its middle layers, it attached two **auxiliary classifiers** to intermediate modules, adding their losses with weight 0.3 during training and discarding them at inference. Its successors added batch normalization and found that the auxiliary classifiers did not speed up convergence and acted mainly as regularizers; Inception v3 also factorized $5 \times 5$ convolutions into two $3 \times 3$ ones, VGG's argument applied inside the module ([Szegedy et al., 2016](#references), sections 3 and 4).
+
+## Residual networks: making depth trainable
+
+By 2015, batch normalization and good initialization had solved the problem of signals vanishing in deep plain networks; they started to train. They did not train *well*. [He et al. (2016)](#references) compared plain networks of 18 and 34 layers on ImageNet, both with batch normalization after every convolution: the 34-layer network had the higher training error throughout training, and the higher validation error, 28.54% top-1 against 27.94% (Table 2, 10-crop testing). This is the **degradation problem**. It is not overfitting, since the training error is higher too, and the deeper network can represent the shallower one by setting its extra layers to the identity; the optimizer does not find that solution. Nor is it vanishing gradients: the authors checked that forward signals and backward gradients kept healthy norms (section 4.1).
+
+<aside class="callout"><strong>Key idea.</strong> Make the identity the default. A residual block outputs $x + F(x)$: with small weights $F \approx 0$ and the block passes its input through, so adding blocks can never make the starting point worse, and each block only learns a correction. The shortcut also carries the gradient past every block through an identity term.</aside>
+
+The [Machine Learning course](/notes/ml/training-deep-networks#residual-connections) derives why: unrolled, a residual stack is its input plus a sum of corrections, and the gradient of the loss with respect to an early block contains the identity, so it reaches every block without passing through any weight matrix. What ResNet adds is the block design that made this work at the scale of ImageNet.
+
+**The basic block** (ResNet-18 and ResNet-34): two $3 \times 3$ convolutions, each followed by batch normalization, with a ReLU between them; the input is added to the result, and a ReLU follows the sum. **The bottleneck block** (ResNet-50, 101 and 152) replaces the two $3 \times 3$ layers by three: a $1 \times 1$ convolution that reduces the channels by 4, a $3 \times 3$ convolution at the reduced width, and a $1 \times 1$ convolution that restores them (section 4.1, "Deeper bottleneck architectures"). At 256 channels the bottleneck has $256 \cdot 64 + 64 \cdot 64 \cdot 9 + 64 \cdot 256 = 69{,}632$ weights, where two $3 \times 3$ layers at 256 channels would have $1{,}179{,}648$.
+
+<ResidualBlocks />
+
+1. The branch $F(x)$, two $3 \times 3$ convolutions with batch normalization, computes a correction.
+2. The shortcut carries $x$ unchanged, with no weights.
+3. The two are added, and a ReLU follows.
+4. The bottleneck reduces 256 channels to 64 with a $1 \times 1$ convolution, works at 64 with a $3 \times 3$, and restores 256 with a $1 \times 1$.
+
+When a block changes the shape, halving the resolution with stride 2 and doubling the channels, the identity no longer fits. ResNet then uses a **projection shortcut**, a $1 \times 1$ convolution with stride 2, on those blocks only (option B of section 3.3); identity shortcuts everywhere else keep the network cheap. Downsampling inside the network is done by strided convolutions, and the head is global average pooling and one fully connected layer.
+
+**What it bought.** With shortcuts, the 34-layer network beat the 18-layer one, 25.03% against 27.88% top-1 error (Table 2): depth helped again. ResNet-152 costs 11.3 billion FLOPs, less than VGG-16, reached a single-model top-5 validation error of 4.49%, and an ensemble won ILSVRC-2015 with 3.57% (section 4.1). On CIFAR-10 a 1202-layer network trained to under 0.1% training error, although its test error, 7.93%, was worse than the 6.43% of a 110-layer one (section 4.2): beyond some depth, the extra capacity overfits a small dataset. Residual connections have been in nearly every deep architecture since, including the [Transformer](/notes/nlp/transformers#residual-connections).
+
+### An experiment: degradation on small digit images
+
+The Code section reproduces the degradation at toy scale. The data are the bundled $8 \times 8$ digits, 1078 training and 719 test images. Each network is a $3 \times 3$ convolution from 1 to 16 channels, then a number of blocks, each two $3 \times 3$ convolutions at 16 channels with batch normalization, then global average pooling and a linear layer. Three blocks give 7 convolutions, ten blocks 21. The plain and the residual version of each depth have the same layers and the same parameters and differ only in the addition. All four are trained the same way: SGD with momentum 0.9 and a one-cycle schedule up to a learning rate of 0.05, batches of 64, 12 epochs, seed 0.
+
+| convolutions | shortcuts | parameters | first-layer gradient at start | final training loss | test accuracy |
+| --- | --- | --- | --- | --- | --- |
+| 7 | none | 14,346 | 0.076 | 0.0161 | 0.992 |
+| 7 | residual | 14,346 | 0.133 | 0.0150 | 0.992 |
+| 21 | none | 47,050 | 0.222 | 0.2122 | 0.960 |
+| 21 | residual | 47,050 | 0.383 | 0.0049 | 0.986 |
+
+The training loss is measured on the whole training set after training, in evaluation mode. The plain network with 21 convolutions ends with a training loss thirteen times that of the plain network with 7, and 3 points lower test accuracy: degradation, with nothing to do with overfitting. Its gradient at the first layer is not small, larger than the shallow network's, so the gradient does not vanish here either. With shortcuts, the deeper network reaches the lowest training loss of the four. With seeds 1 and 2 the picture is the same: the plain 21-layer network ends at training losses 0.161 and 0.534, the residual one at 0.0046 and 0.0055. On a dataset this small, deeper does not mean better test accuracy, and the residual networks of both depths reach 0.985 to 0.994 across the three seeds; the effect to read is the training loss.
+
+<DepthExperiment />
+
+## DenseNet: concatenate instead of add
+
+DenseNet ([Huang et al., 2017](#references)) pushes the shortcut idea further. Inside a **dense block**, layer $\ell$ receives the concatenation of the outputs of all the layers before it,
+
+$$
+x_\ell = H_\ell\big([x_0, x_1, \dots, x_{\ell-1}]\big),
+$$
+
+where $H_\ell$ is batch normalization, ReLU and a convolution, and $[\cdot]$ concatenates channels. A block of $L$ layers has $L(L+1)/2$ direct connections instead of $L$. Each layer adds only $k$ new channels, the **growth rate**, so layer $\ell$ of a block that starts with $k_0$ channels reads $k_0 + k(\ell - 1)$ channels. Features are reused rather than recomputed, and every layer has a short path to the loss. Between blocks, **transition layers** (a $1 \times 1$ convolution and $2 \times 2$ average pooling) halve the channels and the resolution; inside blocks, a $1 \times 1$ bottleneck to $4k$ channels precedes each $3 \times 3$ convolution.
+
+**Worked example.** The ImageNet DenseNets use $k = 32$ (Table 1). The first block of DenseNet-121 starts from $2k = 64$ channels and has 6 layers, so its output has $64 + 6 \cdot 32 = 256$ channels, and its last layer reads $64 + 5 \cdot 32 = 224$. The whole network has 8.0 million parameters in torchvision's version, a third of a ResNet-50. The cost of the design is memory: the concatenated maps must be kept for the backward pass.
+
+## MobileNet: depthwise-separable convolutions
+
+The networks so far were designed for accuracy on a GPU. MobileNet ([Howard et al., 2017](#references)) was designed for a phone, and replaces almost every convolution by a cheaper factorization.
+
+A standard $k \times k$ convolution from $M$ to $N$ channels does two things at once: it combines neighbouring pixels and it mixes channels. The **depthwise-separable** convolution does them one at a time:
+
+- a **depthwise** convolution filters each input channel with its own $k \times k$ kernel and does not mix channels, in PyTorch `nn.Conv2d(M, M, k, groups=M)`;
+- a **pointwise** $1 \times 1$ convolution then mixes the $M$ channels into $N$.
+
+On an $H' \times W'$ output, the costs in multiply-adds are
+
+$$
+\text{standard: } k^2 M N\, H' W', \qquad
+\text{separable: } \big(k^2 M + M N\big)\, H' W', \qquad
+\frac{\text{separable}}{\text{standard}} = \frac{1}{N} + \frac{1}{k^2} ,
+$$
+
+and the weights shrink by the same ratio, without the factor $H' W'$ (section 3.1). For $3 \times 3$ kernels and hundreds of channels the ratio is just above $1/9$: "8 to 9 times less computation".
+
+**Worked example.** A MobileNet layer with $M = N = 512$ on a $14 \times 14$ grid. A standard $3 \times 3$ convolution has $9 \cdot 512 \cdot 512 = 2{,}359{,}296$ weights and costs 462 million multiply-adds. The separable version has $9 \cdot 512 + 512 \cdot 512 = 4{,}608 + 262{,}144 = 266{,}752$ weights and costs 52 million. The ratio is $0.113 = 1/512 + 1/9$: 8.8 times less. Almost all of what remains is in the $1 \times 1$ convolution; in the whole MobileNet, $1 \times 1$ convolutions take 95% of the computation time and hold 75% of the parameters (section 3).
+
+<DepthwiseSeparable />
+
+1. A standard convolution: each $3 \times 3 \times M$ filter mixes neighbours and all channels at once.
+2. Depthwise: one $3 \times 3$ filter per channel, no mixing across channels.
+3. Pointwise: a $1 \times 1$ convolution mixes the channels at every pixel.
+4. The cost at $M = N = 512$: 8.8 times less.
+
+Within one setup the paper measures the trade. The same architecture built from standard convolutions reached 71.7% ImageNet top-1 accuracy with 29.3 million parameters and 4,866 million multiply-adds; with depthwise-separable convolutions, 70.6% with 4.2 million parameters and 569 million (Table 4). One point of accuracy buys a network seven times smaller and eight times cheaper. Two multipliers then shrink it further: a width multiplier $\alpha$ that scales every channel count, and a resolution multiplier $\rho$ for the input (sections 3.3 and 3.4). MobileNetV2 ([Sandler et al., 2018](#references)) wraps the same factorization in residual blocks that expand the channels with a $1 \times 1$ convolution before the depthwise one and project them back afterwards.
+
+## EfficientNet: scaling depth, width and resolution together
+
+Given a good small network and more computation, there are three ways to grow it: more layers (depth $d$), more channels (width $w$) or larger input images (resolution $r$). Growing one alone saturates. EfficientNet ([Tan and Le, 2019](#references)) scales all three together. The cost of a convolutional network is roughly proportional to $d\, w^2 r^2$: doubling the depth doubles the FLOPs, doubling the width or the resolution quadruples them. **Compound scaling** ties the three to one coefficient $\phi$:
+
+$$
+d = \alpha^\phi, \qquad w = \beta^\phi, \qquad r = \gamma^\phi, \qquad
+\alpha\, \beta^2 \gamma^2 \approx 2, \qquad \alpha, \beta, \gamma \ge 1,
+$$
+
+so that each unit of $\phi$ doubles the FLOPs (section 3.3). The constants come from a small grid search at $\phi = 1$ on the base network, EfficientNet-B0, which was itself found by architecture search over mobile blocks built on MobileNetV2's: $\alpha = 1.2$, $\beta = 1.1$, $\gamma = 1.15$ (section 4).
+
+**Worked example.** $\alpha \beta^2 \gamma^2 = 1.2 \cdot 1.21 \cdot 1.3225 = 1.920$. At $\phi = 7$: depth $\times 1.2^7 = 3.58$, width $\times 1.1^7 = 1.95$, resolution $\times 1.15^7 = 2.66$, which takes B0's $224 \times 224$ input to $596$ pixels, close to the 600 used by EfficientNet-B7, and the FLOPs grow by $1.920^7 = 96.3$. The torchvision versions of B0 and B7 list 0.39 and 37.75 GFLOPS, a ratio of 96.8. In the paper, B0 reached 77.1% top-1 accuracy with 5.3 million parameters, and B7 84.3% with 66 million (Table 2).
+
+## Transfer learning from ImageNet backbones
+
+A network trained on ImageNet is two parts: a **backbone**, all the convolutional stages up to the global pooling, and a **head**, the final linear classifier. The backbone's features are useful far beyond the 1000 classes. Early layers learn edges, colour blobs and textures that hardly depend on the dataset, and later layers become specific to the task ([Yosinski et al., 2014](#references)). Reusing them is the default way to train a vision model on a few thousand labelled images:
+
+- **Feature extraction (linear probing).** Freeze the backbone, replace the head by a new linear layer for the new classes, and train only that. It is cheap and hard to overfit.
+- **Fine-tuning.** Start from the pretrained weights and train everything, usually with a smaller learning rate for the backbone than for the new head. It is better when the new data differ from ImageNet and there are enough of them.
+
+In either case, the images must be preprocessed exactly as during pretraining, including the per-channel normalization. Better ImageNet models tend to transfer better: across 16 networks and 12 datasets, ImageNet top-1 accuracy correlated with transfer accuracy at $r = 0.99$ for fixed features and $0.96$ for fine-tuning, but on two small fine-grained datasets pretraining brought little ([Kornblith, Shlens and Le, 2019](#references)). The same choices, a frozen encoder with a linear model against fine-tuning everything, are worked through for text in the [NLP course](/notes/nlp/transfer-learning#frozen-features-and-a-linear-model), and [Self-supervised learning](/notes/deep-learning/self-supervised-learning) pretrains backbones without labels.
+
+## Sizes and accuracies side by side
+
+The table lists pretrained weights distributed with torchvision, with the parameters, FLOPs and ImageNet-1K validation top-1 accuracy that its documentation reports for single-crop evaluation ([TorchVision documentation](#references)).
+
+| weights | parameters | GFLOPS | top-1 (%) |
+| --- | --- | --- | --- |
+| AlexNet | 61.1M | 0.71 | 56.522 |
+| VGG-16 | 138.4M | 15.47 | 71.592 |
+| GoogLeNet | 6.6M | 1.5 | 69.778 |
+| Inception v3 | 27.2M | 5.71 | 77.294 |
+| ResNet-18 | 11.7M | 1.81 | 69.758 |
+| ResNet-50, V1 weights | 25.6M | 4.09 | 76.13 |
+| ResNet-50, V2 weights | 25.6M | 4.09 | 80.858 |
+| ResNet-152 | 60.2M | 11.51 | 78.312 |
+| DenseNet-121 | 8.0M | 2.83 | 74.434 |
+| MobileNet V2 | 3.5M | 0.3 | 71.878 |
+| EfficientNet-B0 | 5.3M | 0.39 | 77.692 |
+| EfficientNet-B7 | 66.3M | 37.75 | 84.122 |
+
+The parameter and FLOP columns describe the architectures. The accuracy column does not rank them, because the rows were not produced in one setup:
+
+- **Training recipes differ.** The two ResNet-50 rows are the same architecture; the V2 weights were trained with a newer recipe and are 4.7 points better. Several rows were trained by torchvision, others were ported from the original authors.
+- **Input resolutions differ.** Inception v3 is evaluated on $299 \times 299$ crops and EfficientNet-B7 on $600 \times 600$; most of the others on $224 \times 224$.
+- **Reported numbers differ between sources.** EfficientNet-B0 has 77.1% in its paper and 77.692% here, for the same architecture.
+
+Within one row, or between rows of one paper's own controlled comparison, such as MobileNet's 71.7% against 70.6% above, a difference means something. Across rows of this table, a difference of a few points may come from the recipe as much as from the architecture.
+
+## What changed
+
+| network | problem it addressed | what it introduced |
+| --- | --- | --- |
+| LeNet | learning features for digits | convolution, pooling, a dense classifier |
+| AlexNet | scale: ImageNet, GPUs | the same pattern, larger, with ReLU and dropout |
+| VGG | how much depth helps | uniform $3 \times 3$ stacks, $27C^2$ against $49C^2$ |
+| Inception | cost of large kernels | parallel branches, $1 \times 1$ reductions, global average pooling |
+| ResNet | deeper plain nets train worse | residual blocks $x + F(x)$, bottlenecks, projection shortcuts |
+| DenseNet | feature reuse | concatenation of all earlier layers, growth rate |
+| MobileNet | computation on small devices | depthwise-separable convolutions, $1/N + 1/k^2$ of the cost |
+| EfficientNet | how to spend more computation | compound scaling of depth, width and resolution |
+
+## Limitations
+
+- **FLOPs are not speed.** Depthwise convolutions and concatenations have few FLOPs but move a lot of memory per operation; on a GPU a MobileNet can run slower than its FLOP count suggests, and latency must be measured on the target device ([data-level parallelism and the roofline](/notes/acos/data-level-parallelism)).
+- **Comparisons are setup-dependent.** Recipes, resolutions, augmentation and evaluation protocols move ImageNet accuracy by several points, as the two ResNet-50 rows show; architecture papers often compare against baselines trained with older recipes.
+- **Classification only.** All of these networks output one label per image; the next two notes reuse their backbones for boxes and for pixels.
+- **ImageNet is not the world.** Features pretrained on ImageNet transfer less to images unlike it, such as medical scans or satellite images, and fine-grained tasks gain little.
+- **Convolution's priors cut both ways.** Locality and weight sharing help with little data, but with very large datasets [Vision Transformers](/notes/deep-learning/vision-transformers), which drop most of these priors, match or exceed convolutional networks.
+
+## What you should remember
+
+- The pattern since LeNet: convolutions and downsampling that trade resolution for channels, then a classifier; the dense head of AlexNet and VGG holds 89–96% of their parameters, and global average pooling removes it.
+- Stacked $3 \times 3$ layers: $n$ of them see $(2n+1) \times (2n+1)$ pixels; three cost $27C^2$ weights against $49C^2$ for one $7 \times 7$.
+- $1 \times 1$ reductions make wide or multi-branch blocks affordable: Inception (3a) has 163,328 weights and 256 output channels.
+- Deeper plain networks can train worse even with batch normalization: degradation, not overfitting and not vanishing gradients. Residual blocks $x + F(x)$ fix it; the bottleneck $1 \times 1 \to 3 \times 3 \to 1 \times 1$ keeps them cheap.
+- Depthwise-separable convolutions cost $1/N + 1/k^2$ of a standard one, about $1/9$ for $3 \times 3$ kernels.
+- Compound scaling grows depth, width and resolution as $1.2^\phi$, $1.1^\phi$, $1.15^\phi$, doubling the FLOPs per unit of $\phi$.
+- Pretrained backbones transfer: linear probing or fine-tuning, with the pretraining preprocessing. Accuracy tables from different setups do not rank architectures.
+
+## Code
+
+Parameter counts of LeNet, AlexNet and VGG-16, the $3 \times 3$ argument, Inception (3a), the ResNet blocks, a depthwise-separable layer and EfficientNet's scaling constants, then the experiment of the residual section. Seeds are fixed; exact numbers can differ across platforms and library versions. The script runs in about 30 seconds on a laptop CPU, almost all of it in the experiment.
+
+```python
+import torch
+from torch import nn
+import torch.nn.functional as F
+from sklearn.datasets import load_digits
+from sklearn.model_selection import train_test_split
+torch.set_num_threads(1)                    # small convolutions run faster on one thread
+
+count = lambda m: sum(p.numel() for p in m.parameters())
+conv = lambda cin, cout, k, groups=1: nn.Conv2d(cin, cout, k, padding=k // 2, groups=groups, bias=False)
+
+# 1. a LeNet-5-shaped network for 32 x 32 inputs (every C3 map connected to all six S2 maps)
+lenet = nn.Sequential(nn.Conv2d(1, 6, 5), nn.Tanh(), nn.AvgPool2d(2), nn.Conv2d(6, 16, 5), nn.Tanh(), nn.AvgPool2d(2),
+                      nn.Flatten(), nn.Linear(400, 120), nn.Tanh(), nn.Linear(120, 84), nn.Tanh(), nn.Linear(84, 10))
+print(count(lenet), tuple(lenet(torch.zeros(1, 1, 32, 32)).shape))           # 61706 (1, 10)
+
+# 2. where the parameters of AlexNet and VGG-16 sit (the layer sizes of torchvision's versions, biases included)
+convs = lambda layers: sum(cout * (cin * k * k + 1) for cin, cout, k in layers)
+dense = lambda dims: sum(b * (a + 1) for a, b in zip(dims, dims[1:]))
+alexnet = convs([(3, 64, 11), (64, 192, 5), (192, 384, 3), (384, 256, 3), (256, 256, 3)]), dense([256 * 6 * 6, 4096, 4096, 1000])
+widths = [3, 64, 64, 128, 128, 256, 256, 256, 512, 512, 512, 512, 512, 512]
+vgg16 = convs([(a, b, 3) for a, b in zip(widths, widths[1:])]), dense([512 * 7 * 7, 4096, 4096, 1000])
+for name, (c, d) in [('AlexNet', alexnet), ('VGG-16', vgg16)]:
+    print(name, c, d, c + d, round(d / (c + d), 3))
+# AlexNet 2469696 58631144 61100840 0.96
+# VGG-16 14714688 123642856 138357544 0.894      convolutions, dense head, total, share of the head
+
+# 3. VGG: three stacked 3 x 3 layers against one 7 x 7 layer, C = 256 channels, same receptive field
+C = 256
+print(count(nn.Sequential(*[conv(C, C, 3) for _ in range(3)])), count(conv(C, C, 7)))   # 1769472 3211264
+
+# 4. Inception (3a): 192 input channels on a 28 x 28 grid, branches 64 | 96 -> 128 | 16 -> 32 | pool -> 32
+branches = [conv(192, 64, 1), conv(192, 96, 1), conv(96, 128, 3), conv(192, 16, 1), conv(16, 32, 5), conv(192, 32, 1)]
+p = sum(count(b) for b in branches)
+print(p, p * 28 * 28, 64 + 128 + 32 + 32)                                      # 163328 128049152 256
+print(count(conv(96, 128, 3)) + count(conv(192, 96, 1)) + count(conv(16, 32, 5)) + count(conv(192, 16, 1)),
+      count(conv(192, 128, 3)) + count(conv(192, 32, 5)))                      # 144896 374784: with and without the 1 x 1 reductions
+
+# 5. ResNet blocks at 256 channels: two 3 x 3 layers against the 1 x 1 -> 3 x 3 -> 1 x 1 bottleneck through 64
+print(count(nn.Sequential(conv(256, 256, 3), conv(256, 256, 3))),
+      count(nn.Sequential(conv(256, 64, 1), conv(64, 64, 3), conv(64, 256, 1))))   # 1179648 69632
+
+# 6. depthwise-separable convolution, M = N = 512 channels on a 14 x 14 grid (a MobileNet layer)
+M = N = 512
+standard, depthwise, pointwise = conv(M, N, 3), conv(M, M, 3, groups=M), conv(M, N, 1)
+x = torch.randn(1, M, 14, 14)
+per_channel = torch.cat([F.conv2d(x[:, c:c + 1], depthwise.weight[c:c + 1], padding=1) for c in range(M)], 1)
+print(f'{(depthwise(x) - per_channel).abs().max().item():.1e}')               # 0.0e+00: groups=M filters each channel on its own
+ps, pd = count(standard), count(depthwise) + count(pointwise)
+print(ps, pd, ps * 14 * 14, pd * 14 * 14, round(pd / ps, 4), round(1 / N + 1 / 9, 4))
+# 2359296 266752 462422016 52283392 0.1131 0.1131
+
+# 7. EfficientNet compound scaling: depth 1.2^phi, width 1.1^phi, resolution 1.15^phi
+a, b, g = 1.2, 1.1, 1.15
+print(round(a * b ** 2 * g ** 2, 3), [round(v ** 7, 2) for v in (a, b, g)], round(224 * g ** 7), round((a * b ** 2 * g ** 2) ** 7, 1))
+# 1.92 [3.58, 1.95, 2.66] 596 96.3
+
+# 8. plain against residual CNNs on 8 x 8 digits: 1078 training and 719 test images
+X, y = load_digits(return_X_y=True)
+Xtr, Xte, ytr, yte = train_test_split(X / 16.0, y, test_size=0.4, random_state=0, stratify=y)
+Xtr, Xte = [torch.tensor(a, dtype=torch.float32).view(-1, 1, 8, 8) for a in (Xtr, Xte)]
+ytr, yte = torch.tensor(ytr), torch.tensor(yte)
+
+class Block(nn.Module):                     # conv-BN-ReLU-conv-BN, plus the input if residual, then ReLU
+    def __init__(self, c, residual):
+        super().__init__()
+        self.residual = residual
+        self.f = nn.Sequential(conv(c, c, 3), nn.BatchNorm2d(c), nn.ReLU(), conv(c, c, 3), nn.BatchNorm2d(c))
+    def forward(self, x):
+        return F.relu(x + self.f(x) if self.residual else self.f(x))
+
+def make(blocks, residual, c=16):          # 1 + 2 * blocks convolutions, global average pooling, a linear classifier
+    return nn.Sequential(nn.Conv2d(1, c, 3, padding=1), nn.ReLU(), *[Block(c, residual) for _ in range(blocks)],
+                         nn.AdaptiveAvgPool2d(1), nn.Flatten(), nn.Linear(c, 10))
+
+def train(model, epochs=12, lr=0.05):
+    opt = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9)
+    loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(Xtr, ytr), batch_size=64, shuffle=True)
+    sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=lr, total_steps=epochs * len(loader))
+    curve = []
+    for epoch in range(epochs):
+        model.train()
+        total = 0.0
+        for xb, yb in loader:
+            opt.zero_grad()
+            loss = F.cross_entropy(model(xb), yb)
+            loss.backward()
+            opt.step()
+            sched.step()
+            total += loss.item() * len(xb)
+        curve.append(total / len(Xtr))
+    model.eval()
+    with torch.no_grad():
+        return curve, F.cross_entropy(model(Xtr), ytr).item(), (model(Xte).argmax(1) == yte).float().mean().item()
+
+SEEDS = (0,)                                # (0, 1, 2) repeats the run with two more seeds, about 75 seconds in all
+print('layers  residual  params  first-layer grad  train loss  test acc')
+for blocks in (3, 10):
+    for residual in (False, True):
+        for seed in SEEDS:
+            torch.manual_seed(seed)
+            model = make(blocks, residual)
+            F.cross_entropy(model(Xtr), ytr).backward()                        # gradient at initialization
+            g0 = model[0].weight.grad.norm().item()
+            model.zero_grad()
+            curve, train_loss, acc = train(model)
+            print(f'{1 + 2 * blocks:6} {str(residual):9} {count(model):7} {g0:12.4f} {train_loss:13.4f} {acc:9.3f}')
+            print('   ', [round(v, 3) for v in curve])
+# layers  residual  params  first-layer grad  train loss  test acc
+#      7 False       14346       0.0757        0.0161     0.992
+#     [2.31, 2.012, 1.501, 0.913, 0.439, 0.21, 0.124, 0.087, 0.063, 0.035, 0.028, 0.024]
+#      7 True        14346       0.1332        0.0150     0.992
+#     [2.31, 1.751, 0.976, 0.425, 0.239, 0.139, 0.09, 0.061, 0.047, 0.029, 0.027, 0.021]
+#     21 False       47050       0.2220        0.2122     0.960
+#     [2.307, 2.051, 1.682, 1.333, 1.075, 1.006, 0.939, 0.696, 0.486, 0.381, 0.305, 0.27]
+#     21 True        47050       0.3833        0.0049     0.986
+#     [2.291, 1.373, 0.724, 0.384, 0.191, 0.093, 0.048, 0.024, 0.018, 0.013, 0.013, 0.009]
+# with SEEDS = (0, 1, 2), seeds 1 and 2 give train loss / test acc
+#   7 plain 0.0188 / 0.993, 0.0166 / 0.993      7 residual 0.0118 / 0.994, 0.0122 / 0.985
+#  21 plain 0.1613 / 0.961, 0.5336 / 0.832     21 residual 0.0046 / 0.985, 0.0055 / 0.989
+```
+
+## Next
+
+Every network in this note answers one question per image: which class. Most uses of vision need more: where each object is, and how many there are. The [next note](/notes/deep-learning/object-detection) keeps these backbones and changes the head, from one label per image to a set of boxes with labels, and introduces the losses and the metrics that come with it.
+
+## References
+
+- Y. LeCun, L. Bottou, Y. Bengio, P. Haffner. [Gradient-based learning applied to document recognition](https://doi.org/10.1109/5.726791). *Proceedings of the IEEE*, 86(11):2278–2324, 1998. Section II.B (LeNet-5).
+- A. Krizhevsky, I. Sutskever, G. E. Hinton. [ImageNet classification with deep convolutional neural networks](https://proceedings.neurips.cc/paper/2012/hash/c399862d3b9d6b76c8436e924a68c45b-Abstract.html). NeurIPS, 2012. Section 3.5 (architecture).
+- K. Simonyan, A. Zisserman. [Very deep convolutional networks for large-scale image recognition](https://arxiv.org/abs/1409.1556). ICLR, 2015. Section 2.3 (stacks of $3 \times 3$ layers), sections 3.1 and 3.3 (initialization, training time), Table 2 (parameters), section 4.5 (ILSVRC-2014 results).
+- C. Szegedy et al. [Going deeper with convolutions](https://arxiv.org/abs/1409.4842). CVPR, 2015. The Inception module, Table 1 (the layers of GoogLeNet), global average pooling and auxiliary classifiers, the ILSVRC-2014 classification results.
+- C. Szegedy, V. Vanhoucke, S. Ioffe, J. Shlens, Z. Wojna. [Rethinking the Inception architecture for computer vision](https://arxiv.org/abs/1512.00567). CVPR, 2016. Section 3 (factorizing large convolutions), section 4 (auxiliary classifiers).
+- K. He, X. Zhang, S. Ren, J. Sun. [Deep residual learning for image recognition](https://arxiv.org/abs/1512.03385). CVPR, 2016. Section 3.3 (shortcuts and architectures), section 4.1 and Table 2 (plain against residual networks on ImageNet, bottleneck blocks), section 4.2 (CIFAR-10, 1202 layers).
+- G. Huang, Z. Liu, L. van der Maaten, K. Q. Weinberger. [Densely connected convolutional networks](https://arxiv.org/abs/1608.06993). CVPR, 2017. Section 3 (dense connectivity, growth rate, bottleneck and compression), Table 1.
+- A. G. Howard et al. [MobileNets: efficient convolutional neural networks for mobile vision applications](https://arxiv.org/abs/1704.04861). arXiv:1704.04861, 2017. Section 3.1 (depthwise-separable convolution and its cost), section 3.3 (width and resolution multipliers), Table 4.
+- M. Sandler, A. Howard, M. Zhu, A. Zhmoginov, L.-C. Chen. [MobileNetV2: inverted residuals and linear bottlenecks](https://arxiv.org/abs/1801.04381). CVPR, 2018.
+- M. Tan, Q. V. Le. [EfficientNet: rethinking model scaling for convolutional neural networks](https://arxiv.org/abs/1905.11946). ICML, 2019. Section 3.3 (compound scaling), section 4 (EfficientNet-B0 and the constants), Table 2.
+- J. Yosinski, J. Clune, Y. Bengio, H. Lipson. [How transferable are features in deep neural networks?](https://arxiv.org/abs/1411.1792) NeurIPS, 2014.
+- S. Kornblith, J. Shlens, Q. V. Le. [Do better ImageNet models transfer better?](https://arxiv.org/abs/1805.08974) CVPR, 2019.
+- TorchVision documentation. [Models and pre-trained weights](https://docs.pytorch.org/vision/stable/models.html), accessed October 2026. The table of ImageNet-1K classification weights (single-crop accuracy, parameters, GFLOPS) and the pages of the individual weights (inference resolution, porting notes).
+- I. Goodfellow, Y. Bengio, A. Courville. [*Deep Learning*](https://www.deeplearningbook.org/). MIT Press, 2016. Chapter 9.
+- A. Zhang, Z. C. Lipton, M. Li, A. J. Smola. [*Dive into Deep Learning*](https://d2l.ai/). Cambridge University Press, 2023. Chapter 8 (AlexNet, VGG, network in network, GoogLeNet, ResNet, DenseNet), section 14.2 (fine-tuning).
+- S. J. D. Prince. [*Understanding Deep Learning*](https://udlbook.github.io/udlbook/). MIT Press, 2023. Chapter 10 (convolutional networks), chapter 11 (residual networks).
+- *Глубинное обучение 1* (Deep Learning 1), Faculty of Computer Science, HSE University. Course materials, [repository xiyori/intro-to-dl-hse, branch 2025-2026](https://github.com/xiyori/intro-to-dl-hse/tree/2025-2026): lecture 5 (CNN architectures from LeNet to EfficientNet, transfer learning).
