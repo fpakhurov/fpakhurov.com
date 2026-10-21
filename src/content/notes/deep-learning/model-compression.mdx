@@ -1,0 +1,417 @@
+---
+title: Model compression
+description: "How to make a trained network smaller and faster: why memory traffic dominates cost, magnitude and structured pruning, the lottery ticket hypothesis, knowledge distillation with temperature and the factor T squared, low-rank factorization, and how to measure a real speed-up."
+course: deep-learning
+section: Robustness and Deployment
+order: 12
+status: published
+tags: [model-compression, pruning, magnitude-pruning, structured-pruning, sparsity, lottery-ticket-hypothesis, knowledge-distillation, temperature, low-rank-factorization, svd, latency, energy]
+prerequisites: [Convolutional architectures, Losses and regularization, KL divergence]
+---
+
+import PruningPatterns from '../../../components/figures/model-compression/PruningPatterns.astro';
+import PruningAccuracy from '../../../components/figures/model-compression/PruningAccuracy.astro';
+import DistillationFlow from '../../../components/figures/model-compression/DistillationFlow.astro';
+
+The [previous note](/notes/deep-learning/adversarial-examples) made a network robust at the price of more training. At deployment the network meets a different budget. A phone has a few gigabytes of memory shared with everything else and a battery; a server answering millions of requests pays for every multiply-add; a car needs an answer within milliseconds. A network trained for accuracy is usually larger than the function it computes requires. This note shows four ways to remove the excess, pruning weights, distilling the network into a smaller one, factorizing its layers and storing its numbers in fewer bits, and how to check whether the result is really faster, which a smaller parameter count does not guarantee.
+
+**Notation.** A layer has a weight matrix $W \in \mathbb R^{m \times n}$, with $m$ outputs and $n$ inputs; $N$ is the number of parameters of a network. A **mask** $M \in \{0, 1\}^{m \times n}$ marks the weights that are kept, $\odot$ is the elementwise product, and the **sparsity** $s$ is the fraction of weights set to zero. For distillation, $v$ are the logits of the **teacher**, $z$ those of the **student**, $K$ is the number of classes and $T$ the temperature; $q = \operatorname{softmax}(v / T)$ are the **soft targets** and $p = \operatorname{softmax}(z / T)$ the student's softened prediction. $r$ is a rank.
+
+## Baseline: deploy the network as trained
+
+A trained network costs three things at inference. **Memory**: $N$ parameters at 4 bytes each in 32-bit floating point, plus the activations. **Computation**: about one multiply-add per weight per input for a fully connected layer, more for a convolution, which reuses each weight at every position. **Time and energy**: what the hardware needs to move the weights and activations and to do the arithmetic. A ResNet-50 has 25.6 million parameters, 102 MB in 32-bit floats, and needs about 4.1 billion multiply-adds for one $224 \times 224$ image, listed as 4.09 GFLOPS ([Convolutional architectures](/notes/deep-learning/cnn-architectures#sizes-and-accuracies-side-by-side)). The teacher network of the Code section, $64 \to 512 \to 512 \to 10$ on the bundled $8 \times 8$ digits, has 301,066 parameters, 1.2 MB, and classifies 0.976 of the 540 test images correctly.
+
+## Why compress: memory, latency and energy
+
+The three costs are not proportional to each other, and the one that dominates is usually memory traffic. Fetching a number from off-chip memory costs far more than computing with it. For a 45 nm process, a 32-bit floating-point addition takes 0.9 pJ and a multiplication 3.7 pJ, reading 32 bits from an on-chip SRAM cache 5 pJ, and reading them from off-chip DRAM 640 pJ ([Han et al., 2015](#references), Figure 1, after Horowitz).
+
+**Worked example.** If each of the teacher's 301,066 weights had to come from DRAM for one image, the reads would cost $301{,}066 \cdot 640\ \text{pJ} = 0.19$ mJ, and the multiply-adds $301{,}066 \cdot (3.7 + 0.9)\ \text{pJ} = 1.4\ \mu$J: 139 times less. A batch shares one fetch of each weight among all its images, which is why throughput-oriented servers batch requests; an interactive application that classifies one input at a time pays the full fetch for every input. Han et al. make the same point at scale: a network with one billion connections run 20 times per second needs $20 \cdot 10^9 \cdot 640\ \text{pJ} = 12.8$ W for DRAM access alone, beyond the power budget of a phone.
+
+So a layer at batch size 1 is usually **memory-bound**: its time is set by the bytes it must read, not by its arithmetic. The [roofline model](/notes/acos/data-level-parallelism#the-roofline-model-arithmetic-or-memory) of the computer architecture course makes this precise through the arithmetic intensity, the number of operations per byte moved. Fewer and smaller weights help twice: less memory and less traffic.
+
+<aside class="callout"><strong>Key idea.</strong> A trained network is redundant: many of its weights, units and directions contribute little to its outputs. Compression removes the redundancy, by zeroing weights (pruning), by training a smaller network to imitate the large one (distillation), or by replacing a matrix by a product of thin ones (factorization), and usually retrains briefly to recover the accuracy. Only a smaller dense computation, or hardware built for the sparsity pattern, turns "smaller" into "faster".</aside>
+
+## Pruning: remove the smallest weights
+
+**Magnitude pruning** keeps the weights that are large in absolute value and zeroes the rest:
+
+$$
+W' = M \odot W, \qquad M_{ij} = \mathbf 1\big[\, \lvert W_{ij} \rvert > \tau \,\big],
+$$
+
+with the threshold $\tau$ chosen so that a fraction $s$ of the weights falls below it. A **global** threshold is one $\tau$ for all layers, so layers with many small weights lose more of them; a **layerwise** threshold prunes every layer to the same sparsity.
+
+Why should the smallest weights matter least? **Optimal Brain Damage** ([LeCun, Denker and Solla, 1990](#references)) estimates the increase of the loss when weight $i$ is deleted, from a Taylor expansion around the trained weights $w$:
+
+$$
+\boxed{\; \Delta L_i \approx \tfrac12\, H_{ii}\, w_i^2 \;}
+$$
+
+The steps: deleting weight $i$ is the change $\Delta w = -w_i e_i$, where $e_i$ is the $i$-th unit vector. To second order,
+
+$$
+\begin{aligned}
+L(w + \Delta w) - L(w) &\approx g^\top \Delta w + \tfrac12\, \Delta w^\top H\, \Delta w \\
+&= -g_i w_i + \tfrac12\, H_{ii}\, w_i^2 \\
+&\approx \tfrac12\, H_{ii}\, w_i^2 ,
+\end{aligned}
+$$
+
+where $g$ and $H$ are the gradient and the Hessian of the loss at $w$. The second line substitutes $\Delta w = -w_i e_i$, which picks out one entry of $g$ and one diagonal entry of $H$. The third uses that training has ended near a minimum, where $g \approx 0$. The **saliency** $\tfrac12 H_{ii} w_i^2$ ranks the weights; if the curvatures $H_{ii}$ are similar, it ranks them by $\lvert w_i \rvert$, which is magnitude pruning. Deleting several weights at once adds the off-diagonal terms of $H$, which the estimate ignores, so pruning is done in rounds with retraining between them.
+
+**Worked example.** Six weights $w = (0.8, -0.05, 0.3, -0.6, 0.02, 0.1)$ pruned to $s = 0.5$. The three smallest magnitudes are $0.02$, $0.05$ and $0.1$, so any $\tau$ between $0.1$ and $0.3$ gives $w' = (0.8, 0, 0.3, -0.6, 0, 0)$. Half the weights are gone, but only $0.02^2 + 0.05^2 + 0.1^2 = 0.0129$ of the squared norm $1.1029$, 1.2% of it.
+
+[Han et al. (2015)](#references) prune, retrain the remaining weights with the mask fixed, and repeat. Without retraining, accuracy drops sharply; with it, AlexNet lost 9 times its parameters, from 61 to 6.7 million, and VGG-16 13 times, from 138 to 10.3 million, without loss of ImageNet accuracy. The Code section prunes the teacher globally and fine-tunes it for 10 epochs with the mask fixed (one run, test accuracy on the 540 digits):
+
+| sparsity $s$ | 0.5 | 0.8 | 0.9 | 0.95 | 0.98 |
+| --- | --- | --- | --- | --- | --- |
+| after pruning | 0.978 | 0.967 | 0.887 | 0.444 | 0.126 |
+| after 10 epochs of fine-tuning | 0.980 | 0.981 | 0.981 | 0.963 | 0.700 |
+
+Nine weights in ten can go without any loss, once the survivors are retrained; past 95% the accuracy falls quickly.
+
+### Unstructured and structured sparsity
+
+Zeroing individual weights gives **unstructured** sparsity: the zeros are scattered irregularly. It saves less than it seems.
+
+- **Memory.** A sparse format must store where each nonzero is. Compressed sparse row (CSR) stores a 4-byte value and a 4-byte column index per nonzero, plus one pointer per row: about $8 (1 - s)\, mn$ bytes against $4mn$ dense. At $s = 0.5$ it saves nothing (the Code section measures 1.003 of the dense size), at $s = 0.9$ it needs 0.203.
+- **Speed.** A dense matrix product does the same work whether a weight is zero or not. Sparse kernels skip the zeros but access memory irregularly, and on general-purpose hardware they pay off only at very high sparsity.
+
+**Structured** pruning removes whole units: rows of $W$ for a fully connected layer, filters or channels of a convolution, heads of attention. What remains is a smaller dense network, which every library and every processor runs faster. [Li et al. (2017)](#references) rank the filters of each convolutional layer by the sum of their absolute weights and remove the smallest; with retraining, this cut the inference cost of VGG-16 by up to 34% and of ResNet-110 by up to 38% on CIFAR-10, with close to the original accuracy. Between the two lies **semi-structured** sparsity: in the 2:4 pattern, two of every four consecutive weights are zero, a pattern that the sparse tensor cores of NVIDIA's Ampere GPUs execute at twice the throughput of dense ones ([Mishra et al., 2021](#references)).
+
+<PruningPatterns />
+
+1. The dense weight matrix of a layer, 8 outputs by 8 inputs.
+2. Unstructured: the 32 smallest weights of the whole matrix are zeroed, wherever they are.
+3. 2:4: in every group of four consecutive weights of a row, the two smallest are zeroed.
+4. Structured: the four rows with the smallest norms are removed; what is left is a dense $4 \times 8$ matrix.
+
+The Code section prunes the teacher's hidden units by the norm of their incoming weights and builds the smaller dense network that remains. Keeping 128 of the 512 units in each hidden layer leaves 26,122 parameters, 8.7% of the teacher, and 0.970 accuracy after fine-tuning; unstructured pruning keeps 0.981 with 10% of the weights. Near a tenth of the parameters, structured pruning loses a little more accuracy than unstructured pruning, but its smaller network is faster on any hardware. At the extreme the order reverses in this run: 32 units per layer, 1.2% of the parameters, keep 0.922 after fine-tuning, while unstructured pruning to 2% of the weights keeps 0.700.
+
+<PruningAccuracy />
+
+### The lottery ticket hypothesis
+
+If 90% of the weights can be removed after training, could the small network have been trained alone from the start? Trained from a fresh random initialization, pruned architectures usually do worse. [Frankle and Carbin (2019)](#references) found a way that works: train the dense network, prune the smallest weights, **reset the survivors to their original initial values**, and retrain; repeat for several rounds (iterative magnitude pruning). The subnetworks found this way, at less than 10–20% of the size of fully connected and convolutional networks on MNIST and CIFAR-10, trained to the accuracy of the full network, often faster. The same masks with fresh random initial values trained far worse. Their hypothesis: a dense randomly initialized network contains such **winning tickets**, subnetworks whose initial weights happen to suit training. For large networks such as ResNet-50 on ImageNet, the survivors must be reset not to their initial values but to their values from early in training ([Frankle et al., 2020](#references)). Finding a ticket costs several full trainings, so the result explains why pruning works more than it saves training time.
+
+## Knowledge distillation
+
+A pruned network keeps the architecture of the original. **Knowledge distillation** ([Hinton, Vinyals and Dean, 2015](#references)) trains a different, smaller **student** to imitate a trained **teacher**. The labels say only which class is correct. The teacher's output says more: how much an image of a 2 resembles a 3 or a 7. Training the student to reproduce that distribution, not only the label, passes this information on.
+
+A trained teacher is usually very confident, so its probabilities for the wrong classes are tiny. A **temperature** $T > 1$ divides the logits before the softmax and brings them out:
+
+$$
+q_k = \frac{e^{v_k / T}}{\sum_{j=1}^K e^{v_j / T}}, \qquad p_k = \frac{e^{z_k / T}}{\sum_{j=1}^K e^{z_j / T}} .
+$$
+
+Dividing by $T$ divides every log-ratio by $T$: $\log(q_k / q_j) = (v_k - v_j)/T$. The student is trained on a weighted sum of the usual cross-entropy with the label, at temperature 1, and a soft loss at temperature $T$:
+
+$$
+\boxed{\; \mathcal L = \alpha\, \ell_{\text{CE}}\big(y, \operatorname{softmax}(z)\big) + (1 - \alpha)\, T^2\, D_{\mathrm{KL}}(q \,\|\, p) \;}
+$$
+
+The KL divergence equals the cross-entropy $-\sum_k q_k \log p_k$ minus the entropy of $q$, which does not depend on the student, so the two give the same gradient ([KL divergence](/notes/generative-models/entropy-and-divergences)). After training, the student is used at $T = 1$.
+
+**Worked example.** Teacher logits $v = (5, 2, 0)$. At $T = 1$ the softmax gives $(0.9465, 0.0471, 0.0064)$: class 1 takes almost everything, and the difference between classes 2 and 3 is buried in the last two numbers. At $T = 4$ the logits become $(1.25, 0.5, 0)$ and the soft targets $(0.5685, 0.2686, 0.1629)$. The ratio of the second to the third probability falls from $e^{2} = 7.39$ to $e^{0.5} = 1.65$, and the student now gets a gradient of useful size from both wrong classes.
+
+<DistillationFlow />
+
+1. The teacher's logits are divided by $T$ and passed through a softmax: the soft targets $q$.
+2. The student's logits are divided by the same $T$: its softened prediction $p$.
+3. The soft loss is $D_{\mathrm{KL}}(q \,\|\, p)$, multiplied by $T^2$.
+4. The hard loss is the cross-entropy of the student's logits at $T = 1$ with the label.
+5. The total loss mixes the two with weight $\alpha$; only the student is trained.
+
+### Why the soft loss is multiplied by T squared
+
+The gradient of the soft loss with respect to the student's logits shrinks like $1/T^2$. Start from the derivative of the cross-entropy with respect to the logits of a softmax, $p - q$ ([backpropagation](/notes/ml/backpropagation#a-two-layer-network-forward-and-backward)). Here the softmax acts on $z / T$, so the chain rule adds a factor $1/T$:
+
+$$
+\frac{\partial}{\partial z_i} \Big( -\sum_k q_k \log p_k \Big) = \frac1T \big( p_i - q_i \big) .
+$$
+
+The difference $p_i - q_i$ is itself small when $T$ is large compared with the logits. Expand the exponentials to first order, $e^{z_i / T} \approx 1 + z_i / T$, and assume the logits of each example have mean zero, $\sum_j z_j = \sum_j v_j = 0$ (adding a constant to all logits does not change a softmax, so this loses nothing):
+
+$$
+\begin{aligned}
+p_i &\approx \frac{1 + z_i / T}{K + \sum_j z_j / T} = \frac{1}{K} + \frac{z_i}{K T}, \qquad q_i \approx \frac{1}{K} + \frac{v_i}{K T}, \\
+\frac1T \big( p_i - q_i \big) &\approx \frac{z_i - v_i}{K T^2} .
+\end{aligned}
+$$
+
+The first line uses the expansion in numerator and denominator and the zero mean. The second subtracts the two and multiplies by $1/T$. So the soft gradient falls like $1/T^2$, and multiplying the soft loss by $T^2$ keeps its contribution comparable with the hard loss whatever temperature is chosen ([Hinton, Vinyals and Dean, 2015](#references), section 2). The second line also shows what distillation becomes at high temperature: after the factor $T^2$, the gradient $(z_i - v_i)/K$ is that of $\frac{1}{2K} \sum_i (z_i - v_i)^2$, matching the logits directly.
+
+**Worked example.** The Code section takes random logits $z$ and $v$ for $K = 10$ classes and computes the gradient of the soft loss exactly. Its norm is $0.385$ at $T = 1$, $0.0889$ at $T = 2$, $0.0215$ at $T = 4$ and $0.00132$ at $T = 16$, falling by about 4 for each doubling of $T$. The high-temperature formula gives $0.0846$, $0.0212$ and $0.00132$ at the last three. Multiplied by $T^2$, the norms are $0.385$, $0.356$, $0.344$ and $0.339$: almost constant.
+
+### What the soft targets carry
+
+Hinton et al. trained a large, strongly regularized network on MNIST that made 67 test errors; a smaller network with two hidden layers of 800 units trained on the labels made 146; the same small network trained also to match the large one's soft targets at $T = 20$ made 74 (section 3). They then removed every 3 from the student's training data: the distilled student had never seen a 3, and yet, after a correction of the bias of class 3, it recognized 98.6% of the test 3s.
+
+The Code section repeats both experiments on the digits with a student $64 \to 32 \to 10$ of 2,410 parameters, 125 times fewer than the teacher, trained for 150 epochs with $T = 20$ and the soft loss alone ($\alpha = 0$; one run each):
+
+| student trained on | test accuracy | test 3s recognized |
+| --- | --- | --- |
+| labels, all training digits | 0.974 | 0.982 |
+| soft targets, all training digits | 0.965 | 0.982 |
+| labels, training digits without the 3s | 0.878 | 0.000 |
+| soft targets, training digits without the 3s | 0.965 | 0.927 |
+
+With all the labels, this small student does as well on its own as with the teacher: the problem is easy enough that distillation adds nothing here. Without the 3s, the student trained on labels cannot output a class it never saw. The distilled student recognizes 92.7% of the test 3s, without any bias correction, from what the teacher's soft targets on other digits say about how much each of them resembles a 3. That information is what the hard labels lack.
+
+Distillation is used at every scale. The DistilBERT model of the [NLP course](/notes/nlp/quantization#distillation-and-pruning) is a BERT distilled to half its depth. A teacher trained with [label smoothing](/notes/deep-learning/losses-and-regularization#label-smoothing) is a worse teacher: smoothing pulls the wrong-class probabilities towards uniform and erases part of the similarity structure ([Müller, Kornblith and Hinton, 2019](#references)).
+
+## Low-rank factorization
+
+A fully connected layer computes $Wx$. If $W$ is close to a matrix of rank $r$, it can be replaced by two thin layers, $W \approx AB$ with $A \in \mathbb R^{m \times r}$ and $B \in \mathbb R^{r \times n}$, and $Wx \approx A(Bx)$ costs $r(m + n)$ multiply-adds instead of $mn$. The best choice of $A$ and $B$ comes from the singular value decomposition $W = U \Sigma V^\top$ with singular values $\sigma_1 \ge \sigma_2 \ge \dots$: keep the first $r$ of them,
+
+$$
+W_r = U_{:, 1:r}\, \Sigma_{1:r}\, V_{:, 1:r}^\top, \qquad A = U_{:, 1:r}\, \Sigma_{1:r}, \quad B = V_{:, 1:r}^\top, \qquad
+\frac{\lVert W - W_r \rVert_F}{\lVert W \rVert_F} = \sqrt{\frac{\sum_{i > r} \sigma_i^2}{\sum_i \sigma_i^2}} .
+$$
+
+By the Eckart–Young theorem, no matrix of rank $r$ is closer to $W$ in the Frobenius norm. The factorization saves work only when $r(m + n) < mn$, that is, $r < mn/(m + n)$.
+
+**Worked example.** The teacher's middle layer is $512 \times 512$: 262,144 weights, and the break-even rank is $512 \cdot 512 / 1024 = 256$. At $r = 8$ the two factors have $8 \cdot 1024 = 8{,}192$ weights, 32 times fewer. The relative error of the approximation is large, $0.628$, and yet the network's test accuracy stays at $0.976$, unchanged; at $r = 4$ it drops to $0.717$. The weights are dominated by their random initialization, which the network does not rely on, while what training added to them is nearly low-rank: 91.1% of the norm of the change from the initial to the trained weights lies in its top 8 singular directions. The same observation, that useful weight updates are low-rank, is the basis of [LoRA](/notes/nlp/peft#lora-a-low-rank-update) for fine-tuning large language models.
+
+Convolutions can be factorized in the same way, across their input channels, output channels and kernel dimensions. [Denton et al. (2014)](#references) sped up the convolutional layers of large ImageNet networks by a factor of 2 on CPU and GPU, keeping the accuracy within 1% of the original. Depthwise-separable convolutions, the building block of [MobileNet](/notes/deep-learning/cnn-architectures#mobilenet-depthwise-separable-convolutions), are a factorization built into the architecture from the start.
+
+## Quantization, briefly
+
+The fourth route keeps the architecture and every weight, and stores each number in fewer bits: 8-bit integers instead of 32-bit floats take 4 times less memory and traffic, and integer arithmetic is cheaper still. The affine map from floats to integers, what it does to a matrix product, and the methods that quantize large language models are the subject of the NLP course's [quantization note](/notes/nlp/quantization); the floating-point formats themselves, including fp16 and bf16, are in the [computer architecture course](/notes/acos/floating-point#narrow-formats-for-machine-learning). The routes combine: pruning, then quantization of the remaining weights and an entropy code for their storage, made AlexNet 35 times smaller, from 240 MB to 6.9 MB, and VGG-16 49 times smaller, from 552 MB to 11.3 MB, without loss of accuracy ([Han, Mao and Dally, 2016](#references)).
+
+## Measuring the real speed-up
+
+Parameters, multiply-adds and time are three different quantities, and a compression method can shrink one without the others. A review of 81 pruning papers found that they rarely reported comparable measurements: different architectures, datasets and metrics, and often only parameter counts or FLOPs, a "theoretical speedup" that says nothing about wall-clock time ([Blalock et al., 2020](#references)).
+
+The Code section times one layer, the teacher's $512 \times 512$ middle layer applied to a batch of 256 activations, on one CPU thread, as the median of 200 repetitions. The dense layer takes a fraction of a millisecond on a laptop CPU. Relative to it:
+
+| variant of the layer | weights stored | time relative to dense |
+| --- | --- | --- |
+| dense | 262,144 | 1 |
+| 90% of the weights zeroed, still a dense matrix | 262,144 | 1.0 |
+| the same zeros in CSR format | 26,215 nonzeros | about 40 |
+| structured: 51 of the 512 output units kept | 26,112 | about 0.2 |
+
+Zeros in a dense matrix change nothing. The sparse format is about 40 times slower than the dense product at this size and sparsity, although it does a tenth of the multiply-adds. Removing 90% of the output units makes the layer about 5 times faster, not 10 times: a small product has fixed overheads that do not shrink with it. The exact ratios depend on the machine, the library and the batch size; the pattern does not.
+
+A measurement that means something follows a protocol:
+
+- **Measure the deployment setting.** The same hardware, batch size, numerical precision and library as in production. A model that is faster at batch 256 on a GPU can be slower at batch 1 on a phone.
+- **Time correctly.** Warm up first, repeat many times and report the median; fix the number of threads. On a GPU, operations run asynchronously, so the clock must stop only after the device has finished ([Zhang et al.](#references), section 13.2).
+- **Report all three.** Parameters or bytes, multiply-adds, and measured latency or throughput, each with its setup, and the accuracy at that size.
+- **Compare against a smaller dense model.** A network with fewer units trained from scratch, or distilled, is the baseline any compressed model must beat at the same size and speed.
+
+## What changed
+
+| | Network as trained | After compression (digits) |
+| --- | --- | --- |
+| Parameters | 301,066 (1.2 MB in fp32) | about 30,000 nonzero weights at 90% sparsity; 26,122 after structured pruning; 2,410 in the student |
+| Test accuracy | 0.976 | 0.981 pruned and fine-tuned; 0.970 structured; 0.974 student on labels |
+| Middle layer | $512 \times 512$, 262,144 weights | rank 8, 8,192 weights, accuracy 0.976 |
+| Faster? | | only the smaller dense networks; unstructured zeros are not faster here |
+
+## Limitations
+
+- **Smaller is not faster.** Unstructured sparsity reduces parameters but needs sparse kernels or special hardware, and at moderate sparsity those are often slower than dense products. Only structured changes speed up standard hardware.
+- **Retraining is part of the method.** Most compression loses accuracy until the network is fine-tuned, which needs the training data or a transfer set, and compute.
+- **Distillation needs a good teacher and a gap to close.** When a small network already matches the teacher on the labels, as here, soft targets add little; a teacher trained with label smoothing transfers less.
+- **The redundancy depends on the task.** The 8 × 8 digits are easy, so a tenth of the weights or rank 8 suffice; on harder tasks the same ratios cost accuracy.
+- **Accuracy is not all that changes.** A compressed model can keep its average accuracy and lose it on rare classes or inputs, and its robustness can change; it must be evaluated on what matters, not only on the average.
+
+## What you should remember
+
+- Memory traffic dominates the energy and often the time of inference: 640 pJ for a 32-bit DRAM read against 3.7 pJ for a multiplication.
+- Magnitude pruning zeroes the weights with the smallest $\lvert w \rvert$, justified by the saliency $\tfrac12 H_{ii} w_i^2$; with retraining, 90% of the weights of the digit network went with no loss.
+- Unstructured sparsity saves memory only below a density of about one half and gives no speed-up on dense hardware; structured pruning gives a smaller dense network that is faster everywhere; 2:4 sparsity needs hardware support.
+- Lottery tickets: sparse subnetworks that train to full accuracy from the original initialization, found by pruning and resetting.
+- Distillation: $\alpha\, \ell_{\text{CE}} + (1 - \alpha)\, T^2 D_{\mathrm{KL}}(\operatorname{softmax}(v/T) \,\|\, \operatorname{softmax}(z/T))$; the soft gradient scales as $1/T^2$, hence the $T^2$; at high $T$ it matches logits.
+- Low-rank factorization replaces $mn$ weights by $r(m + n)$, worthwhile for $r < mn/(m + n)$; truncated SVD is the best rank-$r$ approximation.
+- Measure the real speed-up in the deployment setting, and report parameters, multiply-adds and time.
+
+## Code
+
+Soft targets and the $T^2$ scaling, a teacher on the bundled digits, magnitude and structured pruning with fine-tuning, low-rank factorization of a layer, distillation into a small student with and without the 3s, and timings of a pruned layer. Seeds are fixed; exact numbers can differ slightly across platforms and library versions, and the timings vary between runs and machines. The script runs in about 20 seconds on a laptop CPU.
+
+```python
+import time, warnings, torch
+from torch import nn
+import torch.nn.functional as F
+from sklearn.datasets import load_digits
+from sklearn.model_selection import train_test_split
+
+# 1. soft targets: teacher logits v = (5, 2, 0) at temperatures 1 and 4
+v = torch.tensor([5.0, 2.0, 0.0])
+print([round(p, 4) for p in F.softmax(v, 0).tolist()], [round(p, 4) for p in F.softmax(v / 4, 0).tolist()])
+# [0.9465, 0.0471, 0.0064] [0.5685, 0.2686, 0.1629]
+
+# 2. the soft loss's gradient shrinks like 1/T^2; multiplying by T^2 restores it
+torch.manual_seed(0)
+z, v10 = torch.randn(10, requires_grad=True), torch.randn(10)
+for T in (1, 2, 4, 8, 16):
+    soft = -(F.softmax(v10 / T, 0) * F.log_softmax(z / T, 0)).sum()
+    g, = torch.autograd.grad(soft, z)
+    approx = (z - v10 - (z - v10).mean()).norm() / (10 * T * T)   # the high-temperature formula
+    print(T, round(g.norm().item(), 5), round(approx.item(), 5), round(T * T * g.norm().item(), 4))
+# 1 0.38541 0.33842 0.3854 | 2 0.0889 0.08461 0.3556 | 4 0.0215 0.02115 0.3439
+# 8 0.00532 0.00529 0.3403 | 16 0.00132 0.00132 0.3391   (T, |grad|, high-T formula, T^2 |grad|)
+
+# 3. digits: 1257 training and 540 test images; a teacher 64 -> 512 -> 512 -> 10 with dropout
+X, y = load_digits(return_X_y=True)
+Xtr, Xte, ytr, yte = train_test_split(X / 16.0, y, test_size=0.3, random_state=0, stratify=y)
+Xtr, Xte = torch.tensor(Xtr, dtype=torch.float32), torch.tensor(Xte, dtype=torch.float32)
+ytr, yte = torch.tensor(ytr), torch.tensor(yte)
+
+def acc(m, x=Xte, y=yte):
+    with torch.no_grad():
+        return round((m(x).argmax(1) == y).float().mean().item(), 3)
+
+def train(model, loss_fn, epochs, rows=None, masks=None, seed=0):
+    torch.manual_seed(seed)
+    rows = torch.arange(len(Xtr)) if rows is None else rows
+    opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+    for _ in range(epochs):
+        model.train()
+        for idx in rows[torch.randperm(len(rows))].split(64):
+            opt.zero_grad()
+            loss_fn(model(Xtr[idx]), idx).backward()
+            opt.step()
+            if masks:                                            # keep pruned weights at zero while fine-tuning
+                with torch.no_grad():
+                    for w, m in masks:
+                        w.mul_(m)
+    return model.eval()
+
+hard = lambda out, idx: F.cross_entropy(out, ytr[idx])
+torch.manual_seed(0)
+teacher = train(nn.Sequential(nn.Linear(64, 512), nn.ReLU(), nn.Dropout(0.3), nn.Linear(512, 512), nn.ReLU(),
+                              nn.Dropout(0.3), nn.Linear(512, 10)), hard, 60)
+weights = [teacher[0].weight, teacher[3].weight, teacher[6].weight]
+n_par = sum(p.numel() for p in teacher.parameters())
+print(n_par, acc(teacher))                                       # 301066 0.976
+
+# 4. global magnitude pruning: zero the smallest |w| over all weight matrices, then fine-tune 10 epochs
+state = {k: t.clone() for k, t in teacher.state_dict().items()}
+print('sparsity  pruned  fine-tuned  CSR bytes / dense bytes')
+for s in (0.5, 0.8, 0.9, 0.95, 0.98):
+    teacher.load_state_dict(state)
+    allw = torch.cat([w.detach().abs().flatten() for w in weights])
+    thr = allw.kthvalue(int(s * len(allw))).values
+    masks = [(w, (w.detach().abs() > thr).float()) for w in weights]
+    with torch.no_grad():
+        for w, m in masks:
+            w.mul_(m)
+    a0 = acc(teacher)
+    a1 = acc(train(teacher, hard, 10, masks=masks))
+    csr = sum(8 * int(m.sum()) + 4 * (m.shape[0] + 1) for _, m in masks)   # fp32 value + int32 column per nonzero, row pointers
+    print(f'{s:8.2f} {a0:7.3f} {a1:11.3f} {csr / (4 * len(allw)):10.3f}')
+teacher.load_state_dict(state)
+# sparsity  pruned  fine-tuned  CSR bytes / dense bytes
+#     0.50   0.978       0.980      1.003
+#     0.80   0.967       0.981      0.403
+#     0.90   0.887       0.981      0.203
+#     0.95   0.444       0.963      0.103
+#     0.98   0.126       0.700      0.043
+
+# 5. structured pruning: keep the hidden units with the largest incoming-weight norms; the result is a smaller dense network
+def shrink(net, keep):
+    i1 = net[0].weight.norm(dim=1).topk(keep).indices
+    i2 = net[3].weight.norm(dim=1).topk(keep).indices
+    small = nn.Sequential(nn.Linear(64, keep), nn.ReLU(), nn.Linear(keep, keep), nn.ReLU(), nn.Linear(keep, 10))
+    with torch.no_grad():
+        small[0].weight.copy_(net[0].weight[i1]); small[0].bias.copy_(net[0].bias[i1])
+        small[2].weight.copy_(net[3].weight[i2][:, i1]); small[2].bias.copy_(net[3].bias[i2])
+        small[4].weight.copy_(net[6].weight[:, i2]); small[4].bias.copy_(net[6].bias)
+    return small.eval()
+print('units  parameters  pruned  fine-tuned')
+for keep in (256, 128, 64, 32):
+    small = shrink(teacher, keep)
+    print(f'{keep:5d} {sum(p.numel() for p in small.parameters()):11d} {acc(small):7.3f} {acc(train(small, hard, 10)):11.3f}')
+# units  parameters  pruned  fine-tuned
+#   256       85002   0.956       0.978
+#   128       26122   0.869       0.970
+#    64        8970   0.656       0.957
+#    32        3466   0.369       0.922
+
+# 6. low-rank factorization of the middle 512 x 512 layer by truncated SVD, no fine-tuning
+W = teacher[3].weight.detach().clone()
+U, S, Vh = torch.linalg.svd(W)
+for r in (4, 8, 16, 32):
+    with torch.no_grad():
+        teacher[3].weight.copy_(U[:, :r] * S[:r] @ Vh[:r])
+    err = (S[r:].square().sum() / S.square().sum()).sqrt().item()
+    print(r, 2 * 512 * r, round(err, 3), acc(teacher))         # rank, parameters of the factors, relative error, accuracy
+with torch.no_grad():
+    teacher[3].weight.copy_(W)
+# 4 4096 0.784 0.717 | 8 8192 0.628 0.976 | 16 16384 0.562 0.976 | 32 32768 0.524 0.976
+torch.manual_seed(0)                                             # the teacher's initial weights, drawn again from the same seed
+W0 = nn.Sequential(nn.Linear(64, 512), nn.Linear(512, 512))[1].weight.detach()
+s_upd = torch.linalg.svdvals(W - W0)
+print(round((s_upd[:8].square().sum() / s_upd.square().sum()).sqrt().item(), 3))   # share of the training update in 8 directions
+# 0.911
+
+# 7. distillation: a student 64 -> 32 -> 10 (2410 parameters), 150 epochs
+with torch.no_grad():
+    v_tr = teacher(Xtr)
+def distill(T):
+    return lambda out, idx: T * T * F.kl_div(F.log_softmax(out / T, 1), F.log_softmax(v_tr[idx] / T, 1),
+                                             log_target=True, reduction='batchmean')
+student = lambda: nn.Sequential(nn.Linear(64, 32), nn.ReLU(), nn.Linear(32, 10))
+no3 = (ytr != 3).nonzero().squeeze(1)                            # the training images without a single 3
+three = yte == 3
+for name, loss_fn, rows in (('labels, all digits', hard, None), ('soft targets T=20, all digits', distill(20), None),
+                            ('labels, no 3s', hard, no3), ('soft targets T=20, no 3s', distill(20), no3)):
+    torch.manual_seed(0)
+    s = train(student(), loss_fn, 150, rows=rows)
+    with torch.no_grad():
+        pred = s(Xte).argmax(1)
+    print(f'{name:30} {acc(s):.3f}  3s recognized: {(pred[three] == 3).float().mean().item():.3f}')
+# labels, all digits             0.974  3s recognized: 0.982
+# soft targets T=20, all digits  0.965  3s recognized: 0.982
+# labels, no 3s                  0.878  3s recognized: 0.000
+# soft targets T=20, no 3s       0.965  3s recognized: 0.927
+
+# 8. what the speed-up really is: the middle layer on a batch of 256, one thread, median of 200 runs
+torch.set_num_threads(1)
+xb = Xte[:256]
+def ms(f):
+    times = []
+    for _ in range(200):
+        t = time.perf_counter(); f(); times.append(time.perf_counter() - t)
+    return 1000 * sorted(times)[100]
+Wd = teacher[3].weight.detach()
+W90 = Wd * (Wd.abs() > Wd.abs().flatten().kthvalue(int(0.9 * Wd.numel())).values)
+warnings.filterwarnings('ignore', 'Sparse CSR')               # CSR support is marked beta
+Wcsr = W90.to_sparse_csr()
+h = torch.relu(teacher[0](xb)).detach()
+with torch.no_grad():
+    t_dense = ms(lambda: h @ Wd.T)
+    t_zeros = ms(lambda: h @ W90.T)
+    t_csr = ms(lambda: (Wcsr @ h.T).T)
+    W51 = Wd[:51].contiguous()
+    t_small = ms(lambda: h @ W51.T)
+print(round(t_dense, 3), round(t_zeros / t_dense, 2), round(t_csr / t_dense, 2), round(t_small / t_dense, 2))
+# e.g. 0.124 1.0 38.21 0.2: dense ms, then relative times for 90% zeros kept dense, the same in CSR, 51 of 512 rows kept
+```
+
+## Next
+
+Every note of the course has ended with a network that trains: its loss falls, its accuracy rises, its numbers come out as printed. Getting there on a new problem is rarely that smooth. A bug in the data pipeline, a learning rate ten times too large or a missing call to `model.eval()` all produce a network that trains, just badly, without any error message. The [last note](/notes/deep-learning/training-in-practice) is a recipe for training a network from scratch that catches these failures early: the checks to run before the first real experiment, how to choose the learning rate, how to read the curves, and how to keep runs reproducible and within a compute budget.
+
+## References
+
+- Y. LeCun, J. S. Denker, S. A. Solla. [Optimal brain damage](https://proceedings.neurips.cc/paper/1989/hash/6c9882bbac1c7093bd25041881277658-Abstract.html). NeurIPS (NIPS 2), 1990.
+- S. Han, J. Pool, J. Tran, W. J. Dally. [Learning both weights and connections for efficient neural networks](https://arxiv.org/abs/1506.02626). NeurIPS, 2015. Figure 1 (the energy table, after M. Horowitz, ISSCC 2014), Table 1 (AlexNet and VGG-16).
+- S. Han, H. Mao, W. J. Dally. [Deep compression: compressing deep neural networks with pruning, trained quantization and Huffman coding](https://arxiv.org/abs/1510.00149). ICLR, 2016.
+- H. Li, A. Kadav, I. Durdanovic, H. Samet, H. P. Graf. [Pruning filters for efficient ConvNets](https://arxiv.org/abs/1608.08710). ICLR, 2017.
+- A. Mishra, J. A. Latorre, J. Pool, D. Stosic, D. Stosic, G. Venkatesh, C. Yu, P. Micikevicius. [Accelerating sparse deep neural networks](https://arxiv.org/abs/2104.08378). arXiv, 2021.
+- J. Frankle, M. Carbin. [The lottery ticket hypothesis: finding sparse, trainable neural networks](https://arxiv.org/abs/1803.03635). ICLR, 2019.
+- J. Frankle, G. K. Dziugaite, D. M. Roy, M. Carbin. [Linear mode connectivity and the lottery ticket hypothesis](https://arxiv.org/abs/1912.05671). ICML, 2020.
+- G. Hinton, O. Vinyals, J. Dean. [Distilling the knowledge in a neural network](https://arxiv.org/abs/1503.02531). NeurIPS Deep Learning Workshop, 2014 (arXiv 2015). Section 2 (temperature, the $T^2$ factor, matching logits), section 3 (MNIST, the omitted 3s).
+- R. Müller, S. Kornblith, G. Hinton. [When does label smoothing help?](https://arxiv.org/abs/1906.02629) NeurIPS, 2019.
+- E. Denton, W. Zaremba, J. Bruna, Y. LeCun, R. Fergus. [Exploiting linear structure within convolutional networks for efficient evaluation](https://arxiv.org/abs/1404.0736). NeurIPS, 2014.
+- C. Eckart, G. Young. [The approximation of one matrix by another of lower rank](https://doi.org/10.1007/BF02288367). *Psychometrika*, 1(3):211–218, 1936.
+- D. Blalock, J. J. Gonzalez Ortiz, J. Frankle, J. Guttag. [What is the state of neural network pruning?](https://arxiv.org/abs/2003.03033) MLSys, 2020.
+- I. Goodfellow, Y. Bengio, A. Courville. [*Deep Learning*](https://www.deeplearningbook.org/). MIT Press, 2016. Section 12.1.4 (model compression).
+- A. Zhang, Z. C. Lipton, M. Li, A. J. Smola. [*Dive into Deep Learning*](https://d2l.ai/). Cambridge University Press, 2023. Section 13.2 (asynchronous computation), section 13.4 (hardware).
+- S. J. D. Prince. [*Understanding Deep Learning*](https://udlbook.github.io/udlbook/). MIT Press, 2023. Section 20.5 (pruning and knowledge distillation).
+- *Глубинное обучение 1* (Deep Learning 1), Faculty of Computer Science, HSE University. Course materials, [repository xiyori/intro-to-dl-hse, branch 2025-2026](https://github.com/xiyori/intro-to-dl-hse/tree/2025-2026): lecture 12 (optimizing inference).

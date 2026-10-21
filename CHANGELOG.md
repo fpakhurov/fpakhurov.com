@@ -4,6 +4,25 @@ Notable changes to the site, newest first. Each entry gives the date, what chang
 
 ## 2026-10-22
 
+- **A new course: Deep Learning.** It has 14 notes in four sections, in English and Russian, and sits between Machine Learning and the Generative Models and NLP courses.
+  - **Training neural networks:**
+    - what deep learning is;
+    - PyTorch and automatic differentiation, with a scalar autograd built from scratch;
+    - losses and regularization;
+    - normalization and initialization;
+    - optimizing deep networks: schedules and warm-up, AdamW, SAM, mixed precision.
+  - **Convolutional networks:** convolution, the architectures from LeNet to EfficientNet, object detection, semantic segmentation.
+  - **Representations and vision transformers:** self-supervised learning, Vision Transformers.
+  - **Robustness and deployment:** adversarial examples, model compression, training networks in practice.
+
+  The scope follows the HSE course "Глубинное обучение 1". It is cited, not copied. Topics that the other courses already develop are linked rather than repeated: sequences and Transformers for text are in NLP, and GANs, VAEs and diffusion are in Generative Models.
+  - **Code:** every Code section is PyTorch that runs on a laptop CPU in under a minute, and its printed numbers match the text. Several notes run small experiments: degradation without residual connections, warm-up rescuing a post-norm network, U-Net skips and boundaries, a SimCLR linear probe, and distillation transferring an unseen class.
+  - **Figures:** 49, computed at build time.
+  - **Course graph:** it now reads Probability → Machine Learning → Deep Learning → Generative Models and NLP, with Computer Architecture and Operating Systems apart. Long course titles wrap in the wide layout too.
+
+  Why: the Generative Models and NLP courses had to explain convolutions, normalization and training on the side. The HSE curriculum has a deep learning course between machine learning and both of them.
+
+
 - **A new course: Computer Architecture and Operating Systems.** 32 notes in ten sections, in English and Russian, tell how a computer runs a program, from the bits of a number to a process talking over the network:
   - **Foundations:** what a computer system is, bits, integers and byte order, floating point.
   - **RISC-V assembly:** the instruction set, encoding, branches and memory, procedures and the stack.

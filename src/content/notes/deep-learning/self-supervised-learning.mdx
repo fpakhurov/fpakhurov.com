@@ -1,0 +1,329 @@
+---
+title: Self-supervised learning
+description: "How a network learns useful image features without labels: pretext tasks such as rotation and jigsaw, contrastive learning with SimCLR's NT-Xent loss and MoCo's queue, BYOL and SimSiam without negatives, masked autoencoders, and the linear probe that measures the result."
+course: deep-learning
+section: Representations and Vision Transformers
+order: 9
+status: published
+tags: [self-supervised-learning, pretext-tasks, contrastive-learning, simclr, nt-xent, infonce, temperature, moco, byol, simsiam, masked-autoencoder, linear-probe]
+prerequisites: [Convolutional architectures, Losses and regularization]
+---
+
+import SimClrPipeline from '../../../components/figures/self-supervised-learning/SimClrPipeline.astro';
+import TemperatureWeights from '../../../components/figures/self-supervised-learning/TemperatureWeights.astro';
+import LinearProbe from '../../../components/figures/self-supervised-learning/LinearProbe.astro';
+
+Every network of the Convolutional Networks section learned from labels: a class per image, a box per object, a class per pixel. Labels are the expensive part of a dataset, and the pixel masks of the [previous note](/notes/deep-learning/semantic-segmentation) the most expensive of all, while unlabelled images cost almost nothing. **Self-supervised learning** trains a network on images alone, with a task whose targets are computed from the images themselves, and then reuses the network's features for the task that has labels. This note covers the three families of such tasks, from the early pretext tasks through contrastive learning, which made self-supervised features as good as supervised ones, to masked image modelling, the image analogue of [BERT](/notes/nlp/bert), and the linear probe that measures what the features are worth. It ends with SimCLR trained on unlabelled digits, whose features beat raw pixels when only five labels per class are available.
+
+**Notation.** An encoder $f$ maps an image $x$ to a **representation** $h = f(x) \in \mathbb R^d$, the features that are kept. A random **augmentation** $t$ drawn from a family $\mathcal T$ produces a **view** $t(x)$ of the image. A small **projection head** $g$ maps $h$ to $z = g(h)$, the vector the loss compares; $\bar z = z / \lVert z \rVert$ is its normalized form. A batch of $N$ images gives $2N$ views, indexed by $i$, and $p(i)$ is the index of the other view of the same image. $s_{ik} = \bar z_i^\top \bar z_k$ is the cosine similarity of two views and $\tau > 0$ a **temperature**.
+
+## Baseline: pretrain on labels
+
+The standard recipe of the [previous section](/notes/deep-learning/cnn-architectures#transfer-learning-from-imagenet-backbones) pretrains a backbone on ImageNet's 1.28 million labelled images and fine-tunes it on the target task. It works, and until about 2020 no method trained without labels matched it. Its cost is the labels: a human has to look at every image, and outlining every object for segmentation is far more work than naming one class. Its other limit is that the features learn only what the 1000 class names require, such as telling dog breeds apart, and nothing the labels do not ask for.
+
+The question of this note is whether the images alone, without a single label, can train a backbone whose features are as useful as those of supervised pretraining. A self-supervised method answers with a **pretext task**: a prediction problem whose target can be computed from the image, solved only as a means to good features. What it is worth is measured afterwards, on a task with labels.
+
+## Pretext tasks: labels made from the image
+
+The first pretext tasks transform the image in a known way and ask the network which transformation was applied.
+
+- **Rotation** ([Gidaris, Singh and Komodakis, 2018](#references)). Each image is rotated by 0°, 90°, 180° or 270°, and the network classifies the rotation: a four-way cross-entropy, with the rotation index as the label. To tell which way is up, the network has to find the object and recognize its parts, which is the knowledge a classifier needs.
+- **Jigsaw** ([Noroozi and Favaro, 2016](#references)). The image is cut into a $3 \times 3$ grid of tiles, the tiles are shuffled by one of a fixed set of permutations, and the network classifies which permutation was applied. Of the $9! = 362{,}880$ possible orders the authors use a subset of 1000, chosen so that any two differ in many positions.
+
+Both tasks suffer from **shortcuts**: low-level cues that solve the task without any understanding of the content. Jigsaw tiles can be ordered by matching the edges of adjacent tiles or by the colour fringes that camera lenses add towards the borders of an image, which is why the tiles are cut with random gaps between them and their colour channels are jittered. A shortcut solves the pretext task and teaches nothing. The pretext features came close to supervised pretraining on some transfer tasks, 2.4 points below it on PASCAL VOC detection for rotation, but stayed well below it under a linear probe on ImageNet, and each task had to be designed by hand for a kind of data.
+
+## Contrastive learning
+
+<aside class="callout"><strong>Key idea.</strong> Instead of predicting a property of one image, compare images. Two random augmentations of the same image are a <strong>positive pair</strong>, any two views of different images are a <strong>negative pair</strong>. Train the encoder so that a view is closer to its partner than to every other view in the batch. The features must then keep what survives the augmentations, the content of the image, and may discard what the augmentations change.</aside>
+
+### SimCLR: two views, an encoder and a projection head
+
+SimCLR ([Chen et al., 2020a](#references)) is the simplest complete form of the idea. For every image of a batch it draws two augmentations and runs both views through the same network:
+
+$$
+x \;\xrightarrow{\;t,\ t' \sim \mathcal T\;}\; t(x),\ t'(x) \;\xrightarrow{\;f\;}\; h,\ h' \;\xrightarrow{\;g\;}\; z,\ z' .
+$$
+
+The encoder $f$ is a ResNet whose output after global average pooling is $h$; the head $g$ is a small network with one hidden layer, $z = W_2\, \operatorname{ReLU}(W_1 h)$. The loss compares the $z$ of all $2N$ views of the batch at once and is described next. After training, the head is thrown away and $h$ is the representation that is reused.
+
+<SimClrPipeline />
+
+1. Draw two random augmentations for each of the $N$ images; the batch becomes $2N$ views.
+2. The encoder $f$, shared by all views, maps each view to its representation $h$.
+3. The head $g$ maps $h$ to $z$, which is normalized to unit length.
+4. Compute the cosine similarity of every pair of views and divide it by $\tau$; a view is not compared with itself.
+5. Each row is a classification over the other $2N - 1$ views with the partner view as the correct class; the loss is its cross-entropy, averaged over the rows.
+
+### The NT-Xent loss
+
+For the view $i$, the loss is
+
+$$
+\boxed{\;\ell_i = -\log \frac{\exp\!\big(s_{i,p(i)}/\tau\big)}{\sum_{k \ne i} \exp\!\big(s_{ik}/\tau\big)}\;}, \qquad L = \frac{1}{2N} \sum_{i=1}^{2N} \ell_i .
+$$
+
+[Chen et al. (2020a)](#references) call it **NT-Xent**, the normalized temperature-scaled cross-entropy; it is the InfoNCE loss of [van den Oord, Li and Vinyals (2018)](#references) applied to pairs of views. Read it as a classification. The logits of view $i$ are its similarities to the $2N - 1$ other views, divided by $\tau$; the "class" to predict is its partner $p(i)$; the loss is the [cross-entropy from logits](/notes/deep-learning/losses-and-regularization#classification-cross-entropy-from-logits) of that $(2N-1)$-way problem. Both views of an image are anchors in turn, so every positive pair contributes twice.
+
+The gradient follows from the cross-entropy gradient $\partial \ell / \partial(\text{logit}) = q - e_{p(i)}$, with the logit $s_{ik}/\tau$ and $q_{ik} = \exp(s_{ik}/\tau) / \sum_{k' \ne i} \exp(s_{ik'}/\tau)$ the softmax over the candidates:
+
+$$
+\frac{\partial \ell_i}{\partial s_{ik}} = \frac{1}{\tau}\Big(q_{ik} - \mathbb 1[k = p(i)]\Big) .
+$$
+
+The positive is pulled closer with force $(1 - q_{i,p(i)})/\tau$, and each negative is pushed away with force $q_{ik}/\tau$, in proportion to how probable it is under the softmax. A negative that already looks dissimilar gets almost no gradient; a **hard negative**, a view of another image that looks similar, gets most of it. The normalization matters: with $\bar z$ on the unit sphere every similarity lies in $[-1, 1]$, so the only way to lower the loss is to arrange the directions, not to inflate the lengths.
+
+**Worked example.** Two images $a$ and $b$, two views each, ordered $(a, b, a', b')$, with normalized two-dimensional embeddings $\bar z_a = (1, 0)$, $\bar z_b = (0, 1)$, $\bar z_{a'} = (0.8, 0.6)$, $\bar z_{b'} = (-0.6, 0.8)$. The similarities are $s_{aa'} = 0.8$, $s_{bb'} = 0.8$, $s_{ba'} = 0.6$, $s_{ab'} = -0.6$ and $s_{ab} = s_{a'b'} = 0$. With $\tau = 0.5$, the anchor $b$ has the logits $0$ for $a$, $1.2$ for $a'$ and $1.6$ for its partner $b'$:
+
+$$
+\ell_b = -\log \frac{e^{1.6}}{e^{0} + e^{1.2} + e^{1.6}} = -\log \frac{4.953}{1 + 3.320 + 4.953} = -\log 0.534 = 0.627 .
+$$
+
+The anchor $a$ has the logits $0$, $1.6$ and $-1.2$, so $\ell_a = -\log(4.953 / 6.254) = 0.233$; by symmetry $\ell_{a'} = \ell_b$ and $\ell_{b'} = \ell_a$, and $L = 0.430$. The anchor $b$ loses more because $a'$ is a hard negative: it is almost as close to $b$ ($0.6$) as $b$'s own partner ($0.8$). Its softmax weights are $q = (0.108, 0.358, 0.534)$, so the hard negative $a'$ receives a push of $0.358/0.5 = 0.716$ and the easy negative $a$ only $0.216$.
+
+### Why the temperature matters
+
+The temperature sets how sharply the softmax distinguishes candidates. The ratio of the gradients on two negatives with similarities $s$ and $s'$ is
+
+$$
+\frac{q_{ik}}{q_{ik'}} = \exp\!\Big(\frac{s - s'}{\tau}\Big),
+$$
+
+so a small $\tau$ makes the hardest negatives dominate the gradient and a large $\tau$ spreads it evenly. In the worked example the hard negative $a'$ of anchor $b$ gets $e^{0.6} = 1.8$ times the gradient of the easy one at $\tau = 1$, $e^{1.2} = 3.3$ times at $\tau = 0.5$ and $e^{6} = 403$ times at $\tau = 0.1$. The loss of $b$ falls from $0.819$ to $0.627$ and $0.127$, because dividing by a small $\tau$ also stretches the gap between the positive and the negatives.
+
+<TemperatureWeights />
+
+Neither extreme is good. With a very large $\tau$ every negative counts the same and the loss barely distinguishes a good arrangement from a bad one; with a very small $\tau$ the gradient comes from a handful of negatives, some of which are not really negatives (two different photographs of cats), and pushing them apart harms the features. With ResNet-50, batches of 4096 and 100 epochs, SimCLR's linear-probe accuracy on ImageNet was 59.7% at $\tau = 0.05$, 64.4% at $\tau = 0.1$, 60.7% at $0.5$ and 58.0% at $1$; without the normalization, the network solved the contrastive task more often (92% against 88% at $\tau = 0.1$) and its features were worse, 57% ([Chen et al., 2020a](#references), Table 5). The same scaling of logits by a temperature appears in [sampling from a language model](/notes/nlp/gpt#temperature), where it trades reliability for variety.
+
+### Why large batches matter
+
+Each anchor is classified against $2N - 2$ negatives, so the batch size sets the difficulty of the task. Two effects follow. If all similarities were equal, every $q_{ik}$ would be $1/(2N - 1)$ and the loss would be $\log(2N - 1)$, $6.236$ for $N = 256$; this is the starting point of training, and the scale on which progress is measured. And [van den Oord, Li and Vinyals (2018)](#references), section 2.3, show that the InfoNCE loss with $K$ candidates bounds the mutual information between the two views from below, $I \ge \log K - \ell$: since $\ell \ge 0$, the bound can never exceed $\log K$, so a batch of 256 images ($K = 511$) can certify at most $6.24$ nats of shared information between views however good the encoder. More negatives make a harder task with a higher ceiling.
+
+In SimCLR's experiments larger batches helped most when training was short: at 100 epochs, linear-probe accuracy rose steadily with the batch size from 256 to 8192, and with longer training the gaps shrank ([Chen et al., 2020a](#references), section 5.2 and Figure 9). A batch of 4096 images, the default, needs many accelerators, which is the practical weakness that MoCo addresses below.
+
+### Which augmentations, and why the head is thrown away
+
+The augmentations define what the features ignore, so they decide what the features contain. SimCLR uses random crops resized back to full size, colour distortion and Gaussian blur, and found one composition decisive: crop with colour distortion. Crops alone have a shortcut: two crops of the same photograph share its colour histogram, which identifies the image without any recognition of its content; distorting the colours independently in each view removes the shortcut ([Chen et al., 2020a](#references), section 3.1 and Figure 6). Contrastive learning also wants stronger augmentation than supervised training: as the colour distortion was made stronger, SimCLR's linear-probe accuracy rose from 59.6% to 64.5%, while the accuracy of a supervised ResNet-50 trained with the same augmentation fell from 77.0% to 75.4% (section 3.2, Table 1). The augmentations must keep the label of the downstream task: as in [supervised augmentation](/notes/deep-learning/losses-and-regularization#data-augmentation), a horizontal flip suits photographs and is wrong for digits.
+
+The head is thrown away because the loss makes $z$ invariant to the augmentations, and that invariance destroys information, such as colour or orientation, that a downstream task may need. The head gives the network a place to discard it: $h$, before the head, keeps more. With a nonlinear head, a linear classifier on $h$ was more than 10 points better than one on $z$, and the nonlinear head beat a linear one by 3 points and no head at all by more than 10 ([Chen et al., 2020a](#references), section 4.2 and Figure 8).
+
+With all of this, a linear classifier on SimCLR features reached 69.3% top-1 on ImageNet with a ResNet-50 and 76.5% with a ResNet-50 four times as wide, the accuracy of a supervised ResNet-50 ([Chen et al., 2020a](#references), Table 6).
+
+<aside class="callout"><strong>Check yourself.</strong> (1) A batch of $N = 128$ images is trained with NT-Xent. How many negatives does each anchor have, and what is the loss when all similarities are equal? (2) Two negatives of an anchor have similarities $0.9$ and $0.3$. What is the ratio of their gradients at $\tau = 0.2$? (3) Why is a rotation by 180° a poor augmentation for contrastive learning on digits?<details><summary>Answers</summary>(1) $2N - 2 = 254$ negatives among $2N - 1 = 255$ candidates; the loss is $\log 255 = 5.54$. (2) $e^{(0.9 - 0.3)/0.2} = e^{3} = 20.1$. (3) It changes the label: a 6 rotated by 180° is a 9, and the features would be trained to treat the two digits as the same.</details></aside>
+
+## MoCo: a queue of negatives and a momentum encoder
+
+SimCLR draws its negatives from the current batch, so more negatives need a bigger batch. **MoCo** ([He et al., 2020](#references)) separates the two. It keeps a **queue** of the encoded keys $k$ of recent batches as a dictionary of negatives: every step, the keys of the current batch are added and the oldest are removed. The query view $q$ of an image is compared with its own key $k_+$, the other view, and with the $K$ keys of the queue by the same InfoNCE loss, $\ell_q = -\log\big(e^{q \cdot k_+/\tau} / \sum_{i=0}^{K} e^{q \cdot k_i/\tau}\big)$, with the sum over $k_+$ and the $K$ queued keys; MoCo uses $K = 65{,}536$ and $\tau = 0.07$ with ordinary batches of 256 images.
+
+The keys in the queue must stay comparable, although they were computed many steps ago. If the key encoder were the query encoder itself, its weights would change at every step and the old keys would be encoded by a different network. MoCo therefore computes the keys with a separate encoder whose weights $\theta_k$ follow the query encoder's $\theta_q$ as a slow moving average, and only $\theta_q$ is trained by backpropagation:
+
+$$
+\theta_k \leftarrow m\, \theta_k + (1 - m)\, \theta_q, \qquad m = 0.999 .
+$$
+
+**Worked example.** With $m = 0.999$ the key encoder averages roughly the last $1/(1 - m) = 1000$ versions of the query encoder: if $\theta_q$ moves to a new value and stays there, $\theta_k$ covers $1 - 0.999^{1000} = 63\%$ of the distance in 1000 steps. The queue of 65,536 keys holds 256 batches of 256, so its oldest keys were encoded 256 steps ago, by a key encoder that has since moved only $1 - 0.999^{256} = 23\%$ of the way towards any change of the query encoder: old and new keys come from almost the same network. With a queue of 4096 the momentum mattered: linear-probe accuracy was 55.2% at $m = 0.9$, 57.8% at $0.99$, 59.0% at $0.999$ and 58.9% at $0.9999$, and with $m = 0$, the key encoder a copy of the query encoder, training did not converge ([He et al., 2020](#references), section 4.1). With a ResNet-50, MoCo reached 60.6% under the linear probe, and its features fine-tuned for detection and segmentation outperformed supervised ImageNet pretraining on 7 tasks on PASCAL VOC, COCO and other datasets (sections 4.1 and 4.2).
+
+## Without negatives: BYOL and SimSiam
+
+*Optional depth: two methods that drop the negatives. The rest of the note does not depend on it.*
+
+Negatives are there to prevent **collapse**: without them, the loss "views of the same image should agree" is minimized by an encoder that maps every image to the same vector. **BYOL** ([Grill et al., 2020](#references)) drops the negatives anyway and avoids collapse by an asymmetry. An online network with an extra **predictor** $q_\theta$ predicts the normalized projection of the other view computed by a target network, and the loss is the squared distance between the two normalized vectors, $\lVert \bar q_\theta(z) - \bar z'_\xi \rVert^2 = 2 - 2 \cos\big(q_\theta(z), z'_\xi\big)$. No gradient flows into the target network; its weights $\xi$ are a moving average of the online weights $\theta$, as in MoCo. BYOL reached 74.3% with a ResNet-50 under the linear probe. **SimSiam** ([Chen and He, 2021](#references)) showed that even the moving average is unnecessary: with a predictor on one side and a **stop-gradient** on the other, a single shared network does not collapse and reaches 67.7% after 100 epochs. Removing the stop-gradient alone makes it collapse to a constant, with 0.1% accuracy, the level of guessing among 1000 classes. Why the asymmetry prevents collapse is still only partly understood; both papers offer explanations rather than proofs.
+
+## Masked image modelling: MAE
+
+A different family returns to prediction, now of the image itself. [BERT](/notes/nlp/bert#masked-language-modelling) hides 15% of the tokens of a sentence and predicts them from the rest. The **masked autoencoder** (MAE, [He et al., 2022](#references)) does the same with an image cut into patches, using the Vision Transformer of the [next note](/notes/deep-learning/vision-transformers), which processes an image as a sequence of patches:
+
+1. Cut the image into patches of $16 \times 16$ pixels and hide a random 75% of them.
+2. The encoder sees only the visible 25%; it never sees a mask token.
+3. A small decoder receives the encoded visible patches and mask tokens in the hidden positions, and reconstructs the pixels of the hidden patches; in the best variant each target patch is normalized by its own mean and standard deviation.
+4. The loss is the mean squared error on the hidden patches only, as BERT's loss is on the masked tokens only.
+
+The masking ratio is the main difference from BERT. Text is dense in meaning, so 15% of hidden words make a hard task; images are redundant, and a missing patch can be filled in from its neighbours unless most of them are gone too. At 75%, the task needs a model of objects and scenes, not interpolation, and since the encoder processes a quarter of the patches, pretraining is three or more times faster. A ViT-Huge pretrained this way on ImageNet-1K alone reached 87.8% after fine-tuning at resolution 448. The masked autoencoder is a [denoising autoencoder](/notes/generative-models/autoencoders#denoising-autoencoder) whose noise is masking.
+
+MAE features illustrate why one evaluation is not enough. With ViT-Large, they reach 84.9% when the whole network is fine-tuned but only 73.5% under a linear probe, lower than contrastive features of the same network; fine-tuning only the last block already gives 81.0% ([He et al., 2022](#references), section 4.1, Table 1 and section 4.3). The pixel-reconstruction features are less linearly separable but strong once a few layers adapt.
+
+## The linear probe
+
+Self-supervised features are judged on a labelled task. The standard protocol is the **linear probe**: freeze the encoder, compute $h$ for every labelled image, and train only a linear classifier (logistic regression) on top. Its accuracy measures how much of the class information the features carry in a linearly accessible form. Three protocols complement it:
+
+- **Fine-tuning**: train the whole network, starting from the pretrained weights, on the labelled task. It measures the features as an initialization, which is how they are used in practice ([transfer learning](/notes/deep-learning/cnn-architectures#transfer-learning-from-imagenet-backbones)).
+- **Few labels**: the probe or fine-tuning with 1% or 10% of the labels, where pretraining matters most.
+- **Transfer**: other datasets and tasks, such as detection and segmentation.
+
+The probe needs a reference point. A random, untrained encoder is the floor that the architecture alone provides; raw pixels are another. A probe that beats both shows that the pretraining, not the architecture, put the information there.
+
+## An experiment: SimCLR on digits
+
+The Code section trains SimCLR on the 1078 training images of the bundled $8 \times 8$ digits without their labels. The encoder is a three-layer convolutional network with batch normalization, 16, 32 and 64 channels and one pooling, giving $h \in \mathbb R^{64}$; the head maps $64 \to 64 \to 32$. A view is a random rotation of up to 15°, a scale between 0.9 and 1.1, a shift of up to one pixel, a random contrast and Gaussian pixel noise; flips are excluded because they change digits. Training uses NT-Xent with $\tau = 0.5$, batches of 256 images (511 candidates per anchor), Adam at learning rate $10^{-3}$ and 50 epochs, that is 200 steps; the loss falls from $6.10$ after the first epoch to $4.76$, against the $\log 511 = 6.24$ of an encoder that cannot tell views apart.
+
+The linear probe is a logistic regression on standardized frozen features, trained with 5 or 10 labelled images per class (averaged over five random draws of the labelled images) or with all 1078, and tested on the 719 held-out images:
+
+| features | 5 labels per class | 10 per class | all 1078 |
+| --- | --- | --- | --- |
+| raw pixels (64 values) | 0.825 | 0.897 | 0.968 |
+| random encoder, $h$ | 0.806 | 0.884 | 0.968 |
+| SimCLR encoder, $h$ | 0.942 | 0.956 | 0.987 |
+| SimCLR, $z = g(h)$ | 0.942 | 0.947 | 0.978 |
+
+<LinearProbe />
+
+With five labels per class, the SimCLR features raise the probe from 0.825 on pixels and 0.806 on the random encoder to 0.942; with all labels the gain shrinks to about two points, because 1078 labels are enough for a linear model on pixels. The random encoder is no better than the pixels: the architecture alone did not help here. Two seeds more give the same picture (SimCLR $h$: 0.933 and 0.936 with five labels; random encoder: 0.772 and 0.763). The features before the head are as good as or better than those after it, but by one point at most, far from the gap of more than 10 points of SimCLR on ImageNet, presumably because mild augmentations of small images leave the head little to discard. Changing $\tau$ to $0.1$ or $1.0$ moved the five-label probe to 0.916 and 0.935, one run each, too close to rank. All of these numbers come from a single small setting and say nothing about ImageNet-scale behaviour.
+
+## What changed
+
+| | Supervised pretraining | Self-supervised pretraining |
+| --- | --- | --- |
+| Training signal | human labels | a task computed from the images: rotation, jigsaw, matching views, hidden patches |
+| What the features keep | what the class names need | what survives the augmentations (contrastive), or what predicts hidden content (masked) |
+| Loss | cross-entropy over classes | NT-Xent / InfoNCE over $2N - 1$ or $K + 1$ candidates; MSE on hidden patches |
+| Key hyperparameters | learning rate, regularization | augmentations, temperature, batch or queue size, masking ratio |
+| Evaluation | accuracy on the labelled task | linear probe on frozen features, fine-tuning, few labels, transfer |
+| Digits here, 5 labels per class | 0.825 on pixels | 0.942 with SimCLR features |
+
+## Limitations
+
+- **The augmentations are the prior.** Contrastive features are invariant to exactly what the augmentations change. Colour-invariant features are wrong for a task about colour, and choosing augmentations for medical images or spectrograms is as much design work as the old pretext tasks.
+- **False negatives.** Two images of the same class in a batch are pushed apart as negatives. With many classes this is rare; with few classes, or a small temperature, it pulls the features against the downstream labels.
+- **Compute.** Contrastive methods need large batches or queues and hundreds of epochs; the ImageNet results above took 100 to 1000 epochs, SimCLR's with batches of 4096 images.
+- **One number does not rank methods.** Linear probe, fine-tuning and transfer can order methods differently, as MAE shows; results from different protocols, architectures or epochs are not comparable.
+- **Collapse is a real failure mode.** Methods without negatives depend on asymmetries (predictor, stop-gradient, moving average) whose removal makes them collapse, and whose working is only partly explained.
+
+## What you should remember
+
+- Self-supervised learning trains on a task whose targets come from the data, then reuses the features; the linear probe on frozen features measures them.
+- Pretext tasks (rotation, jigsaw) work but invite shortcuts; contrastive and masked objectives replaced them.
+- SimCLR: two augmented views, shared encoder $f$, projection head $g$, and NT-Xent, $\ell_i = -\log\big(e^{s_{i,p(i)}/\tau} / \sum_{k \ne i} e^{s_{ik}/\tau}\big)$, a $(2N - 1)$-way cross-entropy on cosine similarities. Keep $h$, throw away $g$.
+- The gradient on a negative is $q_{ik}/\tau$: the temperature decides how much the hardest negatives dominate. Batch size sets the number of negatives and the ceiling $\log(2N - 1)$ of the loss.
+- MoCo keeps 65,536 negatives in a queue encoded by a momentum encoder, $\theta_k \leftarrow 0.999\,\theta_k + 0.001\,\theta_q$; BYOL and SimSiam need no negatives but depend on a predictor and stop-gradient to avoid collapse.
+- MAE hides 75% of the patches and reconstructs them, the BERT objective for images; its features excel after fine-tuning, less under a linear probe.
+- On digits with five labels per class, SimCLR features give a probe accuracy of 0.942 against 0.825 on raw pixels.
+
+## Code
+
+The worked example of NT-Xent at three temperatures, the loss of an encoder that cannot tell views apart, SimCLR on unlabelled digits, and linear probes on pixels, a random encoder and the trained one. Seeds are fixed; exact numbers can differ across platforms and library versions. The script runs in about 20 seconds on a laptop CPU, almost all of it in training.
+
+```python
+import math, numpy as np, torch
+from torch import nn
+import torch.nn.functional as F
+from sklearn.datasets import load_digits
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LogisticRegression
+torch.set_num_threads(1)                    # small convolutions run faster on one thread
+
+def nt_xent(z, tau):
+    """NT-Xent for 2N views ordered (x_1..x_N, x'_1..x'_N): view i's positive is view i + N (mod 2N)."""
+    z = F.normalize(z, dim=1)
+    s = z @ z.T / tau
+    s.fill_diagonal_(float('-inf'))                       # a view is never its own candidate
+    n = len(z) // 2
+    target = torch.cat([torch.arange(n, 2 * n), torch.arange(n)])
+    return F.cross_entropy(s, target, reduction='none')   # one loss per anchor
+
+# 1. the worked example: two images, two views each, 2-D embeddings; order (a, b, a', b')
+z = torch.tensor([[1.0, 0.0], [0.0, 1.0], [0.8, 0.6], [-0.6, 0.8]])
+print([[round(v, 2) for v in row] for row in (F.normalize(z) @ F.normalize(z).T).tolist()])
+# [[1.0, 0.0, 0.8, -0.6], [0.0, 1.0, 0.6, 0.8], [0.8, 0.6, 1.0, 0.0], [-0.6, 0.8, 0.0, 1.0]]
+for tau in (1.0, 0.5, 0.1):
+    l = nt_xent(z, tau)
+    print(tau, [round(v, 4) for v in l.tolist()], round(l.mean().item(), 4))
+# 1.0 [0.5282, 0.8189, 0.8189, 0.5282] 0.6736
+# 0.5 [0.2333, 0.6271, 0.6271, 0.2333] 0.4302
+# 0.1 [0.0003, 0.1272, 0.1272, 0.0003] 0.0638
+
+# 2. at random (all similarities equal) the loss is log(2N - 1): one positive among 2N - 1 candidates
+N = 256
+print(round(nt_xent(torch.ones(2 * N, 8), 0.5).mean().item(), 4), round(math.log(2 * N - 1), 4))   # 6.2364 6.2364
+
+# 3. data: 1078 training digits used without labels, 719 test digits; labels only for the linear probe
+X, y = load_digits(return_X_y=True)
+Xtr, Xte, ytr, yte = train_test_split(X / 16.0, y, test_size=0.4, random_state=0, stratify=y)
+Xtr, Xte = [torch.tensor(a, dtype=torch.float32).view(-1, 1, 8, 8) for a in (Xtr, Xte)]
+
+def augment(x):
+    """A random view: rotation up to 15 degrees, scale 0.9-1.1, shift up to 1 pixel, contrast, pixel noise."""
+    n = len(x)
+    angle = (torch.rand(n) * 2 - 1) * math.radians(15)
+    scale = 1 + (torch.rand(n) * 2 - 1) * 0.1
+    shift = (torch.rand(n, 2) * 2 - 1) * 0.25           # 0.25 in grid units = 1 pixel of 8
+    cos, sin = torch.cos(angle) / scale, torch.sin(angle) / scale
+    theta = torch.stack([torch.stack([cos, -sin, shift[:, 0]], 1), torch.stack([sin, cos, shift[:, 1]], 1)], 1)
+    out = F.grid_sample(x, F.affine_grid(theta, x.shape, align_corners=False), align_corners=False)
+    return out * (0.7 + 0.6 * torch.rand(n, 1, 1, 1)) + 0.1 * torch.randn_like(out)
+
+def encoder():                              # f: 8 x 8 image -> h in R^64
+    return nn.Sequential(nn.Conv2d(1, 16, 3, padding=1), nn.BatchNorm2d(16), nn.ReLU(),
+                         nn.Conv2d(16, 32, 3, padding=1), nn.BatchNorm2d(32), nn.ReLU(), nn.MaxPool2d(2),
+                         nn.Conv2d(32, 64, 3, padding=1), nn.BatchNorm2d(64), nn.ReLU(),
+                         nn.AdaptiveAvgPool2d(1), nn.Flatten())
+
+def features(net, x):
+    net.eval()
+    with torch.no_grad():
+        return net(x).numpy()
+
+def probe(Htr, Hte, per_class=None, draws=5):
+    """Linear probe: logistic regression on frozen, standardized features; test accuracy, mean over label draws."""
+    mu, sd = Htr.mean(0), Htr.std(0) + 1e-6
+    Htr, Hte = (Htr - mu) / sd, (Hte - mu) / sd
+    accs = []
+    for d in range(draws if per_class else 1):
+        rng = np.random.default_rng(d)
+        idx = (np.concatenate([rng.choice(np.where(ytr == c)[0], per_class, replace=False) for c in range(10)])
+               if per_class else np.arange(len(ytr)))
+        accs.append(LogisticRegression(max_iter=2000).fit(Htr[idx], ytr[idx]).score(Hte, yte))
+    return np.mean(accs)
+
+# 4. SimCLR: two views per image, encoder f, projection head g, NT-Xent, batches of 256 images
+TAU = 0.5
+torch.manual_seed(0)
+random_f = encoder()                        # the baseline: the same encoder, never trained
+torch.manual_seed(0)
+f, g = encoder(), nn.Sequential(nn.Linear(64, 64), nn.ReLU(), nn.Linear(64, 32))
+opt = torch.optim.Adam([*f.parameters(), *g.parameters()], lr=1e-3)
+for epoch in range(50):
+    f.train(); g.train()
+    perm = torch.randperm(len(Xtr))
+    for i in range(0, len(Xtr) - N + 1, N):  # 4 steps per epoch, the last partial batch dropped
+        xb = Xtr[perm[i:i + N]]
+        loss = nt_xent(g(f(torch.cat([augment(xb), augment(xb)]))), TAU).mean()
+        opt.zero_grad(); loss.backward(); opt.step()
+    if epoch in (0, 49):
+        print(epoch + 1, round(loss.item(), 3))
+# 1 6.102
+# 50 4.758
+
+# 5. linear probes with 5 and 10 labels per class (mean over 5 draws) and with all 1078 labels
+reps = {'raw pixels': (Xtr.flatten(1).numpy(), Xte.flatten(1).numpy()),
+        'random encoder h': (features(random_f, Xtr), features(random_f, Xte)),
+        'SimCLR h': (features(f, Xtr), features(f, Xte)),
+        'SimCLR z = g(h)': (features(nn.Sequential(f, g), Xtr), features(nn.Sequential(f, g), Xte))}
+print('features              5/class 10/class   all')
+for name, (Htr, Hte) in reps.items():
+    print(f'{name:20} {probe(Htr, Hte, 5):8.3f} {probe(Htr, Hte, 10):8.3f} {probe(Htr, Hte):6.3f}')
+# features              5/class 10/class   all
+# raw pixels              0.825    0.897  0.968
+# random encoder h        0.806    0.884  0.968
+# SimCLR h                0.942    0.956  0.987
+# SimCLR z = g(h)         0.942    0.947  0.978
+# with TAU = 0.1, SimCLR h gives 0.916 0.948 0.990; with TAU = 1.0, 0.935 0.957 0.986
+# with both seeds set to 1 (or 2): random encoder 0.772 0.870 0.951 (0.763 0.850 0.960), SimCLR h 0.933 0.963 0.989 (0.936 0.953 0.990)
+```
+
+## Next
+
+The masked autoencoder needed an encoder that takes an image as a set of patches and can simply drop three quarters of them, which a convolutional network cannot do. The [next note](/notes/deep-learning/vision-transformers) builds that encoder: the Vision Transformer cuts an image into patches, treats them as tokens and processes them with the Transformer of the NLP course. It has almost none of the convolution's built-in assumptions about images, which is why it needs either very large datasets or the pretraining of this note, and CLIP, at its end, applies the contrastive loss of this note to pairs of images and captions.
+
+## References
+
+- S. Gidaris, P. Singh, N. Komodakis. [Unsupervised representation learning by predicting image rotations](https://arxiv.org/abs/1803.07728). ICLR, 2018.
+- M. Noroozi, P. Favaro. [Unsupervised learning of visual representations by solving jigsaw puzzles](https://arxiv.org/abs/1603.09246). ECCV, 2016. Section 3 (the permutation set, shortcuts).
+- T. Chen, S. Kornblith, M. Norouzi, G. Hinton. [A simple framework for contrastive learning of visual representations](https://arxiv.org/abs/2002.05709). ICML, 2020 (cited as Chen et al., 2020a). Section 2.1 (the NT-Xent loss), section 3 (augmentations), section 4.2 (projection head), sections 5.1–5.2 (temperature, batch size), Tables 5 and 6.
+- A. van den Oord, Y. Li, O. Vinyals. [Representation learning with contrastive predictive coding](https://arxiv.org/abs/1807.03748). arXiv, 2018. Section 2.3 (InfoNCE and the mutual-information bound).
+- K. He, H. Fan, Y. Wu, S. Xie, R. Girshick. [Momentum contrast for unsupervised visual representation learning](https://arxiv.org/abs/1911.05722). CVPR, 2020. Section 3 (queue and momentum update), section 4 (ablations, linear probe, transfer).
+- J.-B. Grill et al. [Bootstrap your own latent: a new approach to self-supervised learning](https://arxiv.org/abs/2006.07733). NeurIPS, 2020.
+- X. Chen, K. He. [Exploring simple Siamese representation learning](https://arxiv.org/abs/2011.10566). CVPR, 2021. Section 4.1 (stop-gradient).
+- K. He, X. Chen, S. Xie, Y. Li, P. Dollár, R. Girshick. [Masked autoencoders are scalable vision learners](https://arxiv.org/abs/2111.06377). CVPR, 2022. Section 3 (approach), section 4.1 and Table 1 (masking ratio, linear probe against fine-tuning), section 4.3 (partial fine-tuning).
+- I. Goodfellow, Y. Bengio, A. Courville. [*Deep Learning*](https://www.deeplearningbook.org/). MIT Press, 2016. Chapter 15 (representation learning, unsupervised pretraining).
+- A. Zhang, Z. C. Lipton, M. Li, A. J. Smola. [*Dive into Deep Learning*](https://d2l.ai/). Cambridge University Press, 2023. Section 14.2 (fine-tuning a pretrained network).
+- S. J. D. Prince. [*Understanding Deep Learning*](https://udlbook.github.io/udlbook/). MIT Press, 2023. Chapter 9 (regularization, including transfer learning and self-supervised learning), chapter 14 (unsupervised learning).
+- *Глубинное обучение 1* (Deep Learning 1), Faculty of Computer Science, HSE University. Course materials, [repository xiyori/intro-to-dl-hse, branch 2025-2026](https://github.com/xiyori/intro-to-dl-hse/tree/2025-2026): lecture 10 (self-supervised learning: pretext tasks, contrastive learning, SimCLR).
