@@ -1,0 +1,320 @@
+---
+title: The datapath and pipelining
+description: "How a RISC-V processor executes add, lw, sw and beq in one long cycle, why splitting that cycle into five overlapped stages raises throughput but not latency, and what hazards, forwarding, stalls and branch prediction cost in cycles per instruction."
+course: acos
+section: Inside the Processor
+order: 9
+status: published
+tags: [datapath, pipelining, hazards, forwarding, stalls, branch-prediction, cpi, risc-v]
+prerequisites: [RISC-V instructions and their encoding, "Branches, loops and memory access", Caches]
+---
+
+import PipelinedDatapath from '../../../components/figures/pipelining/PipelinedDatapath.astro';
+import PipelineDiagram from '../../../components/figures/pipelining/PipelineDiagram.astro';
+import TwoBitPredictor from '../../../components/figures/pipelining/TwoBitPredictor.astro';
+
+The memory-hierarchy notes made memory look fast ([caches](/notes/acos/caches)) and private to every program ([virtual memory](/notes/acos/virtual-memory)). They treated the processor as a black box that issues one load or store after another. This note opens the box. It builds the hardware that executes four RISC-V instructions, `add`, `lw`, `sw` and `beq`, first as one long clock cycle per instruction and then as a **pipeline** of five short stages that work on five instructions at once. The pipeline is the reason a processor can finish close to one instruction per cycle at a high clock rate. It also creates the problems that the rest of this section and the [next one](/notes/acos/instruction-level-parallelism) keep returning to: instructions that need a result before it exists, branches whose outcome is not known in time, and, in the [next note](/notes/acos/exceptions-and-interrupts), an exception in the middle of five unfinished instructions.
+
+**Notation.** $T_c$ is the clock period (the cycle time) and $f = 1/T_c$ the clock rate. $n$ is the number of instructions a program executes and $k$ the number of pipeline stages. **CPI** is the average number of clock cycles per instruction, so the execution time is $n \cdot \text{CPI} \cdot T_c$. Times are in picoseconds (1 ps $= 10^{-12}$ s). Registers use the ABI names of the [instructions note](/notes/acos/risc-v-instructions): `t0`–`t6` temporaries, `a0`–`a7` arguments, and `x0`, which always reads as zero.
+
+## Baseline: the single-cycle datapath
+
+The **datapath** is the hardware that moves data through an instruction: the program counter (PC), the memories, the register file and the arithmetic-logic unit (ALU), with the wires and multiplexers between them. A **control unit** reads the opcode and sets the multiplexers and write enables. The simplest datapath executes every instruction in a single clock cycle. What each of the four instructions needs:
+
+- **`add rd, rs1, rs2`** reads the instruction at PC from instruction memory, reads two registers, adds them in the ALU and writes the sum into `rd`.
+- **`lw rd, imm(rs1)`** reads the instruction and `rs1`, adds the sign-extended 12-bit immediate in the ALU to form an address, reads data memory at that address and writes the word into `rd`.
+- **`sw rs2, imm(rs1)`** forms the address the same way and writes `rs2` into data memory. It writes no register.
+- **`beq rs1, rs2, label`** reads two registers and compares them (the ALU subtracts and checks for zero); in parallel an adder computes the target PC $+$ offset. If they are equal, the next PC is the target, otherwise PC $+ 4$.
+
+All four start the same way: fetch at PC, decode, read registers. RISC-V helps here, because the base instructions are 32 bits long and keep `rs1`, `rs2` and `rd` in the same bit positions in every format, so the registers can be read before the opcode is fully decoded. The four also share one rule: everything an instruction changes (a register, a memory word, the PC) is written at the end of its cycle, on the clock edge.
+
+The clock period must cover the slowest instruction. Suppose the units have these delays (round numbers for this note, of the right order for a simple design; real values depend on the technology): instruction memory 250 ps, register read and decode 150 ps, ALU 200 ps, data memory 250 ps, register write 100 ps. An instruction's time is the sum of the units on its path:
+
+| Instruction | Fetch | Register read | ALU | Data memory | Register write | Total |
+| --- | --- | --- | --- | --- | --- | --- |
+| `lw` | 250 | 150 | 200 | 250 | 100 | **950 ps** |
+| `sw` | 250 | 150 | 200 | 250 | | 850 ps |
+| `add` | 250 | 150 | 200 | | 100 | 700 ps |
+| `beq` | 250 | 150 | 200 | | | 600 ps |
+
+The path of `lw` through all five units is the **critical path**, so $T_c = 950$ ps, $f \approx 1.05$ GHz, and $\text{CPI} = 1$ by construction: 1.05 billion instructions per second at best. The design breaks in two ways. Every `add` waits 950 ps for a result that is ready after 700, and a `beq` after 600: the common case pays for the slowest one. And each unit works for a fifth of the cycle and idles for the rest: while the ALU adds, the instruction memory has nothing to do.
+
+## Five stages
+
+Cut the path at the boundaries between the units. Each piece becomes a **stage**, and a **pipeline register** at every cut holds what the next stage needs: the instruction bits, the values read, the ALU result, the control signals. The five stages of the classic RISC pipeline:
+
+| Stage | Work | `add` | `lw` | `sw` | `beq` |
+| --- | --- | --- | --- | --- | --- |
+| **IF**, instruction fetch | read the instruction at PC, compute PC $+ 4$ | fetch | fetch | fetch | fetch |
+| **ID**, instruction decode | decode, read `rs1` and `rs2`, extend the immediate | read 2 registers | read `rs1` | read `rs1`, `rs2` | read 2 registers |
+| **EX**, execute | ALU operation, address or comparison | sum | address | address | compare, target |
+| **MEM**, memory access | load or store | (pass) | read word | write word | (pass) |
+| **WB**, write back | write the result into `rd` | write `rd` | write `rd` | (none) | (none) |
+
+Every instruction goes through all five stages, even when a stage has nothing to do for it, so that instructions never overtake one another and never compete for a stage. Each stage holds a different instruction, so five instructions are in flight at once, and each clock edge moves all of them one stage forward.
+
+<PipelinedDatapath />
+
+1. **IF.** The PC addresses instruction memory, and the instruction goes into the IF/ID register. The next PC is PC $+ 4$ unless a branch in EX is taken.
+2. **ID.** The register file is read with `rs1` and `rs2` and the immediate is sign-extended; the values and the destination register number `rd` go into ID/EX.
+3. **EX.** The ALU computes the result, the address or the branch comparison. A taken branch sends its target back to the PC (the dashed line).
+4. **MEM.** `lw` reads and `sw` writes data memory at the address from EX; other instructions pass the ALU result along.
+5. **WB.** A multiplexer chooses the loaded word or the ALU result and writes it into the register file (the red line back to ID).
+6. **Forwarding and hazard detection** (amber), the subject of the next sections: results waiting in EX/MEM and MEM/WB can be sent back to the ALU inputs, and a hazard unit can freeze the PC and the IF/ID register.
+
+The write-back line is the one place where data flows against the pipeline: WB writes into the register file that ID reads. The register file is written in the first half of a cycle and read in the second, so an instruction in ID reads the value that an instruction in WB writes in the same cycle.
+
+## Pipelining raises throughput, not latency
+
+<aside class="callout"><strong>Key idea.</strong> A pipeline does not make any single instruction faster: each one still passes through every stage, and pays for the pipeline registers on top. It makes the processor finish instructions more often. With $k$ balanced stages the clock is up to $k$ times shorter and, when nothing stalls, one instruction completes per cycle.</aside>
+
+The pipelined clock must cover the slowest stage, plus the time to get a value into a pipeline register before the edge, about 30 ps in this example: $T_c = 250 + 30 = 280$ ps. The first instruction finishes after $k$ cycles, every later one a cycle after its predecessor, so $n$ instructions take
+
+$$
+T_\text{pipe}(n) = (k + n - 1)\, T_c ,
+\qquad
+T_\text{single}(n) = n \cdot 950 \text{ ps} .
+$$
+
+**Worked example.** One `lw` on its own takes $5 \times 280 = 1400$ ps in the pipeline against 950 ps in the single-cycle design: the **latency** got worse, by the four extra pipeline registers and by the stages that are faster than the 250 ps they are given. Four instructions take $(5 + 3) \times 280 = 2240$ ps against $4 \times 950 = 3800$ ps, a speed-up of 1.7. For $n = 1000$, $T_\text{pipe} = 1004 \times 280 = 281{,}120$ ps against $950{,}000$ ps, a speed-up of 3.38; as $n \to \infty$ it tends to $950 / 280 = 3.39$, the ratio of the two clock periods. It is not 5 for two reasons that every real pipeline shares: the stages are not balanced (the 100 ps of WB are given 250 ps), and the pipeline registers add time. With five perfectly balanced 190 ps stages and free registers, the speed-up would reach 5.
+
+The **throughput**, instructions completed per second, went from $1/950$ ps $\approx 1.05$ billion to $1/280$ ps $\approx 3.57$ billion. This is the trade the rest of the course keeps making: more work in flight to complete more of it per second, at the price of a longer time for each piece of work. The [next section of the course](/notes/acos/instruction-level-parallelism) pushes it further with deeper pipelines and several instructions per stage.
+
+## Hazards: when the next instruction cannot go
+
+The formula above assumes that a new instruction can enter the pipeline in every cycle. A **hazard** is a situation that prevents it. There are three kinds.
+
+- **Structural hazards**: two instructions need the same hardware in the same cycle. With a single memory for instructions and data, the MEM stage of a `lw` and the IF stage of the instruction three behind it would collide in every load. The pipeline avoids this by design: separate instruction and data memories, which in a real processor are the separate L1 instruction and data caches of the [caches note](/notes/acos/caches), and a register file with two read ports and one write port, written and read in different halves of the cycle.
+- **Data hazards**: an instruction needs a register value that an earlier instruction has not yet written. This is the read-after-write dependence of every sequence like `add t1, t0, t2` after `lw t0, 0(a0)`.
+- **Control hazards**: the pipeline must fetch the next instruction before it knows which one it is, because a branch is decided only in EX.
+
+The simplest cure for any hazard is to **stall**: hold the waiting instruction (and everything behind it) in place and let a **bubble**, an instruction that does nothing, go down the pipeline instead. Stalls preserve correctness and cost cycles. The next two sections remove most of them.
+
+Without any extra hardware, how long must a dependent instruction wait? It reads its operands in ID, and the value is written in the producer's WB, three stages after the producer's EX. Because of the split-cycle register file, the consumer's ID may be in the same cycle as the producer's WB. An instruction right after its producer (distance 1) therefore stalls for 2 cycles, one at distance 2 for 1 cycle, and from distance 3 on the value is in the register file in time. In the four-instruction example of the next section, each instruction depends on the one before it: 3 dependences of 2 stalls each, so $4 + 4 + 6 = 14$ cycles instead of 8.
+
+## Forwarding and the load-use stall
+
+The 2-cycle wait is mostly unnecessary. An `add` computes its sum at the end of EX, and the sum is then sitting in the EX/MEM register; the next instruction needs it at the start of its own EX, one cycle later. **Forwarding** (or *bypassing*) adds wires from the EX/MEM and MEM/WB registers back to the ALU inputs and a multiplexer that picks the newest value of the register. The conditions, for the first operand (the second is the same with `rs2`):
+
+- forward from EX/MEM if the instruction there writes a register, its `rd` is not `x0`, and its `rd` equals the `rs1` of the instruction in EX;
+- otherwise forward from MEM/WB if the same holds for the instruction there;
+- otherwise use the value read from the register file in ID.
+
+The order matters: if both earlier instructions write `rs1`, the one in EX/MEM is the more recent, and its value wins. The test for `x0` matters too: an instruction may name `x0` as its destination, the write is discarded, and a forwarded "result" would break the rule that `x0` reads as zero.
+
+With forwarding, an ALU result is never late. A load result can be. It leaves data memory at the end of MEM, and the next instruction needs it at the start of EX in the same cycle: forwarding cannot send a value back in time. The **hazard detection unit** in ID catches this case, the **load-use hazard**: if the instruction in EX is a load and its `rd` is one of the registers the instruction in ID reads, it freezes the PC and the IF/ID register for one cycle and puts a bubble into EX. One cycle later the loaded word is in MEM/WB and forwarding delivers it.
+
+<PipelineDiagram />
+
+1. `lw t0, 0(a0)` goes through the five stages one per cycle. Its value exists at the end of MEM, in cycle 4.
+2. In cycle 4, `add t1, t0, t2` should be in EX but `t0` is not ready. The hazard unit keeps `add` in ID and `sub` in IF for one more cycle; the EX stage of cycle 4 holds a bubble.
+3. In cycle 5 the loaded `t0` is forwarded from MEM/WB to the ALU input of `add`.
+4. In cycle 6 the sum `t1` is forwarded from EX/MEM to the ALU input of `sub`.
+5. In cycle 7 `t3` is forwarded from EX/MEM to `sw`, which finishes in cycle 9.
+
+**Worked example.** The four instructions take $5 + 3 = 8$ cycles if nothing stalls, 9 with forwarding (one load-use stall) and 14 without (six stalls). Forwarding removed five of the six stall cycles; the one that remains is the price of loads that are used at once.
+
+The compiler can often hide that last stall. Take `x = a + b; y = c - d` with all four values in memory. Loaded and used in program order, both sums stall for one cycle after their second load: 8 instructions in 14 cycles. If the compiler moves the two loads of `c` and `d` up, next to the first two, at least two other instructions stand between every load and its use, and the same 8 instructions take 12 cycles, the minimum of $5 + 7$. This **instruction scheduling** is legal because the moved loads do not depend on the instructions they move past. Compilers do it for the pipeline they target; the out-of-order processors of the [next section](/notes/acos/instruction-level-parallelism) do it in hardware.
+
+<aside class="callout"><strong>Check yourself.</strong> (1) In the five-stage pipeline with forwarding, how many stall cycles does `lw t0, 0(a0)` followed directly by `sw t0, 4(a0)` cost under this note's model, where every operand is needed in EX? (2) Without forwarding, how many cycles do `addi t1, t1, 1` followed by `addi t2, t1, 1` and then `addi t3, t2, 1` take? (3) Why does the forwarding unit ignore an instruction whose destination is `x0`?<details><summary>Answers</summary>(1) One: `sw` reads `t0` in EX like any operand here, and the loaded value exists only after MEM, so it is a load-use hazard. A real pipeline can avoid even this stall by forwarding the store data from MEM/WB to MEM, because `sw` needs its data only in MEM. (2) Each instruction depends on the one before it at distance 1, so 2 stalls each: $3 + 4 + 2 \times 2 = 11$ cycles. (3) A write to `x0` is discarded, so `x0` still reads as zero; forwarding the computed value would let a later instruction see a nonzero `x0`.</details></aside>
+
+## Control hazards and branch prediction
+
+A `beq` compares its registers in EX. By then the pipeline has already fetched the two instructions after it, because IF does not wait. The cheapest policy is to **predict not taken**: keep fetching sequentially, and if the branch turns out to be taken, **flush** the two wrong instructions (turn them into bubbles; they have changed nothing yet, because nothing is written before MEM) and fetch from the target. A taken branch then costs 2 cycles, the **misprediction penalty** of this pipeline. Comparing the registers already in ID, with an extra comparator there, reduces the penalty to 1 cycle but adds a new data hazard on the registers being compared ([Patterson and Hennessy, 2020](#references), Section 4.9).
+
+**Worked example.** A loop that adds three words of an array:
+
+```
+loop: lw   t0, 0(a0)
+      add  t1, t1, t0
+      addi a0, a0, 4
+      bne  a0, a2, loop
+```
+
+Each iteration has a load-use stall (`lw` then `add`), and the backward `bne` is taken twice and falls through once. The 12 instructions take $12 + 4$ cycles plus 3 load-use stalls plus $2 \times 2$ flushed cycles: 23 cycles, a CPI of almost 2 for a loop that has only four instructions per iteration. Swapping `add` and `addi` (the load then has a distance of 2 to its use; the `lw` offset stays 0 because `lw` reads `a0` before `addi` changes it) removes the 3 stalls, and the loop takes 20 cycles. The 4 cycles of the taken branches remain, and loops take their backward branch almost every time.
+
+**Static prediction** fixes the guess per branch at compile time. "Backward taken, forward not taken" exploits the shape of loops: a backward branch closes a loop and is usually taken, a forward branch usually skips rare code. **Dynamic prediction** learns from the branch's own history. A small table, indexed by low bits of the branch's address, holds a state per branch; to fetch the target without waiting for EX, a **branch target buffer** also caches the target address of recently taken branches. A **one-bit** predictor stores the last outcome and predicts it again. A **two-bit saturating counter** ([Smith, 1981](#references)) changes its prediction only after two surprises in a row.
+
+<TwoBitPredictor />
+
+**Worked example.** A loop of 10 iterations, run 100 times; its closing branch goes taken 9 times and then not taken once. Always-not-taken is right 10 % of the time and backward-taken 90 %. The one-bit predictor is right 80 %: it mispredicts the exit, stores "not taken", and mispredicts again on the first iteration of the next run. The two-bit counter is right 90 %: the exit moves it from 11 to 10, which still predicts taken. The static rule ties here, but put the same pattern on a forward branch (an `if` that is usually true) and backward-taken drops to 10 % while the counter still gets 90 %: the counter learns the bias of each branch, whatever its direction. Modern predictors combine the histories of many branches and reach far higher accuracy on real programs; the [next section](/notes/acos/instruction-level-parallelism) returns to them, because deeper pipelines make each misprediction cost many more cycles than 2.
+
+## CPI with stalls
+
+With hazards, the CPI of the pipeline is 1 plus the average number of stall cycles per instruction:
+
+$$
+\text{CPI} = 1 + \sum_{\text{hazard } h} (\text{frequency of } h \text{ per instruction}) \times (\text{stall cycles of } h) .
+$$
+
+**Worked example.** A program mix with 25 % loads, of which 40 % are followed directly by an instruction that uses the loaded value, and 15 % branches, predicted by two-bit counters that are right 90 % of the time, with the 2-cycle penalty of this pipeline:
+
+$$
+\text{CPI} = 1 + 0.25 \times 0.4 \times 1 + 0.15 \times 0.1 \times 2 = 1 + 0.10 + 0.03 = 1.13 .
+$$
+
+The time per instruction is $1.13 \times 280 = 316.4$ ps against 950 ps for the single-cycle design: a speed-up of 3.0, down from the ideal 3.39. With predict-not-taken and 60 % of branches taken, the branch term becomes $0.15 \times 0.6 \times 2 = 0.18$, the CPI 1.28 and the speed-up 2.65. The formula also says where to look: here the load-use term costs three times as much as the mispredictions, and the compiler's scheduling attacks exactly that term.
+
+## What changed
+
+| | Single-cycle datapath | Five-stage pipeline |
+| --- | --- | --- |
+| Clock period | the slowest instruction, 950 ps (`lw`) | the slowest stage plus a register, 280 ps |
+| Latency of one instruction | 950 ps | $5 \times 280 = 1400$ ps |
+| CPI | 1 | 1 plus stalls: 1.13 in the example |
+| Time per instruction | 950 ps | 316 ps in the example |
+| Instructions in flight | 1 | up to 5 |
+| New hardware | | pipeline registers, forwarding multiplexers, hazard unit, branch predictor |
+| New problems | | data hazards, load-use stalls, control hazards, precise exceptions |
+
+## Limitations
+
+- **Unbalanced stages and register overhead** cap the speed-up below $k$: here 3.39 for five stages.
+- **Deeper pipelines** shorten the clock but lengthen the misprediction penalty and the load-use distance, and add register overhead per stage: past some depth they lose.
+- **Load-use stalls** remain with forwarding; scheduling hides them only when independent instructions are available.
+- **A cache miss** stalls the whole in-order pipeline for as many cycles as the miss takes, far more than any hazard in this note.
+- **One instruction per cycle** is the ceiling of a scalar pipeline. Going above it needs several pipelines and out-of-order execution, the subject of the [instruction-level parallelism note](/notes/acos/instruction-level-parallelism).
+- **Exceptions** are harder: when an instruction faults, four others are in flight. The [next note](/notes/acos/exceptions-and-interrupts) shows how the pipeline keeps them precise.
+
+## What you should remember
+
+- The single-cycle clock is set by the critical path, `lw` through all five units; every instruction pays for it.
+- The five stages are IF, ID, EX, MEM, WB, separated by pipeline registers; five instructions are in flight.
+- Pipelining improves throughput, not latency: $T_\text{pipe}(n) = (k + n - 1)T_c$; the speed-up tends to the ratio of clock periods, less than $k$ because stages are unbalanced and registers cost time.
+- Hazards are structural, data and control. Separate instruction and data memories and a split-cycle register file remove the structural ones.
+- Forwarding from EX/MEM and MEM/WB removes ALU-to-ALU stalls; a load followed by a use still costs one stall, which scheduling can hide.
+- Predict-not-taken costs 2 cycles per taken branch here; two-bit counters keep a branch's bias through a single surprise.
+- $\text{CPI} = 1 + \sum$ frequency $\times$ penalty; time per instruction is $\text{CPI} \times T_c$.
+
+## Code
+
+A timing model of the pipeline in Python: it computes the cycle in which every instruction reaches EX from three rules (one instruction per cycle; a dependent instruction waits for its value, through forwarding or through the register file; a taken branch costs two cycles), prints the pipeline diagram, and reproduces every number of the worked examples.
+
+```python
+# A timing model of the five-stage pipeline IF ID EX MEM WB. One instruction enters per cycle. The register
+# file is written in the first half of a cycle and read in the second. Branches are predicted not taken and
+# resolved in EX, so a taken branch flushes the two instructions fetched after it.
+def I(text, dest=None, *srcs, taken=False):
+    return text, dest, srcs, taken
+
+def schedule(prog, forwarding):
+    """The cycle in which every instruction is in EX."""
+    ex = []
+    for i, (_, _, srcs, _) in enumerate(prog):
+        t = ex[-1] + 1 if ex else 3                      # in order, at most one instruction per cycle
+        if i and prog[i - 1][3]:
+            t = max(t, ex[-1] + 3)                       # after a taken branch: fetch the target, 2 lost cycles
+        for s in srcs:
+            p = max((j for j in range(i) if prog[j][1] == s), default=None)   # latest producer of s
+            if p is None:
+                continue
+            if not forwarding:
+                t = max(t, ex[p] + 3)                    # read in ID during the producer's WB
+            elif prog[p][0].startswith('lw'):
+                t = max(t, ex[p] + 2)                    # a loaded value exists only after MEM
+            else:
+                t = max(t, ex[p] + 1)                    # an ALU result is forwarded from EX/MEM
+        ex.append(t)
+    return ex
+
+def cycles(prog, forwarding=True):
+    return schedule(prog, forwarding)[-1] + 2            # until the last instruction leaves WB
+
+def diagram(prog, forwarding=True):
+    ex, f, d = schedule(prog, forwarding), [], []
+    for i, (text, *_) in enumerate(prog):
+        if i and prog[i - 1][3]:
+            f.append(ex[i] - 2); d.append(ex[i] - 1)     # the branch target is fetched after the branch's EX
+        else:                                            # IF when the previous one enters ID, ID when it enters EX
+            f.append(d[-1] if i else 1); d.append(ex[i - 1] if i else 2)
+        cells = {c: 'IF' for c in range(f[i], d[i])} | {c: 'ID' for c in range(d[i], ex[i])}
+        cells |= {ex[i]: 'EX', ex[i] + 1: 'MEM', ex[i] + 2: 'WB'}
+        print(f'{text:<18}' + ''.join(f'{cells.get(c, ""):<4}' for c in range(1, ex[-1] + 3)).rstrip())
+
+# 1. The sequence of the figure: a load-use hazard, then two ALU results that are forwarded
+fig = [I('lw  t0, 0(a0)', 't0', 'a0'), I('add t1, t0, t2', 't1', 't0', 't2'),
+       I('sub t3, t1, t4', 't3', 't1', 't4'), I('sw  t3, 8(a0)', None, 't3', 'a0')]
+for fw in (True, False):
+    print('forwarding' if fw else 'no forwarding', cycles(fig, fw), 'cycles')
+    diagram(fig, fw)
+# forwarding 9 cycles
+# lw  t0, 0(a0)     IF  ID  EX  MEM WB
+# add t1, t0, t2        IF  ID  ID  EX  MEM WB
+# sub t3, t1, t4            IF  IF  ID  EX  MEM WB
+# sw  t3, 8(a0)                     IF  ID  EX  MEM WB
+# no forwarding 14 cycles
+# lw  t0, 0(a0)     IF  ID  EX  MEM WB
+# add t1, t0, t2        IF  ID  ID  ID  EX  MEM WB
+# sub t3, t1, t4            IF  IF  IF  ID  ID  ID  EX  MEM WB
+# sw  t3, 8(a0)                         IF  IF  IF  ID  ID  ID  EX  MEM WB
+
+# 2. Scheduling: x = a + b and y = c - d, with every load moved away from its use
+naive = [I('lw  t0, 0(a0)', 't0', 'a0'), I('lw  t1, 4(a0)', 't1', 'a0'), I('add t2, t0, t1', 't2', 't0', 't1'),
+         I('sw  t2, 8(a0)', None, 't2', 'a0'), I('lw  t3, 12(a0)', 't3', 'a0'), I('lw  t4, 16(a0)', 't4', 'a0'),
+         I('sub t5, t3, t4', 't5', 't3', 't4'), I('sw  t5, 20(a0)', None, 't5', 'a0')]
+moved = [naive[k] for k in (0, 1, 4, 5, 2, 3, 6, 7)]
+print('scheduling:', cycles(naive), 'cycles ->', cycles(moved), 'cycles')
+# scheduling: 14 cycles -> 12 cycles
+
+# 3. A loop that sums 3 words: the backward bne is taken twice, and each taken branch costs 2 cycles
+body = [I('lw   t0, 0(a0)', 't0', 'a0'), I('add  t1, t1, t0', 't1', 't1', 't0'),
+        I('addi a0, a0, 4', 'a0', 'a0'), I('bne  a0, a2, loop', None, 'a0', 'a2', taken=True)]
+loop = body * 2 + body[:3] + [I('bne  a0, a2, loop', None, 'a0', 'a2')]
+print('loop:', len(loop), 'instructions,', cycles(loop), 'cycles')
+diagram(loop[:6])
+# loop: 12 instructions, 23 cycles
+# lw   t0, 0(a0)    IF  ID  EX  MEM WB
+# add  t1, t1, t0       IF  ID  ID  EX  MEM WB
+# addi a0, a0, 4            IF  IF  ID  EX  MEM WB
+# bne  a0, a2, loop                 IF  ID  EX  MEM WB
+# lw   t0, 0(a0)                                IF  ID  EX  MEM WB
+# add  t1, t1, t0                                   IF  ID  ID  EX  MEM WB
+
+# 4. Branch predictors on the loop branch of a 10-iteration loop that is run 100 times
+pattern = ([True] * 9 + [False]) * 100
+def accuracy(predict, update, state):
+    hits = 0
+    for taken in pattern:
+        hits += predict(state) == taken
+        state = update(state, taken)
+    return hits / len(pattern)
+print('always not taken', accuracy(lambda s: False, lambda s, t: s, None))
+print('backward taken  ', accuracy(lambda s: True, lambda s, t: s, None))
+print('1-bit           ', accuracy(lambda s: s, lambda s, t: t, False))
+# the 2-bit counter has states 0..3 (00..11), predicts taken in 2 and 3, and starts in 2
+print('2-bit counter   ', accuracy(lambda s: s >= 2, lambda s, t: min(s + 1, 3) if t else max(s - 1, 0), 2))
+# always not taken 0.1
+# backward taken   0.9
+# 1-bit            0.8
+# 2-bit counter    0.9
+
+# 5. CPI and time per instruction against the single-cycle datapath
+stage_ps = {'IF': 250, 'ID': 150, 'EX': 200, 'MEM': 250, 'WB': 100}
+single = sum(stage_ps.values())                          # lw uses every stage: the critical path
+tc = max(stage_ps.values()) + 30                         # slowest stage + 30 ps for the pipeline register
+n = 1000
+print(single, tc, 5 * tc, n * single, (n + 4) * tc, round(n * single / ((n + 4) * tc), 2))
+# 950 280 1400 950000 281120 3.38
+cpi_2bit = 1 + 0.25 * 0.4 * 1 + 0.15 * (1 - 0.9) * 2     # load-use stalls + mispredicted branches
+cpi_nt = 1 + 0.25 * 0.4 * 1 + 0.15 * 0.6 * 2             # predict not taken, 60 % of branches taken
+for cpi in (cpi_2bit, cpi_nt):
+    print(round(cpi, 2), round(cpi * tc, 1), round(single / (cpi * tc), 2))
+# 1.13 316.4 3.0
+# 1.28 358.4 2.65
+```
+
+The model is a timing model only: it computes no values. It also leaves out what this note's pipeline does not have, such as cache misses and multicycle operations like division. To see the same pipeline execute real programs cycle by cycle, with and without forwarding and hazard detection, the Ripes simulator ([Petersen, 2021](#references)) runs RISC-V assembly on single-cycle and five-stage processors and draws the datapath as it goes.
+
+## Next
+
+The pipeline keeps five instructions in flight and assumes that each of them finishes normally. Some do not: a load hits an unmapped page, an instruction turns out to be illegal, or a device needs attention in the middle of the program. The [next note](/notes/acos/exceptions-and-interrupts) shows how the processor stops what it is doing, records why, jumps to a handler in a more privileged mode and comes back, and how a pipeline makes that stop **precise**: every instruction before the faulting one completed, none after it.
+
+## References
+
+- A. Tatarnikov. *Computer Architecture and Operating Systems* (HSE), [lecture 10: processor and pipeline](https://andrewt0301.github.io/hse-acos-course/part1ca/10_Pipeline/lecture.html), with its workshop on hazards.
+- D. A. Patterson, J. L. Hennessy. [*Computer Organization and Design RISC-V Edition*](https://shop.elsevier.com/books/computer-organization-and-design-risc-v-edition/patterson/978-0-12-820331-6), 2nd ed. Morgan Kaufmann, 2020. Section 4.4 (a simple implementation scheme), Section 4.6 (an overview of pipelining), Section 4.7 (pipelined datapath and control), Section 4.8 (data hazards: forwarding versus stalling), Section 4.9 (control hazards).
+- S. L. Harris, D. M. Harris. [*Digital Design and Computer Architecture, RISC-V Edition*](https://shop.elsevier.com/books/digital-design-and-computer-architecture-risc-v-edition/harris/978-0-12-820064-3). Morgan Kaufmann, 2021. Chapter 7 (microarchitecture: single-cycle and pipelined processors, hazards).
+- J. L. Hennessy, D. A. Patterson. [*Computer Architecture: A Quantitative Approach*](https://shop.elsevier.com/books/computer-architecture/hennessy/978-0-12-811905-1), 6th ed. Morgan Kaufmann, 2017. Appendix C (pipelining: basic and intermediate concepts), Chapter 3 (branch prediction).
+- R. E. Bryant, D. R. O'Hallaron. [*Computer Systems: A Programmer's Perspective*](https://csapp.cs.cmu.edu/), 3rd ed. Pearson, 2015. Section 4.4 (general principles of pipelining), Section 4.5 (pipelined implementations).
+- J. E. Smith. A study of branch prediction strategies. *Proceedings of the 8th International Symposium on Computer Architecture (ISCA)*, 1981, pp. 135–148. Reprinted in [*25 Years of the International Symposia on Computer Architecture*](https://doi.org/10.1145/285930.285980), ACM, 1998.
+- M. B. Petersen. [Ripes: a visual computer architecture simulator](https://doi.org/10.1109/WCAE53984.2021.9707149). *ACM/IEEE Workshop on Computer Architecture Education (WCAE)*, 2021. Software: [github.com/mortbopet/Ripes](https://github.com/mortbopet/Ripes).

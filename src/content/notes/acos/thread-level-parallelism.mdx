@@ -1,0 +1,367 @@
+---
+title: Multicore processors and thread-level parallelism
+description: "Why chips gained cores instead of speed, how much a program gains from them by Amdahl's and Gustafson's laws, how the MESI protocol keeps private caches coherent, why false sharing is slow, what sequential consistency promises, and hardware multithreading."
+course: acos
+section: Parallelism and Performance
+order: 13
+status: published
+tags: [multicore, thread-level-parallelism, amdahl, gustafson, cache-coherence, mesi, false-sharing, memory-consistency, sequential-consistency, smt]
+prerequisites: [Instruction-level parallelism, Caches]
+---
+
+import AmdahlSpeedup from '../../../components/figures/thread-level-parallelism/AmdahlSpeedup.astro';
+import MesiSteps from '../../../components/figures/thread-level-parallelism/MesiSteps.astro';
+
+The [previous note](/notes/acos/instruction-level-parallelism) pushed one instruction stream as far as it goes: a core that renames registers, executes out of order and speculates past branches ran the example loop at two instructions per cycle, the limit of its width. Going further costs area and power that grow faster than the parallelism found, and the [first note](/notes/acos/computer-systems#how-processors-got-fast-and-why-that-changed) showed that power is exactly what stopped growing around 2005. Since then the extra transistors of every generation have gone into more cores on the same chip. More cores make a single program faster only if the program is split into several instruction streams, **threads**, that run at the same time and share memory. This note asks how much that gains, and what the hardware must do so that threads sharing memory through private caches still see one consistent memory.
+
+**Notation.** $n$ is the number of cores. $T_1$ is the running time of a program on one core and $T_n$ on $n$ cores; the **speed-up** is $S(n) = T_1/T_n$ and the **efficiency** $S(n)/n$. In Amdahl's law, $p$ is the fraction of $T_1$ that can be spread over the cores; in Gustafson's law, $s$ is the fraction of $T_n$ that is serial. A **thread** is an instruction stream with its own program counter, registers and stack that shares its memory with the other threads of the same program; the [processes and threads note](/notes/acos/processes-and-threads) shows how the operating system creates them. Here they are created with the POSIX call `pthread_create(&id, NULL, f, arg)`, which starts a thread running `f(arg)`, and `pthread_join(id, NULL)`, which waits for it to finish.
+
+## Why more cores instead of a faster core
+
+Dynamic power is proportional to $C V^2 f$, and within the range in which a core can run, the voltage it needs grows roughly in proportion to its clock rate. That makes power grow roughly as $f^3$, and gives a clear choice for a fixed power budget.
+
+**Worked example.** One core runs at frequency $f$ and voltage $V$ and draws power $P$. Replace it by two cores of the same design, each at $0.8f$ and $0.8V$. Each draws $0.8 \cdot 0.8^2 \cdot P = 0.512\,P$, both together $1.02\,P$: the same power budget. If the work splits evenly between them, they do $2 \cdot 0.8 = 1.6$ times as much per second. If it does not split at all, the program runs at $0.8$ of its old speed. Multicore is a good deal for exactly the programs that can be divided.
+
+The trend data compiled by [Rupp (2022)](#references) shows the switch: the fastest clock of any processor in the dataset reached 3.65 GHz in 2004 and has stayed below 5 GHz since, while the largest core count grew from 1 before 2004 to more than 200 by 2016. Every core runs its own instruction stream and has its own private caches: such a chip is a **shared-memory multiprocessor**, one physical address space that every core can load from and store to. The Apple M1 used for the measurements in this note has 8 cores, 4 fast and 4 power-efficient.
+
+Parallelism between threads comes in two kinds. **Task-level parallelism** runs independent jobs at once (a compiler building different files, a server answering different clients) and needs nothing from the programmer beyond starting them. A **parallel program** splits one job into threads that cooperate, and its threads must divide the work, exchange results and wait for each other, which costs time that a single thread does not spend.
+
+## Baseline: one core, several threads
+
+The simplest way to run several threads is to run them on one core in turns. The operating system switches the core between threads every few milliseconds, saving one thread's registers and loading another's (a **context switch**, triggered by a timer interrupt as in the [exceptions note](/notes/acos/exceptions-and-interrupts)). To a user the threads appear to run at once, and while one waits for a disk or the network, another runs. But only one instruction stream executes at any moment: two compute-bound threads take as long together as one after the other, plus the cost of the switches. This baseline gives concurrency, not speed. Real speed needs several cores, and with them come two questions: how much of a program can use them, and how they share memory.
+
+## How much faster: Amdahl's law
+
+Split the one-core time $T_1$ into a part $pT_1$ that divides evenly among the cores and a serial part $(1 - p)T_1$ that does not: reading the input, combining the results, the parts of the algorithm that are inherently sequential. On $n$ cores the serial part takes as long as before and the parallel part $n$ times less:
+
+$$
+T_n = (1 - p)\,T_1 + \frac{p\,T_1}{n} .
+$$
+
+Dividing $T_1$ by $T_n$ cancels $T_1$ and gives **Amdahl's law** ([Amdahl, 1967](#references), who made the argument in words; the formula is its usual form):
+
+$$
+\boxed{\;S(n) = \frac{1}{(1 - p) + p/n} \;\le\; \frac{1}{1 - p}\;}
+$$
+
+The bound holds because $p/n > 0$, and $S(n)$ approaches it as $n \to \infty$. However many cores there are, the serial part alone takes $(1 - p)T_1$, so the speed-up can never exceed $1/(1 - p)$.
+
+**Worked example.** A program with $p = 0.95$ runs $1/(0.05 + 0.95/8) = 5.93$ times faster on 8 cores, an efficiency of 74 %. On 1,024 cores it runs 19.64 times faster, and no number of cores gets it past 20: the 5 % that is serial on one core is 98 % of the time on 1,024 cores. Read backwards, the law says how parallel a program must be. Solving $S = 1/((1 - p) + p/n)$ for $p$ gives $p = (1 - 1/S)/(1 - 1/n)$: a speed-up of 6 on 8 cores needs $p = 0.952$, and a speed-up of 50 on 64 cores needs $p = 0.9956$, a serial part below half a percent.
+
+<AmdahlSpeedup />
+
+The law is optimistic in two ways. It assumes the parallel part divides into exactly equal pieces; with **load imbalance**, the slowest core sets the time, so the parallel part takes longer than $pT_1/n$. And it ignores the cost of coordination: creating threads, waiting for each other, and moving shared data between caches, which grows with $n$.
+
+## Gustafson's law: a larger problem on more cores
+
+Amdahl's law keeps the problem fixed while adding cores, which is called **strong scaling**. Often the point of more cores is a larger problem in the same time: a finer simulation grid, a larger model. [Gustafson (1988)](#references) measures the serial fraction $s$ on the parallel machine instead: on $n$ cores, a run takes time 1, of which $s$ is serial and $1 - s$ is spread over the cores. A single core would do the same work in $s + (1 - s)\,n$, because each core's share of the parallel part would have to run after the others. The **scaled speed-up** is therefore
+
+$$
+\boxed{\;S_{\text{scaled}}(n) = s + (1 - s)\,n = n - s\,(n - 1)\;}
+$$
+
+which grows linearly in $n$. With $s = 0.05$, 8 cores give 7.65 and 1,024 cores give 972.85. This is **weak scaling**: the work per core stays fixed and the problem grows with the machine. The two laws do not contradict each other; they answer different questions. Amdahl's $p$ is a fraction of the one-core time of a fixed problem, Gustafson's $s$ a fraction of the parallel time of a growing one, and in a growing problem the serial part usually becomes a smaller share of the work.
+
+<aside class="callout"><strong>Check yourself.</strong> (1) 80 % of a program's one-core time parallelizes perfectly. What speed-up do 4 cores give, and what is the most any number of cores can give? (2) On 16 cores, a weakly scaled run spends 10 % of its time in serial code. What is its scaled speed-up? (3) Two cores at $0.7f$ and $0.7V$ replace one core at $f$ and $V$. What power do they draw together, and what throughput do they give on a perfectly parallel job?<details><summary>Answers</summary>(1) $1/(0.2 + 0.8/4) = 2.5$; at most $1/0.2 = 5$. (2) $0.1 + 0.9 \cdot 16 = 14.5$. (3) Each draws $0.7^3 P = 0.343\,P$, together $0.686\,P$; throughput $2 \cdot 0.7 = 1.4$ times that of the single core, at about two thirds of its power.</details></aside>
+
+## Shared memory and the coherence problem
+
+On a multicore chip each core has private caches (an L1 data cache, and often an L2), and the cores share a last-level cache and main memory. Private caches are what make each core fast, but they let two cores hold copies of the same memory block, and a write by one core changes only its own copy.
+
+**Worked example.** Two cores, A and B, with write-back caches as in the [caches note](/notes/acos/caches), and a variable `X` that is 0 in memory.
+
+| Step | Event | A's cache | B's cache | Memory |
+| --- | --- | --- | --- | --- |
+| 1 | A reads `X` | 0 | | 0 |
+| 2 | B reads `X` | 0 | 0 | 0 |
+| 3 | A writes 1 to `X` | 1 | 0 | 0 |
+| 4 | B reads `X` | 1 | 0 | 0 |
+
+At step 4 B reads 0, a value that was overwritten one step earlier, and it would keep reading it for as long as the line stays in its cache. A memory system is **coherent** when this cannot happen ([Patterson and Hennessy, 2020](#references), §5.10):
+
+1. a read by a core of a location it wrote, with no write by another core in between, returns the value it wrote;
+2. a read of a location written by another core returns the written value if the read comes sufficiently long after the write and no other write intervenes;
+3. writes to the same location are **serialized**: all cores see them in the same order.
+
+Coherence is enforced by the cache controllers, in units of cache lines, by one of two kinds of protocol. In a **snooping** protocol every cache controller watches (snoops) the requests the others broadcast on a shared bus or interconnect and reacts to those for lines it holds. In a **directory** protocol, a directory next to memory records which caches hold each line and sends messages only to those; it scales to more cores because it does not broadcast. Both keep track of a state for every cached line, and the most common set of states is MESI.
+
+## The MESI protocol
+
+<aside class="callout"><strong>Key idea.</strong> Allow many readers or one writer per cache line. A core that wants to write a line first invalidates every other copy, so a line that is being written exists in exactly one cache; a core that wants to read a line that another cache has modified gets the new data from that cache. Every line carries one of four states that records which of the two situations holds.</aside>
+
+The protocol of [Papamarcos and Patel (1984)](#references), now called **MESI** after the initials of its states, gives every line in a cache one of four states:
+
+| State | Meaning | Other caches | Memory |
+| --- | --- | --- | --- |
+| **M**odified | this cache has the only copy and has written it | no copy | out of date |
+| **E**xclusive | this cache has the only copy, unwritten | no copy | up to date |
+| **S**hared | this cache has an unwritten copy | may have copies | up to date |
+| **I**nvalid | no valid data | | |
+
+A cache changes a line's state when its own core reads or writes the line, and when it snoops a request from another cache:
+
+| State | Own read | Own write | Snooped read | Snooped write or invalidation |
+| --- | --- | --- | --- | --- |
+| M | hit | hit | supply the data, write it back, go to S | supply the data, go to I |
+| E | hit | hit, go to M (no bus traffic) | go to S | go to I |
+| S | hit | send an invalidation, go to M | stay in S | go to I |
+| I | miss: read the line; go to E if no other cache has it, else to S | miss: read the line for ownership, invalidating other copies; go to M | | |
+
+<MesiSteps />
+
+The example of the coherence problem, run under MESI, as numbered in the figure:
+
+1. **A reads `X`.** A misses and puts a read request on the bus. No other cache has the line, so memory supplies it, and A holds it in E with value 0.
+2. **B reads `X`.** B misses and requests the line. A snoops the request and sees that it holds the line; both copies become S, and memory, which is up to date, supplies B's copy.
+3. **A writes 1 to `X`.** A holds the line in S, so other copies may exist. Before writing, it broadcasts an invalidation; B's copy becomes I, and A writes 1 into its own copy, which becomes M. Memory still holds 0, and nobody can read it from there: the only valid copy is in A.
+4. **B reads `X`.** B's copy is invalid, so it misses and requests the line. A snoops the request, supplies the value 1 and writes it back to memory, and both copies become S. B reads 1: the read that returned a stale 0 without coherence now returns the latest value.
+5. **B writes 2 to `X`.** B holds the line in S, so it broadcasts an invalidation; A's copy becomes I, and B's becomes M with value 2.
+
+The E state pays for itself in the common pattern of reading a private variable and then writing it: the line arrives in E, and the write changes it to M silently, without asking the other caches. Without E (the older MSI protocol), the line would arrive in S and the write would need an invalidation broadcast that nobody needed to hear.
+
+Coherence has a cost that a single core never pays. The miss at step 4 is a **coherence miss**: the line was in B's cache, but A's write invalidated it; steps 3 and 5 each had to broadcast an invalidation before writing. A line that two cores write in turns moves between their caches on every write, and each move costs about as much as a miss to the shared cache.
+
+## False sharing
+
+Coherence is tracked per cache line, not per variable. Two threads that write *different* variables that happen to lie on the same line take turns invalidating each other's copy, exactly as if they shared one variable, though no data is actually shared. This is **false sharing**.
+
+**Worked example (measured).** Two threads each add 1 to their own counter 100 million times with an atomic add (the usual way to keep shared statistics counters correct; the [synchronization note](/notes/acos/synchronization) explains atomics). In the first run the two counters are 8 bytes apart, on one line; in the second, each starts a 128-byte line of its own, the line size macOS reports for the M1. On the M1 (macOS 26.5, Apple clang 21, `-O0`), one run took 2.52 s with the counters on one line and 0.22 s on separate lines, 11 times longer for the same work, though the threads never touch each other's counter. The times vary from run to run and between machines; three runs gave 2.46–2.52 s and 0.21–0.22 s. With plain `volatile long` counters and `(*c)++` instead of atomics, the difference on the same machine was much smaller and unstable, between 1.0 and 1.7 times in eight runs: an atomic read-modify-write needs the line in M at every step, while plain stores can wait in the core's store buffer and reach the cache together.
+
+The fix is layout: put data written by different threads on different lines, by padding or aligning each thread's data to the line size (`alignas(128)` in C11), or give each thread its own copy of the counter and add the copies at the end.
+
+## Memory consistency: in what order do writes become visible?
+
+Coherence is about one location: all cores agree on the order of writes to `X`. A program usually communicates through several locations, for example by writing data and then setting a flag, and then it matters in what order a core sees another core's writes to *different* locations. The rules for that are the **memory consistency model**.
+
+The model programmers expect is **sequential consistency**, defined by [Lamport (1979)](#references): the result of any execution is the same as if the operations of all cores were executed in some single sequential order in which the operations of each core appear in the order of its program. Every execution is then an interleaving of the threads' instructions.
+
+**Worked example.** Two threads start with `x = y = 0` in memory:
+
+| Thread 1 | Thread 2 |
+| --- | --- |
+| `x = 1;` | `y = 1;` |
+| `r1 = y;` | `r2 = x;` |
+
+There are six interleavings of the four operations, and they give $(r_1, r_2) = (0, 1)$, $(1, 0)$ or $(1, 1)$, never $(0, 0)$: whichever load comes first in the interleaving, the other thread's store came before it. Sequential consistency forbids $r_1 = r_2 = 0$ (the Python of the Code section enumerates the interleavings).
+
+Real processors produce it. A store that misses in the cache would stall the core for the whole miss, so cores put stores into a **store buffer** and let later loads go ahead. Thread 1's load of `y` then reads memory while its store to `x` is still in its store buffer, invisible to thread 2, and thread 2 does the same. Both read 0. The C program in the Code section runs the test a million times on the M1 with relaxed atomic operations, compiled at `-O0` so that the compiler keeps each store before its load: in one run $r_1 = r_2 = 0$ in 882,022 of 1,000,000 trials (between 83 % and 94 % in six runs). With sequentially consistent atomics, which make the compiler emit ARM's ordered store and load instructions, it happened in none.
+
+Hardware relaxes the order because sequential consistency is expensive: every load would have to wait until all earlier stores are visible to every other core. x86 processors allow exactly this reordering of a store with a later load (the total store order model); ARM and the RISC-V weak memory model RVWMO allow more, such as reordering two stores or two loads to different addresses ([Adve and Gharachorloo, 1996](#references), for the classes of relaxed models). Programs that need an order ask for it: RISC-V has the `fence` instruction, which keeps every memory access before it ahead of every access after it, and C11 atomics with `memory_order_seq_cst` compile to the instructions or fences that each processor needs. Programs that protect all shared data with locks and atomics, and so have no data races, behave as if the machine were sequentially consistent. How to write them is the subject of the [synchronization note](/notes/acos/synchronization).
+
+## Hardware multithreading
+
+A core that waits for memory leaves its functional units idle, and the [previous note](/notes/acos/instruction-level-parallelism) showed that a single thread rarely fills a wide core anyway. **Hardware multithreading** keeps the architectural state of several threads in one core, each with its own program counter and registers, and lets them share the functional units and caches. Switching between hardware threads takes no operating-system involvement and costs at most a few cycles. Three kinds:
+
+- **Coarse-grained** multithreading switches to another thread only on a long stall, such as a miss to main memory. It hides long stalls but not short ones, and pays a pipeline refill on every switch.
+- **Fine-grained** multithreading switches threads every cycle, round robin, skipping threads that are stalled. It hides short stalls too, but each thread runs slower, because with $k$ threads it gets at most every $k$-th cycle.
+- **Simultaneous multithreading** (SMT; [Tullsen, Eggers and Levy, 1995](#references)) uses the out-of-order superscalar core of the previous note: in the same cycle, the issue queue may start instructions from different threads. Renaming keeps their registers apart, so the issue logic does not need to know which thread an instruction belongs to.
+
+**Worked example.** A four-wide core runs a thread that alternates between 6 cycles in which it starts 2 instructions per cycle and 4 cycles stalled on a cache miss: 12 instructions in 10 cycles, IPC 1.2, using 30 % of the 40 issue slots. With SMT and a second thread of the same kind, the core starts up to 4 instructions per cycle from the two threads together, and 24 instructions in 10 cycles, IPC 2.4, if the two threads do not slow each other down in the caches. Each thread is no faster than alone; the core gets more done. Intel's first implementation of SMT, Hyper-Threading, ran two threads per core, added less than 5 % to the chip's size and power, and measured gains of up to 30 % on server benchmarks ([Marr et al., 2002](#references)). The M1 used here has no SMT: macOS reports 8 cores and 8 hardware threads.
+
+## What changed
+
+| | One core | Multicore with coherent caches |
+| --- | --- | --- |
+| Instruction streams at once | one, threads take turns | one per core (more with SMT) |
+| Speed-up of a program | from ILP only | at most $1/(1 - p)$ for a fixed problem (Amdahl); about $n$ for a problem that grows with $n$ (Gustafson) |
+| Where performance comes from | frequency and IPC | the number of cores, each at a lower frequency |
+| Caches | private, invisible to software | private but kept coherent by a protocol (MESI) |
+| New costs | context switches | coherence misses, false sharing, synchronization |
+| Order of memory accesses | program order | a consistency model; relaxed in hardware, fences to restore order |
+
+## Limitations
+
+- **The serial part.** Amdahl's law caps the speed-up of a fixed problem at $1/(1 - p)$, and load imbalance and coordination make it worse.
+- **Parallel programming is hard.** The work must be divided, the threads synchronized, and data races avoided; bugs depend on timing and are hard to reproduce.
+- **Coherence does not scale for free.** Snooping needs every cache to see every request; directories cost memory and add a hop to every miss. Writes to shared lines move them between caches.
+- **Shared resources.** The cores share the last-level cache and the memory bandwidth, so programs limited by memory gain less from more cores than the core count suggests.
+- **Relaxed consistency.** Without fences or atomics, a thread may see another thread's writes in an order that no interleaving explains.
+
+## What you should remember
+
+- After the end of Dennard scaling, power, not transistors, became the limit, and two slower cores do more work per watt than one fast core on work that divides.
+- Amdahl: $S(n) = 1/((1 - p) + p/n) \le 1/(1 - p)$. With $p = 0.95$: 5.93 on 8 cores, never more than 20.
+- Gustafson: for a problem that grows with the machine, $S = s + (1 - s)\,n$ with $s$ the serial fraction of the parallel run.
+- Coherence: reads return the latest write, and writes to one location are seen in one order. MESI implements it with invalidation: many readers or one writer per line.
+- False sharing: different variables on one line make the line move between cores on every write; pad hot per-thread data to the line size. Measured on the M1: 2.52 s against 0.22 s.
+- Sequential consistency (Lamport) means some interleaving explains every execution. Store buffers break it; fences and sequentially consistent atomics restore it.
+- Hardware multithreading shares one core among several threads; SMT starts instructions from several threads in the same cycle.
+
+## Code
+
+Amdahl's and Gustafson's laws, the power of two slower cores, and the interleavings that sequential consistency allows:
+
+```python
+from itertools import combinations
+
+# Amdahl's law: a fraction p of the one-core time runs n times faster
+amdahl = lambda p, n: 1 / ((1 - p) + p / n)
+print([round(amdahl(0.95, n), 2) for n in (2, 4, 8, 64, 1024)], round(1 / 0.05))
+# [1.9, 3.48, 5.93, 15.42, 19.64] 20
+
+# the parallel fraction needed for a speed-up S on n cores: p = (1 - 1/S) / (1 - 1/n)
+need = lambda S, n: (1 - 1 / S) / (1 - 1 / n)
+print(round(need(6, 8), 4), round(need(50, 64), 4))
+# 0.9524 0.9956
+
+# Gustafson's law: a fraction s of the time on n cores is serial, the rest scales with n
+gustafson = lambda s, n: s + (1 - s) * n
+print(round(gustafson(0.05, 8), 2), round(gustafson(0.05, 1024), 2))
+# 7.65 972.85
+
+# dynamic power C V^2 f: two cores at 0.8 f and 0.8 V against one core at f and V
+print(round(2 * 0.8 * 0.8 ** 2, 3), 2 * 0.8)
+# 1.024 1.6: the same power, 1.6 times the throughput on a job that divides
+
+# sequential consistency for the store-buffering test: every interleaving of the two threads
+T1 = [('st', 'x'), ('ld', 'y', 'r1')]
+T2 = [('st', 'y'), ('ld', 'x', 'r2')]
+outcomes = set()
+for pos in combinations(range(4), 2):                # the slots taken by thread 1, in its program order
+    order, i, j = [], 0, 0
+    for s in range(4):
+        if s in pos: order.append(T1[i]); i += 1
+        else:        order.append(T2[j]); j += 1
+    mem, reg = {'x': 0, 'y': 0}, {}
+    for op in order:
+        if op[0] == 'st': mem[op[1]] = 1
+        else:             reg[op[2]] = mem[op[1]]
+    outcomes.add((reg['r1'], reg['r2']))
+print(sorted(outcomes))                              # (0, 0) is not among them
+# [(0, 1), (1, 0), (1, 1)]
+```
+
+False sharing. Compile with `clang -std=c17 -Wall -Wextra -O0 false_sharing.c -o false_sharing`. The times depend on the machine and vary between runs; the output shown is one run on an Apple M1 (macOS 26.5, Apple clang 21) with other programs running.
+
+```c
+// False sharing: two threads each add 1 to their own counter 100 million times.
+// In `same` the two counters sit next to each other, on one cache line;
+// in `padded` each counter starts its own 128-byte line (the line size macOS reports on the M1).
+#include <pthread.h>
+#include <stdalign.h>
+#include <stdatomic.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <time.h>
+
+#define N 100000000L
+
+struct same   { _Atomic long a; _Atomic long b; };
+struct padded { alignas(128) _Atomic long a; alignas(128) _Atomic long b; };
+static struct same same;
+static struct padded padded;
+
+static void *count(void *arg) {                // the body of each thread
+    _Atomic long *c = arg;
+    for (long i = 0; i < N; i++)
+        atomic_fetch_add_explicit(c, 1, memory_order_relaxed);   // one atomic read-modify-write
+    return NULL;
+}
+
+static double run(_Atomic long *x, _Atomic long *y) {   // two threads, one per counter; seconds
+    struct timespec t0, t1;
+    pthread_t a, b;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    pthread_create(&a, NULL, count, (void *)x);
+    pthread_create(&b, NULL, count, (void *)y);
+    pthread_join(a, NULL);
+    pthread_join(b, NULL);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    return (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
+}
+
+int main(void) {
+    printf("distance between the counters: same %zu bytes, padded %zu bytes\n",
+           offsetof(struct same, b), offsetof(struct padded, b));
+    double ts = run(&same.a, &same.b);
+    double tp = run(&padded.a, &padded.b);
+    printf("counts: %ld %ld %ld %ld\n", (long)same.a, (long)same.b, (long)padded.a, (long)padded.b);
+    printf("same line %.2f s, separate lines %.2f s\n", ts, tp);
+    return 0;
+}
+// distance between the counters: same 8 bytes, padded 128 bytes
+// counts: 100000000 100000000 100000000 100000000
+// same line 2.52 s, separate lines 0.22 s        (one run; the times vary)
+```
+
+The store-buffering test of sequential consistency, a million trials with relaxed and with sequentially consistent atomics. The count of $r_1 = r_2 = 0$ outcomes varies between runs and machines; on processors that allow the reordering it is positive with relaxed atomics, and it is always 0 with sequentially consistent ones.
+
+```c
+// Store buffering: thread 1 runs x = 1; r1 = y;  thread 2 runs y = 1; r2 = x.
+// Sequential consistency forbids r1 == 0 && r2 == 0. Count how often it happens anyway.
+#include <pthread.h>
+#include <stdatomic.h>
+#include <stdio.h>
+
+#define TRIALS 1000000
+
+static _Atomic int x, y, r1, r2;
+static _Atomic int go[2];                  // trials finished by each thread
+static _Atomic int round_no;               // the trial now running
+static memory_order mo;                    // relaxed, or seq_cst
+
+static void *t1(void *arg) {
+    (void)arg;
+    for (int k = 1; k <= TRIALS; k++) {
+        while (atomic_load(&round_no) != k) ;        // wait for the trial to start
+        atomic_store_explicit(&x, 1, mo);
+        atomic_store_explicit(&r1, atomic_load_explicit(&y, mo), memory_order_relaxed);
+        atomic_fetch_add(&go[0], 1);
+    }
+    return NULL;
+}
+static void *t2(void *arg) {
+    (void)arg;
+    for (int k = 1; k <= TRIALS; k++) {
+        while (atomic_load(&round_no) != k) ;
+        atomic_store_explicit(&y, 1, mo);
+        atomic_store_explicit(&r2, atomic_load_explicit(&x, mo), memory_order_relaxed);
+        atomic_fetch_add(&go[1], 1);
+    }
+    return NULL;
+}
+
+static long run(memory_order order) {
+    mo = order;
+    atomic_store(&round_no, 0); atomic_store(&go[0], 0); atomic_store(&go[1], 0);
+    pthread_t a, b;
+    pthread_create(&a, NULL, t1, NULL);
+    pthread_create(&b, NULL, t2, NULL);
+    long both_zero = 0;
+    for (int k = 1; k <= TRIALS; k++) {
+        atomic_store(&x, 0); atomic_store(&y, 0);
+        atomic_store(&round_no, k);                  // start trial k
+        while (atomic_load(&go[0]) != k || atomic_load(&go[1]) != k) ;
+        both_zero += atomic_load(&r1) == 0 && atomic_load(&r2) == 0;
+    }
+    pthread_join(a, NULL); pthread_join(b, NULL);
+    return both_zero;
+}
+
+int main(void) {
+    printf("relaxed: r1 = r2 = 0 in %ld of %d trials\n", run(memory_order_relaxed), TRIALS);
+    printf("seq_cst: r1 = r2 = 0 in %ld of %d trials\n", run(memory_order_seq_cst), TRIALS);
+    return 0;
+}
+// relaxed: r1 = r2 = 0 in 882022 of 1000000 trials    (one run on the M1; the count varies)
+// seq_cst: r1 = r2 = 0 in 0 of 1000000 trials
+```
+
+## Next
+
+Threads give a program several instruction streams, each fetching, decoding and scheduling its own instructions, and they must coordinate through coherent memory. Much of the work in graphics, signal processing and machine learning is simpler than that: the same operation on every element of a large array. The [next note](/notes/acos/data-level-parallelism) exploits that with one instruction stream that operates on many data elements at once: SIMD instructions, vector processors and GPUs, and the roofline model that tells whether such a computation is limited by arithmetic or by memory.
+
+## References
+
+- A. Tatarnikov. *Computer Architecture and Operating Systems* (HSE), [lecture 14: thread-level parallelism](https://andrewt0301.github.io/hse-acos-course/part1ca/14_TLP/lecture.html).
+- D. A. Patterson, J. L. Hennessy. *Computer Organization and Design, RISC-V Edition*, 2nd ed. Morgan Kaufmann, 2020. §5.10 (cache coherence), §6.2 (the difficulty of creating parallel programs; strong and weak scaling), §6.4 (hardware multithreading), §6.5 (multicore and other shared-memory multiprocessors).
+- J. L. Hennessy, D. A. Patterson. *Computer Architecture: A Quantitative Approach*, 6th ed. Morgan Kaufmann, 2019. Chapter 3 (multithreading), Chapter 5 (multiprocessors and thread-level parallelism: snooping and directory coherence, models of memory consistency).
+- G. M. Amdahl. [Validity of the single processor approach to achieving large scale computing capabilities](https://doi.org/10.1145/1465482.1465560). *AFIPS Spring Joint Computer Conference*, 1967.
+- J. L. Gustafson. [Reevaluating Amdahl's law](https://doi.org/10.1145/42411.42415). *Communications of the ACM*, 31(5), 1988.
+- M. S. Papamarcos, J. H. Patel. [A low-overhead coherence solution for multiprocessors with private cache memories](https://doi.org/10.1145/800015.808204). *ISCA*, 1984 (the protocol now called MESI).
+- L. Lamport. [How to make a multiprocessor computer that correctly executes multiprocess programs](https://doi.org/10.1109/TC.1979.1675439). *IEEE Transactions on Computers*, C-28(9), 1979 (sequential consistency).
+- S. V. Adve, K. Gharachorloo. [Shared memory consistency models: a tutorial](https://doi.org/10.1109/2.546611). *IEEE Computer*, 29(12), 1996.
+- D. M. Tullsen, S. J. Eggers, H. M. Levy. [Simultaneous multithreading: maximizing on-chip parallelism](https://doi.org/10.1145/223982.224449). *ISCA*, 1995.
+- D. T. Marr, F. Binns, D. L. Hill, G. Hinton, D. A. Koufaty, J. A. Miller, M. Upton. [Hyper-Threading Technology architecture and microarchitecture](https://www.intel.com/content/dam/www/public/us/en/documents/research/2002-vol06-iss-1-intel-technology-journal.pdf). *Intel Technology Journal*, 6(1), 2002 (die size and power, measured gains).
+- D. J. Sorin, M. D. Hill, D. A. Wood. *A Primer on Memory Consistency and Cache Coherence*. Morgan & Claypool, 2011 (2nd ed., with V. Nagarajan, 2020).
+- K. Rupp. [Microprocessor trend data](https://github.com/karlrupp/microprocessor-trend-data), 2022 (clock frequency and core counts by year, `50yrs/frequency.dat` and `50yrs/cores.dat`).

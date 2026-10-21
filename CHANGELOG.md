@@ -2,6 +2,32 @@
 
 Notable changes to the site, newest first. Each entry gives the date, what changed and why.
 
+## 2026-10-22
+
+- **A new course: Computer Architecture and Operating Systems.** 32 notes in ten sections, in English and Russian, tell how a computer runs a program, from the bits of a number to a process talking over the network:
+  - **Foundations:** what a computer system is, bits, integers and byte order, floating point.
+  - **RISC-V assembly:** the instruction set, encoding, branches and memory, procedures and the stack.
+  - **Memory hierarchy:** caches and virtual memory.
+  - **Inside the processor:** the pipelined datapath, exceptions and interrupts, input and output.
+  - **Parallelism and performance:** instruction-, thread- and data-level parallelism, making programs fast, and domain-specific architectures with the TPU.
+  - **The operating system:** C for systems programming, system calls, linking and loading, dynamic memory allocation.
+  - **Processes and concurrency:** processes and threads, synchronization, inter-process communication.
+  - **Files, users and isolation:** files and I/O, permissions, virtual machines and containers.
+  - **Networking:** computer networks and sockets.
+  - **Languages and compilers:** language runtimes and LLVM.
+
+  The scope and order follow A. Tatarnikov's HSE course "Computer Architecture and Operating Systems". Patterson and Hennessy, Harris and Harris, CS:APP, OSTEP and *The Linux Programming Interface* are cited section by section. The text, examples, figures and code are the site's own.
+
+  66 figures are computed at build time; most mechanism figures step through numbered stages. Every Code section runs as written:
+  - RISC-V assembly in RARS syntax, checked with an RV32IM interpreter;
+  - C compiled and run on macOS;
+  - the Linux-only examples (POSIX message queues, `strace`, `LD_DEBUG`, `LD_PRELOAD`, an `epoll` server, namespaces and cgroups) run in a Debian 13 container;
+  - the raw-`ecall` RISC-V program under `qemu-riscv64`.
+
+  Excerpts that need a RISC-V machine or RARS itself (CSRs, atomics, the vector extension) are labelled as not run. The course stands on its own on the course graph and links to the other courses where they meet: floating point to quantization, caches to FlashAttention, the TPU to neural networks.
+
+  Why: the site covered the mathematics and models but not the machine they run on, and the HSE curriculum puts this course alongside the others.
+
 ## 2026-10-21
 
 - **NLP: how a large language model is built, adapted and run.** The NLP course goes from 37 to 41 notes. Its second half is reordered, so that a reader first sees how an LLM is built, then how it is adapted and turned into an assistant, then how it is run cheaply.

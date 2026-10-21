@@ -1,0 +1,433 @@
+---
+title: Files and input/output
+description: "How a program reads and writes files: file descriptors and the three kernel tables behind them, what fork and dup share, buffered and unbuffered I/O compared by their system calls, inodes, directories and links, the VFS, mapping files into memory, and fsync."
+course: acos
+section: Files, Users and Isolation
+order: 25
+status: published
+tags: [files, file-descriptors, open-file-table, inodes, stdio, buffering, hard-links, symbolic-links, vfs, mmap, fsync]
+prerequisites: [System calls, Processes and threads, Virtual memory, Inter-process communication]
+---
+
+import FileTables from '../../../components/figures/files-and-io/FileTables.astro';
+import LinksAndInodes from '../../../components/figures/files-and-io/LinksAndInodes.astro';
+
+The [previous note](/notes/acos/inter-process-communication) connected processes through pipes, shared memory and signals. Every one of those channels disappears when the processes exit. A pipe, though, already looked like a file: the program got a small integer, a *descriptor*, and passed it to `read` and `write`. This note is about the real thing, data that outlives the process that wrote it. It answers five questions in turn: what a descriptor refers to inside the kernel and what `fork` and `dup` share, why reading one byte per system call is slow and how buffering fixes it, how a file system finds the bytes of a file by name, how a file can be read without `read` at all, and when written data is actually safe on the disk.
+
+**Notation.** $n$ is the size of a file in bytes and $B$ the size of a buffer, so a loop that reads $B$ bytes per call makes $\lceil n/B \rceil + 1$ calls: the last one returns 0 at the end of the file. $P$ is the page size of the virtual memory system. Sizes use binary units: 1 KiB $= 2^{10}$ bytes, 1 MiB $= 2^{20}$, 1 GiB $= 2^{30}$, 1 TiB $= 2^{40}$.
+
+## What a program sees: descriptors and five calls
+
+To a Unix program a file is a sequence of bytes with a name. The kernel imposes no records, lines or types; a text file is a byte sequence that happens to contain newline characters. A process does not use the name for every access. It *opens* the file once and gets a **file descriptor**, a small non-negative integer, and passes that number to every later call. Every process starts with three descriptors that the shell opened for it: 0 is standard input, 1 standard output, 2 standard error. `open` always returns the lowest number not in use, so the first file a program opens is usually descriptor 3.
+
+Five system calls do almost all the work:
+
+```c
+int     open(const char *path, int flags, ... /* mode_t mode, when creating */);
+ssize_t read(int fd, void *buf, size_t count);
+ssize_t write(int fd, const void *buf, size_t count);
+off_t   lseek(int fd, off_t offset, int whence);
+int     close(int fd);
+```
+
+- `flags` says how to open: exactly one of `O_RDONLY`, `O_WRONLY` or `O_RDWR`, plus options such as `O_CREAT` (create the file if it does not exist, with permission bits `mode`), `O_TRUNC` (cut it to length 0) and `O_APPEND` (every write goes to the current end).
+- Every open file has a current **offset**. `read` and `write` start at the offset and advance it by the number of bytes they transferred. `lseek` sets it: to `offset` itself (`SEEK_SET`), relative to the current offset (`SEEK_CUR`) or relative to the end of the file (`SEEK_END`), and returns the new value.
+- `read` returns the number of bytes it actually read, which may be fewer than `count`, and 0 at the end of the file. Both `read` and `write` return $-1$ on error and set `errno`. A program must loop when it needs exactly `count` bytes, because pipes, terminals and sockets routinely return less.
+
+**Worked example.** A file holds the 10 bytes `hello, os\n`, numbered 0 to 9. `open` returns 3. `read(3, buf, 4)` returns 4, puts `hell` in `buf` and moves the offset to 4. `lseek(3, -2, SEEK_END)` returns $10 - 2 = 8$. `read(3, buf, 4)` asks for 4 bytes but only bytes 8 and 9 remain, so it returns 2: `s` and the newline. The next `read` returns 0, the end of the file, and `close(3)` frees the descriptor.
+
+The same five calls work on a terminal, a pipe, a socket or a device. The `write(1, buffer, 13)` of the hello-world program in the [first note](/notes/acos/computer-systems) does not know whether descriptor 1 is a terminal, a file or a pipe to another program; the shell decided that before the program started.
+
+## Three tables behind a descriptor
+
+A descriptor is an index, and what it indexes takes three levels of kernel tables:
+
+- **The descriptor table**, one per process, part of the process's kernel state. Entry $i$ holds a pointer to an open file description and one flag, close-on-exec.
+- **The open file table**, one for the whole system. Each entry, an **open file description**, records how the file was opened: the current offset, the access mode, status flags such as `O_APPEND`, and how many descriptors point to it.
+- **The inode table**, the kernel's in-memory copies of **inodes**. An inode describes the file itself: its type, owner, permission bits, size, timestamps and where its blocks are on the disk. There is one per file, however many times the file is open.
+
+<aside class="callout"><strong>Key idea.</strong> The offset lives in the open file description, not in the descriptor and not in the file. Descriptors that share a description share one offset: <code>dup</code> and <code>fork</code> make such descriptors. Every call to <code>open</code> makes a new description with its own offset, even for the same file.</aside>
+
+Each call changes the tables in its own way. `open` takes the lowest free slot, creates a new description with offset 0 and points it at the file's inode. `dup(fd)` takes another free slot and points it at the *same* description. `fork` copies the whole descriptor table of the parent, so every descriptor of the child points to the same description as the parent's descriptor with the same number. `close` empties a slot and decrements the description's count; the description disappears only when the count reaches 0.
+
+**Worked example.** A process creates `log.txt` and gets descriptor 3 (description A), calls `dup(3)` and gets 4, and opens the file a second time and gets 5 (description B). Then it forks. The child writes the 6 bytes `child ` through descriptor 3. Description A is shared by descriptors 3 and 4 of both processes, four references in all, so its offset becomes 6 for all of them; the parent's `lseek(4, 0, SEEK_CUR)` returns 6. Description B was never written through, and the parent's `lseek(5, 0, SEEK_CUR)` returns 0. If the parent now writes `XY` through descriptor 5, the bytes land at offset 0 and overwrite `ch`; if it then writes `parent\n` through 4, the bytes land at offset 6. The file ends up as `XYild parent`, which is what the second program in the Code section prints.
+
+<FileTables />
+
+1. `open` returns descriptor 3, which points to a new description A, which points to the inode.
+2. `dup(3)` returns descriptor 4, a second slot pointing to the same A.
+3. A second `open` of the same path returns descriptor 5 and a new description B, with an offset of its own and the same inode.
+4. `fork` copies the table: the child's descriptors 3, 4 and 5 point to the same A and B.
+5. The child's write through descriptor 3 moves the offset of A from 0 to 6, for every descriptor that shares A.
+
+Both behaviours are used on purpose. A shell runs `cmd > out 2>&1` by opening `out` as descriptor 1 and then calling `dup2(1, 2)`: standard output and standard error share one offset, so their lines follow each other in the file instead of overwriting each other. Two programs that append to one log file open it separately, so their offsets are independent; they use `O_APPEND`, which makes the kernel move the offset to the end of the file before every write, as one step.
+
+<aside class="callout"><strong>Check yourself.</strong> (1) A process opens a file as descriptor 3 and forks. The parent reads 100 bytes through descriptor 3, then the child reads 10 bytes through its descriptor 3. Which bytes does the child get? (2) Same, but the child opens the file again after the fork and reads through the new descriptor. (3) After the fork the parent closes descriptor 3. Can the child still read through its descriptor 3?<details><summary>Answers</summary>(1) Bytes 100 to 109: parent and child share one description and one offset, which the parent's read moved to 100. (2) Bytes 0 to 9: a new <code>open</code> makes a new description with offset 0. (3) Yes. Closing decrements the count of the description from 2 to 1; it is freed only when the child closes its descriptor as well.</details></aside>
+
+## Baseline: one system call per byte
+
+The simplest way to process a file is a loop that reads one byte at a time:
+
+```c
+char c;
+while (read(fd, &c, 1) == 1)
+    process(c);
+```
+
+It works for every kind of file and handles each byte as soon as it arrives. The cost is the number of calls: $n + 1$ for a file of $n$ bytes. Each call enters the kernel and returns, as the [system-calls note](/notes/acos/system-calls) showed, and costs far more than the one byte it moves. On an Apple M1 (macOS 26.5, `clang -O0`), reading a 1,000,000-byte file this way took about 450 ms when the file was already in memory, about 450 ns per call; reading it 4096 bytes per call took about 1.3 ms (the last program in the Code section; the numbers vary between machines and runs). The work per byte is the same in both loops. The difference is almost entirely the cost of entering and leaving the kernel a million times.
+
+## Buffering: fewer and larger calls
+
+The fix is to move many bytes per call. A loop that reads into a buffer of $B$ bytes makes
+
+$$
+\Big\lceil \frac{n}{B} \Big\rceil + 1
+$$
+
+calls: $\lceil n/B \rceil$ that return data and a final one that returns 0. For a file of $n = 100{,}000$ bytes and $B = 4096$, that is $\lceil 24.41 \rceil + 1 = 26$ calls instead of $100{,}001$, about 3,800 times fewer.
+
+The C standard library does this for us. A `FILE *` from `fopen` carries a buffer in the process's own memory. `fgetc` takes the next byte from the buffer and calls `read` only when the buffer is empty, to refill it with up to $B$ bytes; `fputc` and `printf` fill an output buffer and call `write` only when it is full, at a newline for a terminal, or when the program calls `fflush`, `fclose` or `exit`. The library picks $B$ itself, usually the file system's preferred block size; on the test machine it chose 4096 bytes. The first program in the Code section makes this visible: it reads the 100,000-byte file with `fgetc` and watches the kernel's offset, which jumps by 4096 only when the library refills its buffer. It sees 25 refills and 100,000 calls to `fgetc`, against the 100,001 `read` calls of the one-byte loop.
+
+| Reading 1,000,000 bytes | `read` calls | Time, one run (Apple M1, `-O0`) |
+| --- | --- | --- |
+| `read`, 1 byte per call | 1,000,001 | about 450 ms |
+| `fgetc` with a 4096-byte stdio buffer | 246 | about 19 ms |
+| `read`, 4096 bytes per call | 246 | about 1.3 ms |
+
+The stdio loop is 24 times faster than the baseline, but it is still 15 times slower than reading blocks directly, with the same number of system calls. What remains is the cost of one library call per byte: POSIX requires every stdio function to lock its `FILE` against other threads, and `fgetc` pays that on each byte. Reading in blocks with `fread`, or calling `getc_unlocked` in a single-threaded loop, removes most of it.
+
+Output buffering has one trap worth knowing. `printf("before fork\n")` followed by `fork()` prints the line once when the output is a terminal, which is line-buffered, but twice when the output goes to a file or a pipe: the line is still in the parent's buffer at the fork, the child gets a copy of the buffer, and both copies are flushed when the two processes exit. Call `fflush(stdout)` before `fork`.
+
+There is a second buffer below this one. The kernel keeps recently used file blocks in memory, in the **page cache**, so a `read` of data that is already cached copies it from memory and never touches the disk; the timings above were measured with the file in the cache. Writes go to the page cache too, which matters for the last section.
+
+## Where the bytes live: inodes and directories
+
+A disk is an array of fixed-size blocks, typically 4 KiB. A file system builds files and names on top of it with two structures.
+
+An **inode** describes one file: its type (regular file, directory, symbolic link, device), its owner and group, its permission bits, its size, three timestamps, a **link count**, and the locations of its data blocks. Inodes are numbered, and the number is unique within one file system. The inode does *not* contain the file's name.
+
+The classic Unix layout, used by ext2, keeps 15 block pointers in the inode: 12 point straight at data blocks, the 13th at a block full of pointers (*single indirect*), the 14th at a block of pointers to such blocks (*double indirect*), and the 15th one level deeper still (*triple indirect*). With 4 KiB blocks and 4-byte pointers, a block of pointers holds 1024 of them, so the four parts cover
+
+$$
+\begin{aligned}
+12 \cdot 4\ \text{KiB} &= 48\ \text{KiB}, & 1024 \cdot 4\ \text{KiB} &= 4\ \text{MiB}, \\
+1024^2 \cdot 4\ \text{KiB} &= 4\ \text{GiB}, & 1024^3 \cdot 4\ \text{KiB} &= 4\ \text{TiB}.
+\end{aligned}
+$$
+
+Small files, the common case, need nothing but the inode; large files pay one or two extra block reads.
+
+**Worked example.** Byte 1,000,000 of a file lies in block $\lfloor 1{,}000{,}000/4096 \rfloor = 244$. Blocks 0 to 11 are direct, so block 244 is entry $244 - 12 = 232$ of the single indirect block: finding it takes the inode, the indirect block and then the data block. Byte 5,000,000 lies in block 1220, beyond the $12 + 1024 = 1036$ blocks of the first two parts, so it is entry $1220 - 1036 = 184$ of the first block under the double indirect pointer: inode, double indirect block, indirect block, data block. ext4 replaces most of these pointers with **extents**, pairs of a starting block and a length of up to 32,768 blocks (128 MiB with 4 KiB blocks), and the inode holds four extents directly. A contiguous file of 100 MB, 24,415 blocks, is then described by a single extent instead of 24,415 pointers.
+
+A **directory** is a file whose data is a list of entries, each a name and an inode number. Opening `/home/ann/notes.txt` is a walk: start from the root directory's inode (number 2 on ext2, ext3 and ext4), read its entries and find `home` with its inode number, read that inode and its entries and find `ann`, then do the same for `notes.txt`. That is four inodes and three directories, read from the disk if they are not cached; Linux keeps recent name lookups in its *dentry cache*, so repeated opens of the same path skip the walk. Every directory on the way must also grant search permission, the subject of the [next note](/notes/acos/users-and-permissions).
+
+## Hard links and symbolic links
+
+Because the name lives in the directory and the file lives in the inode, one file can have several names. A **hard link** is one more directory entry with the same inode number, created by `link` (the shell's `ln`). All names are equal: none of them is the original. The inode's link count says how many there are. `unlink` (the shell's `rm`) removes one name and decrements the count, and the kernel frees the inode and its blocks only when the count is 0 *and* no open file description still points to the inode. A program can therefore create a temporary file, open it and unlink it at once: the data stays usable through the descriptor and disappears by itself when the program closes it or dies. Hard links cannot cross file systems, because inode numbers are only unique within one, and cannot point to directories, which would allow cycles in the tree; the only exceptions are the entries `.` and `..` that every directory has.
+
+A **symbolic link** is a file of its own, with its own inode, whose content is a path. When the kernel meets one during a lookup, it starts over with that path. A symbolic link can point to a directory or to another file system, and it can **dangle**: if the target is removed, the link stays and opening it fails. `stat` follows symbolic links and `lstat` describes the link itself.
+
+<LinksAndInodes />
+
+1. A directory is a file that maps names to inode numbers.
+2. `a.txt` and `b.txt` hold the same number: two names of one file, whose inode has 2 links.
+3. The inode holds the metadata and the pointers to the data blocks, but not the name.
+4. `c.txt` is a symbolic link: an inode of its own whose content is the path `a.txt`, looked up again whenever `c.txt` is opened.
+
+**Worked example.** The third program in the Code section creates `a.txt` with 5 bytes, `data` and a newline, adds the hard link `b.txt` and the symbolic link `c.txt` pointing to `a.txt`. `stat` reports the same inode for `a.txt` and `b.txt` with 2 links, and `lstat` reports `c.txt` as a symbolic link of 5 bytes, the length of the string `a.txt`. After `unlink("a.txt")`, `b.txt` has 1 link and still holds the data, while opening `c.txt` fails with "No such file or directory": the name it contains is gone. Finally the program opens `b.txt` and unlinks it too. The link count is 0, but `read` through the open descriptor still returns the 5 bytes.
+
+## One interface for many file systems: the VFS
+
+A Linux machine mounts many kinds of file system into one tree: ext4 or XFS on the disk, `tmpfs` in memory, NFS over the network, `procfs` at `/proc`, whose files are generated by the kernel when they are read. Pipes and sockets are files too, of internal file systems with no names. A program sees none of this, because the system calls are implemented once, in the **virtual file system** (VFS), and the VFS dispatches to the file system that owns the file.
+
+The VFS works with four kinds of object: a *superblock* for each mounted file system, an *inode* for each file, a *dentry* for each cached name, and a *file* for each open file description. Each file system supplies tables of functions that implement the operations for its own objects. The table for open files looks like this (Linux kernel, `include/linux/fs.h`, abridged; Linux only, not run here):
+
+```c
+struct file_operations {
+    loff_t  (*llseek)    (struct file *, loff_t, int);
+    ssize_t (*read)      (struct file *, char __user *, size_t, loff_t *);
+    ssize_t (*write)     (struct file *, const char __user *, size_t, loff_t *);
+    ssize_t (*read_iter) (struct kiocb *, struct iov_iter *);
+    ssize_t (*write_iter)(struct kiocb *, struct iov_iter *);
+    int     (*mmap)      (struct file *, struct vm_area_struct *);
+    int     (*open)      (struct inode *, struct file *);
+    int     (*fsync)     (struct file *, loff_t, loff_t, int datasync);
+    /* ... and more operations ... */
+};
+```
+
+**Worked example.** The same `read(fd, buf, 4096)` does four different things depending on what `fd` refers to. On a file of an ext4 disk, the VFS calls ext4's `read_iter`, which copies from the page cache and asks the disk driver for any block that is missing. On `/proc/self/status`, procfs formats the calling process's state as text at that moment. On a pipe, the pipe code copies bytes out of the pipe's kernel buffer, or puts the process to sleep until a writer supplies some. On `/dev/zero`, the character device driver fills the buffer with zeros. BSD and macOS have the same structure under the name *vnode* layer, after the design that introduced it at Sun ([Kleiman, 1986](#references)).
+
+## Mapping a file into memory
+
+There is a way to read a file without `read`. The `mmap` system call makes a range of a file part of the process's address space:
+
+```c
+char *p = mmap(NULL, n, PROT_READ, MAP_PRIVATE, fd, 0);   /* p[i] is now byte i of the file */
+```
+
+No data is copied when `mmap` returns. The kernel only records that this range of virtual addresses is backed by this file. The first access to each page causes a page fault, as in the [virtual-memory note](/notes/acos/virtual-memory); the fault handler finds the page of the file in the page cache, reading it from the disk if needed, and maps that very page into the process. From then on, `p[i]` is an ordinary load. With `MAP_SHARED`, stores go into the page cache as well, other processes that map the file see them, and the kernel writes them back to the file; with `MAP_PRIVATE`, the first store to a page gives the process its own copy (copy-on-write) and the file is not changed. The kernel maps executables and shared libraries into memory the same way ([linking and loading](/notes/acos/linking-and-loading)).
+
+**Worked example.** Reading the 100,000-byte file through a mapping makes no `read` calls. With pages of $P = 4096$ bytes, it touches $\lceil 100{,}000/4096 \rceil = 25$ pages, so it takes at most 25 page faults; with the 16 KiB pages of the Apple M1 test machine, at most $\lceil 100{,}000/16{,}384 \rceil = 7$. Each fault enters the kernel, as a system call does, so for one sequential pass a mapping saves little over `read` with a large buffer. It pays off for random access to a large file, for data read many times, and for sharing one copy between processes. It has costs of its own: a page is the smallest unit, pipes and sockets cannot be mapped, and an error appears as a signal instead of a return value: accessing a page beyond the end of a file that another process has truncated raises `SIGBUS`.
+
+## When is the data safe? The page cache and fsync
+
+`write` returns as soon as the bytes are in the page cache. The page is marked *dirty*, and the kernel writes it to the disk later, in the background. On Linux, by default, a flusher thread wakes every 5 seconds and writes back pages that have been dirty for more than 30 seconds (the `vm.dirty_writeback_centisecs` and `vm.dirty_expire_centisecs` settings, 500 and 3000). A power failure loses whatever has not been written back yet, roughly the last half minute of writes, although every program saw its `write` succeed. `close` does not change this.
+
+A program that must not lose data asks for it explicitly. `fsync(fd)` returns only after the file's data and metadata have been sent to the storage device; `fdatasync` skips the metadata that is not needed to read the data back, such as the modification time. A newly created file also needs an `fsync` of its directory, because its name lives in the directory's data. On macOS, `fsync` hands the data to the drive but does not force the drive to empty its own cache; the man page directs programs that need that guarantee, such as databases, to `fcntl(fd, F_FULLFSYNC)`.
+
+**Worked example.** An editor saving a document must never leave a half-written file, even if the power fails in the middle. It writes the new content to a temporary file in the same directory, calls `fsync` on it, renames it over the old name with `rename`, which replaces a directory entry in one step, and calls `fsync` on the directory. After a crash the name refers either to the complete old file or to the complete new one. File systems protect their own structures, the inodes, directories and free-block maps, with a journal or with copy-on-write; they do not, by themselves, protect the contents of a file that a program was in the middle of writing.
+
+## What changed
+
+| | `read`, 1 byte | `read`, $B$ bytes | stdio (`fgetc`, `printf`) | `mmap` |
+| --- | --- | --- | --- | --- |
+| System calls for $n$ bytes | $n + 1$ | $\lceil n/B \rceil + 1$ | about $\lceil n/B \rceil$, $B$ chosen by the library | 1, plus a page fault per page touched |
+| Copies of the data | kernel to user, 1 byte at a time | kernel to user | kernel to stdio buffer, then to the program | none: the page cache page is mapped |
+| Works on | everything | everything | everything | regular files and devices that support mapping |
+| On disk when | the kernel writes back, or `fsync` | same | after `fflush`, then as for `write` | `msync` or write-back, for `MAP_SHARED` |
+
+## Limitations
+
+- **Short reads and writes.** `read` and `write` may transfer fewer bytes than asked, especially on pipes, terminals and sockets, and a signal can interrupt them. Correct code loops.
+- **Two buffers can disagree.** Mixing `fgetc` and `read` on the same file gives wrong results, because stdio has already read ahead into its buffer. Unflushed output is lost by `_exit` and a crash, and duplicated by `fork`.
+- **Shared and separate offsets.** Descriptors from `dup` and `fork` move each other's offset; separate `open`s overwrite each other's data unless they use `O_APPEND`.
+- **Mappings have sharp edges.** Page granularity, no pipes or sockets, and `SIGBUS` when the file shrinks under the mapping.
+- **Durability costs time and trust.** `fsync` waits for the device, and its guarantee is only as good as the device's handling of its own cache.
+- **Links have limits.** Hard links stay within one file system and never point to directories; symbolic links can dangle.
+
+## What you should remember
+
+- A descriptor indexes the process's descriptor table; the entry points to an open file description (offset, mode, flags), which points to the inode (owner, permissions, size, blocks).
+- `dup` and `fork` share a description and its offset; every `open` makes a new description.
+- A loop with a $B$-byte buffer makes $\lceil n/B \rceil + 1$ `read` calls instead of $n + 1$; stdio does this for us, with a buffer of a few KiB. On an M1, one-byte `read`s cost about 450 ns each.
+- An inode holds everything about a file except its name; a directory maps names to inode numbers. A hard link is another name for the same inode; a symbolic link is a separate file containing a path.
+- A file's data is freed when its link count is 0 and nothing has it open.
+- The VFS gives every file system, pipe and device the same system calls, through per-file-system tables of operations.
+- `mmap` maps the page cache into the address space: no `read`, no copy, one page fault per page.
+- `write` reaches the page cache, not the disk; use `fsync` (and on macOS `F_FULLFSYNC`) when data must survive a crash, and write-then-rename to replace a file atomically.
+
+## Code
+
+The file of the baseline and buffering sections, read four ways: one byte per `read`, 4096 bytes per `read`, `fgetc` with stdio's buffer, and `mmap`. It counts the system calls it makes and prints what it read (macOS and Linux; compile with `clang -std=c17 -Wall -Wextra -O0`):
+
+```c
+// Read one file four ways and count the read() system calls each way makes.
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
+
+#define N 100000                       // file size: "hello, os\n" written 10,000 times
+
+int main(void) {
+    char path[] = "/tmp/io-demo-XXXXXX";
+    int fd = mkstemp(path);            // creates and opens a new file, returns its descriptor
+    for (int i = 0; i < N / 10; i++)
+        write(fd, "hello, os\n", 10);  // 10,000 write calls of 10 bytes
+    close(fd);
+
+    // 1. Unbuffered, one byte per call: N + 1 calls (the last one returns 0 at end of file).
+    fd = open(path, O_RDONLY);
+    char c, first[11] = {0};
+    long calls = 0, bytes = 0;
+    ssize_t r;
+    while ((r = read(fd, &c, 1)) > 0) {
+        if (bytes < 10) first[bytes] = c;
+        bytes += r, calls++;
+    }
+    calls++;                           // the final call that returned 0
+    printf("read, 1 byte:     %ld bytes, %ld calls, starts \"%.9s\"\n", bytes, calls, first);
+
+    // 2. Unbuffered, a 4096-byte buffer: 25 calls that return data, then one that returns 0.
+    lseek(fd, 0, SEEK_SET);
+    char buf[4096];
+    calls = bytes = 0;
+    while ((r = read(fd, buf, sizeof buf)) > 0) bytes += r, calls++;
+    calls++;
+    printf("read, 4096 bytes: %ld bytes, %ld calls\n", bytes, calls);
+    close(fd);
+
+    // 3. Buffered stdio, one fgetc per byte. The library refills its buffer with read();
+    //    each refill moves the kernel's file offset, which lseek(..., SEEK_CUR) reports.
+    //    (The lseek calls are only here to watch; a real program would not make them.)
+    FILE *fp = fopen(path, "r");
+    setvbuf(fp, NULL, _IOFBF, 4096);   // a 4096-byte buffer, as stdio picks for this file by itself
+    long refills = 0, offset = 0, lines = 0, fgetcs = 0;
+    int ch;
+    while ((ch = fgetc(fp)) != EOF) {
+        fgetcs++;
+        if (ch == '\n') lines++;
+        long now = lseek(fileno(fp), 0, SEEK_CUR);
+        if (now != offset) refills++, offset = now;
+    }
+    printf("stdio fgetc:      %ld fgetc calls, %ld lines, %ld refills + 1 read at end of file\n",
+           fgetcs, lines, refills);
+    fclose(fp);
+
+    // 4. mmap: no read() at all; the bytes appear in the address space, page by page.
+    fd = open(path, O_RDONLY);
+    char *p = mmap(NULL, N, PROT_READ, MAP_PRIVATE, fd, 0);
+    long hellos = 0;
+    for (long i = 0; i + 5 <= N; i += 10) hellos += memcmp(p + i, "hello", 5) == 0;
+    printf("mmap:             0 read calls, %ld \"hello\"s, last byte '\\n'? %s\n",
+           hellos, p[N - 1] == '\n' ? "yes" : "no");
+    munmap(p, N);
+    close(fd);
+    unlink(path);
+    return 0;
+}
+// read, 1 byte:     100000 bytes, 100001 calls, starts "hello, os"
+// read, 4096 bytes: 100000 bytes, 26 calls
+// stdio fgetc:      100000 fgetc calls, 10000 lines, 25 refills + 1 read at end of file
+// mmap:             0 read calls, 10000 "hello"s, last byte '\n'? yes
+```
+
+Which descriptors share an offset, the worked example of the three tables:
+
+```c
+// Which descriptors share an offset: dup and fork share one open file description, a second open() does not.
+#include <fcntl.h>
+#include <stdio.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+int main(void) {
+    char path[] = "/tmp/share-demo-XXXXXX";
+    int a = mkstemp(path);                 // fd 3 -> open file description A, offset 0
+    int b = dup(a);                        // fd 4 -> the same description A
+    int c = open(path, O_RDWR);            // fd 5 -> a new description B, offset 0, same inode
+    printf("fds %d %d %d\n", a, b, c);
+    if (fork() == 0) {                     // the child gets copies of fds 3, 4, 5: same descriptions
+        write(a, "child ", 6);             // moves the offset of A to 6
+        _exit(0);
+    }
+    wait(NULL);
+    printf("offset via fd 4: %lld, via fd 5: %lld\n",
+           (long long)lseek(b, 0, SEEK_CUR), (long long)lseek(c, 0, SEEK_CUR));
+    write(c, "XY", 2);                     // B is still at 0: overwrites "ch"
+    write(b, "parent\n", 7);               // A is at 6: writes after "child "
+    char buf[32];
+    ssize_t n = pread(a, buf, sizeof buf, 0);
+    printf("file: %.*s", (int)n, buf);
+    unlink(path);
+    return 0;
+}
+// fds 3 4 5
+// offset via fd 4: 6, via fd 5: 0
+// file: XYild parent
+```
+
+Hard links, a symbolic link, and a file that outlives its last name:
+
+```c
+// Hard links, a symbolic link, and a file that outlives its last name while it is open.
+#include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+int main(void) {
+    char dir[] = "/tmp/links-demo-XXXXXX";
+    mkdtemp(dir);
+    chdir(dir);                                   // work inside a fresh directory
+    int fd = open("a.txt", O_WRONLY | O_CREAT, 0644);
+    write(fd, "data\n", 5);
+    close(fd);
+    link("a.txt", "b.txt");                       // a second name for the same inode
+    symlink("a.txt", "c.txt");                    // a new inode whose content is the path "a.txt"
+    struct stat sa, sb, sc, lc;
+    stat("a.txt", &sa); stat("b.txt", &sb); stat("c.txt", &sc); lstat("c.txt", &lc);
+    printf("a, b same inode: %s, links %d\n", sa.st_ino == sb.st_ino ? "yes" : "no", (int)sa.st_nlink);
+    printf("c follows to a: %s; c itself is a symlink of %lld bytes\n",
+           sc.st_ino == sa.st_ino ? "yes" : "no", (long long)lc.st_size);
+    unlink("a.txt");                              // remove one name
+    stat("b.txt", &sb);
+    printf("after unlink a: b has %d link, open c: %s\n", (int)sb.st_nlink,
+           open("c.txt", O_RDONLY) < 0 ? strerror(errno) : "ok");
+    fd = open("b.txt", O_RDONLY);
+    unlink("b.txt");                              // the last name is gone, the file is still open
+    fstat(fd, &sb);
+    char buf[8];
+    ssize_t n = read(fd, buf, sizeof buf);
+    printf("after unlink b: %d links, still reads %zd bytes: %.4s\n", (int)sb.st_nlink, n, buf);
+    close(fd);                                    // now the inode and its blocks are freed
+    unlink("c.txt");
+    chdir("/");
+    rmdir(dir);
+    return 0;
+}
+// a, b same inode: yes, links 2
+// c follows to a: yes; c itself is a symlink of 5 bytes
+// after unlink a: b has 1 link, open c: No such file or directory
+// after unlink b: 0 links, still reads 5 bytes: data
+```
+
+The timings of the buffering section. The times depend on the machine, the operating system and whether the file is cached, so the output below is one run on an Apple M1 with macOS 26.5 and `clang -O0`, with the file in the page cache:
+
+```c
+// Time reading a 1,000,000-byte file: one read() per byte, one fgetc() per byte, one read() per 4096 bytes.
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+#include <unistd.h>
+
+#define N 1000000
+static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
+
+int main(void) {
+    char path[] = "/tmp/io-time-XXXXXX";
+    int fd = mkstemp(path);
+    static char block[N];
+    for (int i = 0; i < N; i++) block[i] = "hello, os\n"[i % 10];
+    write(fd, block, N);
+    close(fd);
+    long sum = 0;                       // a checksum, so that every byte is really used
+    char c, buf[4096];
+    ssize_t r;
+    for (int rep = 0; rep < 3; rep++) {
+        double t0 = now();
+        fd = open(path, O_RDONLY);
+        while (read(fd, &c, 1) == 1) sum += c;
+        close(fd);
+        double t1 = now();
+        FILE *fp = fopen(path, "r");
+        int ch;
+        while ((ch = fgetc(fp)) != EOF) sum += ch;
+        fclose(fp);
+        double t2 = now();
+        fd = open(path, O_RDONLY);
+        while ((r = read(fd, buf, sizeof buf)) > 0) for (ssize_t i = 0; i < r; i++) sum += buf[i];
+        close(fd);
+        double t3 = now();
+        printf("read 1 byte: %.1f ms  fgetc: %.2f ms  read 4096: %.2f ms\n", (t1 - t0) * 1e3, (t2 - t1) * 1e3, (t3 - t2) * 1e3);
+    }
+    printf("checksum %ld\n", sum);
+    unlink(path);
+}
+// read 1 byte: 449.7 ms  fgetc: 18.86 ms  read 4096: 1.25 ms
+// read 1 byte: 450.4 ms  fgetc: 18.58 ms  read 4096: 1.25 ms
+// read 1 byte: 451.1 ms  fgetc: 18.73 ms  read 4096: 1.24 ms
+// checksum 759600000
+```
+
+## Next
+
+Every `open` in this note succeeded because the programs opened their own files. The inode, though, also stores an owner, a group and a set of permission bits, and the kernel consults them on every `open`, on every `exec` and at every directory on a path. The [next note](/notes/acos/users-and-permissions) explains who a process is in the kernel's eyes, how the nine permission bits decide what it may do, and the special bits that let an ordinary user change a password stored in a file only root may write.
+
+## References
+
+- A. Tatarnikov. *Computer Architecture and Operating Systems* (HSE), [lecture 3: system calls](https://andrewt0301.github.io/hse-acos-course/part2os/03_SystemCalls/lecture.html) (`open`, `read`, `write`, `close`), [lecture 9: inter-process communication](https://andrewt0301.github.io/hse-acos-course/part2os/09_IPC/lecture.html) (memory mapping) and [lecture 10: users, groups and permissions](https://andrewt0301.github.io/hse-acos-course/part2os/10_Permissions/lecture.html) (links).
+- M. Kerrisk. [*The Linux Programming Interface*](https://man7.org/tlpi/). No Starch Press, 2010. Chapter 4 (the universal I/O model), §5.4 (relationship between file descriptors and open files), Chapter 13 (file I/O buffering), Chapter 14 (file systems), Chapter 18 (directories and links), Chapter 49 (memory mappings).
+- R. E. Bryant, D. R. O'Hallaron. *Computer Systems: A Programmer's Perspective*, 3rd ed. Pearson, 2016. Chapter 10 (system-level I/O: sharing files, I/O redirection, standard I/O), §9.8 (memory mapping).
+- R. H. Arpaci-Dusseau, A. C. Arpaci-Dusseau. *Operating Systems: Three Easy Pieces*. Arpaci-Dusseau Books, 2018. [Chapter 39: files and directories](https://pages.cs.wisc.edu/~remzi/OSTEP/file-intro.pdf), [Chapter 40: file system implementation](https://pages.cs.wisc.edu/~remzi/OSTEP/file-implementation.pdf), [Chapter 42: crash consistency, FSCK and journaling](https://pages.cs.wisc.edu/~remzi/OSTEP/file-journaling.pdf).
+- A. S. Tanenbaum, H. Bos. *Modern Operating Systems*, 4th ed. Pearson, 2015. Chapter 4 (file systems).
+- S. R. Kleiman. Vnodes: an architecture for multiple file system types in Sun UNIX. *USENIX Summer Conference*, 1986.
+- The Linux kernel documentation: [Overview of the Linux virtual file system](https://docs.kernel.org/filesystems/vfs.html); [ext4 data structures: the contents of inode.i_block](https://docs.kernel.org/filesystems/ext4/ifork.html) (direct and indirect blocks, extents of up to 32,768 blocks); `mm/page-writeback.c` (default write-back interval of 5 s and expiry of 30 s).
+- Linux manual pages: [open(2)](https://man7.org/linux/man-pages/man2/open.2.html), [mmap(2)](https://man7.org/linux/man-pages/man2/mmap.2.html), [fsync(2)](https://man7.org/linux/man-pages/man2/fsync.2.html), [inode(7)](https://man7.org/linux/man-pages/man7/inode.7.html); macOS manual page fsync(2) (`F_FULLFSYNC`).

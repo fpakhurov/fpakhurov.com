@@ -1,0 +1,369 @@
+---
+title: Virtual machines and containers
+description: "Two ways to give a program a machine of its own: virtual machines, from the Popek–Goldberg requirements, trap-and-emulate and hardware support to two-level address translation, and containers built from namespaces, cgroups and layered images, with what each one isolates."
+course: acos
+section: Files, Users and Isolation
+order: 27
+status: published
+tags: [virtualization, hypervisor, popek-goldberg, trap-and-emulate, vt-x, risc-v-h-extension, nested-paging, containers, namespaces, cgroups, overlayfs, docker, qemu]
+prerequisites: ["Users, groups and permissions", Virtual memory, Exceptions and interrupts, Processes and threads]
+---
+
+import VmVsContainer from '../../../components/figures/virtual-machines-and-containers/VmVsContainer.astro';
+import NestedWalk from '../../../components/figures/virtual-machines-and-containers/NestedWalk.astro';
+
+The [previous note](/notes/acos/users-and-permissions) ended with the limit of permissions: users with different UIDs still share one kernel, one file tree, one list of processes and one network, and root or a kernel bug crosses every boundary at once. This note builds stronger walls in two ways. A **virtual machine** gives a program a whole computer of its own, kernel included, by making one physical machine look like several. A **container** keeps one kernel but gives each group of processes its own view of it, with its own files, process IDs and network, and limits on what it may consume. The note asks when a processor can run an operating system as a guest at all, what the hardware adds to make it fast, why memory needs two translations, and how containers are assembled from ordinary kernel features.
+
+**Notation.** The **host** is the real machine, the **hypervisor** or virtual machine monitor (VMM) is the software that runs virtual machines, and a **guest** is an operating system running inside one. A guest virtual address (gVA) is translated by the guest's page tables into a guest physical address (gPA), which the hypervisor's tables translate into a host physical address (hPA). $n$ and $m$ are the numbers of page-table levels in the guest and in the host.
+
+## Why virtualize?
+
+A virtual machine is a software copy of a computer: virtual processors, virtual memory, virtual disks and network cards. The idea dates from IBM mainframes around 1972 and became mainstream on PCs and servers after 2000. The reasons are practical:
+
+- **Consolidation.** Many lightly loaded servers become many virtual machines on one physical machine.
+- **Isolation.** A crash, a compromise or a misconfiguration inside one guest does not reach the others or the host.
+- **Running another system.** A Mac or Windows laptop runs Linux, or an old operating system keeps running on new hardware.
+- **Encapsulation.** A whole machine becomes a set of files: it can be snapshotted, copied, and moved to another host while it runs (live migration). Cloud computing is built on this.
+
+## Baseline: emulate every instruction
+
+The simplest way to run a guest is an **emulator**: a program that keeps the guest's registers and memory in arrays and executes the guest's instructions one by one in a loop, fetching, decoding and carrying out each in software, exactly as the processor of the [pipelining note](/notes/acos/pipelining) does in hardware. Privileged instructions are no problem: the emulator just updates its own copy of the control registers. An emulator can even run a guest written for a different instruction set, such as RISC-V on an x86 laptop.
+
+It breaks on speed. Every guest instruction costs a fetch, a decode, a dispatch and the work itself, dozens of host instructions for one `add`. Nearly all guest instructions, though, are ordinary arithmetic, loads, stores and branches that the host processor could execute itself. The question of the next section is when that is safe.
+
+## When can a guest run directly? The Popek and Goldberg requirements
+
+Run the guest's code directly on the processor, but in user mode, with the hypervisor in the privileged mode. The guest's applications behave exactly as before. The guest *kernel* believes it runs in supervisor mode, and every time it does something only a kernel may do, the hardware must hand control to the hypervisor, so that the hypervisor can do it on the guest's behalf.
+
+[Popek and Goldberg (1974)](#references) made this precise. They required a VMM to provide **equivalence** (a program behaves as on the real machine, apart from timing and resources), **resource control** (the VMM keeps complete control of the real resources) and **efficiency** (most instructions run directly, without the VMM). They classified instructions:
+
+- an instruction is **privileged** if it traps when executed in user mode and does not trap in supervisor mode;
+- an instruction is **sensitive** if it changes the configuration of the machine (the mode, the memory mapping, interrupt enabling) or if its result depends on that configuration.
+
+Their Theorem 1: a VMM with the three properties can be built for a machine if every sensitive instruction is privileged.
+
+<aside class="callout"><strong>Key idea.</strong> A guest kernel can run directly on the processor, deprivileged, if every instruction that touches or reveals the machine's configuration traps when executed outside supervisor mode. Then the hypervisor sees each such instruction and emulates it against a virtual copy of the processor state; everything else runs at full speed.</aside>
+
+## Trap and emulate
+
+The hypervisor keeps a **virtual CPU** for each guest: the values the guest believes its control registers hold, its virtual privilege mode, its virtual interrupt-enable flag. It runs the guest kernel in user mode. Whenever the guest kernel executes a privileged instruction, the processor raises an exception, as in the [exceptions note](/notes/acos/exceptions-and-interrupts), and the trap goes to the hypervisor. The hypervisor decodes the instruction, applies its effect to the virtual CPU, advances the guest's program counter past it and returns to the guest.
+
+On RISC-V without the hypervisor extension, a guest kernel that installs a new page table executes (an excerpt; not run here, it needs a RISC-V machine with privileged mode):
+
+```asm
+        csrw  satp, a0          # in S-mode: switch the page table. In U-mode: illegal-instruction trap
+```
+
+In user mode, any access to a supervisor CSR such as `satp` or `sstatus`, and the instructions `sret` and `sfence.vma`, raise an illegal-instruction exception, so the hypervisor gets control. It records the new value in the virtual `satp` of that guest and builds the page tables the hardware will really use (the [address-translation section](#two-level-address-translation) below). The RISC-V privileged specification says of its baseline design that the few privileged instructions are easy to detect and trap, so classic virtualization works ([RISC-V Privileged Architecture](#references), hypervisor chapter).
+
+**Worked example.** The first Python program in the Code section has a toy processor with a mode, an interrupt flag and a page-table base, and a guest kernel of six instructions: disable interrupts, add, set the page-table base to 7, enable interrupts, add, and `popf 0`, which restores the flags with interrupts disabled. Run natively in kernel mode, the guest ends with interrupts off, page-table base 7 and accumulator 7. Run deprivileged, the three privileged instructions trap and the hypervisor emulates them on the virtual CPU: 3 traps, and the adds run directly. The result differs in one place: the virtual interrupt flag is 1, not 0. The cause is the last instruction.
+
+## When sensitive instructions do not trap
+
+The toy `popf` imitates x86's `POPF`, which loads the flags register from the stack. In kernel mode it changes the interrupt-enable flag; in user mode it silently leaves that flag alone and does not trap. It is sensitive but not privileged, so the hypervisor never sees it, and the guest kernel believes it disabled interrupts when it did not. [Robin and Irvine (2000)](#references) found seventeen such instructions on the Pentium. Classic x86 therefore broke Popek and Goldberg's condition, and for years it was thought impossible to virtualize efficiently. Three ways around it followed:
+
+- **Binary translation.** The hypervisor runs guest *user* code directly but scans guest *kernel* code before it runs, a basic block at a time, and replaces each problematic instruction with a call into the hypervisor or an equivalent safe sequence. Translated blocks are cached, so each is translated once. VMware's products, from 1999, worked this way ([Adams and Agesen, 2006](#references)).
+- **Paravirtualization.** The guest kernel is modified to call the hypervisor explicitly, with **hypercalls**, instead of executing sensitive instructions; Xen took this approach ([Barham et al., 2003](#references)). It requires changing the guest's source code, but it is fast, and its idea survives today in paravirtual devices: instead of emulating a real network card register by register, the hypervisor offers a simple device, standardized as virtio, with shared-memory queues that the guest driver fills directly.
+- **Hardware support**, the subject of the next section, which made the first approach unnecessary for the processor itself.
+
+In the Code section, making the toy `popf` trap restores equivalence: 4 traps, and the virtual interrupt flag ends at 0, as on the real machine.
+
+## Hardware support: VT-x and the RISC-V H extension
+
+Intel's VT-x (2005) and AMD's AMD-V (2006) add a new dimension to the privilege modes instead of making more instructions trap ([Uhlig et al., 2005](#references)). VT-x has *VMX root* operation, for the hypervisor, and *VMX non-root* operation, for guests, each with the usual rings. A guest kernel runs in ring 0 of non-root mode, so most of its privileged instructions simply work, on the guest's own state. A data structure in memory, the virtual machine control structure, says which events cause a **VM exit** to the hypervisor (for example, accesses to certain registers, I/O instructions, external interrupts) and holds the guest's and the host's state for the switch. The hypervisor resumes the guest with a VM entry.
+
+RISC-V's **H extension** does the same for RISC-V. It adds a virtualization mode bit V: with V = 0 the hart runs in M-mode, in HS-mode (supervisor mode extended with hypervisor controls) or in U-mode; with V = 1 it runs a guest in VS-mode (virtual supervisor) or VU-mode (virtual user). In VS-mode the guest kernel's accesses to `sstatus`, `satp` and the other supervisor CSRs go to a separate set of shadow registers (`vsstatus`, `vsatp`, …) without trapping, while the hypervisor in HS-mode configures what does trap, through registers such as `hstatus` and `hgatp`. An instruction the hypervisor has chosen to intercept raises a *virtual-instruction exception*. The specification states the purpose: the baseline architecture can already be virtualized by trapping, and the extension reduces how often those traps happen. It was ratified as version 1.0 in the privileged specification.
+
+The result is the same on both architectures: the guest kernel runs at full speed in a mode that looks like supervisor mode, and the hypervisor is entered only for the events it asked for.
+
+## Two-level address translation
+
+Memory needs two translations. The guest kernel maps its processes' virtual addresses to what it believes are physical addresses, gPAs; the hypervisor decides where those really are in host memory, hPAs. The hardware of the [virtual-memory note](/notes/acos/virtual-memory) has one page-table walker, so a hypervisor without hardware help keeps **shadow page tables**: tables that map gVA directly to hPA, built by combining the guest's tables with its own. The hardware walks the shadow tables at native speed. The cost is that the hypervisor must notice every change the guest makes to its own tables, so it write-protects them, and every guest page-table update becomes a trap.
+
+**Nested paging** (Intel EPT, AMD NPT, and the G-stage of the RISC-V H extension) makes the walker do both stages. On RISC-V, `vsatp` points to the guest's tables, which translate gVA to gPA (*VS-stage*), and `hgatp` points to the hypervisor's tables, which translate gPA to hPA (*G-stage*). The guest edits its own tables freely, without traps. The price comes on a TLB miss. The guest's tables live in guest-physical memory, so every guest table entry the walker reads must first have *its own* address translated through the host's tables.
+
+<NestedWalk />
+
+1. The guest's root table is at a gPA: the host walks its 3 levels (reads 1 to 3), and then the guest entry is read (4).
+2. The same for the guest's level-1 table (5 to 8).
+3. The same for the level-0 table (9 to 12).
+4. The data's own gPA needs one more host walk (13 to 15); then the data is read.
+
+Counting: each of the $n$ guest levels costs a host walk of $m$ reads plus the read of the guest entry, and the final gPA costs one more host walk:
+
+$$
+n(m + 1) + m = (n + 1)(m + 1) - 1 .
+$$
+
+**Worked example.** With Sv39 in the guest and Sv39x4 in the host, $n = m = 3$: $4 \cdot 4 - 1 = 15$ page-table reads, against 3 without virtualization. (Sv39x4 is Sv39 with a 16 KiB root table that accepts 2 extra address bits, so that guest-physical memory may be 4 times larger; the number of levels is unchanged.) With the four-level tables of x86-64, $n = m = 4$ gives $5 \cdot 5 - 1 = 24$ reads, six times the native 4 ([Bhargava et al., 2008](#references)). The second Python program in the Code section builds both sets of tables, walks them and counts 15 reads. A TLB hit still costs nothing extra, because the TLB caches the finished gVA-to-hPA translation; the hardware also caches intermediate entries, and large pages shorten both walks.
+
+## Type 1 and type 2 hypervisors
+
+A **type 1** hypervisor runs directly on the hardware and is itself a small operating system whose processes are virtual machines: VMware ESXi, Xen, Microsoft Hyper-V. A **type 2** hypervisor is an application on an ordinary operating system, which provides its drivers, files and scheduling: VirtualBox, VMware Workstation and Fusion, Parallels Desktop. Linux's **KVM** blurs the line: a kernel module that turns Linux itself into a hypervisor, so each virtual machine is a Linux process whose virtual CPUs are threads, scheduled like any other ([Kivity et al., 2007](#references)). A user-space program, usually QEMU, opens `/dev/kvm`, gives it the guest's memory and asks it to run a virtual CPU; when the guest touches an emulated device, the run call returns to QEMU, which emulates the device and resumes the guest.
+
+Type 1 hypervisors are favoured in data centres, where the machine does nothing else; type 2 on desktops, where the machine is someone's computer first. The RISC-V H extension is designed for both kinds.
+
+## Containers: one kernel, many views
+
+A virtual machine isolates by giving each guest its own kernel. Often that is more than needed: the program is a Linux program, and the goal is only that it cannot see or disturb others and gets a predictable share of the machine. A **container** is a group of ordinary processes on the host kernel that the kernel shows a restricted view of the system and holds to resource limits. Nothing is emulated: a system call from a container is a system call to the host kernel. Three kernel mechanisms do the work.
+
+### Namespaces: a private view
+
+A **namespace** wraps one kind of global resource, so that processes inside it see their own instance. Linux has eight kinds ([`namespaces(7)`](#references)): mount points (a private file tree), PIDs (a private numbering of processes, starting at 1), network (private interfaces, addresses, ports and routing), UTS (a private host name), IPC (private System V IPC objects and POSIX message queues), users (private UIDs: root inside may map to an unprivileged UID outside), cgroups (a private view of the cgroup tree) and time (private boot and monotonic clocks). A process enters new namespaces with `clone` or `unshare`, and the command `unshare` wraps that call (Linux only; run as root in a privileged container on Docker Desktop, kernel 5.10, not on macOS):
+
+```text
+# hostname
+68491b3e5191
+# unshare --uts --pid --fork --mount-proc sh -c 'hostname box1; hostname; echo pid $$; ps -o pid,comm'
+box1
+pid 1
+PID   COMMAND
+    1 ps
+# hostname
+68491b3e5191
+```
+
+Inside, the shell sets the host name to `box1`, finds that it is process 1, and `ps`, which replaced the shell as its last command, sees only itself. Outside, the host name has not changed, and the processes inside are visible under ordinary, larger PIDs.
+
+### Control groups: limits
+
+A namespace limits what a process *sees*, not what it *uses*. **Control groups** (cgroups) limit and account for resources. In cgroup version 2, a group is a directory under `/sys/fs/cgroup`, its member processes are listed in its `cgroup.procs` file, and each controller is a set of files ([cgroup v2 documentation](#references)). `cpu.max` holds two numbers, a quota and a period in microseconds: the group may run for at most the quota in each period. `memory.max` caps memory in bytes, and `pids.max` caps the number of processes. Controllers are enabled for a group's children in `cgroup.subtree_control`; inside a container, the container's own processes were first moved into a child group, because cgroup v2 does not let a group with member processes hand controllers to its children (Linux only; same setup):
+
+```text
+# echo "+cpu +memory +pids" > /sys/fs/cgroup/cgroup.subtree_control
+# mkdir /sys/fs/cgroup/demo && cd /sys/fs/cgroup/demo
+# echo "50000 100000" > cpu.max; echo 64M > memory.max; echo 16 > pids.max
+# cat cpu.max memory.max pids.max
+50000 100000
+67108864
+16
+# (move a shell into the group with  echo $$ > cgroup.procs  and run a busy loop for 3 seconds)
+# cat cpu.stat
+usage_usec 1200523
+user_usec 205180
+system_usec 995343
+nr_periods 24
+nr_throttled 24
+throttled_usec 1299688
+```
+
+**Worked example.** `50000 100000` means 50 ms of CPU time per 100 ms period: half a CPU. Over the 24 periods in which the busy loop wanted to run, it received $1.20\ \text{s}$ of CPU, $1.20 / (24 \cdot 0.1) = 0.50$ of the time, and it was throttled in all 24. `64M` is $64 \cdot 2^{20} = 67{,}108{,}864$ bytes. In a second run, a shell in the group that tried to build a 100 MB string was killed by the kernel's out-of-memory killer (exit status 137, which is 128 plus signal 9, `SIGKILL`; `memory.events` counted one `oom_kill`), while a 10 MB string fit. With `pids.max` at 16, starting 20 background processes failed with "can't fork: Resource temporarily unavailable".
+
+### Layered images: a private file tree, shared on disk
+
+A container needs its own file tree, with the libraries and programs its application expects, usually a whole small distribution. Copying it for every container would waste disk and start-up time. **OverlayFS** stacks directories instead: read-only *lower* layers and one writable *upper* layer appear merged in one directory. Reading finds a file in the topmost layer that has it. Writing to a file from a lower layer first copies it up (copy-on-write), and deleting one leaves a *whiteout* in the upper layer that hides it (Linux only; same setup):
+
+```text
+# mkdir /x && mount -t tmpfs tmpfs /x && cd /x && mkdir lower upper work merged
+# echo "from the image" > lower/a.txt; echo "base config" > lower/b.txt
+# mount -t overlay overlay -o lowerdir=/x/lower,upperdir=/x/upper,workdir=/x/work /x/merged
+# echo "changed in the container" > merged/b.txt; echo new > merged/c.txt; rm merged/a.txt
+# ls merged
+b.txt
+c.txt
+# ls lower; cat lower/b.txt
+a.txt
+b.txt
+base config
+# ls -l upper
+c---------    2 root     root        0,   0 Oct 21 10:32 a.txt
+-rw-r--r--    1 root     root            25 Oct 21 10:32 b.txt
+-rw-r--r--    1 root     root             4 Oct 21 10:32 c.txt
+```
+
+The lower layer is untouched. The upper layer holds the modified `b.txt` (25 bytes), the new `c.txt`, and the whiteout for `a.txt`, a character device with device number 0, 0.
+
+A **Docker image** is a stack of such read-only layers, one for each build step that changes files, plus metadata such as the command to run. For example, the image `haproxy:3.2-alpine` on the arm64 test machine has 14 build steps in its history, of which 6 produce file-system layers; the two large ones are the Alpine Linux base system (8.66 MB) and the step that installs HAProxy (34.3 MB), and steps such as `ENV` and `CMD` change only metadata. Every container started from the image shares those layers on disk and gets its own upper layer. A container runtime puts the pieces together: it creates the namespaces, mounts the layered file tree as the container's root, places the processes in a cgroup with the requested limits, drops most capabilities (Docker keeps 14 of the 41 by default, and not `CAP_SYS_ADMIN`), and runs the image's command as process 1.
+
+A container needs a Linux kernel, because it *is* processes on that kernel. The shell sessions above ran on a Mac, but `uname -sr` printed `Darwin 25.5.0` on the host and `Linux 5.10.124-linuxkit` inside the container: Docker Desktop on macOS runs a small Linux virtual machine and starts the containers inside it.
+
+## What each one isolates
+
+<VmVsContainer />
+
+1. The same hardware at the bottom.
+2. The hypervisor divides the CPU, memory and devices among the guests and traps the events it must handle.
+3. Each VM has its own kernel, libraries and apps; the boundary is the virtual hardware interface.
+4. One host kernel: namespaces give each container its own view of the system, cgroups limit its resources.
+5. A container holds only libraries and apps, from image layers; the boundary is the system-call interface.
+
+| | Process (users and permissions) | Container | Virtual machine | Emulator |
+| --- | --- | --- | --- | --- |
+| Kernel | shared | shared | its own | its own |
+| Instruction set | the host's | the host's | the host's | any |
+| File tree | shared, filtered by permissions | its own, from image layers | its own virtual disk | its own virtual disk |
+| Process IDs, host name, network | shared | its own, by namespaces | its own | its own |
+| Resource limits | few (per-process limits) | cgroups | the virtual hardware's size | the virtual hardware's size |
+| What an attacker must break | the permission checks | the host kernel's system-call interface | the hypervisor's narrow interface | the emulator |
+| Start-up | a process | a process plus namespaces and mounts | a kernel boot | a kernel boot, emulated |
+| Speed of ordinary code | native | native | native, except exits and TLB misses | far slower, unless translated |
+
+The boundary is the key difference. A container's processes talk to the host kernel through its hundreds of system calls, and a single kernel bug can let one container escape. A virtual machine's guest talks to the hypervisor through a much smaller interface, virtual devices and a few exits, which is why many public clouds run customers' containers inside virtual machines, and why lightweight hypervisors that start a small VM per container exist.
+
+## Emulation and virtualization: QEMU
+
+**QEMU** shows both sides in one program ([Bellard, 2005](#references)). Alone, it is an emulator that improves on the baseline: its **Tiny Code Generator** translates each basic block of guest code into host code once, stores it in a translation cache and chains translated blocks together, so a hot loop runs as host code instead of being decoded on every iteration. That is how it runs a RISC-V Linux on an x86 or an Arm machine, at a substantial cost in speed. When the guest's instruction set matches the host's, QEMU can instead hand the guest's CPUs to a hardware hypervisor, KVM on Linux, and keep only the job of emulating devices: then guest code runs natively, and QEMU acts as the device model of a virtual machine. The same command line is an emulator or a virtual machine depending on whether the instruction sets match and hardware support is used.
+
+## What changed
+
+| | Emulator (baseline) | Trap-and-emulate VM | VM with hardware support | Container |
+| --- | --- | --- | --- | --- |
+| Guest code runs | in software, instruction by instruction | directly; privileged instructions trap | directly, in a guest mode | directly, as host processes |
+| Needs from the ISA | nothing | every sensitive instruction privileged | VT-x, AMD-V or the H extension | nothing; needs a kernel with namespaces and cgroups |
+| Memory translation | in software | shadow page tables, a trap per guest table update | nested paging: up to $(n+1)(m+1)-1$ reads per TLB miss | one walk, as for any process |
+| Kernels | one per guest | one per guest | one per guest | one for all |
+| Isolation boundary | the emulator | the hypervisor | the hypervisor | the host kernel's system calls |
+
+## Limitations
+
+- **Virtual machines are heavy.** Each carries a full kernel and its memory, boots like a computer, and pays for VM exits and for longer page walks on TLB misses.
+- **Device I/O is the slow path.** Emulated devices cost an exit per register access; paravirtual devices or devices passed through to the guest are needed for speed.
+- **Containers share the kernel.** A kernel vulnerability is a vulnerability of every container, and a container cannot run a different kernel or operating system.
+- **Root inside a container is still root on the kernel**, unless user namespaces map it to an unprivileged UID; capabilities and system-call filters narrow it but do not remove the shared surface.
+- **Not every resource is isolated.** Caches, memory bandwidth and the TLB are shared by everything on a core, which lets one tenant slow another or, through side channels, observe it.
+- **Emulation is slow.** Translating between instruction sets costs a large factor even with a translation cache.
+
+## What you should remember
+
+- A virtual machine runs a guest kernel on a hypervisor; a container runs processes on the host kernel with a restricted view.
+- Popek and Goldberg: a machine can be virtualized efficiently by trap-and-emulate if every sensitive instruction is privileged. Classic x86 broke this (`POPF` and sixteen others); binary translation, paravirtualization and then VT-x and AMD-V worked around it.
+- RISC-V's baseline privileged architecture can be virtualized by trapping; the H extension adds VS and VU modes, shadow CSRs and a G-stage translation to make it fast.
+- Nested paging translates gVA to gPA to hPA in hardware; a TLB miss can cost $(n + 1)(m + 1) - 1$ page-table reads: 15 for Sv39 on Sv39x4, 24 for four-level x86-64.
+- Type 1 hypervisors run on the bare machine, type 2 on an operating system; KVM makes Linux a hypervisor and QEMU its device model.
+- Containers combine namespaces (what a process sees), cgroups (what it may use, such as `cpu.max` = `50000 100000` for half a CPU) and layered images on OverlayFS (copy-on-write file trees).
+- The narrower the boundary, the stronger the isolation: permissions, then containers, then virtual machines.
+
+## Code
+
+A toy processor with one sensitive instruction that does not trap, run natively and under trap-and-emulate, and a two-stage page walk that counts its reads (Python, standard library only):
+
+```python
+# A toy CPU with one sensitive instruction that does not trap, run natively and under trap-and-emulate.
+class Trap(Exception):
+    pass
+
+PRIVILEGED = {'cli', 'sti', 'setptbr'}          # trap when executed in user mode
+
+def execute(state, op, arg, privileged=PRIVILEGED):
+    """What the hardware does with one instruction; state = mode, interrupt flag IF, page-table base, acc."""
+    if op in privileged and state['mode'] == 'user':
+        raise Trap(op)
+    if op == 'add':
+        state['acc'] += arg
+    elif op == 'cli':
+        state['IF'] = 0
+    elif op == 'sti':
+        state['IF'] = 1
+    elif op == 'setptbr':
+        state['ptbr'] = arg
+    elif op == 'popf':                          # like x86 POPF: in user mode the IF bit is silently ignored
+        if state['mode'] == 'kernel':
+            state['IF'] = arg
+
+guest_kernel = [('cli', None), ('add', 5), ('setptbr', 7), ('sti', None), ('add', 2), ('popf', 0)]
+
+def native(prog):
+    cpu = {'mode': 'kernel', 'IF': 1, 'ptbr': 0, 'acc': 0}
+    for op, arg in prog:
+        execute(cpu, op, arg)
+    return {k: cpu[k] for k in ('IF', 'ptbr', 'acc')}
+
+def trap_and_emulate(prog, privileged=PRIVILEGED):
+    real = {'mode': 'user', 'IF': 1, 'ptbr': 0, 'acc': 0}     # the guest kernel runs deprivileged
+    vcpu = {'mode': 'kernel', 'IF': 1, 'ptbr': 0}             # what the guest believes; kept by the VMM
+    traps = 0
+    for op, arg in prog:
+        try:
+            execute(real, op, arg, privileged)                # runs directly on the CPU
+        except Trap:
+            traps += 1                                        # the VMM emulates it on the virtual CPU
+            execute(vcpu, op, arg, privileged)
+    return {'IF': vcpu['IF'], 'ptbr': vcpu['ptbr'], 'acc': real['acc']}, traps
+
+print('native:            ', native(guest_kernel))
+print('trap and emulate:  ', *trap_and_emulate(guest_kernel))
+print('popf made to trap: ', *trap_and_emulate(guest_kernel, PRIVILEGED | {'popf'}))
+# native:             {'IF': 0, 'ptbr': 7, 'acc': 7}
+# trap and emulate:   {'IF': 1, 'ptbr': 7, 'acc': 7} 3
+# popf made to trap:  {'IF': 0, 'ptbr': 7, 'acc': 7} 4
+
+# Two-level address translation: count the page-table reads of one TLB miss.
+# Both stages are 3-level radix tables with 9-bit indices and 4 KiB pages, as Sv39 (guest) and Sv39x4 (host)
+# (Sv39x4 also widens the top index by 2 bits; that does not change the count).
+LEVELS, BITS, PAGE = 3, 9, 4096
+
+def build(mapping, memory, next_free):
+    """Store a page table for {virtual page: physical page} in memory; return the root's page number."""
+    root = next_free(); memory[root] = {}
+    for vpn, ppn in mapping.items():
+        table = root
+        for level in range(LEVELS - 1, 0, -1):
+            i = (vpn >> (BITS * level)) & 511
+            if i not in memory[table]:
+                memory[table][i] = next_free(); memory[memory[table][i]] = {}
+            table = memory[table][i]
+        memory[table][vpn & 511] = ppn
+    return root
+
+def walk(root, vpn, read):
+    table = root
+    for level in range(LEVELS - 1, -1, -1):
+        table = read(table, (vpn >> (BITS * level)) & 511)    # one memory read per level
+    return table
+
+# Guest: virtual page 0x12345 -> guest-physical page 0x00042. Its tables live in guest-physical pages 100, 101, ...
+guest_mem, gfree = {}, iter(range(100, 200))
+groot = build({0x12345: 0x42}, guest_mem, lambda: next(gfree))
+# Host: every guest-physical page g used above lives in host-physical page 5000 + g.
+host_mem, hfree = {}, iter(range(900, 1000))
+gpages = list(guest_mem) + [0x42]
+hroot = build({g: 5000 + g for g in gpages}, host_mem, lambda: next(hfree))
+
+count = {'reads': 0}
+def host_read(table, i):                                      # a read of a host page-table entry
+    count['reads'] += 1
+    return host_mem[table][i]
+def guest_read(gtable, i):                                    # a guest PTE lives at a guest-physical address:
+    htable = walk(hroot, gtable, host_read)                   # translate it through the host tables first
+    count['reads'] += 1
+    return guest_mem[gtable][i]
+
+gpa = walk(groot, 0x12345, guest_read)                        # stage 1, each step translated by stage 2
+hpa = walk(hroot, gpa, host_read)                             # stage 2 for the data's own address
+print('guest page 0x12345 -> guest-physical', hex(gpa), '-> host-physical', hpa, '| page-table reads:', count['reads'])
+for n, m in ((2, 2), (3, 3), (4, 4), (5, 5)):
+    print(f'{n}-level guest, {m}-level host: native {n} reads, nested {(n + 1) * (m + 1) - 1}')
+# guest page 0x12345 -> guest-physical 0x42 -> host-physical 5066 | page-table reads: 15
+# 2-level guest, 2-level host: native 2 reads, nested 8
+# 3-level guest, 3-level host: native 3 reads, nested 15
+# 4-level guest, 4-level host: native 4 reads, nested 24
+# 5-level guest, 5-level host: native 5 reads, nested 35
+```
+
+The namespace, cgroup and OverlayFS shell sessions in the containers section are Linux-only; they need root (or a privileged container) and a kernel with cgroup v2.
+
+<aside class="callout"><strong>Check yourself.</strong> (1) A hypervisor uses five-level tables in the host (Sv57x4) under a guest with three-level tables (Sv39). How many page-table reads can one TLB miss cost? (2) Why can a container not run a FreeBSD program on a Linux host, while a virtual machine can? (3) A cgroup has <code>cpu.max</code> set to <code>25000 50000</code>. What share of one CPU may it use, and how often is the quota renewed?<details><summary>Answers</summary>(1) $(3 + 1)(5 + 1) - 1 = 23$: three guest levels, each preceded by a five-level host walk, plus five reads for the data's own address, $3 \cdot 6 + 5 = 23$. (2) A container's programs make system calls to the host kernel, which is Linux and implements Linux's system calls; a virtual machine runs its own FreeBSD kernel on virtual hardware, which needs only the same instruction set. (3) 25 ms per 50 ms period: half a CPU, renewed every 50 ms.</details></aside>
+
+## Next
+
+Virtual machines and containers each come with their own network: a virtual network card, or a network namespace with its own interfaces and ports, joined to the outside by a virtual switch or bridge in the host. Everything a program does with another machine, whether in the same rack or across the world, goes through such an interface. The [next note](/notes/acos/networking) follows the bytes: how they are split into packets, addressed, routed and delivered reliably through the protocol layers.
+
+## References
+
+- A. Tatarnikov. *Computer Architecture and Operating Systems* (HSE), [lecture 11: virtual machines](https://andrewt0301.github.io/hse-acos-course/part2os/11_VM/lecture.html).
+- G. J. Popek, R. P. Goldberg. [Formal requirements for virtualizable third generation architectures](https://doi.org/10.1145/361011.361073). *Communications of the ACM*, 17(7), 412–421, 1974. Theorem 1.
+- J. S. Robin, C. E. Irvine. [Analysis of the Intel Pentium's ability to support a secure virtual machine monitor](https://www.usenix.org/legacy/events/sec2000/full_papers/robin/robin_html/index.html). *9th USENIX Security Symposium*, 2000. §3 (seventeen sensitive, unprivileged instructions; `POPF`).
+- K. Adams, O. Agesen. [A comparison of software and hardware techniques for x86 virtualization](https://doi.org/10.1145/1168857.1168860). *ASPLOS*, 2006.
+- P. Barham, B. Dragovic, K. Fraser, S. Hand, T. Harris, A. Ho, R. Neugebauer, I. Pratt, A. Warfield. [Xen and the art of virtualization](https://doi.org/10.1145/945445.945462). *SOSP*, 2003.
+- R. Uhlig et al. [Intel virtualization technology](https://doi.org/10.1109/MC.2005.163). *IEEE Computer*, 38(5), 48–56, 2005.
+- R. Bhargava, B. Serebrin, F. Spadini, S. Manne. [Accelerating two-dimensional page walks for virtualized systems](https://doi.org/10.1145/1346281.1346286). *ASPLOS*, 2008. (a walk with four-level guest and four-level nested tables makes six times the references of a native four-level walk).
+- A. Kivity, Y. Kamay, D. Laor, U. Lublin, A. Liguori. [kvm: the Linux virtual machine monitor](https://www.kernel.org/doc/ols/2007/ols2007v1-pages-225-230.pdf). *Ottawa Linux Symposium*, 2007.
+- F. Bellard. [QEMU, a fast and portable dynamic translator](https://www.usenix.org/legacy/event/usenix05/tech/freenix/bellard.html). *USENIX Annual Technical Conference, FREENIX Track*, 41–46, 2005.
+- RISC-V International. [*The RISC-V Instruction Set Manual, Volume II: Privileged Architecture*](https://github.com/riscv/riscv-isa-manual/releases). Chapter "H extension for hypervisor support, version 1.0" (virtualization modes, two-stage address translation, Sv39x4).
+- R. H. Arpaci-Dusseau, A. C. Arpaci-Dusseau. *Operating Systems: Three Easy Pieces*. [Appendix B: virtual machine monitors](https://pages.cs.wisc.edu/~remzi/OSTEP/vmm-intro.pdf).
+- A. S. Tanenbaum, H. Bos. *Modern Operating Systems*, 4th ed. Pearson, 2015. Chapter 7 (virtualization and the cloud).
+- J. L. Hennessy, D. A. Patterson. *Computer Architecture: A Quantitative Approach*, 6th ed. Morgan Kaufmann, 2019. §2.4 (virtual memory and virtual machines).
+- Linux documentation: [namespaces(7)](https://man7.org/linux/man-pages/man7/namespaces.7.html), [unshare(1)](https://man7.org/linux/man-pages/man1/unshare.1.html), [Control Group v2](https://www.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html) (`cpu.max`, `memory.max`, `pids.max`), [Overlay filesystem](https://docs.kernel.org/filesystems/overlayfs.html), [the KVM API](https://docs.kernel.org/virt/kvm/api.html).
+- Docker documentation: [understanding image layers](https://docs.docker.com/get-started/docker-concepts/building-images/understanding-image-layers/); [running containers: runtime privilege and Linux capabilities](https://docs.docker.com/engine/containers/run/) (the default list of kept capabilities).
+- [QEMU: the Tiny Code Generator](https://www.qemu.org/docs/master/devel/tcg.html).
+- OASIS. [Virtual I/O Device (VIRTIO) version 1.2](https://docs.oasis-open.org/virtio/virtio/v1.2/virtio-v1.2.html).

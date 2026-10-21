@@ -1,0 +1,426 @@
+---
+title: Linking and loading
+description: "How separately compiled files become a running process: ELF object files, symbols and their resolution, relocation worked through on RISC-V, static and shared libraries, the PLT and GOT with lazy binding, the loader and ASLR, library interposition, and CMake."
+course: acos
+section: The Operating System
+order: 20
+status: published
+tags: [linking, loading, elf, object-files, symbols, relocation, static-libraries, shared-libraries, plt, got, aslr, ld-preload, cmake]
+prerequisites: [C for systems programming, System calls, Virtual memory, RISC-V instructions and their encoding]
+---
+
+import LinkerFlow from '../../../components/figures/linking-and-loading/LinkerFlow.astro';
+import PltGot from '../../../components/figures/linking-and-loading/PltGot.astro';
+import LoadSegments from '../../../components/figures/linking-and-loading/LoadSegments.astro';
+
+The [previous note](/notes/acos/system-calls) followed a call to `write` into the kernel. One question was left open: how the call in our program reaches the code of `write`, which lives in the C library, a file the compiler never saw. The [C note](/notes/acos/c-for-systems-programming) showed the last stage of the compiler driver only from outside: the assembler leaves an object file in which some addresses are still zero, and the linker produces an executable in which they are filled in. This note opens that stage. It shows what an object file contains, how the linker matches names to definitions and patches the addresses into the instructions, how shared libraries are found and bound while the program runs, how the kernel and the dynamic linker load the result into a process, and what that machinery makes possible: randomized addresses and replacing a library function without recompiling.
+
+**Notation.** In a relocation, $S$ is the address of the symbol the relocation refers to, $A$ the addend stored with it (0 in all our examples), and $P$ the address of the place being patched. *hi* and *lo* are the upper 20 bits and the lower 12 bits of a 32-bit value, as the [encoding note](/notes/acos/risc-v-instructions) split them for `lui` and `addi`. Hexadecimal numbers are written `0x…`; in tool output they appear without the prefix.
+
+All examples are built for 64-bit RISC-V Linux with LLVM (`clang`, `ld.lld`, `llvm-objdump`, `llvm-readelf`): the tools run on any machine, even where the result cannot. macOS uses a different object format, Mach-O, which the section on macOS compares; the explanation is in terms of ELF, the format of Linux and most other Unix systems.
+
+## Baseline: one source file
+
+The simplest build needs no linker beyond the trivial: put the whole program, and every library function it calls, into one source file and compile it. It breaks in three ways.
+
+- **Every change recompiles everything.** A one-line fix in one function costs a rebuild of the whole program; large projects have millions of lines.
+- **Libraries are compiled again and again.** The C library would have to be source code inside every program.
+- **Every process carries its own copy.** The C library of a Debian 13 system for arm64, `libc.so.6` (glibc 2.41), is 1,716,616 bytes. Two hundred processes, each with a private copy of its code, would hold 343 MB of identical bytes; one copy shared by all of them holds 1.7 MB.
+
+Separate compilation fixes the first two and shared libraries the third. Both need a program that joins pieces compiled separately: the **linker**. Shared libraries also need one that does part of the joining at run time: the **dynamic linker**.
+
+## Object files and ELF sections
+
+The example program has three source files. `counter.c` defines a global counter and a function that bumps it:
+
+```c
+int counter = 5;                 /* initialized global: .data */
+static int calls;                /* zero-initialized, file-local: .bss */
+
+int bump(int by) {
+    calls++;
+    counter += by;
+    return counter;
+}
+```
+
+`main.c` uses them, knowing only their declarations:
+
+```c
+extern int counter;              /* defined in counter.c */
+int bump(int by);                /* defined in counter.c */
+
+int main(void) {
+    bump(2);
+    return bump(3) + counter;    /* 10 + 10 = 20 */
+}
+```
+
+and `start.s` is the entry point, playing the role of the C library's start-up file `crt1.o`: it calls `main` and passes its result to the `exit` system call.
+
+```asm
+    .globl _start
+_start:                          # what crt1.o does, minus the C library
+    call main                    # a0 = main()
+    li   a7, 93                  # 93 = exit on Linux for RISC-V
+    ecall                        # exit(a0)
+```
+
+`clang -c` turns each file into a **relocatable object file** in the **ELF** format (Executable and Linkable Format, [System V ABI](#references)). An ELF file starts with a header that begins with the four bytes `7f 45 4c 46` (`\x7f` and `ELF`) and records the machine (RISC-V), the word size (64 bits), the byte order (little-endian) and the file type. The same format, with different types, holds three other kinds of files: an **executable** (type `EXEC`, or `DYN` for a position-independent one), a **shared object** (`DYN`, a `.so` library) and a core dump. A relocatable file is divided into **sections**:
+
+| Section | Holds | In `counter.o` |
+| --- | --- | --- |
+| `.text` | machine code | `bump`, 36 bytes |
+| `.rodata` | constants, string literals | (none) |
+| `.data` | initialized globals | `counter`, 4 bytes |
+| `.bss` | zero-initialized globals; type `NOBITS`, takes no space in the file | `calls`, 4 bytes |
+| `.symtab`, `.strtab` | the symbol table and the names it uses | `bump`, `counter`, `calls` |
+| `.rela.text` | relocation entries for `.text` | 6 entries |
+| `.debug_*` | debugging information, with `-g` | (none) |
+
+Every address inside a relocatable file starts at 0 in its own section: the assembler cannot know where the section will end up.
+
+## Symbols and the symbol table
+
+A **symbol** is a name with a value: a function or a variable that a file defines or uses. `llvm-nm` prints the symbol tables of the two object files:
+
+```text
+main.o:                                 counter.o:
+                 U bump                 0000000000000000 T bump
+                 U counter              0000000000000000 b calls
+0000000000000000 T main                 0000000000000000 D counter
+```
+
+The letter is the kind: `T` defined in `.text`, `D` in `.data`, `b` in `.bss`, `U` undefined: used here, defined elsewhere. Uppercase letters are **global** symbols, visible to other files; lowercase are **local**: `calls` is `static`, so it never takes part in linking and another file can have its own `calls`.
+
+**Symbol resolution** matches each undefined symbol with exactly one global definition among all the input files and libraries. Two errors are possible, and `ld.lld` reports them as follows:
+
+```text
+ld.lld: error: undefined symbol: bump        # main.o linked without counter.o
+>>> referenced by main.c
+ld.lld: error: duplicate symbol: counter     # a second file also defines int counter = 7;
+>>> defined at counter.c
+>>> defined at other.c
+```
+
+A function or a variable defined in a header that two `.c` files include produces the second error; that is why headers hold declarations only. GCC and Clang also have **weak** symbols, marked with `__attribute__((weak))`: a weak definition is used only if no ordinary (strong) one exists, which lets a library provide a default that a program may replace ([Bryant and O'Hallaron, 2016](#references), §7.6.1).
+
+## Relocation: patching the addresses
+
+After resolution, the linker knows which definition every name refers to, but not yet where anything will be. It proceeds in two more steps.
+
+<LinkerFlow />
+
+1. **Resolution**, as above: `bump` and `counter`, undefined in `main.o`, are defined in `counter.o`.
+2. **Layout.** The linker concatenates the sections of the same name from all inputs (all `.text` together, all `.data` together) and assigns each output section an address. `ld.lld` puts `.text` at `0x11190`: `_start` from `start.o` at `0x11190`, `main` at `0x111a0`, `bump` at `0x111d8`. `.data` starts at `0x121fc`, so `counter` is at `0x121fc`, and `.bss` follows, with `calls` at `0x12200`. Every symbol now has its final address $S$.
+3. **Relocation.** For every entry of every `.rela` section, the linker computes a value from $S$, $A$ and $P$ and writes it into the instruction at $P$, in the bit positions the entry's type prescribes ([RISC-V ELF psABI](#references)).
+
+In `main.o`, the assembler left three kinds of entries:
+
+```text
+   c: 97 00 00 00   auipc  ra, 0            R_RISCV_CALL_PLT  bump
+  10: e7 80 00 00   jalr   ra
+  20: b7 05 00 00   lui    a1, 0            R_RISCV_HI20      counter
+  24: 83 a5 05 00   lw     a1, 0(a1)        R_RISCV_LO12_I    counter
+```
+
+A **call** is a pair `auipc ra, hi` and `jalr ra, lo(ra)`: the target is $P + (\mathit{hi} \ll 12) + \mathit{lo}$, so the value to encode is the distance $S - P$. A **global variable** in the non-position-independent code of this example is reached by `lui a1, hi` and `lw a1, lo(a1)`, whose address is $(\mathit{hi} \ll 12) + \mathit{lo}$, so the value is $S$ itself. In both cases *lo* is a signed 12-bit field, sign-extended by the processor, so the split must round:
+
+$$
+\mathit{hi} = \Big\lfloor \frac{v + \texttt{0x800}}{2^{12}} \Big\rfloor, \qquad \mathit{lo} = v - \mathit{hi} \cdot 2^{12} \in [-2048, 2047] .
+$$
+
+Adding `0x800` before dropping the low 12 bits moves *hi* up by one exactly when the low 12 bits are `0x800` or more, that is, when *lo* will be negative.
+
+**Worked example.** The first call to `bump` sits at $P = \texttt{0x111ac}$ (`main` at `0x111a0` plus offset `0xc`), and $S = \texttt{0x111d8}$:
+
+- $v = S - P = \texttt{0x2c} = 44$; $\mathit{hi} = \lfloor (44 + 2048)/4096 \rfloor = 0$, $\mathit{lo} = 44$. The pair becomes `auipc ra, 0` and `jalr 44(ra)`, exactly what `llvm-objdump` shows in `prog`. The second call, at `0x111b8`, gets `jalr 32(ra)`.
+- `counter` is at $S = \texttt{0x121fc}$. Its low 12 bits, `0x1fc` = 508, are below `0x800`, so $\mathit{hi} = \texttt{0x12} = 18$ and $\mathit{lo} = 508$: `lui a1, 18` and `lw a1, 508(a1)`, and $18 \cdot 4096 + 508 = 74{,}236 = \texttt{0x121fc}$. In `bump`, `calls` at `0x12200` becomes `lw a2, 512(a1)` after the same `lui a1, 18`.
+- Had `counter` been at `0x12a44`, whose low bits `0xa44` exceed `0x7ff`, the split would be $\mathit{hi} = 19$, $\mathit{lo} = \texttt{0xa44} - 4096 = -1468$, and $19 \cdot 4096 - 1468 = \texttt{0x12a44}$ again.
+
+The result, `prog`, is a complete executable of 1,528 bytes with no undefined symbols. Its entry point is `0x11190`, the address of `_start`.
+
+<aside class="callout"><strong>Key idea.</strong> Compilation leaves holes; linking fills them. The compiler and the assembler translate each file without knowing where anything will be, and record every place that needs an address as a relocation entry: where it is, which symbol it needs and how to encode it. The linker matches each name with one definition, decides the address of everything, and computes each hole's contents from three numbers: the symbol's address, the addend and the place's own address. Shared libraries postpone part of this work until the program runs.</aside>
+
+## Static libraries
+
+A **static library** is an archive of object files, made with `ar`: `llvm-ar rcs libcounter.a counter.o`. Linking with `-lcounter` (with `-L.` to search the current directory) does not copy the whole archive into the program; the linker takes only the members that define a symbol still undefined at that point, plus whatever those members need in turn. A program that calls one function of a large static library gets that function's object file, not the library.
+
+GNU `ld` scans the inputs once, from left to right, and pulls archive members only for symbols undefined *so far*: `ld main.o -lcounter` works, while `ld -lcounter main.o` fails with an undefined reference, because when the archive was scanned nothing needed `bump` yet ([Bryant and O'Hallaron, 2016](#references), §7.6.3). `ld.lld` remembers the archives and accepts either order. Static linking produces a self-contained executable that runs on any system with the same kernel interface, at the price of a copy of every library function in every program, and of relinking every program to fix a bug in a library.
+
+## Dynamic linking: shared libraries, the PLT and the GOT
+
+A **shared library** (`.so` on Linux, `.dylib` on macOS, `.dll` on Windows) is linked into the program when it is *loaded*, not when it is built. The file `libc.so.6` is mapped into every process that uses it, and its code pages, which never change, are the same physical pages in all of them: one copy in memory, as the baseline asked. Fixing a bug in the library fixes every program at its next start.
+
+Sharing has a condition. A library is loaded at a different address in each process (and, with ASLR, on each run), and if its code contained absolute addresses, the dynamic linker would have to patch them in each process, making private copies of the pages. Shared code is therefore compiled as **position-independent code** (PIC, `-fPIC`): it never contains its own absolute addresses. It reaches its own code and data by PC-relative addressing (`auipc` plus an offset, which stays the same wherever the library is loaded), and it reaches anything outside itself through two tables kept in the process's writable data:
+
+- the **GOT** (global offset table) holds the addresses of external variables. Code reads the address from the GOT, then the variable. The dynamic linker fills the GOT at load time; the code itself is never modified.
+- the **PLT** (procedure linkage table) holds a small *stub* for each external function. A call goes to the stub, and the stub jumps through a slot in the GOT's part for functions, `.got.plt`.
+
+The executable `prog-dyn` is built from the same `main.c`, compiled with `-fPIE` and linked against `libcounter.so` instead of `counter.o`. `llvm-readelf` shows what is left for run time: the dynamic section names the library (`NEEDED libcounter.so`), and two relocations remain, `R_RISCV_64 counter` for a GOT entry at `0x2528` and `R_RISCV_JUMP_SLOT bump` for the PLT slot at `0x3540`. The access to `counter` in `main` has become `auipc a1, 1; ld a1, 356(a1)`, which loads the address of `counter` from `0x2528`, followed by `lw a1, 0(a1)`, which loads the value.
+
+<PltGot />
+
+The calls to `bump` go to the stub `bump@plt` at `0x1400`, whose three instructions are `auipc t3, 2`, `ld t3, 320(t3)` (that is, load the slot at `0x3400 + 320 = 0x3540`) and `jalr t1, t3`. The slot does not hold the address of `bump` at first. It holds `0x13e0`, the address of the PLT's common header, PLT0. This is **lazy binding**:
+
+1. `main` calls `bump@plt`.
+2. The stub loads the slot and jumps to its contents.
+3. On the first call that is PLT0, which computes the slot's number from the stub's address and jumps to the dynamic linker's resolver, whose address the dynamic linker stored in `.got.plt[0]` when it loaded the program.
+4. The resolver looks up the name `bump` in the symbol tables of the loaded libraries and writes the address it finds into the slot.
+5. It jumps to `bump`, which returns directly to `main`.
+6. Every later call loads the new value of the slot and jumps to `bump` at once: one load and one indirect jump more than a direct call.
+
+Lazy binding spends the lookup only on functions that are actually called; a program that links against a library with thousands of functions and calls ten of them resolves ten. The cost is a writable table of code addresses, which an attacker who can write memory can redirect. Hardened builds therefore link with `-z now` (and full RELRO, which makes the GOT read-only after loading): every symbol is resolved at load time, and the environment variable `LD_BIND_NOW=1` does the same for any program.
+
+**Worked example: watching the binding happen.** The dynamic linker of glibc reports its work when the environment variable `LD_DEBUG` is set. A program that calls `puts` twice, linked for lazy binding and run in a Debian 13 container (glibc 2.41, arm64), shows the binding of `puts` after control has passed to the program, once, right before the first call prints; with `LD_BIND_NOW=1` the same binding appears before the program starts. Linux only, not run on macOS; the excerpt keeps the relevant lines and drops the process-ID column:
+
+```text
+$ LD_DEBUG=bindings ./hello
+...
+    transferring control: ./hello
+    binding file ./hello [0] to /lib/aarch64-linux-gnu/libc.so.6 [0]: normal symbol `puts' [GLIBC_2.17]
+first call
+second call
+$ LD_BIND_NOW=1 LD_DEBUG=bindings ./hello
+...
+    binding file ./hello [0] to /lib/aarch64-linux-gnu/libc.so.6 [0]: normal symbol `puts' [GLIBC_2.17]
+...
+    transferring control: ./hello
+first call
+second call
+```
+
+## The loader and the process image
+
+`execve("./prog", argv, envp)` asks the kernel to replace the program running in the calling process ([Processes and threads](/notes/acos/processes-and-threads)). The kernel does not read the sections; it reads the **program headers**, a second table in the ELF file that groups the sections into **segments** to be mapped into memory. For `prog`:
+
+```text
+Entry point 0x11190
+  Type   Offset   VirtAddr  FileSiz  MemSiz   Flg
+  LOAD   0x000000 0x010000  0x000190 0x000190 R        headers
+  LOAD   0x000190 0x011190  0x00006c 0x00006c R E      .text
+  LOAD   0x0001fc 0x0121fc  0x000004 0x000008 RW       .data and .bss
+```
+
+<LoadSegments />
+
+1. The kernel checks the ELF header and reads the program headers.
+2. It maps each `LOAD` segment at its address, with the permissions of its flags, using the same mechanism as `mmap` of a file: the pages are not read now but on first access, through [page faults](/notes/acos/virtual-memory). Each segment's offset in the file and its address agree modulo the page size (`0x1fc` and `0x121fc` both end in `1fc`), which is what makes mapping the file's pages directly possible.
+3. Where `MemSiz` exceeds `FileSiz`, the rest is zero-filled: the 4 bytes of the data segment beyond the file are `.bss`, where `calls` lives.
+4. It builds the initial stack: the argument count, the argument and environment strings and pointers to them, and the *auxiliary vector*, a list of facts for the program and its dynamic linker (the page size, the address of the program headers, the entry point).
+5. It sets the program counter to the entry point, `0x11190`, and returns to U-mode. `_start` runs.
+
+For a dynamically linked program there is one more step. The program headers contain an `INTERP` entry naming the dynamic linker, here `/lib/ld-linux-riscv64-lp64.so.1` (on x86-64, `/lib64/ld-linux-x86-64.so.2`). The kernel maps that file too and starts *it* instead of the program. The dynamic linker reads the program's `NEEDED` entries, finds and maps each library (and their own `NEEDED` libraries), applies the relocations that cannot wait (GOT entries such as `counter`, and every slot if binding is immediate), fills `.got.plt[0]` and `[1]`, runs the libraries' initialization functions and jumps to the program's entry point. In a C program that entry is `_start` from `crt1.o`, which calls `__libc_start_main`, which calls `main` and passes its return value to `exit`. The many `openat`, `mmap` and `mprotect` calls that `strace` shows before `main` in the [system-calls note](/notes/acos/system-calls#watching-system-calls-strace) are this loading.
+
+`/proc/self/maps` shows the resulting process image on Linux: one line per mapped region, with its addresses, permissions and file. The [C note](/notes/acos/c-for-systems-programming#the-memory-layout-of-a-program) drew where the regions lie.
+
+## Address space layout randomization
+
+If the code of a program and its libraries is always at the same addresses, an attacker who can overwrite a return address knows exactly where to jump: into `system` in the C library, for example. **Address space layout randomization** (ASLR) moves the regions to random addresses on every run, so such an attack must first find out where they are. Linux controls it with `/proc/sys/kernel/randomize_va_space`: 0 turns it off; 1 randomizes the stack, the area where `mmap` places libraries, and the vDSO; 2, the usual default, also randomizes the start of the heap ([Linux kernel documentation](#references)). The executable itself moves only if it is position-independent, which is why distributions now build programs as PIE by default; the Linux addresses quoted in the [C note](/notes/acos/c-for-systems-programming#the-memory-layout-of-a-program) are those of a run with randomization off.
+
+**Worked example.** The program `aslr.c` in the Code section prints the address of `main`, of a global, of a heap block and of a local, and runs twice on an Apple M1 (macOS always randomizes):
+
+- run 1: `main` at `0x102ca44f8`, global at `0x102cac000`, stack at `0x16d15a668`;
+- run 2: `main` at `0x10434c4f8`, global at `0x104354000`, stack at `0x16bab2668`.
+
+Each base moved, but within one run the distance from `main` to the global is `0x7b08` both times: the linker fixed it, and the whole image moved as one block. The low 14 bits of each address are also the same, `0x04f8` for `main`: the M1's pages are 16 KiB, and randomization works in whole pages. Both observations are why ASLR has limits: a single leaked address of a function reveals the position of the whole image it belongs to.
+
+## Library interposition
+
+Because symbols are resolved by name, a program can be made to call a different function of the same name without being recompiled. This is **library interposition**, and it is possible at three times ([Bryant and O'Hallaron, 2016](#references), §7.13):
+
+- **at compile time**, with a macro: `#define malloc(n) mymalloc(n)` in a header included before the calls;
+- **at link time**, with the linker option `--wrap=malloc`, which sends undefined references to `malloc` to `__wrap_malloc` and lets `__real_malloc` reach the original;
+- **at load time**, with the environment variable `LD_PRELOAD`, which makes the dynamic linker load a given library before all others ([ld.so(8)](#references)). Its definitions come first in the search order, so they win.
+
+The load-time form needs no access to the program's source or build. A wrapper that finds the original with `dlsym(RTLD_NEXT, ...)`, "the next definition of this name after mine", and prints a line before each call to `puts`:
+
+```c
+// trace.c: Linux only; not run on macOS.
+// gcc -O1 -shared -fPIC trace.c -o libtrace.so    then    LD_PRELOAD=./libtrace.so ./hello
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <stdio.h>
+
+int puts(const char *s) {                    /* same name as the C library's puts */
+    static int (*real_puts)(const char *);
+    if (!real_puts)
+        real_puts = (int (*)(const char *))dlsym(RTLD_NEXT, "puts");
+    real_puts("[trace] puts is called");
+    return real_puts(s);
+}
+// Output of LD_PRELOAD=./libtrace.so ./hello in a Debian 13 container (glibc 2.41, arm64; the programs built with LLVM):
+// [trace] puts is called
+// first call
+// [trace] puts is called
+// second call
+```
+
+Interposition is how memory debuggers, profilers and tracers attach to unmodified programs. For security, the dynamic linker ignores `LD_PRELOAD` entries containing a slash in set-user-ID programs, which run with another user's rights ([Users, groups and permissions](/notes/acos/users-and-permissions)). macOS has the same mechanism under the name `DYLD_INSERT_LIBRARIES`, restricted for system programs by System Integrity Protection.
+
+## Building with CMake, briefly
+
+Commands such as those above are typed once. A real project has hundreds of files, several libraries and several platforms, and is built with a build system. `make` reads a `Makefile` of rules (a target, the files it depends on, and the command that makes it) and reruns a command only when a dependency is newer than its target. **CMake** sits one level higher: it reads a platform-independent description, `CMakeLists.txt`, and generates the `Makefile` (or a Ninja or IDE project) for the current platform and compiler.
+
+```cmake
+cmake_minimum_required(VERSION 3.16)
+project(counter_demo LANGUAGES C)
+
+set(CMAKE_C_STANDARD 17)
+add_compile_options(-Wall -Wextra)
+
+add_library(counter STATIC counter.c)     # SHARED would build libcounter.so (.dylib on macOS)
+add_executable(prog main.c)
+target_link_libraries(prog PRIVATE counter)
+```
+
+`add_library` and `add_executable` declare targets; `target_link_libraries` says that `prog` links against `counter`, and CMake works out the order of the build and the linker flags. The build happens in a separate directory, so the source tree stays clean: `cmake -S . -B build` configures, `cmake --build build` builds.
+
+## A note on macOS: Mach-O
+
+macOS does not use ELF. Its format is **Mach-O**: a 64-bit Mach-O file begins with the bytes `cf fa ed fe` (the number `0xfeedfacf` stored little-endian), and instead of ELF sections and segments it has *segments* such as `__TEXT` and `__DATA` that contain *sections* such as `__text`, `__cstring` and `__data`. The pieces of this note all have counterparts. `__stubs` plays the role of the PLT and `__got` that of the GOT; the dynamic linker is `dyld`; libraries are `.dylib` files, recorded with their install path, and symbols are looked up in a specific library rather than in all of them (*two-level namespaces*); newer binaries replace lazy binding by *chained fixups* that dyld applies at load time. The tools differ in name (`otool -l` for `readelf -l`, `otool -L` for `ldd`, `nm` and `size` exist on both), but the questions they answer are the ones of this note: which sections, which symbols, which libraries, which addresses.
+
+## What changed
+
+| | One source file | Separate compilation with static linking | Shared libraries |
+| --- | --- | --- | --- |
+| Rebuild after a change | everything | the changed file, then relink | the changed file; libraries not at all |
+| Library code in the program | compiled in | copied from the archive | mapped at load time, shared in memory |
+| Addresses fixed by | the compiler | the linker | the linker for the program, the dynamic linker for the libraries |
+| Calls into a library | direct | direct | through a PLT stub and a GOT slot |
+| Run time work | none | none | loading, relocation, lazy binding |
+| Replace a library function | edit the source | relink | `LD_PRELOAD`, or install a new library |
+
+## Limitations
+
+- **Linker errors are late and terse.** A missing definition or a mismatch between a declaration and a definition in different files shows up only when linking, and a type mismatch across files is often not detected at all.
+- **Shared libraries bring versioning problems.** A program built against one version of a library may fail with another: a function removed, a structure changed. Symbol versioning (the `[GLIBC_2.17]` in the trace) and the `.so.6` suffix exist to manage this.
+- **Indirection costs a little.** A call through the PLT is an extra load and indirect jump; position-independent code needs a GOT load for each external variable. Loading and relocation add to the start-up time of programs with many libraries.
+- **Lazy binding trades security for speed.** A writable table of code addresses is a target; full RELRO and `-z now` remove it at the cost of resolving everything at start.
+- **ASLR leaks.** One disclosed pointer reveals the base of the whole image it belongs to, and on 32-bit systems the number of possible positions is small enough to try them all.
+
+## What you should remember
+
+- An object file (ELF) holds sections (`.text`, `.data`, `.bss`, `.rodata`), a symbol table (defined `T`/`D`/`b`, undefined `U`) and relocation entries for every address it could not fill in.
+- The linker resolves each undefined symbol to exactly one definition, lays out the merged sections, and patches each relocation from $S$, $A$ and $P$. On RISC-V the value is split into *hi* = $\lfloor (v + \texttt{0x800}) / 4096 \rfloor$ and a signed *lo*: the call to `bump` at `0x111ac` gets `jalr 44(ra)`, `counter` at `0x121fc` gets `lui 18` and `lw 508`.
+- Static libraries are archives of object files; only the members needed are copied. Shared libraries are mapped at load time and shared between processes.
+- Shared code is position-independent: external variables through the GOT, external functions through PLT stubs whose GOT slots are filled lazily, on the first call, by the dynamic linker (or at load time with `-z now`).
+- `execve` maps the `LOAD` segments of the program headers, zero-fills `.bss`, builds the stack, and starts the dynamic linker named by `INTERP`, which loads the libraries and jumps to `_start`.
+- ASLR moves whole images by whole pages on every run; `LD_PRELOAD` puts a library first in the symbol search and so replaces functions without recompiling.
+
+## Code
+
+The relocation arithmetic of the worked example:
+
+```python
+# reloc.py: python3 reloc.py -- the arithmetic of the three RISC-V relocations in the worked example
+def hi_lo(value):
+    """Split a 32-bit value into hi (for lui/auipc, upper 20 bits) and lo (for addi/lw/jalr, signed 12 bits)."""
+    hi = (value + 0x800) >> 12          # round, because lo is sign-extended
+    lo = value - (hi << 12)             # always in [-2048, 2047]
+    return hi, lo
+
+symbols = {"_start": 0x11190, "main": 0x111A0, "bump": 0x111D8, "counter": 0x121FC, "calls": 0x12200}
+
+# R_RISCV_CALL_PLT at P: auipc ra, hi; jalr ra, lo(ra)  with value S - P
+for place in (0x111AC, 0x111B8):
+    print(f"call bump at {place:#x}: offset {symbols['bump'] - place}, hi/lo {hi_lo(symbols['bump'] - place)}")
+# R_RISCV_HI20 / R_RISCV_LO12_I: lui a1, hi; lw a1, lo(a1)  with value S
+for name in ("counter", "calls"):
+    print(f"{name} at {symbols[name]:#x}: hi/lo {hi_lo(symbols[name])}")
+# when the low 12 bits are 0x800 or more, hi grows by one and lo is negative
+print(f"0x12a44: hi/lo {hi_lo(0x12A44)}, check {(hi_lo(0x12A44)[0] << 12) + hi_lo(0x12A44)[1]:#x}")
+# call bump at 0x111ac: offset 44, hi/lo (0, 44)
+# call bump at 0x111b8: offset 32, hi/lo (0, 32)
+# counter at 0x121fc: hi/lo (18, 508)
+# calls at 0x12200: hi/lo (18, 512)
+# 0x12a44: hi/lo (19, -1468), check 0x12a44
+```
+
+Building the example statically and against a shared library, with `counter.c`, `main.c` and `start.s` as in the section on object files. It needs LLVM's own tools, because Apple's `clang` has no RISC-V backend (on macOS with Homebrew: `PATH="$(brew --prefix llvm)/bin:$PATH"`). The programs are only built here; running them needs RISC-V Linux.
+
+```bash
+CFLAGS="--target=riscv64-linux-gnu -march=rv64g -mabi=lp64 -mno-relax -O1"
+clang $CFLAGS -msmall-data-limit=0 -fno-asynchronous-unwind-tables -fno-pic -c main.c counter.c
+clang $CFLAGS -c start.s
+llvm-nm main.o counter.o                       # main.o: U bump, U counter, T main; counter.o: T bump, b calls, D counter
+llvm-objdump -dr main.o | grep -A1 -E "auipc|lui|lw"
+#        c: 97 00 00 00  auipc ra, 0           R_RISCV_CALL_PLT bump   (and the same at 0x18)
+#       20: b7 05 00 00  lui   a1, 0           R_RISCV_HI20     counter
+#       24: 83 a5 05 00  lw    a1, 0(a1)       R_RISCV_LO12_I   counter
+ld.lld -o prog start.o main.o counter.o
+llvm-objdump -d prog | grep -E "<|auipc|jalr|lui|lw"
+#   0000000000011190 <_start>:  ...  00000000000111a0 <main>:
+#   111ac: auipc ra, 0 / 111b0: jalr 44(ra) / 111b8: auipc ra, 0 / 111bc: jalr 32(ra)
+#   111c0: lui a1, 18 / 111c4: lw a1, 508(a1)
+#   00000000000111d8 <bump>:  111d8: lui a1, 18 / 111dc: lw a2, 512(a1) / 111e0: lui a3, 18 / 111e4: lw a4, 508(a3)
+llvm-readelf -l prog | grep -E "Entry|LOAD"
+#   Entry point 0x11190
+#   LOAD 0x000000 0x0000000000010000 0x0000000000010000 0x000190 0x000190 R   0x1000
+#   LOAD 0x000190 0x0000000000011190 0x0000000000011190 0x00006c 0x00006c R E 0x1000
+#   LOAD 0x0001fc 0x00000000000121fc 0x00000000000121fc 0x000004 0x000008 RW  0x1000
+
+# the same program against a shared library
+clang $CFLAGS -fPIC -c counter.c -o counter.pic.o
+clang $CFLAGS -fPIE -c main.c -o main.pie.o
+ld.lld -shared -o libcounter.so counter.pic.o
+ld.lld -pie --dynamic-linker /lib/ld-linux-riscv64-lp64.so.1 -o prog-dyn start.o main.pie.o libcounter.so
+llvm-readelf -r prog-dyn | grep R_RISCV
+#   0000000000002528  0000000200000002 R_RISCV_64         0000000000000000 counter + 0
+#   0000000000003540  0000000100000005 R_RISCV_JUMP_SLOT  0000000000000000 bump + 0
+llvm-objdump -d -j .plt prog-dyn | tail -4     # the stub bump@plt
+#   1400: auipc t3, 2 / 1404: ld t3, 320(t3) / 1408: jalr t1, t3 / 140c: nop
+llvm-objdump -s -j .got.plt prog-dyn | tail -2
+#   3530 00000000 00000000 00000000 00000000   .got.plt[0] and [1], filled by the dynamic linker
+#   3540 e0130000 00000000                     the slot of bump: 0x13e0, the PLT header
+```
+
+ASLR on macOS (the addresses change on every run; one pair of runs on an Apple M1, macOS 26.5):
+
+```c
+// aslr.c: clang -std=c17 -Wall -Wextra -O0 aslr.c -o aslr && ./aslr && ./aslr
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+int global = 1;
+
+int main(void) {
+    int local = 2;
+    void *heap = malloc(16);
+    printf("main %p  global %p  heap %p  stack %p\n", (void *)main, (void *)&global, heap, (void *)&local);
+    printf("global - main = %#lx (fixed by the linker)\n", (unsigned long)((uintptr_t)&global - (uintptr_t)main));
+    free(heap);
+    return 0;
+}
+// main 0x102ca44f8  global 0x102cac000  heap 0x1034b19b0  stack 0x16d15a668
+// global - main = 0x7b08 (fixed by the linker)
+// main 0x10434c4f8  global 0x104354000  heap 0x104bad9b0  stack 0x16bab2668
+// global - main = 0x7b08 (fixed by the linker)
+```
+
+The CMake project of the section on CMake, with `counter.c` and `main.c` from this note, built natively on macOS (CMake 3.25, Apple clang 21):
+
+```bash
+cmake -S . -B build          # ... -- Build files have been written to: .../build
+cmake --build build          # [ 50%] Linking C static library libcounter.a ... [100%] Linking C executable prog
+./build/prog; echo "exit status $?"
+# exit status 20
+```
+
+## Next
+
+Every object in this note had a size known when the program was linked: code, initialized data, zeroed data, and a stack that grows and shrinks with the calls. Most programs also need memory whose size and lifetime are known only while they run. The [next note](/notes/acos/memory-allocation) builds the allocator behind `malloc` and `free`, shows how it gets its memory from the kernel with `brk` and `mmap`, and ends with the bugs the C interface makes possible and with C strings.
+
+## References
+
+- A. Tatarnikov. *Computer Architecture and Operating Systems* (HSE), [lecture 4: linking and loading](https://andrewt0301.github.io/hse-acos-course/part2os/04_Linking/lecture.html).
+- R. E. Bryant, D. R. O'Hallaron. *Computer Systems: A Programmer's Perspective*, 3rd ed. Pearson, 2016. Chapter 7: §7.3–7.4 (object files, relocatable ELF), §7.5–7.6 (symbols, resolution, weak symbols, static libraries and their order), §7.7 (relocation), §7.9 (loading executables), §7.10–7.12 (shared libraries, position-independent code, PLT and GOT), §7.13 (library interpositioning).
+- D. A. Patterson, J. L. Hennessy. *Computer Organization and Design, RISC-V Edition*, 2nd ed. Morgan Kaufmann, 2020. §2.12 (translating and starting a program: assembler, linker, loader, dynamic linking).
+- J. R. Levine. *Linkers and Loaders*. Morgan Kaufmann, 2000.
+- M. Kerrisk. *The Linux Programming Interface*. No Starch Press, 2010. Chapters 41–42 (shared libraries, `dlopen` and `dlsym`).
+- [System V Application Binary Interface: the ELF format](https://refspecs.linuxfoundation.org/elf/gabi4+/contents.html) (header, sections, symbol table, relocation, program headers).
+- [RISC-V ELF psABI](https://github.com/riscv-non-isa/riscv-elf-psabi-doc) (relocation types `R_RISCV_CALL_PLT`, `R_RISCV_HI20`, `R_RISCV_LO12_I`, `R_RISCV_JUMP_SLOT`; the PLT).
+- U. Drepper. [How to write shared libraries](https://www.akkadia.org/drepper/dsohowto.pdf). 2011.
+- Linux man-pages: [ld.so(8)](https://man7.org/linux/man-pages/man8/ld.so.8.html) (`LD_PRELOAD`, `LD_BIND_NOW`, `LD_DEBUG`, secure-execution mode), [dlsym(3)](https://man7.org/linux/man-pages/man3/dlsym.3.html), [elf(5)](https://man7.org/linux/man-pages/man5/elf.5.html); [Linux kernel documentation, `randomize_va_space`](https://docs.kernel.org/admin-guide/sysctl/kernel.html#randomize-va-space).
+- [CMake documentation](https://cmake.org/cmake/help/latest/) (`add_library`, `add_executable`, `target_link_libraries`).

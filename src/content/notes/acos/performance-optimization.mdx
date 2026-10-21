@@ -1,0 +1,656 @@
+---
+title: Making programs fast
+description: "How to make a program faster without guessing: wall and CPU time, repeated runs and profilers, what an optimizing compiler does and what stops it, algorithmic against constant-factor gains, and a matrix product sped up 26 times by loop order and blocking."
+course: acos
+section: Parallelism and Performance
+order: 15
+status: published
+tags: [performance, profiling, compiler-optimization, aliasing, loop-interchange, cache-blocking, matrix-multiplication, amdahls-law]
+prerequisites: [Caches, "Vectors, SIMD and GPUs", Multicore processors and thread-level parallelism]
+---
+
+import LoopOrders from '../../../components/figures/performance-optimization/LoopOrders.astro';
+import MatmulResults from '../../../components/figures/performance-optimization/MatmulResults.astro';
+
+The [previous note](/notes/acos/data-level-parallelism) added the last of the three kinds of parallelism a processor offers: several numbers per instruction, next to several instructions per cycle and several cores, all fed by the cache hierarchy. None of it helps a program that is not written and compiled to use it. The [first note](/notes/acos/computer-systems) of the course already saw this: the same matrix product, the same instructions in three loop orders, took 1.5 s in one order and 6.4 s in another. This note turns that observation into a method. Measure first, and measure properly. Let the compiler do what it can, and know what stops it. Prefer a better algorithm when there is one. Then fix the memory access pattern. Matrix multiplication is the running example, and Amdahl's law says when to stop.
+
+**Notation.** $n$ is the order of the square matrices in $C = AB$, with entries $A_{ik}$; the product does $n^3$ multiply-adds, which we count as $2n^3$ floating-point operations, so a run of $t$ seconds achieves $2n^3/t$ FLOP/s (GFLOP/s when divided by $10^9$). $b$ is a block size. For Amdahl's law, $f$ is the fraction of the running time spent in the part we speed up, $s$ the speed-up of that part, and $S$ the speed-up of the whole program.
+
+**Setup of every measurement in this note.** One Apple M1 (8 GB, macOS 26.5), Apple clang 21.0.0, one thread, $n = 1024$ doubles (8 MiB per matrix), the minimum of five timings unless stated. The M1 reports 128-byte cache lines and a 128 KiB level-1 data cache per performance core (`sysctl hw.cachelinesize hw.perflevel0.l1dcachesize`). The machine was shared with other jobs, and repeated runs differ by 10–20 %, so only ratios that are well above that spread mean anything.
+
+## Baseline: compile, run, time once
+
+The obvious way to find out how fast a program is: compile it with the defaults, run it, and look at a clock. Both clang and GCC default to `-O0`, no optimization. The textbook loop order for $C = AB$,
+
+```c
+for (int i = 0; i < N; i++)
+    for (int j = 0; j < N; j++) {
+        double s = 0;
+        for (int k = 0; k < N; k++) s += A[i][k] * B[k][j];
+        C[i][j] = s;
+    }
+```
+
+compiled that way took 3.87 s in the best of five runs, 0.55 GFLOP/s. The baseline breaks in three places:
+
+- **One number hides the noise.** The five runs took between 3.87 s and 4.34 s, and an earlier session on the same machine gave 4.57 s for its fastest run. A single timing cannot tell a 10 % improvement from luck.
+- **It does not say where the time goes.** In a larger program the matrix product might be 90 % of the time or 5 %, and only a profile tells which.
+- **It measures the wrong program.** An unoptimized build keeps every variable in memory; no one ships it, and its bottlenecks are not those of the real build.
+
+<aside class="callout"><strong>Key idea.</strong> A program gets faster in three ways: it does less work (a better algorithm), each piece of work takes fewer instructions (the compiler), and each instruction waits less for memory (access order and blocking). Measure first to find which one limits the program, check every change with repeated runs, and stop when Amdahl's law says the rest of the program dominates.</aside>
+
+## How to measure a program
+
+### Wall time and CPU time
+
+Two clocks answer two different questions. **Wall time** (elapsed real time) is what a user waits for; read it with `clock_gettime(CLOCK_MONOTONIC, …)`, a clock that never jumps when the system time is adjusted. **CPU time** is the processor time the process consumed, summed over its threads; `clock()` and `getrusage()` report it, and the shell's `time` command prints both (`real` is wall time, `user` and `sys` the CPU time in the program and in the kernel on its behalf). One run of the Code section's program on the setup above:
+
+| What the program did | Wall time | CPU time |
+| --- | --- | --- |
+| 0.7 s of arithmetic | 0.72 s | 0.72 s |
+| sleep for 0.5 s | 0.51 s | 0.00 s |
+| the same arithmetic in two threads at once | 0.80 s | 1.52 s |
+
+Waiting (for a disk, the network, a lock or a timer) costs wall time and no CPU time. Parallel work costs more CPU time than wall time. A program whose wall time is much larger than its CPU time is waiting, and no amount of faster arithmetic will help it; the [input and output note](/notes/acos/input-and-output) is about that kind of time.
+
+### Repetitions and variance
+
+The same 0.7 s of arithmetic, timed five times in a row: 0.848, 0.729, 0.720, 0.716 and 0.717 s. The first run is slower: its pages were touched for the first time, and the core may still have been raising its clock. Other processes, interrupts, the operating system moving the thread between the M1's performance and efficiency cores, and the state of the caches add noise to every run. Three rules follow:
+
+- Run several times and report the minimum (what the code can do when nothing interferes) and the median (what a user typically sees). Discard or report separately the first, warm-up run.
+- Treat a difference smaller than the spread between runs as no difference.
+- Change one thing at a time, and keep the input, the machine and the compiler flags fixed and written down.
+
+### The cycle counter
+
+A clock in nanoseconds measures time; a counter of processor cycles measures work in the unit of the [performance equation](/notes/acos/computer-systems). RISC-V defines three read-only counters for this, `cycle`, `time` and `instret` (instructions retired), read with the pseudo-instructions `rdcycle`, `rdtime` and `rdinstret` ([RISC-V Unprivileged ISA](#references), the Zicntr extension). Dividing the cycles by the instructions between two points of a program gives its CPI directly:
+
+```asm
+# not run here; runs on a RISC-V machine whose operating system allows user access to the counters
+        rdcycle   t0            # cycles so far
+        rdinstret t1            # instructions retired so far
+        # ... the code being measured ...
+        rdcycle   t2
+        rdinstret t3
+        sub       t2, t2, t0    # cycles spent
+        sub       t3, t3, t1    # instructions executed; CPI = t2 / t3
+```
+
+Other architectures have their own counters. On x86 the `rdtsc` instruction reads a time-stamp counter, which on current processors ticks at a constant rate rather than with the actual clock. On ARM64 the register `cntvct_el0` is a fixed-frequency system counter: on the M1 it ticks at 24 MHz (the register `cntfrq_el0` says so), one tick per 42 ns, and timed the 0.7 s of arithmetic as 17,431,896 ticks, 0.726 s. True core-cycle counts live in the performance-monitoring unit, which the operating system controls and profilers read on the program's behalf.
+
+### Profilers
+
+A **profiler** says where the time goes. A **sampling** profiler interrupts the program many times per second and records the program counter and the call stack; functions that appear in many samples are where the time is spent. An **instrumenting** profiler inserts code at every function entry, which counts calls exactly but adds overhead. The usual tools, with the program built at the optimization level it ships with:
+
+```bash
+# Linux only; not run here
+perf stat -e cycles,instructions,cache-misses ./mm   # hardware counters for the whole run
+perf record -g ./mm && perf report                   # sampled call stacks, hottest functions first
+gcc -O2 -pg mm.c -o mm && ./mm && gprof mm gmon.out  # gprof: call counts plus sampled time per function
+# macOS: the Time Profiler of Instruments, from the command line
+xcrun xctrace record --template 'Time Profiler' --launch -- ./mm
+```
+
+A profile names the hot spot. Whether it is worth optimizing is a question for [Amdahl's law](#amdahls-law-for-an-optimization).
+
+## What an optimizing compiler does
+
+At `-O0` the compiler translates each statement on its own and keeps every variable in its stack slot, so that a debugger can show and change any variable at any line. At `-O1`, `-O2` and `-O3` it rewrites the program into a faster one that produces the same observable results: the same output, the same values in memory that the program can see. Take a small file:
+
+```c
+static int square(int x) { return x * x; }
+
+int answer(void) { return square(10) + 5; }
+
+void update(int *a, int n, int x, int y) {
+    for (int i = 0; i < n; i++)
+        a[i] = a[i] * 8 + x * y;
+}
+```
+
+`clang -S` writes the assembly instead of an executable. For ARM64 at `-O0`, `answer` calls `square` (`bl _square`), which stores its argument on the stack, loads it twice, multiplies and returns, and then adds 5. At `-O2` the whole function is two instructions:
+
+```asm
+_answer:                     ; clang -O2, arm64
+        mov     w0, #105     ; square(10) + 5, computed by the compiler
+        ret
+```
+
+The compiler **inlined** `square` (replaced the call by the body) and then **folded** the constant expression $10 \cdot 10 + 5$. The loop of `update` shows four more transformations. At `-O0` one iteration is 20 instructions, 12 of them loads and stores, 10 of those to the stack:
+
+```asm
+LBB2_1:                      ; clang -O0: the loop test
+        ldr     w8, [sp, #8]          ; i
+        ldr     w9, [sp, #20]         ; n
+        subs    w8, w8, w9
+        b.ge    LBB2_4                ; leave the loop when i >= n
+        b       LBB2_2
+LBB2_2:                      ; the body
+        ldr     x8, [sp, #24]         ; a
+        ldrsw   x9, [sp, #8]          ; i
+        ldr     w9, [x8, x9, lsl #2]  ; a[i]
+        ldr     w8, [sp, #16]         ; x
+        ldr     w10, [sp, #12]        ; y
+        mul     w8, w8, w10           ; x * y, recomputed every iteration
+        add     w8, w8, w9, lsl #3    ; + a[i] * 8, as a shift by 3
+        ldr     x9, [sp, #24]         ; a again
+        ldrsw   x10, [sp, #8]         ; i again
+        str     w8, [x9, x10, lsl #2] ; a[i] = ...
+        b       LBB2_3
+LBB2_3:                      ; i++
+        ldr     w8, [sp, #8]
+        add     w8, w8, #1
+        str     w8, [sp, #8]
+        b       LBB2_1
+```
+
+At `-O2` the main loop handles 16 elements in 14 instructions:
+
+```asm
+        mul     w8, w3, w2            ; x * y, once, before the loop
+        dup.4s  v0, w8                ; copied into the 4 lanes of a vector register
+        ...
+LBB1_6:                      ; clang -O2: 16 elements per iteration
+        ldp     q1, q2, [x11, #-32]   ; load 8 ints
+        ldp     q3, q4, [x11]         ; and 8 more
+        shl.4s  v1, v1, #3            ; * 8 as a shift, 4 lanes at a time
+        shl.4s  v2, v2, #3
+        shl.4s  v3, v3, #3
+        shl.4s  v4, v4, #3
+        add.4s  v1, v1, v0            ; + x * y
+        add.4s  v2, v2, v0
+        add.4s  v3, v3, v0
+        add.4s  v4, v4, v0
+        stp     q1, q2, [x11, #-32]   ; store 8 ints
+        stp     q3, q4, [x11], #64    ; store 8 more, then advance the pointer by 64 bytes
+        subs    x12, x12, #16         ; 16 fewer to go
+        b.ne    LBB1_6
+```
+
+followed by a 4-at-a-time loop and a one-at-a-time loop for the last $n \bmod 16$ elements. Reading the two listings side by side:
+
+| Transformation | What it does | In the listings |
+| --- | --- | --- |
+| Register allocation | keeps variables in registers, not stack slots | 10 stack accesses per element disappear |
+| Inlining | replaces a call by the body of the callee | `bl _square` disappears |
+| Constant folding | evaluates expressions whose operands are known | `mov w0, #105` |
+| Loop-invariant code motion | computes once, before the loop, what does not change inside it | `mul w8, w3, w2` moves out of the loop |
+| Strength reduction | replaces an operation by a cheaper one | `* 8` becomes a shift by 3; `a + 4i` becomes a pointer advanced by 64 bytes per iteration |
+| Vectorization | does several iterations with one SIMD instruction ([data-level parallelism](/notes/acos/data-level-parallelism)) | `shl.4s`, `add.4s` on 4 lanes |
+| Unrolling | puts several iterations in one loop body, saving loop tests and branches | 4 vector operations per kind per iteration |
+
+**Worked example.** 20 instructions per element at `-O0` against $14/16 = 0.875$ at `-O2` is 23 times fewer instructions for a long array, before counting the cheaper instructions and the absent stack traffic.
+
+What `-O3` adds depends on the compiler. For clang, `-O2` and `-O3` give identical code for this file: clang's loop and SLP vectorizers are on at both levels ([LLVM documentation](#references)). GCC vectorizes at `-O2` since version 12, with a cautious cost model, and `-O3` adds more aggressive loop transformations, among them loop interchange, unroll-and-jam, loop distribution and loop versioning, plus a more permissive vectorization cost model ([GCC manual](#references)). `-O3` is not always faster: larger code can miss in the instruction cache. Measure both.
+
+## What blocks optimization
+
+A compiler may apply a transformation only if it can prove that the program's results do not change. Three things often defeat the proof.
+
+### Aliasing
+
+Two pointers **alias** when they may point to the same memory. Compare
+
+```c
+void twice(int *a, const int *b)                     { *a += *b; *a += *b; }
+void twice_r(int *restrict a, const int *restrict b) { *a += *b; *a += *b; }
+```
+
+It is tempting to compile both as `*a += 2 * *b`. For `twice` that is wrong: if `a == b` and the value is 3, the function computes $3 + 3 = 6$ and then $6 + 6 = 12$, while $3 + 2 \cdot 3 = 9$. So clang at `-O2` reloads `*b` after the first store:
+
+```asm
+_twice:                      ; clang -O2
+        ldr     w8, [x1]              ; *b
+        ldr     w9, [x0]              ; *a
+        add     w8, w9, w8
+        str     w8, [x0]              ; *a = *a + *b
+        ldr     w9, [x1]              ; *b again: the store may have changed it
+        add     w8, w9, w8
+        str     w8, [x0]
+        ret
+_twice_r:
+        ldr     w8, [x1]
+        ldr     w9, [x0]
+        add     w8, w9, w8, lsl #1    ; *a + 2 * *b
+        str     w8, [x0]
+        ret
+```
+
+The C99 qualifier `restrict` is the programmer's promise that, inside the function, the object a pointer points to is accessed only through that pointer. With it, the compiler folds the two additions. If the promise is false, the behaviour is undefined. For loops over arrays, the vectorizer has a third option: it emits a run-time check that the arrays do not overlap and keeps a scalar copy of the loop for the case where they do ([LLVM documentation](#references)).
+
+### Function calls and side effects
+
+A call to a function the compiler cannot see, compiled in another file or from a library, might read or write any memory reachable from its arguments or from global variables. The compiler must assume it does. The classic consequence ([Bryant and O'Hallaron, 2016](#references), §5.4) is a loop test that calls a function:
+
+```c
+void lower1(char *s) {                     /* strlen in the loop test: called n + 1 times */
+    for (size_t i = 0; i < strlen(s); i++)
+        if (s[i] >= 'A' && s[i] <= 'Z') s[i] += 'a' - 'A';
+}
+void lower2(char *s) {                     /* strlen hoisted by hand: called once */
+    size_t n = strlen(s);
+    for (size_t i = 0; i < n; i++)
+        if (s[i] >= 'A' && s[i] <= 'Z') s[i] += 'a' - 'A';
+}
+```
+
+`strlen` walks the whole string, so `lower1` does about $n^2$ character reads for a string of length $n$: $n + 1$ calls of $n$ reads each. Moving the call out of the loop looks like loop-invariant code motion, but the loop writes into `s`, and the compiler would have to prove that no write ever stores a zero byte, which would change the length. It does not attempt that proof. Measured at `-O2` on strings of capital letters:
+
+| $n$ | `lower1` | `lower2` | ratio |
+| --- | --- | --- | --- |
+| 25,000 | 0.0130 s | 0.000011 s | 1,184 |
+| 50,000 | 0.0517 s | 0.000020 s | 2,584 |
+| 100,000 | 0.2053 s | 0.000040 s | 5,131 |
+| 200,000 | 0.8192 s | 0.000082 s | 9,990 |
+
+Doubling $n$ multiplies the time of `lower1` by 4 and that of `lower2` by 2. Compiling with `-O0` instead gives 0.856 s for `lower1` at $n = 200{,}000$: the optimizer barely helps the quadratic version. When the callee is visible (the same file, or link-time optimization with `-flto`), the compiler can inline it and analyse its effects; otherwise the programmer has to hoist the call.
+
+### Floating-point arithmetic
+
+Integer addition is associative, so a compiler may reorder a sum. Floating-point addition is not: $(a + b) + c$ and $a + (b + c)$ round differently, as the [floating-point note](/notes/acos/floating-point) shows. A loop such as `s += x[i]` must therefore add its terms in source order, one at a time, and cannot be split into several partial sums in vector lanes. The `i, j, k` loop of the matrix product is such a reduction, and clang at `-O2` compiles its inner loop to one scalar fused multiply-add (`fmadd d0, …`) per step. The flag `-ffast-math` allows reassociation and lets the loop be vectorized, at the price of results that may differ in the last bits. In two back-to-back runs, the `i, j, k` version took 1.06 s at `-O2 -ffast-math` against 1.46 s at plain `-O2`; it stays slow because the column walk of $B$, not the arithmetic, dominates.
+
+<aside class="callout"><strong>Check yourself.</strong> (1) Why may the compiler not replace `twice` by `*a += 2 * *b`? Give values. (2) A loop calls `f(&x)` in its body, where `f` is defined in another file, and also uses `y * z`, where `y` and `z` are local variables whose addresses are never taken. Which of `x` and `y * z` can the compiler keep in registers across the loop? (3) Why can clang vectorize `a[i] = a[i] * 8 + x * y` but not `s += a[i]` for doubles?<details><summary>Answers</summary>(1) With `a == b` and the value 3, `twice` gives 12 and `*a += 2 * *b` gives 9. (2) `y * z`: no one else can reach `y` and `z`, so the product is loop-invariant and can be hoisted. `x` must be stored before each call and reloaded after it, because `f` received its address and may read or change it. (3) The iterations of the first loop are independent; the second is a chain of floating-point additions whose order the compiler must keep, because reordering changes the rounding. Integer sums or `-ffast-math` remove the restriction.</details></aside>
+
+## Algorithmic versus constant-factor gains
+
+The table for `lower1` and `lower2` is the clearest case of the first rule of optimization: no constant factor competes with a better complexity. The compiler's `-O2` made `lower2` about 5 times faster, and the ratio between the two versions grows linearly with $n$, from about a thousand to ten thousand over the table. Always ask first whether the program does work it does not need: a quadratic loop over something that could be computed once, a linear search where a hash table would do, a sort repeated in a loop.
+
+Constant factors are what is left when the algorithm is right, and they are large. Matrix multiplication by the definition does $n^3$ multiply-adds; algorithms with a smaller exponent exist (Strassen's runs in $O(n^{\log_2 7}) = O(n^{2.81})$), but they are rarely used for dense matrices of moderate size because of their overhead and their weaker numerical stability. With the algorithm fixed at $n^3$, the rest of this note gains a factor of 26 by rewriting loops, and a vendor library gains another factor of 17 on top of that. Both are constant factors, and both come from the hardware: from the cache and from the vector units.
+
+## Matrix multiplication, step by step
+
+### Why the loop order matters
+
+All six orders of the three loops compute the same $C$ with the same $n^3$ multiply-adds, but each walks memory differently. C stores a matrix row by row, so $A_{ik}$ and $A_{i,k+1}$ are neighbours in memory while $A_{ik}$ and $A_{i+1,k}$ are $8n$ bytes apart. A cache line of 128 bytes holds 16 consecutive doubles of one row. Consider what the innermost loop touches in one pass (Figure below):
+
+1. **Order `i, j, k`** (inner loop over $k$): row $i$ of $A$, in order, a new line every 16 steps; column $j$ of $B$, a different line at every step, of which one double in 16 is used; one element of $C$. If the cache cannot keep the $n$ lines of a column until the next $j$ needs their neighbours, every step misses on $B$: about $1 + 1/16$ misses per multiply-add.
+2. **Order `i, k, j`** (inner loop over $j$): $A_{ik}$ is fixed and stays in a register; row $k$ of $B$ and row $i$ of $C$ are read in order. A new line of $B$ is needed every 16 steps, and the row of $C$, $8n$ bytes, is reused for every $k$ and can stay in the cache: about $1/16$ misses per multiply-add.
+3. **Blocked**: the `i, k, j` loops run over $b \times b$ blocks of the three matrices. While the blocks are in use they stay in the cache, and each loaded line is used $b$ times before it is evicted.
+
+<LoopOrders />
+
+**Worked example (simulated).** A fully associative cache of 8 KiB with 128-byte lines, 64 lines in all, and $n = 128$, so that one column of $B$ touches 128 lines and cannot stay. The Code section's simulator counts the misses per multiply-add: 1.070 for `i, j, k`, 0.0635 for `i, k, j` (the $1/16$ of row $k$ of $B$), and 0.0083 for blocks of $b = 16$. The blocked count has a short explanation: for one block of $A$, all $n/b$ blocks of $B$ and $C$ in its row pass through the cache while the block of $A$ stays, so each $b^3$ multiply-adds load two blocks of $b^2/16$ lines, $2/(16b) = 0.0078$ misses per multiply-add. With $b = 32$ three blocks need 24 KiB, more than the cache, and the count jumps back to 0.066.
+
+### Loop interchange
+
+Swapping the two inner loops gives `i, k, j`:
+
+```c
+for (int i = 0; i < N; i++)
+    for (int k = 0; k < N; k++) {
+        double a = A[i][k];
+        for (int j = 0; j < N; j++) C[i][j] += a * B[k][j];
+    }
+```
+
+It needs `C` set to zero first, since every `C[i][j]` is now updated $n$ times. On the setup above, at `-O0` the time fell from 3.87 s to 1.39 s. At `-O2` it fell from 1.39 s to 0.175 s, a factor of 7.9, because the new inner loop is also the kind the compiler can vectorize: the iterations over $j$ are independent, and clang turns them into vector fused multiply-adds on two doubles at a time (`fmla.2d`), while the `i, j, k` version stays a scalar reduction (see [floating-point arithmetic](#floating-point-arithmetic)).
+
+### Blocking
+
+The `i, k, j` order still streams all of $B$, $8n^2 = 8$ MiB, through the cache once for every row $i$. **Blocking** (also called tiling) splits each matrix into $b \times b$ blocks and multiplies block by block, so that a block of $B$ is reused for $b$ rows of $A$ while it is still in the cache:
+
+```c
+for (int ii = 0; ii < N; ii += BS)
+    for (int kk = 0; kk < N; kk += BS)
+        for (int jj = 0; jj < N; jj += BS)
+            for (int i = ii; i < ii + BS; i++)
+                for (int k = kk; k < kk + BS; k++) {
+                    double a = A[i][k];
+                    for (int j = jj; j < jj + BS; j++) C[i][j] += a * B[k][j];
+                }
+```
+
+The block size should let the blocks in use fit in the cache. Three blocks of doubles take $3 \cdot 8 b^2$ bytes: 96 KiB for $b = 64$, which fits in the M1's 128 KiB level-1 data cache, and 384 KiB for $b = 128$, which does not. Measured at `-O2`, in GFLOP/s: 12.75 for $b = 16$, 13.61 for $b = 32$, 14.57 for $b = 64$, then 9.50 for $b = 128$ and 10.09 for $b = 256$. The best block, $b = 64$, took 0.147 s against 0.175 s for the unblocked `i, k, j`, a gain of 1.19. The gain is modest at $n = 1024$, most likely because all of $B$, 8 MiB, fits in the M1's 12 MiB level-2 cache, so `i, k, j` already finds what it reuses there; blocking matters more for larger matrices and for machines with smaller caches, and the same idea, applied at the level of registers and of each cache, is what tuned libraries are built from.
+
+At `-O0` blocking does not pay: 1.55 s against 1.39 s for plain `i, k, j`. The extra loop control, all of it going through the stack, costs more than the misses saved. An optimization that removes memory stalls only shows once the instructions around it are cheap; the order in which optimizations are tried matters.
+
+<MatmulResults />
+
+### How far is the machine's limit?
+
+Apple's Accelerate library, called as `cblas_dgemm` on the same matrices, took 0.0084 s, 255.5 GFLOP/s, 17.5 times the best loop of this note and 461 times the baseline. Its CPU time was close to its wall time (0.054 s and 0.058 s for five calls), so it did not get there by using more cores. How it does get there is not documented by Apple. The lesson is general: for standard kernels, such as matrix products, FFTs and sorting, a tuned library usually beats hand-written loops by a wide margin, and calling it is the first optimization to try. Its first call took 0.0190 s, 1.8 to 2.3 times as long as the later ones, another reason to discard warm-up runs.
+
+## Amdahl's law for an optimization
+
+[Amdahl's law](/notes/acos/thread-level-parallelism#how-much-faster-amdahls-law) bounds the speed-up from more cores. The same argument bounds any optimization of part of a program ([Amdahl, 1967](#references)). If a fraction $f$ of the running time is made $s$ times faster and the rest is unchanged, the new time is $(1 - f) + f/s$ of the old one:
+
+$$
+\boxed{\;S = \frac{1}{(1 - f) + f/s}\;} \qquad\text{and}\qquad S < \frac{1}{1 - f}\ \text{for every } s .
+$$
+
+**Worked example.** Suppose a program spends 3.871 s in the baseline matrix product and 1 s on everything else (a hypothetical figure). Then $f = 3.871/4.871 = 0.795$. Replacing the product by the blocked `-O2` version makes that part $s = 3.871/0.147 = 26.3$ times faster, and the whole program
+
+$$
+S = \frac{1}{0.205 + 0.795/26.3} = 4.25
+$$
+
+times faster: from 4.871 s to 1.147 s. Even an infinitely fast product would give only $1/0.205 = 4.87$. After the change the product is $0.147/1.147 = 12.8\,\%$ of the time, and the next profile points at the other 87 %. In the other direction: if a profile shows a function at $f = 0.7$, making it 10 times faster gives $S = 2.70$, and an overall speed-up of 2 needs $s = 0.7/(0.5 - 0.3) = 3.5$.
+
+The law gives the rule for where to spend effort: optimize the part with the largest $f$, re-profile after each change, and stop when no remaining part is large enough to matter.
+
+## What changed
+
+| | Baseline | This note |
+| --- | --- | --- |
+| Measurement | one run of one clock | wall and CPU time, five runs, minimum and median, a profile |
+| Compilation | `-O0`: every variable on the stack | `-O2`: registers, inlining, hoisting, vectorization |
+| Loop order | `i, j, k`: a column of $B$, a new line per step | `i, k, j`: rows only; then blocks that fit in the cache |
+| Misses per multiply-add (simulated cache) | 1.07 | 0.0635, then 0.0083 with blocks |
+| Time for $n = 1024$ on the M1 | 3.87 s (0.55 GFLOP/s) | 0.147 s (14.6 GFLOP/s), 26 times faster |
+| When to stop | never asked | Amdahl's law with the profiled fraction |
+
+## Limitations
+
+- **One machine.** The numbers come from one M1 under load. Another processor, with 64-byte lines, a 32 KiB level-1 cache or a different vector width, has a different best block size and different ratios; another compiler vectorizes different loops. The method carries over, the numbers do not.
+- **Microbenchmarks flatter.** Repeating one kernel keeps its data and code in the caches and its branches predicted. Inside a real program, other code competes for the same caches, and the gain can be smaller.
+- **Promises to the compiler can be false.** `restrict` on aliasing pointers and `-ffast-math` on code that needs exact IEEE semantics (NaN tests, compensated summation) give wrong results without a warning.
+- **Hand blocking is brittle.** The best block size depends on the cache, and the loops shown here do not handle $n$ that is not a multiple of $b$. Libraries, autotuners and compilers with loop-nest optimizers do this systematically.
+- **This note stays on one core.** Threads would multiply the best result by up to the number of cores, which is the subject of the [thread-level parallelism note](/notes/acos/thread-level-parallelism), and explicit vector code is that of the [data-level parallelism note](/notes/acos/data-level-parallelism).
+
+## What you should remember
+
+- Measure wall time with a monotonic clock and CPU time with `clock` or `getrusage`; waiting shows as wall time without CPU time, threads as CPU time above wall time.
+- Repeat measurements, report the minimum and the median, discard warm-up runs, and ignore differences smaller than the run-to-run spread.
+- Cycle counters (`rdcycle` and `rdinstret` on RISC-V) measure cycles and CPI; profilers, sampling or instrumenting, find the hot spot.
+- `-O2` keeps variables in registers, inlines, folds constants, hoists invariant code, reduces strength, unrolls and vectorizes. Aliasing, opaque function calls and the non-associativity of floating-point addition stop it.
+- A better algorithm beats every constant factor; with the algorithm fixed, the constant factor comes from the memory access pattern and the vector units.
+- For $C = AB$ in C, put the loop over columns innermost (`i, k, j`) and block the loops so that three $b \times b$ blocks fit in the cache. On the M1 that took the product from 0.55 to 14.6 GFLOP/s; a tuned library reached 255.
+- Amdahl's law: $S = 1/\big((1 - f) + f/s\big) < 1/(1 - f)$. Optimize the largest fraction and re-profile.
+
+## Code
+
+The two clocks, repeated runs and the ARM64 counter. Compile with `clang -std=c17 -Wall -Wextra -O0 measure.c -o measure`; the times depend on the machine and the load, and the comment shows one run on the setup of this note:
+
+```c
+#include <pthread.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <time.h>
+#include <unistd.h>
+
+static double wall(void) {                      /* elapsed real time, unaffected by clock changes */
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec + t.tv_nsec * 1e-9;
+}
+static double cpu(void) {                       /* processor time used by this process */
+    return (double)clock() / CLOCKS_PER_SEC;
+}
+static volatile double sink;
+static void work(void) {                        /* about a few hundred ms of arithmetic */
+    double s = 0;
+    for (long i = 1; i <= 200000000; i++) s += 1.0 / i;
+    sink = s;
+}
+static void *thread(void *arg) { (void)arg; work(); return NULL; }
+
+int main(void) {
+    double w0 = wall(), c0 = cpu();
+    work();
+    printf("work:  wall %.2f s  cpu %.2f s\n", wall() - w0, cpu() - c0);
+    w0 = wall(), c0 = cpu();
+    usleep(500000);                             /* waiting: real time passes, the CPU is not used */
+    printf("sleep: wall %.2f s  cpu %.2f s\n", wall() - w0, cpu() - c0);
+
+    pthread_t th[2];                            /* two threads working at once: cpu adds up both */
+    w0 = wall(), c0 = cpu();
+    for (int i = 0; i < 2; i++) pthread_create(&th[i], NULL, thread, NULL);
+    for (int i = 0; i < 2; i++) pthread_join(th[i], NULL);
+    printf("2 threads: wall %.2f s  cpu %.2f s\n", wall() - w0, cpu() - c0);
+
+    double t[5];                                /* the same work five times: the spread is noise */
+    for (int r = 0; r < 5; r++) { w0 = wall(); work(); t[r] = wall() - w0; }
+    printf("five runs:"); for (int r = 0; r < 5; r++) printf(" %.3f", t[r]); printf("\n");
+
+#if defined(__aarch64__)
+    uint64_t f, a, b;                           /* arm64 counter register: a fixed-frequency tick, not core cycles */
+    __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(f));
+    __asm__ volatile("mrs %0, cntvct_el0" : "=r"(a));
+    work();
+    __asm__ volatile("mrs %0, cntvct_el0" : "=r"(b));
+    printf("counter: %llu Hz, %llu ticks = %.3f s\n", (unsigned long long)f, (unsigned long long)(b - a), (double)(b - a) / f);
+#endif
+}
+/* work:  wall 0.72 s  cpu 0.72 s
+   sleep: wall 0.51 s  cpu 0.00 s
+   2 threads: wall 0.80 s  cpu 1.52 s
+   five runs: 0.848 0.729 0.720 0.716 0.717
+   counter: 24000000 Hz, 17431896 ticks = 0.726 s */
+```
+
+The compiler listings of this note come from two small files. `clang -std=c17 -O0 -S opt.c -o -` and `clang -std=c17 -O2 -S opt.c -o -` print the assembly for the processor of the machine (here ARM64); add `--target=riscv64-unknown-elf` to see RISC-V instead:
+
+```c
+/* opt.c */
+static int square(int x) { return x * x; }
+
+int answer(void) { return square(10) + 5; }      /* -O2: mov w0, #105; ret */
+
+void update(int *a, int n, int x, int y) {        /* -O2: x * y hoisted, * 8 as a shift, 16 elements per iteration */
+    for (int i = 0; i < n; i++)
+        a[i] = a[i] * 8 + x * y;
+}
+
+void twice(int *a, const int *b) { *a += *b; *a += *b; }                       /* -O2: *b loaded twice */
+void twice_r(int *restrict a, const int *restrict b) { *a += *b; *a += *b; }   /* -O2: *a + 2 * *b */
+```
+
+The loop test that calls `strlen`. Compile with `clang -std=c17 -Wall -Wextra -O0 lower.c -o lower` (and once more with `-O2`); one run on the setup of this note:
+
+```c
+#include <stdio.h>
+#include <string.h>
+#include <time.h>
+
+static void lower1(char *s) {               /* strlen in the loop test: called n + 1 times */
+    for (size_t i = 0; i < strlen(s); i++)
+        if (s[i] >= 'A' && s[i] <= 'Z') s[i] += 'a' - 'A';
+}
+static void lower2(char *s) {               /* strlen hoisted by hand: called once */
+    size_t n = strlen(s);
+    for (size_t i = 0; i < n; i++)
+        if (s[i] >= 'A' && s[i] <= 'Z') s[i] += 'a' - 'A';
+}
+static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
+static char buf[1 << 20];
+
+int main(void) {
+    for (size_t n = 25000; n <= 200000; n *= 2) {
+        double t[2];
+        for (int v = 0; v < 2; v++) {
+            memset(buf, 'A', n); buf[n] = 0;
+            double t0 = now();
+            (v ? lower2 : lower1)(buf);
+            t[v] = now() - t0;
+        }
+        printf("n %6zu  lower1 %.4f s  lower2 %.6f s  ratio %.0f\n", n, t[0], t[1], t[0] / t[1]);
+    }
+}
+/* -O0: n  25000  lower1 0.0147 s  lower2 0.000051 s  ratio 289
+        n  50000  lower1 0.0567 s  lower2 0.000101 s  ratio 562
+        n 100000  lower1 0.2157 s  lower2 0.000206 s  ratio 1047
+        n 200000  lower1 0.8559 s  lower2 0.000415 s  ratio 2062
+   -O2: n  25000  lower1 0.0130 s  lower2 0.000011 s  ratio 1184
+        n  50000  lower1 0.0517 s  lower2 0.000020 s  ratio 2584
+        n 100000  lower1 0.2053 s  lower2 0.000040 s  ratio 5131
+        n 200000  lower1 0.8192 s  lower2 0.000082 s  ratio 9990 */
+```
+
+The three matrix products. Compile with `clang -std=c17 -Wall -Wextra -O0 mm.c -o mm`, then with `-O2`, and with `-O2 -DBS=16` (32, 128, 256) for the block sizes. Each version runs five times; the check is a sum of squares of the entries of $C$, which are small integers, so all versions must print the same exact value. One run on the setup of this note:
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+#define N 1024                    /* three 1024 x 1024 matrices of doubles: 8 MiB each */
+#ifndef BS
+#define BS 64                     /* block size: three 64 x 64 blocks take 96 KiB */
+#endif
+static double A[N][N], B[N][N], C[N][N];
+
+static void ijk(void) {           /* the textbook order: B is walked down a column */
+    for (int i = 0; i < N; i++)
+        for (int j = 0; j < N; j++) {
+            double s = 0;
+            for (int k = 0; k < N; k++) s += A[i][k] * B[k][j];
+            C[i][j] = s;
+        }
+}
+static void ikj(void) {           /* loops interchanged: B and C are walked along rows */
+    memset(C, 0, sizeof C);
+    for (int i = 0; i < N; i++)
+        for (int k = 0; k < N; k++) {
+            double a = A[i][k];
+            for (int j = 0; j < N; j++) C[i][j] += a * B[k][j];
+        }
+}
+static void blocked(void) {       /* ikj on BS x BS blocks, so that the blocks in use stay in the cache */
+    memset(C, 0, sizeof C);
+    for (int ii = 0; ii < N; ii += BS)
+        for (int kk = 0; kk < N; kk += BS)
+            for (int jj = 0; jj < N; jj += BS)
+                for (int i = ii; i < ii + BS; i++)
+                    for (int k = kk; k < kk + BS; k++) {
+                        double a = A[i][k];
+                        for (int j = jj; j < jj + BS; j++) C[i][j] += a * B[k][j];
+                    }
+}
+static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
+static int cmp(const void *x, const void *y) { double a = *(const double *)x, b = *(const double *)y; return (a > b) - (a < b); }
+
+int main(void) {
+    for (int i = 0; i < N; i++)
+        for (int j = 0; j < N; j++) { A[i][j] = (i + 2 * j) % 7 - 3; B[i][j] = (3 * i + j) % 5 - 2; }
+    void (*f[])(void) = {ijk, ikj, blocked};
+    const char *name[] = {"ijk", "ikj", "blocked"};
+    for (int v = 0; v < 3; v++) {
+        double t[5];
+        for (int r = 0; r < 5; r++) { double t0 = now(); f[v](); t[r] = now() - t0; }
+        qsort(t, 5, sizeof t[0], cmp);
+        double check = 0;         /* entries are small integers, so every order gives the same exact sum */
+        for (int i = 0; i < N; i++) for (int j = 0; j < N; j++) check += C[i][j] * C[i][j];
+        printf("%-7s min %.3f s  median %.3f s  max %.3f s  %5.2f GFLOP/s  check %.0f\n",
+               name[v], t[0], t[2], t[4], 2.0 * N * N * N / t[0] / 1e9, check);
+    }
+}
+/* -O0: ijk     min 3.871 s  median 4.071 s  max 4.344 s   0.55 GFLOP/s  check 54538276
+        ikj     min 1.385 s  median 1.388 s  max 1.538 s   1.55 GFLOP/s  check 54538276
+        blocked min 1.550 s  median 1.586 s  max 1.604 s   1.39 GFLOP/s  check 54538276
+   -O2: ijk     min 1.390 s  median 1.408 s  max 1.445 s   1.54 GFLOP/s  check 54538276
+        ikj     min 0.175 s  median 0.176 s  max 0.179 s  12.29 GFLOP/s  check 54538276
+        blocked min 0.147 s  median 0.147 s  max 0.148 s  14.57 GFLOP/s  check 54538276
+   -O2 -DBS=16:  blocked min 0.168 s  12.75 GFLOP/s
+   -O2 -DBS=32:  blocked min 0.158 s  13.61 GFLOP/s
+   -O2 -DBS=128: blocked min 0.226 s   9.50 GFLOP/s
+   -O2 -DBS=256: blocked min 0.213 s  10.09 GFLOP/s */
+```
+
+The same product through Apple's BLAS. macOS only; compile with `clang -std=c17 -Wall -Wextra -O2 blas.c -framework Accelerate -o blas`:
+
+```c
+#define ACCELERATE_NEW_LAPACK
+#include <Accelerate/Accelerate.h>         /* macOS only: Apple's BLAS */
+#include <stdio.h>
+#include <time.h>
+
+#define N 1024
+static double A[N * N], B[N * N], C[N * N];
+static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
+
+int main(void) {
+    for (int i = 0; i < N; i++)
+        for (int j = 0; j < N; j++) { A[i * N + j] = (i + 2 * j) % 7 - 3; B[i * N + j] = (3 * i + j) % 5 - 2; }
+    double w0 = now(), c0 = (double)clock() / CLOCKS_PER_SEC;
+    for (int r = 0; r < 5; r++) {
+        double t0 = now();
+        cblas_dgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, N, N, N, 1.0, A, N, B, N, 0.0, C, N);
+        double t = now() - t0;
+        printf("run %d: %.4f s  %6.1f GFLOP/s\n", r + 1, t, 2.0 * N * N * N / t / 1e9);
+    }
+    double check = 0;
+    for (int i = 0; i < N * N; i++) check += C[i] * C[i];
+    printf("all five: wall %.3f s  cpu %.3f s  check %.0f\n", now() - w0, (double)clock() / CLOCKS_PER_SEC - c0, check);
+}
+/* run 1: 0.0190 s   113.1 GFLOP/s
+   run 2: 0.0107 s   201.6 GFLOP/s
+   run 3: 0.0101 s   213.5 GFLOP/s
+   run 4: 0.0092 s   233.2 GFLOP/s
+   run 5: 0.0084 s   255.5 GFLOP/s
+   all five: wall 0.058 s  cpu 0.054 s  check 54538276 */
+```
+
+The cache simulation of the worked example and the Amdahl calculations, in Python (machine-independent):
+
+```python
+from collections import OrderedDict
+
+def misses(order, n=128, line=128, cache=8 * 1024, b=16):
+    """Misses of a fully associative LRU cache for C = A B, n x n doubles stored row by row."""
+    lru, count = OrderedDict(), 0
+    def touch(m, i, j):                                   # m = 0, 1, 2 for A, B, C, stored one after another
+        nonlocal count
+        tag = (8 * (m * n * n + i * n + j)) // line       # which cache line holds the element
+        if tag in lru:
+            lru.move_to_end(tag)
+        else:
+            count += 1
+            lru[tag] = True
+            if len(lru) > cache // line:
+                lru.popitem(last=False)                   # evict the least recently used line
+    r = range(n)
+    if order == 'ijk':
+        for i in r:
+            for j in r:
+                for k in r: touch(0, i, k); touch(1, k, j)
+                touch(2, i, j)
+    elif order == 'ikj':
+        for i in r:
+            for k in r:
+                touch(0, i, k)
+                for j in r: touch(1, k, j); touch(2, i, j)
+    else:                                                 # i, k, j inside b x b blocks
+        for ii in range(0, n, b):
+            for kk in range(0, n, b):
+                for jj in range(0, n, b):
+                    for i in range(ii, ii + b):
+                        for k in range(kk, kk + b):
+                            touch(0, i, k)
+                            for j in range(jj, jj + b): touch(1, k, j); touch(2, i, j)
+    return count / n**3                                   # misses per multiply-add
+
+# n = 128, 128-byte lines (16 doubles), an 8 KiB cache: one column of B needs 128 lines, the cache holds 64
+for order in ('ijk', 'ikj', 'blocked'):
+    print(order, round(misses(order), 4))
+# ijk 1.0703 | ikj 0.0635 | blocked 0.0083
+print([(b, round(misses('blocked', b=b), 4)) for b in (8, 16, 32)])   # 3 blocks of 32 x 32 doubles = 24 KiB > 8 KiB
+# [(8, 0.0161), (16, 0.0083), (32, 0.0664)]
+
+def amdahl(f, s):
+    """Overall speed-up when a fraction f of the time is made s times faster."""
+    return 1 / ((1 - f) + f / s)
+
+t_mm, t_rest = 3.871, 1.0                                 # i, j, k at -O0, plus a hypothetical second of other work
+f, s = t_mm / (t_mm + t_rest), 3.871 / 0.147              # blocked at -O2 replaces the product
+print(round(f, 3), round(s, 1), round(amdahl(f, s), 2), round(1 / (1 - f), 2), round(0.147 / (0.147 + t_rest), 3))
+# 0.795 26.3 4.25 4.87 0.128
+print(round(amdahl(0.7, 10), 2), round(0.7 / (1 / 2 - 0.3), 2))   # f = 0.7: s = 10 gives 2.70; overall 2 needs s = 3.5
+# 2.7 3.5
+```
+
+## Next
+
+Every speed-up in this note made a general-purpose core do one computation better: fewer instructions, fewer misses, wider vector instructions. The vendor library went furthest, and still the core spends most of its energy on fetching, decoding, scheduling and caching, not on the multiply-adds themselves. The [next note](/notes/acos/domain-specific-architectures) asks what happens when the hardware itself is built for one kind of computation: domain-specific architectures, and Google's TPU, a chip whose heart is a $256 \times 256$ grid of multipliers that does nothing but matrix products.
+
+## References
+
+- A. Tatarnikov. *Computer Architecture and Operating Systems* (HSE), [lecture 15: optimizations](https://andrewt0301.github.io/hse-acos-course/part1ca/15_Optimize/lecture.html).
+- R. E. Bryant, D. R. O'Hallaron. *Computer Systems: A Programmer's Perspective*, 3rd ed. Pearson, 2016. §1.9.1 (Amdahl's law), Chapter 5 (optimizing program performance: §5.1 optimization blockers, §5.4 the `lower` example, §5.14 profiling), §6.6.2 (rearranging loops in matrix multiplication) and the web aside on blocking.
+- D. A. Patterson, J. L. Hennessy. *Computer Organization and Design, RISC-V Edition*, 2nd ed. Morgan Kaufmann, 2020. Chapter 1 (Amdahl's law among the fallacies and pitfalls), Chapter 5 (the section "Going faster: cache blocking and matrix multiply").
+- C. E. Leiserson, J. Shun. [*Performance Engineering of Software Systems*](https://ocw.mit.edu/courses/6-172-performance-engineering-of-software-systems-fall-2018/) (MIT 6.172), Fall 2018. Lecture 1 (matrix multiplication sped up step by step), lecture 2 (Bentley rules for optimizing work).
+- G. M. Amdahl. [Validity of the single processor approach to achieving large scale computing capabilities](https://doi.org/10.1145/1465482.1465560). *AFIPS Spring Joint Computer Conference*, 1967.
+- [The RISC-V Instruction Set Manual, Volume I: Unprivileged ISA](https://riscv.org/specifications/ratified/). The Zicntr extension (counters `cycle`, `time`, `instret`).
+- LLVM Project. [Auto-vectorization in LLVM](https://llvm.org/docs/Vectorizers.html) (the loop and SLP vectorizers, run-time alias checks, floating-point reductions).
+- GCC. [Options that control optimization](https://gcc.gnu.org/onlinedocs/gcc/Optimize-Options.html) and the [GCC 12 release notes](https://gcc.gnu.org/gcc-12/changes.html) (vectorization at `-O2`).
+- V. Strassen. [Gaussian elimination is not optimal](https://doi.org/10.1007/BF02165411). *Numerische Mathematik*, 13, 1969.

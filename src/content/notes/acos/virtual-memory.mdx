@@ -1,0 +1,300 @@
+---
+title: Virtual memory
+description: "Why every program gets its own virtual address space, and how the hardware translates it page by page: page tables, the two-level Sv32 and three-level Sv39 walks of RISC-V, the TLB, page faults and demand paging, protection bits and huge pages."
+course: acos
+section: Memory Hierarchy
+order: 8
+status: published
+tags: [virtual-memory, paging, page-tables, sv32, sv39, tlb, page-faults, huge-pages]
+prerequisites: [Caches, "Procedures, the stack and calling conventions"]
+---
+
+import PageWalk from '../../../components/figures/virtual-memory/PageWalk.astro';
+
+The [caches note](/notes/acos/caches) made memory look fast, and it did so with physical addresses: an address was the number of a byte in the DRAM chips. That raises a problem it did not address. RARS places the data of every RISC-V program of this course at the same address, `0x10010000`, and its stack just below `0x7FFFF000`. If those were physical addresses, two programs could not run at the same time without overwriting each other, any program could read or change any other program's memory, and no program could use more memory than the machine has. This note gives every program its own **virtual** address space and lets the hardware translate each address, on every access, into a physical one. The translation uses tables in memory and a small cache of recent translations, the TLB, built like the caches of the previous note.
+
+**Notation.** A **virtual address** (VA) is what a program uses; a **physical address** (PA) is what reaches memory. Memory is managed in **pages** of $2^p$ bytes, $p = 12$ for 4 KiB pages. A VA splits into a **virtual page number** (VPN), its high bits, and a page **offset**, its low $p$ bits; a PA splits into a **physical page number** (PPN, the number of a **frame**) and the same offset. A **page table entry** (PTE) holds a PPN and permission bits.
+
+## Baseline: programs use physical addresses
+
+The simplest system lets programs use physical addresses directly, as RARS does and as the earliest computers did. One program at a time works. Several at once fail in four ways:
+
+- **No isolation.** A wrong pointer in one program can overwrite another program, or the operating system itself, and any program can read any other program's secrets.
+- **No common layout.** Two programs that both expect their data at `0x10010000` cannot both be loaded; every program would have to be relocated to wherever free memory happens to be.
+- **No size beyond the hardware.** A program that needs more memory than is installed cannot run at all, even if most of its data is rarely used.
+- **Fragmentation.** Programs start and stop, and free memory breaks into holes between them; a program that needs 100 MiB in one piece may not fit although 200 MiB are free in total.
+
+## Why virtual memory
+
+<aside class="callout"><strong>Key idea.</strong> Put a translation between the addresses a program uses and the addresses memory sees. Divide both address spaces into pages of the same size, and keep, for every process, a table that maps each of its virtual pages to a physical frame, or marks it as absent. The hardware translates every access through the current process's table, so each process sees a private address space starting from the same addresses, and the operating system decides, page by page, where each one really lives, who may touch it, and whether it is in memory at all.</aside>
+
+One mechanism then gives three things ([Bryant and O'Hallaron](#references), §9.3–9.5; [Arpaci-Dusseau and Arpaci-Dusseau](#references), ch. 18):
+
+- **Isolation.** A process can only name memory through its own page table. A frame that is not mapped in that table does not exist for the process, and permission bits in each entry say whether a page may be read, written or executed, and whether user code may touch it at all.
+- **A large private memory.** Every process sees the same layout from address 0 upwards. Frames need not be contiguous, so fragmentation of physical memory no longer matters, and pages that are not in use can live on disk until they are needed.
+- **Sharing.** Two page tables can map virtual pages to the same frame. The code of a shared library is in memory once and mapped into every process that uses it; after [fork](/notes/acos/processes-and-threads) a parent and child share all frames until one of them writes; and a [memory-mapped file](/notes/acos/files-and-io) is the file's cached pages mapped directly into the process.
+
+Virtual memory goes back to the Atlas computer of the University of Manchester, which presented a main memory and a drum as one **one-level store** of pages ([Kilburn et al., 1962](#references)).
+
+## Pages, frames and a single-level page table
+
+With pages of $2^p$ bytes, the offset of a byte inside its page does not change under translation; only the page number does:
+
+$$
+\boxed{\;\text{VA} = \text{VPN} \cdot 2^p + \text{offset} \;\;\longmapsto\;\; \text{PA} = \text{PPN} \cdot 2^p + \text{offset}, \qquad \text{PPN} = \text{table}[\text{VPN}] .\;}
+$$
+
+The simplest table is an array indexed by VPN, one entry per virtual page, stored in memory at an address held in a register.
+
+**Worked example.** 32-bit virtual addresses and 4 KiB pages: the offset is the low 12 bits and the VPN the high 20 bits. A program loads from `0x10010008`, the third word of its data segment. Then
+
+- VPN $=$ `0x10010008` $\gg 12 =$ `0x10010`, and offset $=$ `0x008`;
+- with 4-byte entries and the table at `0x80000000`, the entry is at `0x80000000` $+ 4 \cdot$ `0x10010` $=$ `0x80040040`;
+- if that entry says frame `0x8F0E2`, the physical address is `0x8F0E2` $\cdot\, 2^{12} +$ `0x008` $=$ `0x8F0E2008`.
+
+The load now needs two memory accesses, one for the entry and one for the data. And the table is large: $2^{20}$ entries of 4 bytes are 4 MiB for every process, almost all of them empty for a program that uses a few dozen pages. With 64-bit registers it gets worse: a flat table for 39-bit addresses would hold $2^{27}$ entries of 8 bytes, 1 GiB per process. The next two sections fix the size and then the time.
+
+## Multi-level page tables
+
+Most of the virtual address space of a process is unused: code and data at the bottom, the stack at the top, nothing in between. A **multi-level** (or radix-tree) page table stores the flat table in page-sized pieces and keeps a small table of pointers to the pieces that exist; a piece with no valid entries is simply not allocated ([Arpaci-Dusseau and Arpaci-Dusseau](#references), ch. 20).
+
+**Sv32**, the scheme of 32-bit RISC-V, has two levels ([RISC-V Privileged Specification](#references), section *Sv32*). The 20-bit VPN splits into two 10-bit indices:
+
+| Bits | 31–22 | 21–12 | 11–0 |
+| --- | --- | --- | --- |
+| Field | VPN[1] | VPN[0] | offset |
+| Role | index into the root table | index into a leaf table | byte in the page |
+
+Each table holds $2^{10}$ entries of 4 bytes, exactly one 4 KiB page. The `satp` register holds the PPN of the root table (and the address-space number of the next section), so changing processes means changing one register. A walk, for a virtual address $va$ and the steps of the specification's translation process:
+
+1. Let $a = \text{satp.PPN} \cdot 4096$ and the level $i = 1$.
+2. Read the PTE at $a + 4 \cdot \text{VPN}[i]$.
+3. If its $V$ bit is 0, the page is not mapped: raise a **page fault**.
+4. If its $R$, $W$ and $X$ bits are all 0, it points to the next level: set $a = \text{PTE.PPN} \cdot 4096$, $i = i - 1$, and go back to step 2. Otherwise it is a **leaf**.
+5. Check the permission bits against the access; on a violation raise a page fault.
+6. The physical address is $\text{PTE.PPN} \cdot 4096 + \text{offset}$.
+
+**Worked example.** The same load from `0x10010008`, now through Sv32, with $\text{satp.PPN} =$ `0x80000`:
+
+- VPN[1] $=$ `0x10010008` $\gg 22 =$ `0x040` $= 64$, VPN[0] $=$ (`0x10010008` $\gg 12$) $\bmod 1024 =$ `0x010` $= 16$, offset $=$ `0x008`. These are the 20 bits of VPN `0x10010` cut into two halves.
+- Root entry: at `0x80000000` $+ 4 \cdot 64 =$ `0x80000100`, value `0x20000401`. Its low 10 bits are `0x001`: only $V$ is set, so it is a pointer, and its PPN is `0x20000401` $\gg 10 =$ `0x80001`.
+- Leaf entry: at `0x80001000` $+ 4 \cdot 16 =$ `0x80001040`, value `0x23C388D7`. Its low bits `0xD7` $= 1101\,0111_2$ set $V, R, W, U, A, D$, so it is a leaf for a page the user may read and write; its PPN is `0x23C388D7` $\gg 10 =$ `0x8F0E2`.
+- Physical address: `0x8F0E2` $\cdot 4096 +$ `0x008` $=$ `0x8F0E2008`, the same frame as before.
+
+<PageWalk />
+
+1. The TLB, the translation cache of a later section, has no entry for VPN `0x10010`, so the hardware walks the table.
+2. `satp` locates the root table, and VPN[1] selects entry 64: a pointer.
+3. The pointer's PPN locates the leaf table, and VPN[0] selects entry 16: a leaf.
+4. The leaf gives frame `0x8F0E2` and its permissions; the access is checked, and the translation is stored in the TLB.
+5. The frame number joined with the unchanged offset is the physical address.
+
+**What the levels save.** A small RARS program needs the root table, one leaf table for its data around `0x10010000` and one for its stack below `0x7FFFF000`, since those have different VPN[1]: 3 pages, 12 KiB, instead of a flat 4 MiB table. Any entry of the root table can also be a leaf: it then maps a whole 4 MiB **megapage** in one entry, and VPN[0] passes through untranslated. The Code section maps the program's code at `0x00400000` that way.
+
+**Sv39**, the scheme used by 64-bit RISC-V Linux, follows the same design with three levels. A table still fills one 4 KiB page, but its entries are 8 bytes, so it has 512 of them and each index has 9 bits:
+
+| Bits | 63–39 | 38–30 | 29–21 | 20–12 | 11–0 |
+| --- | --- | --- | --- | --- | --- |
+| Field | copies of bit 38 | VPN[2] | VPN[1] | VPN[0] | offset |
+
+That gives $2^{39}$ bytes, 512 GiB, of virtual space; Linux keeps the lower half for user programs. Bits 63–39 must equal bit 38, or the access faults. The PPN has 44 bits, so physical addresses can have 56 bits. A leaf at level 1 maps a 2 MiB megapage and a leaf at level 2 a 1 GiB gigapage. Sv48 and Sv57 add a fourth and a fifth level for 48-bit and 57-bit addresses, in the same way as x86-64 uses four levels for 48-bit addresses ([Bryant and O'Hallaron](#references), §9.7.1) and newer processors offer a fifth. Each level makes the table smaller for sparse address spaces and the walk one memory access longer.
+
+## Protection bits
+
+Every PTE carries the bits that make isolation work ([RISC-V Privileged Specification](#references), section *Sv32*, Table *Encoding of PTE R/W/X fields*):
+
+| Bit | Name | Meaning |
+| --- | --- | --- |
+| $V$ | valid | the entry is in use; if 0, every access faults and the other bits are free for the OS |
+| $R, W, X$ | read, write, execute | what the page allows; all three 0 means a pointer to the next level |
+| $U$ | user | user-mode code may access the page; kernel pages have $U = 0$ |
+| $G$ | global | the mapping exists in every address space (used for the kernel) |
+| $A$ | accessed | the page was read, written or fetched since the bit was last cleared |
+| $D$ | dirty | the page was written since the bit was last cleared |
+
+The combinations of $R$, $W$ and $X$ are: pointer (000), read-only, read-write, execute-only, read-execute and read-write-execute; write without read is reserved. A typical layout gives code $R + X$, so it cannot be overwritten; data and stack $R + W$, so injected bytes cannot be executed; and kernel memory $U = 0$, so user code cannot touch it at all. A fetch from a page without $X$, a load from a page without $R$ and a store to a page without $W$ raise an instruction, load or store **page fault**. The operating system uses $A$ to see which pages are in use when it must evict one, and $D$ to know whether an evicted page must first be written back to disk.
+
+## The TLB: a cache of translations
+
+The walk costs one memory access per level before the access itself: 2 for Sv32, 3 for Sv39, 4 or 5 on x86-64. Doing that on every load and every instruction fetch would make the program several times slower. Translations, however, have strong locality: the 1,024 ints of a 4 KiB page share one translation. A **translation lookaside buffer** (TLB) is a small cache, inside the processor, of recent translations: its tag is the VPN, its data the PPN and the permission bits ([Arpaci-Dusseau and Arpaci-Dusseau](#references), ch. 19). A typical TLB has 32, 64 or 128 entries and is fully associative, the organization the caches note found too expensive for a large cache and affordable for a small one; larger processors add a bigger, set-associative second-level TLB.
+
+- **Hit**: the VPN is in the TLB. The PPN comes out within the same cycle, the permissions are checked, and the access goes to the cache with its physical address. No page table is read.
+- **Miss**: the hardware walks the page table as in the figure and puts the translation into the TLB, evicting another entry; then the access is retried. RISC-V allows the walk to be done in hardware or by a trap handler in software; MIPS, for example, always left it to software.
+
+When the operating system switches to another process, the old translations become wrong. Either the TLB is flushed, or each entry carries an **address-space identifier** (ASID) and only entries with the current ASID match. In RISC-V the ASID sits in `satp` next to the root PPN, 9 bits for RV32 and 16 for RV64, and the instruction `sfence.vma` flushes stale entries after the OS changes a page table.
+
+**Worked example.** Summing a 1 MiB int array with 4 KiB pages: 262,144 loads touch 256 pages, so 256 TLB misses, one per page, and a hit rate of $1 - 1/1024 = 99.9\,\%$. The column-by-column loop of the caches note is the opposite case: with $N = 4096$ its stride is 16 KiB, exactly one page on the Apple M1, whose pages are 16 KiB (`sysctl hw.pagesize` prints 16384), so every read in a column lands on a different page, 4,096 pages per column.
+
+**Can the cache be read before translation finishes?** In the caches note's 32 KiB, 8-way L1 cache with 64-byte blocks, the index and offset occupy the low $6 + 6 = 12$ bits, exactly the page offset, which translation does not change. The cache can therefore select the set with the virtual address while the TLB translates the page number, and compare the stored physical tags afterwards: a **virtually indexed, physically tagged** cache ([Patterson and Hennessy](#references), §5.7). This works only while capacity divided by associativity is at most the page size, which is one reason L1 caches grow in ways rather than in sets.
+
+## Page faults and demand paging
+
+A **page fault** is an exception: the processor stops the faulting instruction and jumps to the operating system's handler, which decides what the fault means ([Arpaci-Dusseau and Arpaci-Dusseau](#references), ch. 21; the mechanism of exceptions is in the [exceptions note](/notes/acos/exceptions-and-interrupts)):
+
+- **The page is valid but not in memory.** The OS finds a free frame, evicting another page if none is free (and writing it back first if its $D$ bit is set), reads the page from disk or fills it with zeros, writes the PTE with $V = 1$, and returns. The faulting instruction runs again and now succeeds.
+- **The access breaks a rule.** A store to a read-only page, or an access to an address the process never mapped, is a bug, and on Unix the process receives a segmentation fault. A store to a page shared copy-on-write is the exception to the exception: the OS copies the frame, maps the copy writable, and retries.
+
+**Demand paging** builds on the first case. When a program starts, or asks for memory with `mmap` or `malloc`, the OS only records which virtual pages are allowed and maps none of them. The first access to each page faults, and only then does the page get a frame. Pages that are never touched never cost memory, and a program larger than physical memory runs as long as the pages it is actively using fit. When they do not fit, every few accesses wait for the disk, and the system **thrashes**.
+
+**Worked example (toy numbers).** An access takes 100 ns when its page is in memory, and a page fault that reads from a disk takes 5 ms, 50,000 times longer. With one fault per $10^6$ accesses, the average access takes $(1 - 10^{-6}) \cdot 100 + 10^{-6} \cdot 5 \cdot 10^6 \approx 105$ ns, 5 % slower; to stay within 10 %, faults must be rarer than one in 500,000 accesses. A flash drive reads a page in tens of microseconds ([caches note](/notes/acos/caches#how-far-away-is-memory)), which makes faults cheaper but not cheap.
+
+## The cost of translation and huge pages
+
+On a TLB hit translation is nearly free; on a miss it costs a walk. **Worked example (toy numbers):** 100 ns per memory access and a three-level Sv39 walk on a miss:
+
+$$
+\begin{aligned}
+\text{average time} &= h \cdot 100 + (1 - h) \cdot (3 \cdot 100 + 100) \text{ ns} \\
+&= 103 \text{ ns for } h = 0.99, \qquad 130 \text{ ns for } h = 0.90 ,
+\end{aligned}
+$$
+
+where $h$ is the TLB hit rate. In practice the walk often hits in the data caches, which hold recently used page-table entries, so a miss costs less than four DRAM accesses; the toy numbers show only why the hit rate matters.
+
+The amount of memory a TLB covers, its **reach**, is the number of entries times the page size. With 64 entries:
+
+| Page size | TLB reach |
+| --- | --- |
+| 4 KiB | 256 KiB |
+| 2 MiB (an Sv39 megapage) | 128 MiB |
+| 1 GiB (an Sv39 gigapage) | 64 GiB |
+
+A program that works on a few gigabytes of data, a database or the weights of a neural network, misses in a 4 KiB TLB all the time. **Huge pages**, leaves placed higher in the tree, cover the same data with 512 or 262,144 times fewer entries and shorten the walk by one or two levels. They have costs: a huge page must be backed by a contiguous, aligned physical region, which a fragmented memory may not have; it is allocated, zeroed and swapped as a whole; and a process that uses only a few kilobytes of it wastes the rest. Operating systems therefore offer them on request, or, as Linux's transparent huge pages do, use them where a region is large and aligned enough.
+
+## Paging beyond the operating system
+
+The same idea solves memory problems elsewhere. A language model generating text keeps the keys and values of all earlier tokens of every sequence, the **KV cache**, and that cache dominates the memory left after the weights ([quantization note](/notes/nlp/quantization#memory-latency-and-throughput-of-generation)). Serving systems that reserved one contiguous region per request for its maximum length used only 20.4–38.2 % of the KV-cache memory for actual token states ([Kwon et al., 2023](#references), §1, Fig. 2). PagedAttention splits each sequence's cache into fixed-size blocks, keeps a **block table** per request that maps its logical blocks to physical blocks anywhere in GPU memory, allocates blocks on demand as tokens are generated, and shares blocks between sequences with copy-on-write; the paper itself describes blocks as pages, tokens as bytes and requests as processes (§4.2, §4.4). In the authors' measurements vLLM used 96.3 % of the KV-cache memory for token states (Fig. 2). This is the paged KV memory that the [GPT note](/notes/nlp/gpt#making-generation-faster) lists among the techniques of serving engines.
+
+<aside class="callout"><strong>Check yourself.</strong> (1) A system has 64 GiB of virtual space ($2^{36}$ bytes), 4 GiB of physical memory and 16 KiB pages, the page size of the Apple M1. How many bits do a VPN and a PPN have, and how many entries would a flat page table hold? (2) Translate VA `0x00403A7C` under Sv32: what are VPN[1], VPN[0] and the offset? If root entry VPN[1] is a leaf with PPN `0x80400`, what is the PA? (3) Why can the root table of Sv32 hold a leaf only for a megapage whose PPN has its low 10 bits equal to 0?<details><summary>Answers</summary>(1) The offset has 14 bits, so the VPN has $36 - 14 = 22$ bits and the PPN $32 - 14 = 18$ bits; a flat table has $2^{22}$ entries, about 4.2 million. (2) VPN[1] $=$ `0x001`, VPN[0] $=$ `0x003`, offset $=$ `0xA7C`. For a megapage, VPN[0] is copied into the low 10 bits of the PPN: PPN `0x80403`, PA `0x80403A7C`. (3) The low 10 bits of the PPN are replaced by VPN[0], so they must be zero in the entry: the megapage must start at a 4 MiB boundary of physical memory, or the specification requires a page fault.</details></aside>
+
+## What changed
+
+| | Baseline: physical addresses | Paged virtual memory |
+| --- | --- | --- |
+| Address a program uses | the physical address | a virtual address, translated on every access |
+| Isolation | none | separate page tables; $U$, $R$, $W$, $X$ bits per page |
+| Layout | wherever memory is free | the same private layout for every process |
+| Size | at most the installed memory | the virtual space; absent pages live on disk |
+| Sharing | by agreement on addresses | the same frame mapped into several tables |
+| Cost per access | none | a TLB lookup; on a miss, one memory read per level |
+| Cost in memory | none | page tables: 12 KiB for a small Sv32 process |
+
+## Limitations
+
+- **Translation is not free.** A TLB miss costs a walk of 2 to 5 memory accesses, and programs with scattered access to large data miss often; huge pages help, at the price of fragmentation and waste.
+- **Page faults are expensive.** A fault that goes to disk costs milliseconds, tens of thousands of times a memory access; demand paging works only while the pages in use fit in memory.
+- **Context switches cost.** A new `satp` means either a TLB flush or ASID bookkeeping, and every page-table change needs `sfence.vma` on every core that may hold the stale entry.
+- **Page tables take memory.** A process that maps large, sparse regions pays for many leaf tables; Sv39, Sv48 and Sv57 trade a larger address space for longer walks.
+- **Virtual machines double the cost.** A guest operating system has its own page tables, and the hypervisor translates the guest's "physical" addresses again; a TLB miss can then need a walk of the host's table for every level of the guest's (see the [virtual machines note](/notes/acos/virtual-machines-and-containers)).
+- **Not every system has it.** Small microcontrollers run without a page table, with at most physical memory protection, as RARS does.
+
+## What you should remember
+
+- A virtual address is a VPN and an offset; translation replaces the VPN with a PPN and keeps the offset.
+- A flat table for 32-bit addresses and 4 KiB pages is 4 MiB per process; a multi-level table allocates only the parts in use, 12 KiB for a small Sv32 program.
+- Sv32: VPN[1] (10 bits), VPN[0] (10 bits), offset (12 bits); 1,024 four-byte PTEs per table; `satp` holds the root PPN. Sv39: three 9-bit indices, 512 eight-byte PTEs per table, 512 GiB of virtual space.
+- A PTE with $R = W = X = 0$ points to the next level; otherwise it is a leaf. $V$, $U$, $G$, $A$ and $D$ say whether it is valid, user-accessible, global, accessed and dirty.
+- The TLB caches translations; a miss costs one memory access per level. ASIDs avoid flushing it on every context switch.
+- A page fault is an exception handled by the OS: it loads or allocates the page and retries, or it kills a buggy access. Demand paging allocates frames only on first touch.
+- TLB reach is entries times page size; huge pages raise it from 256 KiB to 128 MiB or 64 GiB for 64 entries.
+
+## Code
+
+An Sv32 walk in Python. It builds the page tables of the worked example, translates four accesses and prints the PTE read at each level, then computes the page-table sizes, TLB reach and average access times quoted in the note:
+
+```python
+PAGE = 4096
+V, R, W, X, U, G, A, D = (1 << i for i in range(8))     # PTE bits 0..7
+mem = {}                                                # physical memory: address -> 32-bit word
+
+def pte(ppn, flags):
+    return ppn << 10 | flags                            # PPN in bits 31..10, flags in bits 7..0
+
+def bits(e):
+    return ' '.join(n for n, b in zip('VRWXUGAD', (V, R, W, X, U, G, A, D)) if e & b) or 'none'
+
+def translate(satp_ppn, va, access, user=True):
+    """The Sv32 walk of the privileged specification, without the A/D update and shadow stacks."""
+    vpn = [(va >> 12) & 0x3FF, va >> 22]                # vpn[0]: bits 21..12, vpn[1]: bits 31..22
+    a, i = satp_ppn * PAGE, 1                           # start at the root table, level 1
+    while True:
+        addr = a + vpn[i] * 4                           # the PTE of this level
+        e = mem.get(addr, 0)
+        print(f'  level {i}: PTE at {addr:#010x} = {e:#010x}  bits {bits(e)}')
+        if not e & V or (e & W and not e & R):          # invalid, or the reserved W-without-R
+            return 'page fault (invalid PTE)'
+        if e & (R | X):                                 # R or X set: a leaf
+            break
+        i -= 1                                          # R = W = X = 0: a pointer one level down
+        if i < 0:
+            return 'page fault (no leaf)'
+        a = (e >> 10) * PAGE
+    ppn = e >> 10
+    if i == 1 and ppn & 0x3FF:                          # a megapage must be 4 MiB aligned
+        return 'page fault (misaligned megapage)'
+    if user and not e & U:                              # user mode may touch only U pages
+        return 'page fault (not a user page)'
+    if not e & {'r': R, 'w': W, 'x': X}[access]:        # the access itself must be allowed
+        return 'page fault (permission)'
+    if i == 1:                                          # megapage: vpn[0] passes through untranslated
+        ppn |= vpn[0]
+    return f'PA {ppn * PAGE + (va & 0xFFF):#010x}'      # frame number joined with the page offset
+
+# the page tables of one process: the root at PPN 0x80000, one leaf table at PPN 0x80001
+SATP = 0x80000
+mem[SATP * PAGE + 0x040 * 4] = pte(0x80001, V)                          # root[64] -> leaf table
+mem[0x80001 * PAGE + 0x010 * 4] = pte(0x8F0E2, V | R | W | U | A | D)   # data page: read and write
+mem[0x80001 * PAGE + 0x011 * 4] = pte(0x8F0E3, V | R | U | A)           # the next page: read only
+mem[SATP * PAGE + 0x001 * 4] = pte(0x80400, V | R | X | U | A)          # root[1]: a 4 MiB megapage of code
+
+for va, access in ((0x10010008, 'r'), (0x10011004, 'w'), (0x00403A7C, 'x'), (0x10012000, 'r')):
+    print(f'{access} {va:#010x}: vpn[1] = {va >> 22:#05x}, vpn[0] = {(va >> 12) & 0x3FF:#05x}, offset = {va & 0xFFF:#05x}')
+    print('  ->', translate(SATP, va, access))
+# r 0x10010008: vpn[1] = 0x040, vpn[0] = 0x010, offset = 0x008
+#   level 1: PTE at 0x80000100 = 0x20000401  bits V
+#   level 0: PTE at 0x80001040 = 0x23c388d7  bits V R W U A D
+#   -> PA 0x8f0e2008
+# w 0x10011004: vpn[1] = 0x040, vpn[0] = 0x011, offset = 0x004
+#   level 1: PTE at 0x80000100 = 0x20000401  bits V
+#   level 0: PTE at 0x80001044 = 0x23c38c53  bits V R U A
+#   -> page fault (permission)
+# x 0x00403a7c: vpn[1] = 0x001, vpn[0] = 0x003, offset = 0xa7c
+#   level 1: PTE at 0x80000004 = 0x2010005b  bits V R X U A
+#   -> PA 0x80403a7c
+# r 0x10012000: vpn[1] = 0x040, vpn[0] = 0x012, offset = 0x000
+#   level 1: PTE at 0x80000100 = 0x20000401  bits V
+#   level 0: PTE at 0x80001048 = 0x00000000  bits none
+#   -> page fault (invalid PTE)
+
+# page-table sizes: one flat table per process against the two-level tables of a small RARS program
+KiB, MiB, GiB = 2**10, 2**20, 2**30
+print(2**20 * 4 // MiB, 'MiB flat Sv32;', 2**27 * 8 // GiB, 'GiB flat Sv39')   # 4 MiB flat Sv32; 1 GiB flat Sv39
+used = {0x10010000 >> 22, 0x7FFFEFFC >> 22}            # leaf tables for the data segment and the stack
+print((1 + len(used)) * 4, 'KiB two-level')            # 12 KiB two-level (code in a megapage needs none)
+
+# TLB reach of 64 entries for 4 KiB pages, megapages and gigapages
+def size(n):
+    return next(f'{n // k} {u}' for u, k in (('GiB', GiB), ('MiB', MiB), ('KiB', KiB)) if n >= k)
+print([size(64 * page) for page in (4 * KiB, 2 * MiB, GiB)])   # ['256 KiB', '128 MiB', '64 GiB']
+
+# average access time with a 3-level walk on a TLB miss, and with rare page faults (toy: 100 ns per access, 5 ms per fault)
+print([round(h * 100 + (1 - h) * (3 * 100 + 100), 1) for h in (0.99, 0.90)])   # [103.0, 130.0]
+print(round((1 - 1e-6) * 100 + 1e-6 * 5e6, 1))         # 105.0
+```
+
+The second access faults because its page has no $W$ bit, the third goes through the megapage with no leaf table at all, and the fourth reaches an entry that was never filled.
+
+## Next
+
+The two memory-hierarchy notes made memory look fast and private, and both treated the processor as a box that issues one load or store after another. The [next note](/notes/acos/pipelining) opens that box: it builds the datapath that executes RISC-V instructions and overlaps them in a pipeline, where a load that misses in the cache or the TLB is one of the reasons the pipeline has to wait.
+
+## References
+
+- *The RISC-V Instruction Set Manual, Volume II: Privileged Architecture*, Supervisor-Level ISA version 1.13. [Ratified specifications](https://riscv.org/specifications/ratified/); [PDF of release 20240411](https://github.com/riscv/riscv-isa-manual/releases/download/20240411/priv-isa-asciidoc.pdf). Sections *Supervisor Address Translation and Protection (satp) Register*, *Sv32: Page-Based 32-bit Virtual-Memory Systems* (PTE format, permission encodings, the virtual address translation process, megapages) and *Sv39*, *Sv48*, *Sv57*.
+- R. E. Bryant, D. R. O'Hallaron. *Computer Systems: A Programmer's Perspective*, 3rd ed. Pearson, 2016. Chapter 9: §9.3–9.5 (virtual memory as a tool for caching, memory management and protection), §9.6 (address translation, TLBs, multi-level page tables), §9.7.1 (Core i7 address translation), §9.8 (memory mapping, fork).
+- D. A. Patterson, J. L. Hennessy. *Computer Organization and Design RISC-V Edition*, 2nd ed. Morgan Kaufmann, 2020. §5.7 (virtual memory, TLBs, integrating them with caches).
+- D. M. Harris, S. L. Harris. *Digital Design and Computer Architecture, RISC-V Edition*. Morgan Kaufmann, 2021. §8.4 (virtual memory).
+- R. H. Arpaci-Dusseau, A. C. Arpaci-Dusseau. *Operating Systems: Three Easy Pieces*. [Chapter 18, Paging: Introduction](https://pages.cs.wisc.edu/~remzi/OSTEP/vm-paging.pdf); [chapter 19, Paging: Faster Translations (TLBs)](https://pages.cs.wisc.edu/~remzi/OSTEP/vm-tlbs.pdf); [chapter 20, Paging: Smaller Tables](https://pages.cs.wisc.edu/~remzi/OSTEP/vm-smalltables.pdf); [chapter 21, Beyond Physical Memory: Mechanisms](https://pages.cs.wisc.edu/~remzi/OSTEP/vm-beyondphys.pdf).
+- T. Kilburn, D. B. G. Edwards, M. J. Lanigan, F. H. Sumner. [One-level storage system](https://doi.org/10.1109/TEC.1962.5219356). IRE Transactions on Electronic Computers, EC-11(2), 1962.
+- W. Kwon et al. [Efficient Memory Management for Large Language Model Serving with PagedAttention](https://arxiv.org/abs/2309.06180). SOSP, 2023. §1 and Fig. 2 (memory used for token states), §4.2 (the KV cache manager and block tables), §4.4 (sharing and copy-on-write).
+- A. Tatarnikov. [Virtual memory](https://andrewt0301.github.io/hse-acos-course/part1ca/09_VM/lecture.html), lecture 9 of *Computer Architecture and Operating Systems*, HSE University.

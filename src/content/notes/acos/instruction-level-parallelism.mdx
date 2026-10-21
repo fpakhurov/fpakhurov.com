@@ -1,0 +1,288 @@
+---
+title: Instruction-level parallelism
+description: "How one processor core runs several instructions per cycle: multiple issue, static and dynamic; true, anti and output dependences; register renaming; out-of-order execution with a reorder buffer; branch speculation; and Spectre, the side channel that speculation opened."
+course: acos
+section: Parallelism and Performance
+order: 12
+status: published
+tags: [instruction-level-parallelism, superscalar, vliw, register-renaming, out-of-order, reorder-buffer, speculation, branch-prediction, spectre]
+prerequisites: [The datapath and pipelining, Exceptions and interrupts, Caches]
+---
+
+import OutOfOrderCore from '../../../components/figures/instruction-level-parallelism/OutOfOrderCore.astro';
+import IssueSchedule from '../../../components/figures/instruction-level-parallelism/IssueSchedule.astro';
+
+The [input-and-output note](/notes/acos/input-and-output) finished the tour of a single processor: a pipelined datapath that starts at most one instruction per cycle, traps that redirect it, and devices that it reaches through memory-mapped registers and DMA. This section asks how to get more work out of that hardware. The [first note](/notes/acos/computer-systems) measured a matrix multiplication on an Apple M1 at a CPI of about 0.15, more than six instructions per cycle, which a pipeline that starts one instruction per cycle cannot do. This note explains how: a modern core starts several instructions per cycle, not in program order but as soon as their operands exist, guesses which way branches go, and still makes the program behave exactly as if the instructions had run one after another. The parallelism it finds hides inside one instruction stream, and is called **instruction-level parallelism** (ILP).
+
+**Notation.** $\mathrm{CPI}$ is cycles per instruction, as in the performance equation of the [first note](/notes/acos/computer-systems), and $\mathrm{IPC} = 1/\mathrm{CPI}$ is instructions per cycle. The **issue width** $w$ is the largest number of instructions a core can start in one cycle. The **latency** of an instruction is the number of cycles from the moment it starts until a dependent instruction can use its result. Registers are written in RISC-V ABI names (`t0`, `a0`, …) for the architectural registers a program sees, and `p1`, `p2`, … for the physical registers inside the core.
+
+## Baseline: a pipeline that starts one instruction per cycle
+
+The five-stage pipeline of the [pipelining note](/notes/acos/pipelining) overlaps instructions so that, in the best case, one finishes every cycle: $\mathrm{CPI} = 1$. In practice $\mathrm{CPI} = 1 + (\text{stall cycles per instruction})$, and three things keep it above 1:
+
+- **The peak is one.** Even with no stalls, the pipeline starts at most one instruction per cycle, so $\mathrm{IPC} \le 1$.
+- **A stalled instruction blocks everything behind it.** The pipeline is *in order*: when an instruction waits for an operand, every younger instruction waits too, including ones that do not need the missing value at all. A load that misses in the [cache](/notes/acos/caches) stops the whole pipeline for the duration of the miss.
+- **Deeper pipelines trade one problem for another.** Splitting the work into more, shorter stages shortens the clock period, but a dependent instruction then waits more *cycles* for its operand, a mispredicted branch throws away more partly finished instructions, and the extra pipeline registers and higher clock cost power. The [first note](/notes/acos/computer-systems#how-processors-got-fast-and-why-that-changed) showed where rising power led.
+
+**Worked example.** One loop runs through this note. It multiplies every element of an integer array by a constant $k$, `x[i] = k * x[i]`:
+
+```asm
+loop: lw   t0, 0(a0)       # t0 = x[i]
+      mul  t0, t0, a2      # t0 = k * x[i]
+      sw   t0, 0(a0)       # x[i] = t0
+      addi a0, a0, 4       # a0 = address of the next element
+      bne  a0, a1, loop    # repeat until a0 reaches the end a1
+```
+
+Give the instructions toy latencies: 3 cycles for the load (a hit in the first-level cache), 3 for the multiply and 1 for everything else. A core that starts one instruction per cycle, in order, each as soon as its operands are ready, starts `lw` at cycle 0, `mul` at 3 (it needs `t0` from the load), `sw` at 6 (it needs the product), `addi` at 7 and `bne` at 8. The next `lw` starts at 9. Five instructions take 9 cycles: $\mathrm{IPC} = 5/9 = 0.56$. In 4 of the 9 cycles, nothing new starts, because every instruction waits for the one before it, while `addi` and the next iteration's `lw` do not depend on the multiplication at all.
+
+## Multiple issue: more than one instruction per cycle
+
+The first step is to widen the pipeline: fetch, decode and execute $w$ instructions per cycle, so that $\mathrm{IPC}$ can reach $w$. A 4 GHz core that issues four instructions per cycle could execute 16 billion instructions per second. Duplicated functional units are cheap; the hard part is deciding which instructions may start together. There are two ways to decide.
+
+**Static multiple issue: the compiler decides.** The compiler groups instructions that are independent of each other into an **issue packet**, which the hardware starts as a unit, one instruction per slot. Think of a packet as one very long instruction with several operations in it: a **VLIW** (very long instruction word) machine ([Fisher, 1983](#references)). The two-issue RISC-V of [Patterson and Hennessy (2020)](#references), §4.11, has packets of one ALU-or-branch instruction and one load-or-store instruction; when the compiler finds nothing to put in a slot, it fills it with a `nop`. The hardware stays simple, because it checks nothing. The price is that the compiler must know the latencies of the particular implementation, cannot know at compile time which loads will miss in the cache, and wastes code space on `nop`s. VLIW survives where the code is regular and the hardware fixed: digital signal processors and machine-learning accelerators such as the TPU of the [domain-specific architectures note](/notes/acos/domain-specific-architectures).
+
+**Dynamic multiple issue: the hardware decides.** A **superscalar** processor fetches an ordinary sequential instruction stream and decides at run time, every cycle, how many of the next instructions it can start: zero, one, two, up to $w$. Every program for the instruction set runs correctly on it, whatever its width, and the compiler can still help by ordering instructions well. All high-performance general-purpose cores are superscalar. Intel's Skylake core of 2015, for example, renames four instructions per cycle ([Chips and Cheese, 2022](#references)).
+
+**Worked example.** Make the in-order core of the baseline two-wide: it starts up to two instructions per cycle, in program order, each when its operands are ready. `lw` starts at 0 and `mul` at 3, as before. At cycle 6 `sw` gets its operand, and `addi` starts in the second slot of the same cycle. `bne` needs the new `a0` and starts at 7, together with the next iteration's `lw`. The next `mul` starts at 10. One iteration now takes 7 cycles instead of 9, $\mathrm{IPC} = 0.71$: doubling the width gained 29 %. The width is not the limit. The limit is that in program order, the next `lw` cannot start before `mul` and `sw`, although it does not depend on them.
+
+## Dependences: true, anti and output
+
+To start an instruction early, the core must know which earlier instructions it really depends on. Two instructions that touch the same register can be related in three ways. In the loop:
+
+| Kind | Meaning | In the loop |
+| --- | --- | --- |
+| **True dependence** (read after write, RAW) | the later instruction needs the value the earlier one produces | `mul` reads the `t0` of `lw`; `sw` reads the `t0` of `mul`; `bne` and the next `lw` read the `a0` of `addi` |
+| **Anti-dependence** (write after read, WAR) | the later instruction overwrites a register the earlier one still has to read | `addi` writes `a0`, which `sw` reads; the next `lw` writes `t0`, which `sw` reads |
+| **Output dependence** (write after write, WAW) | both write the same register, and the later value must be the one that remains | `lw` and `mul` both write `t0`; so do `mul` and the next `lw` |
+
+Only true dependences carry a value from one instruction to another; they are a property of the algorithm. Anti- and output dependences are **name dependences**: they exist only because the program reuses the same 32 register names, and they would disappear if every result had a register of its own. Two more kinds of dependence work the same way through other channels. Every instruction after a branch is **control dependent** on it: whether it should run at all is known only when the branch is resolved. And a load is **memory dependent** on an earlier store to the same address: `sw` to `x[i]` and a later `lw` from `x[i]` must stay in order, but the hardware can only tell by comparing their addresses, which are computed at run time.
+
+The loop has a lot of independent work: the iterations touch different elements, and their only true dependence is the chain of `addi` instructions that compute the addresses. Each iteration has a critical path of $3 + 3 + 1 = 7$ cycles from `lw` through `mul` to `sw`, but nothing in iteration 2 except its address waits for iteration 1. What keeps the in-order core from overlapping iterations is the program order, and the name dependences on `t0` and `a0` would keep even a core that ignored the order from going far.
+
+## Register renaming
+
+<aside class="callout"><strong>Key idea.</strong> Give every result a new physical register, so that only true dependences remain; let instructions start as soon as their operands exist, in any order; and keep a list of them in program order, the reorder buffer, from which they retire in order. The program sees the sequential execution it was written for, and the core runs the dependence graph instead of the program text.</aside>
+
+A core with **register renaming** has more physical registers than the instruction set has architectural ones, and a **map table** that says which physical register currently holds each architectural one. When an instruction is renamed, its sources are looked up in the map, and its destination gets a free physical register from a free list; the map is updated to point there. A later instruction that reads the same architectural register then reads the new physical one, and an earlier instruction that still has to read the old value reads the old physical register, which stays untouched. Anti- and output dependences vanish, because no two in-flight instructions write the same physical register.
+
+**Worked example.** Start with `a0` mapped to `p10`, `a1` to `p11` and `a2` to `p12`, and free registers from `p20` on. Renaming two iterations of the loop:
+
+| Instruction | Renamed | Map after it |
+| --- | --- | --- |
+| `lw t0, 0(a0)` | `lw p20, 0(p10)` | `t0 → p20` |
+| `mul t0, t0, a2` | `mul p21, p20, p12` | `t0 → p21` |
+| `sw t0, 0(a0)` | `sw p21, 0(p10)` | unchanged |
+| `addi a0, a0, 4` | `addi p22, p10, 4` | `a0 → p22` |
+| `bne a0, a1, loop` | `bne p22, p11, loop` | unchanged |
+| `lw t0, 0(a0)` | `lw p23, 0(p22)` | `t0 → p23` |
+| `mul t0, t0, a2` | `mul p24, p23, p12` | `t0 → p24` |
+| `sw t0, 0(a0)` | `sw p24, 0(p22)` | unchanged |
+| `addi a0, a0, 4` | `addi p25, p22, 4` | `a0 → p25` |
+| `bne a0, a1, loop` | `bne p25, p11, loop` | unchanged |
+
+The second `lw` writes `p23`, not the `p21` that the first `sw` still has to read, so it may run before that store. The first `addi` writes `p22` while the first `sw` keeps reading `p10`. After renaming, the second iteration depends on the first only through `p22`, the true dependence of the address chain.
+
+A physical register can be reused once no instruction can read it any more: when the next instruction that writes the same architectural register retires, the previous mapping is dead and its physical register returns to the free list. Skylake has 180 integer physical registers behind the 16 general-purpose registers of x86-64 ([WikiChip](#references)). The same transformation can be done in software: a compiler for a VLIW machine unrolls the loop and gives each copy of the body its own registers, which is renaming at compile time, limited by the number of architectural registers.
+
+## Out-of-order execution with a reorder buffer
+
+With only true dependences left, the core can start each instruction as soon as its operands exist, whatever its place in the program. This is **out-of-order execution**, or dynamic scheduling. Its central idea, operands that are forwarded from the functional unit that produces them straight to the instructions that wait for them, comes from the floating-point unit of the IBM System/360 Model 91 ([Tomasulo, 1967](#references)). What makes it safe for whole programs is the **reorder buffer** (ROB) of [Smith and Pleszkun (1988)](#references): a circular queue with one entry per instruction in flight, in program order.
+
+<OutOfOrderCore />
+
+One instruction's way through an out-of-order core, numbered as in the figure, which shows the core at cycle 5 of the loop:
+
+1. **Fetch.** The front end fetches $w$ instructions per cycle from the instruction cache. A branch predictor guesses the direction of every branch it sees, so fetch continues into the next iteration without waiting for `bne`.
+2. **Rename.** Each instruction's registers are renamed through the map table, as in the table above.
+3. **Dispatch.** The renamed instruction is written into an **issue queue** (the reservation stations of Tomasulo's design) and, in program order, into the next entry of the reorder buffer.
+4. **Issue.** Every cycle, the issue queue sends to the functional units the instructions whose source registers are ready, oldest first, up to the number of free units. Program order no longer matters here.
+5. **Complete.** A finished instruction writes its result into its physical register and broadcasts the register's number; queued instructions that were waiting for it become ready. Its ROB entry is marked done.
+6. **Retire.** At the head of the reorder buffer, the oldest instruction leaves once it is done; up to $w$ retire per cycle. Only now does its result become part of the architectural state: the retirement map is updated, and a store is allowed to write the cache. If the instruction raised an exception or was a mispredicted branch, it and every younger instruction are discarded instead.
+
+Retiring in order is what lets the core run out of order without the program noticing. An exception is **precise**, as the [exceptions note](/notes/acos/exceptions-and-interrupts) requires: when the `lw` of iteration 7 causes a page fault, every older instruction has retired and no younger one has changed the architectural registers or memory, so the handler sees the state of a sequential machine stopped between two instructions. The handler runs, the `lw` is restarted, and the work that the younger instructions had done is simply redone.
+
+**How large must the window be?** An instruction occupies its ROB entry from dispatch until it retires. To sustain $w$ instructions per cycle when each stays $L$ cycles in the window, the core needs about $w \cdot L$ entries, the product of throughput and latency (Little's law). In the loop, an iteration's `sw` retires about 7 cycles after its `lw` enters: at two instructions per cycle, about 14 entries keep the machine busy. The simulation in the Code section agrees: with a window of 8 entries the loop takes 4.01 cycles per iteration, with 16 or more entries 2.54. A cache miss of 100 cycles needs a window of hundreds of instructions to hide, which is why Skylake's reorder buffer has 224 entries ([WikiChip](#references)).
+
+## Speculation
+
+Out-of-order execution across iterations requires starting instructions that come after a branch whose outcome is not yet known. A core that waited for every branch would refill its front end after each one and gain little. Instead it **speculates**: the branch predictor guesses the outcome, and the core fetches, renames and executes along the predicted path as if the guess were right. Speculative results stay in physical registers and in the reorder buffer, outside the architectural state, until the branch retires.
+
+- **If the guess was right**, nothing happens: the speculative instructions retire normally, and the waiting time for the branch has been hidden.
+- **If it was wrong**, the branch is found to be mispredicted when it executes. Every younger instruction is removed from the reorder buffer and the issue queue, the map table is restored to its state at the branch, and fetch restarts at the correct target. Nothing visible in registers or memory has changed, because no speculative instruction retired. The cost is the work thrown away and the cycles needed to refill the front end, which grow with the depth of the pipeline.
+
+**Worked example.** In the loop, `bne` is taken in every iteration but the last, which a simple predictor learns at once. Without speculation, nothing after `bne` may enter the window until `bne` has executed and the front end, three stages deep in the model, has delivered the next instruction. The simulation gives 6.01 cycles per iteration without speculation and 2.54 with it. Speculation applies to other guesses too. A load can execute before an earlier store whose address is not yet known, on the bet that the addresses differ; if they turn out to be equal, the load and everything after it are replayed.
+
+### Spectre: speculation leaves traces
+
+Squashed instructions leave the architectural state unchanged, but not the microarchitectural state: a load executed on a mispredicted path still brings its cache line into the cache. [Kocher et al. (2018)](#references) showed that this is enough to read memory a program is not allowed to read. In the bounds-check variant, a victim function contains `if (x < size) y = array2[array1[x] * 256];`, where each of the 256 values of the byte `array1[x]` selects a different cache line of `array2`. The attacker first calls it with valid `x` many times, so that the predictor learns that the branch is taken, then calls it with an out-of-bounds `x` while `size` is not in the cache. While the core waits for `size`, it speculatively reads the secret byte `array1[x]` and loads the line of `array2` that the byte selects. The misprediction is detected and the instructions are squashed, but the line stays cached. The attacker then times a read of each of the 256 candidate lines; the one that is fast reveals the byte, by the cache timing effect of the [caches note](/notes/acos/caches). Defences include fences that stop speculation after sensitive bounds checks, masking indices so that even a speculative access stays in bounds, and hardware that isolates the predictor state of different programs; each costs some of the performance that speculation was for.
+
+## The worked example: six machines on one loop
+
+The Code section simulates the loop for 100 iterations on six machines with the latencies of the baseline. All issue at most two instructions per cycle, except the first; the out-of-order ones bring two instructions per cycle into their window, start any instruction whose operands are ready, and retire in order.
+
+| Machine | Cycles for 100 iterations | Cycles per iteration | IPC |
+| --- | --- | --- | --- |
+| in order, one-wide | 900 | 9.00 | 0.56 |
+| in order, two-wide | 701 | 7.01 | 0.71 |
+| out of order, no renaming | 701 | 7.01 | 0.71 |
+| out of order, no speculation | 601 | 6.01 | 0.83 |
+| out of order, window of 8 entries | 401 | 4.01 | 1.25 |
+| out of order, window of 32 entries | 254 | 2.54 | 1.97 |
+
+Every mechanism is necessary. Out-of-order issue without renaming gains nothing on this loop: the next `lw` must wait until `sw` has read `t0`, and `addi` until `sw` has read `a0`, so the iterations are serialized as in the in-order core. Without speculation, the front end stalls at every branch. With all three mechanisms and a large enough window, the iterations overlap, the 7-cycle critical path of each iteration is hidden, and the loop runs at the limit set by the width: five instructions at two per cycle, 2.5 cycles per iteration.
+
+<IssueSchedule />
+
+<aside class="callout"><strong>Check yourself.</strong> (1) In `add t1, t2, t3; sub t2, t4, t5; or t1, t6, t2`, name every dependence and its kind. Which ones does renaming remove? (2) The loop runs on the out-of-order core with a window of 32 entries, but the issue width is raised to four. What is the new limit on cycles per iteration, and which dependence sets it? (3) Why does a core retire in order when it already executes out of order?<details><summary>Answers</summary>(1) `sub` writes `t2`, which `add` reads: an anti-dependence. `or` writes `t1`, which `add` also writes: an output dependence. `or` reads the `t2` of `sub`: a true dependence. Renaming removes the anti- and the output dependence; the true one remains. (2) Five instructions at four per cycle would allow 1.25 cycles per iteration; the chain of `addi` instructions, each needing the previous `a0`, allows one iteration per cycle, so the width remains the limit at 1.25 (the simulation in the Code section, run with width 4 and a window of 64, gives 1.31 for 100 iterations, the start-up included). (3) So that exceptions are precise and mispredictions can be undone: until an instruction retires, its effects are kept outside the architectural state, and every older instruction has already completed when it does.</details></aside>
+
+## What changed
+
+| | In-order pipeline | Out-of-order superscalar core |
+| --- | --- | --- |
+| Instructions started per cycle | at most 1 | up to $w$ (Skylake renames 4 per cycle) |
+| Order of execution | program order | dataflow order: as soon as operands exist |
+| Dependences that limit it | true, anti and output, plus program order | true dependences, and the window size |
+| Register names | architectural registers only | many more physical registers, a map table |
+| Branches | stall, or fetch along a guess for a few cycles | predicted; dozens of instructions run speculatively |
+| Precise exceptions | by construction | by retiring in order from the reorder buffer |
+| Cost | small and simple | large structures checked every cycle: power and area |
+
+## Limitations
+
+- **Programs have finite ILP.** Long chains of true dependences, such as walking a linked list where each address comes from the previous load, cannot be overlapped by any width or window.
+- **Mispredictions waste work.** Code with branches that depend on data in unpredictable ways throws away many speculative instructions, and the cost grows with pipeline depth and width.
+- **The memory wall.** A miss to main memory takes hundreds of cycles, more than even a large window can cover; the core stalls once the window fills behind the missing load.
+- **Cost grows faster than the gain.** Checking all in-flight instructions for readiness and renaming $w$ instructions per cycle, with dependences among them, cost area and power that grow faster than linearly in $w$. On general programs the IPC stays well below the width.
+- **Speculation is a security boundary.** Side channels such as Spectre show that the hidden state of speculative execution can leak, and their defences cost performance.
+
+## What you should remember
+
+- ILP is the parallelism inside one instruction stream. Multiple issue raises the peak IPC above 1: statically (VLIW, the compiler forms packets) or dynamically (superscalar, the hardware decides every cycle).
+- True dependences (RAW) carry values; anti- (WAR) and output (WAW) dependences come only from reused register names.
+- Register renaming maps each destination to a fresh physical register through a map table, leaving only true dependences.
+- Out-of-order execution starts instructions when their operands are ready; the reorder buffer retires them in program order, which keeps exceptions precise and makes mispredictions recoverable.
+- Speculation executes past unresolved branches; a misprediction squashes the younger instructions. The window size needed is about width times latency.
+- On the example loop: 9 cycles per iteration in order and one-wide, 7 in order and two-wide, 2.54 out of order with renaming, speculation and a 32-entry window.
+- Spectre turns the cache footprint of squashed speculative loads into a way to read secret memory.
+
+## Code
+
+The scheduling simulation of the worked example: in-order and out-of-order machines, with renaming and speculation switched on and off.
+
+```python
+# The loop of the worked example, x[i] = k * x[i]: five instructions per iteration.
+# Each entry: (operation, destination register, source registers, latency in cycles).
+BODY = [('lw',   't0', ['a0'],       3),   # t0 = x[i]
+        ('mul',  't0', ['t0', 'a2'], 3),   # t0 = k * x[i]
+        ('sw',   None, ['t0', 'a0'], 1),   # x[i] = t0
+        ('addi', 'a0', ['a0'],       1),   # a0 = a0 + 4
+        ('bne',  None, ['a0', 'a1'], 1)]   # loop while a0 != a1
+
+def in_order(n, width):
+    """Start instructions in program order, at most `width` per cycle, each once its sources are ready."""
+    ready, t, used, start = {}, 0, 0, []
+    for op, dst, srcs, lat in BODY * n:
+        s = max([t] + [ready.get(r, 0) for r in srcs])
+        if s > t: t, used = s, 0
+        if used == width: t, used = t + 1, 0
+        start.append(t); used += 1
+        if dst: ready[dst] = t + lat
+    return start
+
+def out_of_order(n, width, window, rename=True, speculate=True, depth=3):
+    """`width` instructions per cycle enter a window of `window` entries in program order; any instruction
+    whose operands are ready starts; instructions retire in order. Without speculation, nothing after a
+    branch enters until the branch has executed and the front end (`depth` cycles) has refilled."""
+    prog = BODY * n
+    enter, start, done, retire = [], [], [], []
+    writer, readers, branch = {}, {}, None   # register -> last writer; start cycles of its readers since
+    for i, (op, dst, srcs, lat) in enumerate(prog):
+        e = enter[-1] if enter else 0
+        if i >= width and enter[i - width] == e: e += 1          # at most `width` enter per cycle
+        if i >= window: e = max(e, retire[i - window] + 1)      # wait for a free entry
+        if not speculate and branch is not None: e = max(e, branch + depth)
+        t = max([e] + [done[writer[r]] for r in srcs if r in writer])        # true dependences
+        if not rename and dst:
+            t = max([t] + readers.get(dst, []))                               # anti: not before earlier reads
+            if dst in writer: t = max(t, done[writer[dst]] - lat + 1)        # output: write after earlier write
+        enter.append(e); start.append(t); done.append(t + lat)
+        retire.append(max(done[-1], retire[-1] if retire else 0))
+        for r in srcs: readers.setdefault(r, []).append(t)
+        if dst: writer[dst], readers[dst] = i, []
+        if op == 'bne': branch = t + lat
+    return start
+
+def cycles(start, n):                      # cycles until the last result is written
+    return max(s + ins[3] for s, ins in zip(start, BODY * n))
+
+N = 100
+for name, run in [('in order, 1 wide',             lambda n: in_order(n, 1)),
+                  ('in order, 2 wide',             lambda n: in_order(n, 2)),
+                  ('out of order, no renaming',    lambda n: out_of_order(n, 2, 32, rename=False)),
+                  ('out of order, no speculation', lambda n: out_of_order(n, 2, 32, speculate=False)),
+                  ('out of order, window of 8',    lambda n: out_of_order(n, 2, 8)),
+                  ('out of order, window of 32',   lambda n: out_of_order(n, 2, 32))]:
+    c = cycles(run(N), N)
+    print(f'{name:29s} {c:3d} cycles, {c / N:.2f} per iteration, IPC {5 * N / c:.2f}')
+# in order, 1 wide              900 cycles, 9.00 per iteration, IPC 0.56
+# in order, 2 wide              701 cycles, 7.01 per iteration, IPC 0.71
+# out of order, no renaming     701 cycles, 7.01 per iteration, IPC 0.71
+# out of order, no speculation  601 cycles, 6.01 per iteration, IPC 0.83
+# out of order, window of 8     401 cycles, 4.01 per iteration, IPC 1.25
+# out of order, window of 32    254 cycles, 2.54 per iteration, IPC 1.97
+print(cycles(out_of_order(N, 2, 16), N), cycles(out_of_order(N, 4, 64), N))
+# 254 131: a window of 16 is enough at width 2; width 4 gives 1.31 cycles per iteration
+print(in_order(3, 2))                      # start cycles of the first three iterations
+print(out_of_order(3, 2, 32))
+# [0, 3, 6, 6, 7, 7, 10, 13, 13, 14, 14, 17, 20, 20, 21]
+# [0, 3, 6, 1, 2, 2, 5, 8, 4, 5, 5, 8, 11, 6, 7]
+```
+
+The loop itself, as a complete program for RARS: it multiplies six numbers by 3 and prints them.
+
+```asm
+# x[i] = k * x[i] for an array of 6 words: the loop of the scheduling example
+        .data
+x:      .word 1, 2, 3, 4, 5, 6
+x_end:
+        .text
+main:
+        la   a0, x              # a0 = &x[0]
+        la   a1, x_end          # a1 = one past the last element
+        li   a2, 3              # k = 3
+loop:   lw   t0, 0(a0)          # t0 = x[i]
+        mul  t0, t0, a2         # t0 = k * x[i]
+        sw   t0, 0(a0)          # x[i] = t0
+        addi a0, a0, 4          # next element
+        bne  a0, a1, loop
+        la   s0, x              # print the array
+print:  lw   a0, 0(s0)
+        li   a7, 1
+        ecall
+        li   a0, ' '
+        li   a7, 11
+        ecall
+        addi s0, s0, 4
+        bne  s0, a1, print
+        li   a7, 10
+        ecall
+# prints: 3 6 9 12 15 18
+```
+
+## Next
+
+A core that finds two instructions per cycle in this loop, and a few per cycle in ordinary code, is close to what one instruction stream offers: the width, the window and the power all grow faster than the parallelism they find. Since the mid-2000s the transistors have gone into more cores instead. The [next note](/notes/acos/thread-level-parallelism) runs several instruction streams at once: how much a program gains from more cores (Amdahl's law), how the cores' private caches are kept consistent, and what a core may see of another core's writes.
+
+## References
+
+- A. Tatarnikov. *Computer Architecture and Operating Systems* (HSE), [lecture 13: multiple issue and out-of-order execution](https://andrewt0301.github.io/hse-acos-course/part1ca/13_MultiIssue/lecture.html).
+- D. A. Patterson, J. L. Hennessy. *Computer Organization and Design, RISC-V Edition*, 2nd ed. Morgan Kaufmann, 2020. §4.11 (parallelism via instructions: static and dynamic multiple issue, speculation), §4.12 (the Intel Core i7 6700 and ARM Cortex-A53).
+- J. L. Hennessy, D. A. Patterson. *Computer Architecture: A Quantitative Approach*, 6th ed. Morgan Kaufmann, 2019. Chapter 3 (instruction-level parallelism: dependences, dynamic scheduling and Tomasulo's algorithm, hardware-based speculation, multiple issue, the Intel Core i7 6700).
+- S. L. Harris, D. M. Harris. *Digital Design and Computer Architecture, RISC-V Edition*. Morgan Kaufmann, 2021. §7.7 (advanced microarchitecture: superscalar and out-of-order processors, register renaming).
+- R. M. Tomasulo. [An efficient algorithm for exploiting multiple arithmetic units](https://doi.org/10.1147/rd.111.0025). *IBM Journal of Research and Development*, 11(1), 1967.
+- J. E. Smith, A. R. Pleszkun. [Implementing precise interrupts in pipelined processors](https://doi.org/10.1109/12.4607). *IEEE Transactions on Computers*, 37(5), 1988 (the reorder buffer).
+- J. A. Fisher. [Very long instruction word architectures and the ELI-512](https://doi.org/10.1145/800046.801649). *ISCA*, 1983.
+- P. Kocher, D. Genkin, D. Gruss, W. Haas, M. Hamburg, M. Lipp, S. Mangard, T. Prescher, M. Schwarz, Y. Yarom. [Spectre attacks: exploiting speculative execution](https://arxiv.org/abs/1801.01203). arXiv:1801.01203, 2018; published, with J. Horn and A. Fogh as further authors, at the *IEEE Symposium on Security and Privacy*, 2019. §4 (exploiting conditional branch misprediction, Listing 1).
+- Chips and Cheese. [Skylake: Intel's longest serving architecture](https://chipsandcheese.com/p/skylake-intels-longest-serving-architecture), 2022 (the four-wide renamer).
+- WikiChip. [Skylake (client) microarchitecture](https://en.wikichip.org/wiki/intel/microarchitectures/skylake_(client)) (the 224-entry reorder buffer and the 180-entry integer register file, from Intel's IDF 2015 presentation).

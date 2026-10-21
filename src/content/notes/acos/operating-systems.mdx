@@ -1,0 +1,241 @@
+---
+title: What an operating system does
+description: "The program that turns one machine into many: the abstractions it offers (processes, files, sockets), how it shares the processor and memory, how user and kernel modes enforce isolation, monolithic and microkernel designs, Linux and its tools, and booting."
+course: acos
+section: The Operating System
+order: 17
+status: published
+tags: [operating-system, kernel, user-mode, privilege-levels, monolithic-kernel, microkernel, linux, shell, boot]
+prerequisites: [Exceptions and interrupts, Virtual memory, Input and output]
+---
+
+import OsLayers from '../../../components/figures/operating-systems/OsLayers.astro';
+import KernelCrossings from '../../../components/figures/operating-systems/KernelCrossings.astro';
+import BootChain from '../../../components/figures/operating-systems/BootChain.astro';
+
+The [previous note](/notes/acos/domain-specific-architectures) ended the tour of the hardware with processors built for one kind of work, which a general-purpose processor feeds and supervises. Every program in the first half of the course had the machine to itself. A RARS program owned all 32 registers and the whole memory, and when it executed `ecall` to print a number, the simulator did the printing. A real computer runs many programs at once, written by different people, none of which trusts the others, and none of which knows how to drive a disk. The **operating system** is the program that makes this possible. This note says what it does, which hardware features it relies on, how its central part, the **kernel**, is organized, what Linux consists of, and how a machine gets from power-on to a shell prompt. The notes that follow write C programs against it.
+
+**Terms.** The *kernel* is the part of the operating system that runs with full hardware privilege. Everything else, including the C library, the shell and the system utilities, consists of ordinary programs. A *process* is a running program together with the resources the kernel gave it. *Kernel mode* and *user mode* are the processor's privilege levels; on RISC-V they are called S-mode (supervisor) and U-mode (user), and a third, M-mode (machine), sits below the kernel.
+
+## Baseline: one program on bare hardware
+
+The simplest arrangement has no operating system at all. The program is linked together with the code that drives each device it uses, the processor starts executing it after reset, and it runs until the power goes off. Thermostats, washing machines and many microcontroller boards work this way, and it is the model of every RARS program so far: RARS loads code at address `0x00400000` and data at `0x10010000`, and the program may use any register and any address.
+
+Now put two such programs on one machine.
+
+- **Memory.** Both were built to keep their data at `0x10010000`. Without address translation they cannot both be in memory: the second program's string overwrites the first program's counter, and neither can tell.
+- **The processor.** The first program ends with `loop: j loop`, waiting for a button. It never returns control, so the second program never runs.
+- **Devices.** Each program carries its own driver for the display. If both write to its registers at once, the output is garbage.
+- **Protection.** Nothing stops either program from reprogramming the timer, turning off interrupts or reading the other's data.
+
+Each of these problems needs an arbiter that runs with more authority than the programs it arbitrates, and needs the hardware to give that arbiter a way to take control back. That arbiter is the kernel.
+
+## Three jobs: abstraction, resource management, isolation
+
+An operating system does three things, and most of its code serves more than one of them.
+
+**Abstraction.** The hardware offers registers, physical memory, disk blocks and network frames. Programs want something easier to use, and the kernel provides it:
+
+| Hardware | Abstraction | What a program sees | Where in the course |
+| --- | --- | --- | --- |
+| processor cores, the timer | process, thread | a processor of its own that runs continuously | [Processes and threads](/notes/acos/processes-and-threads) |
+| physical memory | virtual address space | private memory from address 0 upward, 256 GB on RISC-V Linux with Sv39 | [Virtual memory](/notes/acos/virtual-memory) |
+| disk blocks, flash pages | file | a named sequence of bytes that can grow | [Files and input/output](/notes/acos/files-and-io) |
+| network card, packets | socket | a reliable stream of bytes to a process on another machine | [Sockets](/notes/acos/sockets) |
+| terminal, keyboard, any device | file descriptor | a small integer to `read` from and `write` to | [Files and input/output](/notes/acos/files-and-io) |
+
+The abstraction is the same on every machine, whatever disk or network card it has, so one program runs on all of them. The device-specific code lives once, in the kernel's drivers.
+
+**Resource management.** There are more processes than cores, and less memory than all programs would like. The kernel decides who gets the processor and for how long (the *scheduler*), which physical pages belong to whom (the *memory manager*), and in which order requests reach a device. These are policy decisions: fairness, priority, throughput.
+
+**Isolation.** No process may read or write another's memory, touch a device directly or keep the processor against the kernel's will. Isolation is what makes the other two jobs enforceable: a scheduler that a program could switch off would schedule nothing.
+
+**Worked example: sharing one core.** Three programs are runnable on one core. The kernel programs the timer to interrupt every 4 ms; Linux is built with a tick of 1, 3.3, 4 or 10 ms, so 4 ms is one of its standard choices. At each interrupt the kernel saves the registers of the running program and restores those of the next. Each program runs for 4 ms out of every 12 ms, so each gets a third of the processor, and each sees a pause of 8 ms between its turns. The program stuck in `loop: j loop` is interrupted like the others, and the remaining two keep running. None of the three can stop the rotation: reprogramming the timer is an operation the hardware allows only in kernel mode.
+
+<aside class="callout"><strong>Key idea.</strong> The kernel is not a library that programs call when they like. It owns the hardware and lends it out. Programs run directly on the processor at full speed, but in a mode where they cannot touch the timer, the page tables or the devices, and every trap, interrupt and fault hands control back to the kernel at an address the kernel chose in advance. This arrangement is called <em>limited direct execution</em> (<a href="#references">Arpaci-Dusseau and Arpaci-Dusseau, 2023</a>, ch. 6).</aside>
+
+## Kernel mode and user mode
+
+The [exceptions note](/notes/acos/exceptions-and-interrupts) introduced the trap: the processor stops what it was doing, records why, and jumps to a handler. The privilege modes are what turns the trap into a protection mechanism. A RISC-V processor has three: **M-mode** (machine, encoded as 3), the most privileged, where firmware runs; **S-mode** (supervisor, 1), where the kernel runs; and **U-mode** (user, 0), where every process runs ([RISC-V Privileged Architecture](#references), ch. 1). x86-64 calls its levels rings 0 to 3 and uses 0 and 3; Arm calls them EL0 to EL3. The current mode is not in any register a program can read; it is changed only by traps and by the return instructions `sret` and `mret`.
+
+<OsLayers />
+
+1. **System call.** The program executes `ecall`. The processor saves the address of the `ecall` in `sepc`, writes the cause 8 (environment call from U-mode) into `scause`, switches to S-mode and jumps to the address in `stvec`.
+2. **Exception.** An instruction fails, for example a load from a page that is not mapped. The same mechanism runs, with cause 13 (load page fault).
+3. **Interrupt.** A device or the timer raises an interrupt. The running program did nothing wrong, but it is stopped all the same.
+4. **Return.** The kernel finishes and executes `sret`, which switches back to U-mode and jumps to the address in `sepc`.
+
+What does U-mode forbid? Three kinds of things.
+
+- **Privileged instructions and registers.** `sret`, `wfi` and `sfence.vma` raise an illegal-instruction exception in U-mode, and so does any access to a control and status register (CSR) above the current privilege. A CSR's 12-bit address carries its lowest permitted mode in bits 9–8 ([RISC-V Privileged Architecture](#references), §2.1).
+- **Memory marked for the kernel.** Every page-table entry has a U bit. U-mode code can use only pages with U = 1; the kernel is mapped in every process's page table, but with U = 0.
+- **Devices.** Device registers are mapped only in the kernel's part of the address space, so a program cannot reach them at all.
+
+**Worked example.** A program in U-mode executes `csrw satp, a0`, trying to install its own page table. The address of `satp` is `0x180`; bits 9–8 of `0x180` are `01`, so the lowest mode allowed is S. The processor raises an illegal-instruction exception, cause 2, and the kernel's handler sends the process the signal `SIGILL`, which ends it unless the program catches it. A load from a kernel address is stopped differently: the address is mapped, but its page-table entry has U = 0, so the processor raises a load page fault, cause 13, and the kernel sends `SIGSEGV`. In both cases the instruction never takes effect. The Code section tries both on a real machine.
+
+<aside class="callout"><strong>Check yourself.</strong> (1) A program runs <code>loop: j loop</code> forever. How does the kernel get the processor back, and why can the program not prevent it? (2) Why must the address the processor jumps to on a trap be set by the kernel, and not passed by the program as an argument of <code>ecall</code>?<details><summary>Answers</summary>(1) The timer raises an interrupt after the time slice, and the trap enters the kernel at the address in <code>stvec</code>. Turning interrupts off or reprogramming the timer needs privileged CSRs, which raise an exception in U-mode. (2) If the program chose the entry address, it could jump into the middle of kernel code, past the checks on its arguments, and run it with kernel privilege. A single entry point fixed by the kernel means every request passes the same checks.</details></aside>
+
+## How a kernel is organized: monolithic, microkernel, hybrid
+
+Everything in kernel mode can do anything, so a bug anywhere in the kernel can crash the machine or leak any data. How much code to put in kernel mode is the central design question, and there are two answers.
+
+A **monolithic kernel** puts all services in one program running in S-mode, in one address space: the scheduler, the memory manager, the file systems, the network stack and the device drivers. They call each other with ordinary function calls. Linux, the BSDs and classic Unix are monolithic. The structure is fast and simple, but every driver runs with full privilege: a faulty driver for an obscure device can bring the whole system down.
+
+A **microkernel** keeps in S-mode only what cannot live anywhere else: address spaces, threads, and message passing between processes (*inter-process communication*, IPC). File systems, drivers and the network stack become ordinary user processes, called *servers*, and a request to one of them is a message carried by the kernel. Mach, L4, QNX and MINIX 3 are microkernels. A crashed driver is just a crashed process that can be restarted, and the privileged part is small: seL4 has about 8,700 lines of C and 600 lines of assembly, few enough to prove the C code correct against a formal specification ([Klein et al., 2009](#references)). The price is the number of crossings.
+
+<KernelCrossings />
+
+**Worked example: one read from disk.** A program reads a block that is not in memory, so the request must reach the disk driver.
+
+- **Monolithic.** (1) The program traps into the kernel; the file system is kernel code. (2) It calls the driver's function, (3) the driver returns, and (4) the kernel returns to the program with `sret`. Two mode switches, and the program's address space stays in place throughout, because the kernel is mapped in it.
+- **Microkernel.** (1) The program sends a message, which traps into the microkernel; (2) the microkernel delivers it to the file server, switching to the server's address space; (3) the file server sends a message to the driver, (4) which receives it; (5) the driver replies, (6) to the file server; (7) the file server replies, (8) to the program. Eight mode switches and four address-space switches.
+
+Each mode switch saves and restores registers, and each address-space switch may cost a TLB flush and the cache misses that follow. First-generation microkernels such as Mach were slow for this reason; Liedtke argued, with L4 as the evidence, that the slowness came mostly from how their IPC was implemented and not from the idea itself ([Liedtke, 1995](#references)). Still, a monolithic kernel avoids the crossings altogether.
+
+**Hybrid kernels** take the microkernel's structure and run the servers in kernel mode anyway, for speed. Windows NT and Apple's XNU, which combines the Mach microkernel with a BSD kernel in one address space, are the standard examples. Linux in turn is monolithic but modular: a *loadable kernel module* is an object file that can be linked into the running kernel with `insmod` and removed with `rmmod`, which is how most drivers are loaded. A module runs in S-mode with full privilege, so this is a way to organize code, not a way to isolate it.
+
+## Linux: kernel, distribution, shell
+
+Linux, begun by Linus Torvalds in 1991, is a monolithic kernel distributed under the GPL. Its source tree shows the services of the figure above as directories: `kernel/` (processes and scheduling), `mm/` (memory management), `fs/` (the virtual file system and the file systems), `net/` (the network stack), `drivers/` (device drivers) and `arch/` (the code specific to each instruction set, with `arch/riscv` and `arch/x86` side by side). Everything above the system-call interface comes from other projects.
+
+A **distribution** packages the kernel with everything a usable system needs: a C library (glibc or musl), the core utilities (`ls`, `cp`, `cat`), a shell, an init system that starts services (systemd on most distributions), a package manager and thousands of prebuilt packages. Debian and Ubuntu use `apt` and `.deb` packages, Fedora and Red Hat `dnf` and `.rpm`, Alpine `apk` with musl and BusyBox. Android runs the Linux kernel under an entirely different user space with its own C library, Bionic. All of them run the same kernel interface; which one is installed matters to programs mostly through the library versions and the paths of files.
+
+The **shell** (`bash`, `zsh`) is an ordinary user program. It reads a command line, finds the program it names, starts it as a new process with `fork` and `exec` ([Processes and threads](/notes/acos/processes-and-threads)) and waits for it, unless the line ends with `&`. Its operators connect processes: `>` sends a program's output to a file, `|` connects one program's output to the next one's input. The tools used in this part of the course:
+
+| Command | What it does |
+| --- | --- |
+| `ls`, `cd`, `cat`, `cp`, `mv`, `rm` | list, change, print, copy, move, remove files and directories |
+| `grep`, `wc`, `sort`, `head` | search, count, sort and cut text; combined with `\|` |
+| `ps`, `top`, `kill` | list processes, watch them, send them signals |
+| `man 2 write`, `man 3 printf` | read the manual: section 1 is commands, 2 system calls, 3 library functions |
+| `gcc`, `clang`, `make`, `cmake` | compile and build C programs |
+| `strace`, `ltrace`, `gdb` | trace system calls, trace library calls, debug |
+| `nm`, `objdump`, `readelf`, `ldd` | inspect object files and executables |
+
+Linux also exposes kernel state as files. Under `/proc`, each process has a directory: `/proc/self/maps` lists the memory regions of the process that reads it, and `ps` builds its list by reading `/proc/<pid>/stat`. Under `/dev`, devices appear as files: `/dev/null` discards everything written to it. Reading and writing them uses the same system calls as for files on disk, an idea that recurs in the rest of the course.
+
+## Booting, briefly
+
+At power-on there is no kernel in memory, no page table and no file system. Booting is a chain in which each stage loads and starts a more capable one, and the privilege drops as the chain proceeds.
+
+<BootChain />
+
+**Worked example: the QEMU `virt` board.** QEMU's emulated RISC-V board puts a small boot ROM at `0x1000` and RAM at `0x80000000` ([QEMU documentation](#references)). After reset, the processor runs a few ROM instructions in M-mode and jumps to `0x80000000`, where the firmware OpenSBI is loaded. OpenSBI configures the timer and interrupt delegation, stays resident to serve the kernel's requests (the *Supervisor Binary Interface*, SBI: for example setting the next timer interrupt), and enters the next stage in S-mode with `mret`. The kernel image sits 2 MiB above the start of RAM, at `0x80200000`, which is also where OpenSBI's generic 64-bit `fw_jump` build expects the next stage: its offset is `0x200000` ([OpenSBI](#references)). There the kernel starts: it builds its page tables and turns on translation, writes the address of its trap handler into `stvec`, discovers the devices from a *device tree* that describes the board, mounts the root file system, and finally starts the first user program, `/sbin/init`, with process ID 1, in U-mode. Init starts everything else, from the network service to the login prompt and the shell.
+
+A PC follows the same plan with different names: UEFI firmware instead of OpenSBI, a bootloader such as GRUB that reads the kernel from disk, and ACPI tables instead of a device tree. Real RISC-V boards also insert a bootloader, usually U-Boot. In every case the kernel is the last stage that runs with S-mode privilege, and init is the first user process.
+
+## What changed
+
+| | One program on bare hardware | Programs on an operating system |
+| --- | --- | --- |
+| Who controls the processor | the program, until it stops | the kernel, which lends it out in time slices |
+| Memory | physical addresses, shared by everyone | a private virtual address space per process |
+| Devices | each program drives them itself | the kernel's drivers, behind files and sockets |
+| Privilege | everything allowed | U-mode: no privileged instructions, no kernel pages, no devices |
+| A bug in one program | can corrupt everything | ends that process, as a signal such as `SIGSEGV` |
+| Entering the kernel | not applicable | only by a trap: system call, exception or interrupt |
+
+## Limitations
+
+- **Crossings cost time.** Every system call, interrupt and context switch saves and restores state and disturbs the caches and the TLB. The [system-calls note](/notes/acos/system-calls) measures how much.
+- **A kernel bug is a system bug.** In a monolithic kernel, every driver can corrupt any memory. Microkernels shrink that code at the price of more crossings, and hybrids give part of the benefit back for speed.
+- **Isolation is only as good as the hardware.** Meltdown let user code read kernel memory on many processors by exploiting speculative execution, although the page-table permissions were correct ([Lipp et al., 2018](#references)). The fix, unmapping most of the kernel while user code runs, makes every system call on affected processors more expensive.
+- **Abstractions hide costs.** A file read may take nanoseconds when the data is cached and milliseconds when it is not; the same call can be fast or slow for reasons the program cannot see.
+- **Policies are general.** The scheduler and the memory manager are tuned for typical workloads, and a program with unusual needs (a database, a real-time controller) may have to work around them.
+
+## What you should remember
+
+- The operating system provides abstractions (processes, virtual memory, files, sockets), manages resources (processor time, memory, devices) and isolates processes from each other and from the kernel.
+- The kernel runs in a privileged mode (S-mode on RISC-V), processes in user mode (U-mode). Firmware runs in M-mode below the kernel.
+- Control enters the kernel only through a trap (a system call, an exception or an interrupt), at an address the kernel set; `sret` returns to user mode. This is limited direct execution.
+- U-mode cannot execute privileged instructions (illegal instruction, `SIGILL`), cannot touch pages with U = 0 (page fault, `SIGSEGV`) and cannot reach devices.
+- Monolithic kernels (Linux) put all services in kernel mode: fast, one fault domain. Microkernels (seL4, QNX) move them into user processes: isolated, more crossings (8 against 2 for one disk read in the example). Hybrids (Windows, macOS) mix the two.
+- A Linux system is the kernel plus a distribution: C library, utilities, shell, init, packages. The shell is an ordinary process.
+- Booting is a chain of stages with decreasing privilege: ROM, firmware in M-mode, kernel in S-mode, init as process 1 in U-mode.
+
+## Code
+
+What user mode allows and what it does not. The program asks the kernel for its name with the `uname` system call, then tries three things: ordinary arithmetic, masking interrupts (a privileged instruction on every architecture) and reading address 0, which no process has mapped. The kernel turns the last two into signals, and the program catches them instead of dying.
+
+```c
+// modes.c: clang -std=c17 -Wall -Wextra -O0 modes.c -o modes && ./modes
+#include <setjmp.h>
+#include <signal.h>
+#include <stdio.h>
+#include <sys/utsname.h>
+
+static sigjmp_buf back;
+static void on_signal(int sig) { siglongjmp(back, sig); }
+
+static const char *name(int sig) {
+    return sig == SIGILL ? "SIGILL" : sig == SIGSEGV ? "SIGSEGV" : sig == SIGBUS ? "SIGBUS" : "other";
+}
+
+/* Run f; report the signal the kernel sent instead of letting it end the process. */
+static void attempt(const char *what, void (*f)(void)) {
+    int sig = sigsetjmp(back, 1);
+    if (sig == 0) {
+        f();
+        printf("%-20s allowed\n", what);
+    } else {
+        printf("%-20s stopped by the kernel with %s\n", what, name(sig));
+    }
+}
+
+static void privileged(void) {       /* mask interrupts: a kernel-only operation */
+#if defined(__aarch64__)
+    __asm__ volatile("msr daifset, #2");
+#elif defined(__x86_64__)
+    __asm__ volatile("cli");
+#elif defined(__riscv)
+    __asm__ volatile("csrci sstatus, 2");
+#endif
+}
+
+static void read_null(void) {        /* the page at address 0 is never mapped */
+    volatile int *p = NULL;
+    (void)*p;
+}
+
+static void ordinary(void) {         /* plain arithmetic needs no permission */
+    volatile int x = 6 * 7;
+    (void)x;
+}
+
+int main(void) {
+    struct utsname u;
+    uname(&u);                       /* a system call: the kernel describes itself */
+    printf("kernel: %s\n", u.sysname);
+    signal(SIGILL, on_signal);
+    signal(SIGSEGV, on_signal);
+    signal(SIGBUS, on_signal);
+    attempt("arithmetic", ordinary);
+    attempt("masking interrupts", privileged);
+    attempt("reading address 0", read_null);
+    return 0;
+}
+// Output on macOS, Apple M1 (Linux prints "kernel: Linux"; on x86-64 the cli line reports SIGSEGV,
+// because the processor signals a general-protection fault there):
+// kernel: Darwin
+// arithmetic           allowed
+// masking interrupts   stopped by the kernel with SIGILL
+// reading address 0    stopped by the kernel with SIGSEGV
+```
+
+## Next
+
+User programs reach the kernel through the system-call interface, and that interface is defined as a set of C functions: `write`, `read`, `fork`, `mmap`. The kernel itself and the C library are written in C as well. The [next note](/notes/acos/c-for-systems-programming) introduces C as a systems language: its types and their sizes, pointers, the layout of structures and of a whole program in memory, the undefined behaviour that comes with that closeness to the machine, and how a compiler turns C files into an executable. The [system-calls note](/notes/acos/system-calls) after it follows one call from C into the kernel and back.
+
+## References
+
+- A. Tatarnikov. *Computer Architecture and Operating Systems* (HSE), [lecture 1: operating system architecture, Linux](https://andrewt0301.github.io/hse-acos-course/part2os/01_OS_Architecture/lecture.html), and its [workshop on Linux kernel modules](https://andrewt0301.github.io/hse-acos-course/part2os/01_OS_Architecture/kernel/lecture.html).
+- R. H. Arpaci-Dusseau, A. C. Arpaci-Dusseau. [*Operating Systems: Three Easy Pieces*](https://pages.cs.wisc.edu/~remzi/OSTEP/), version 1.10. Arpaci-Dusseau Books, 2023. Chapter 2 (introduction), chapter 6 (limited direct execution).
+- A. S. Tanenbaum, H. Bos. *Modern Operating Systems*, 4th ed. Pearson, 2015. §1.1 (what an operating system is), §1.7 (operating-system structure: monolithic systems, microkernels), chapter 10 (Linux).
+- A. Silberschatz, P. B. Galvin, G. Gagne. *Operating System Concepts*, 10th ed. Wiley, 2018. Chapter 2 (operating-system structures, building and booting).
+- R. E. Bryant, D. R. O'Hallaron. *Computer Systems: A Programmer's Perspective*, 3rd ed. Pearson, 2016. §1.7 (the operating system manages the hardware), §8.2.4 (user and kernel modes).
+- A. Waterman, K. Asanović, J. Hauser (eds.). [*The RISC-V Instruction Set Manual, Volume II: Privileged Architecture*](https://riscv.org/specifications/ratified/), version 20211203. Chapter 1 (privilege levels), §2.1 (CSR address mapping), chapter 4 (supervisor-level ISA: `sstatus`, `stvec`, `sepc`, `scause`, `satp`, exception codes).
+- G. Klein et al. [seL4: formal verification of an OS kernel](https://doi.org/10.1145/1629575.1629596). *SOSP*, 2009 (8,700 lines of C and 600 of assembly).
+- J. Liedtke. [On µ-kernel construction](https://doi.org/10.1145/224056.224075). *SOSP*, 1995.
+- M. Lipp et al. [Meltdown: reading kernel memory from user space](https://www.usenix.org/conference/usenixsecurity18/presentation/lipp). *USENIX Security*, 2018.
+- [The Linux kernel documentation](https://docs.kernel.org/): [RISC-V virtual memory layout](https://docs.kernel.org/arch/riscv/vm-layout.html) (256 GB of user space with Sv39); `kernel/Kconfig.hz` in the kernel source (tick rates of 100, 250, 300 and 1000 Hz).
+- [QEMU `virt` board for RISC-V](https://www.qemu.org/docs/master/system/riscv/virt.html) (`hw/riscv/virt.c`: boot ROM at `0x1000`, RAM at `0x80000000`), and [OpenSBI](https://github.com/riscv-software-src/opensbi) (`docs/firmware/fw_jump.md`; `platform/generic/objects.mk`: jump offset `0x200000` for 64-bit).

@@ -1,0 +1,257 @@
+---
+title: Input and output
+description: "How a processor talks to devices: controllers and their registers, port-mapped and memory-mapped I/O, polling against interrupts with their cost in cycles, direct memory access, and the buses that connect it all, with the latency and bandwidth of real devices."
+course: acos
+section: Inside the Processor
+order: 11
+status: published
+tags: [input-output, mmio, polling, interrupts, dma, buses, pcie, device-drivers]
+prerequisites: [Exceptions and interrupts, Caches, Virtual memory]
+---
+
+import IoMethods from '../../../components/figures/input-and-output/IoMethods.astro';
+import IoOverhead from '../../../components/figures/input-and-output/IoOverhead.astro';
+
+The [previous note](/notes/acos/exceptions-and-interrupts) gave a device a way to interrupt the processor. An interrupt only says "look at me", though; it carries no data. This note is about the conversation itself: how a program reads a key from the keyboard, sends a character to a display or brings a block from a disk into memory. Everything a computer does that anyone can see, it does through input and output (I/O), yet the instruction set of the [RISC-V Assembly section](/notes/acos/processor-and-isa) has no instruction for any device. The answer is that a device looks like memory to the processor, and the questions are how often the processor should look at it, and whether it has to carry every byte itself.
+
+**Notation.** A **device** is the hardware that does the I/O (a disk, a network adapter, a keyboard); its **controller** (or *adapter*) is the electronics that connect it to the computer. Data rates are in bytes per second: 1 MB/s $= 10^6$ B/s, 1 GB/s $= 10^9$ B/s; sizes of buffers and blocks use binary units, 1 KiB $= 1024$ bytes. $f$ is the clock rate of the processor. The cost of an I/O method is the **fraction of CPU time** it takes: cycles spent on I/O per second divided by $f$.
+
+## Baseline: a special instruction for every device
+
+The simplest design gives the processor instructions for its devices: "read a key", "print a character", "read sector 7 of the disk". Early computers worked this way, and RARS still offers it as system calls (`a7 = 5` reads an integer, `a7 = 11` prints a character), which the simulator implements in Java. As a hardware design it breaks at once. Every new kind of device would need new instructions, and an instruction set lives for decades while devices change every few years. Devices also differ in speed by a factor of a million and more, from a keyboard that produces ten bytes a second to a network adapter that produces billions; an instruction that waits for a key would stall the pipeline of the [pipelining note](/notes/acos/pipelining) for most of a second. And a program that could execute such instructions could read any disk sector, whoever owns it. A general mechanism is needed: one way to talk to any device, at any speed, under the control of the kernel.
+
+## Devices and controllers
+
+Every controller presents the same kind of interface, a few **device registers** ([Arpaci-Dusseau and Arpaci-Dusseau](#references), section 36.2):
+
+- a **status** register that tells whether the device is busy, ready or failed;
+- a **command** (or *control*) register that tells the device what to do, and enables or disables its interrupts;
+- one or more **data** registers through which the bytes pass.
+
+Behind the registers, the controller hides everything that makes the device hard: the timing of the disk head, the encoding of the network cable, a small processor and memory of its own in a modern SSD. The software that knows a particular controller's registers is its **device driver**, a part of the kernel; everything above the driver sees a generic device, such as a stream of bytes or an array of blocks, which the [files note](/notes/acos/files-and-io) turns into files.
+
+**Worked example.** RARS simulates a keyboard and a display (its *Keyboard and Display MMIO Simulator* tool) with four 32-bit registers ([RARS](#references), `KeyboardAndDisplaySimulator.java`):
+
+| Address | Register | Meaning |
+| --- | --- | --- |
+| `0xffff0000` | receiver control | bit 0: a key is ready; bit 1: raise an interrupt when it is |
+| `0xffff0004` | receiver data | the character in the low byte; reading it clears the ready bit |
+| `0xffff0008` | transmitter control | bit 0: the display can take a character; bit 1: interrupt when it can |
+| `0xffff000c` | transmitter data | writing a character here displays it and clears the ready bit until the display is done |
+
+Reading a key is two steps: wait until bit 0 of `0xffff0000` is 1, then load `0xffff0004`. The Code section has the full loop.
+
+## Port-mapped and memory-mapped I/O
+
+How does an instruction reach a device register? There are two designs.
+
+**Port-mapped I/O** gives devices their own address space, separate from memory, and special instructions to use it. x86 has 65,536 one-byte I/O ports and the instructions `in` and `out` ([Intel SDM](#references), vol. 1, chapter 19); the PC's legacy keyboard controller, for example, answers at ports `0x60` and `0x64`. Because the instructions are privileged (the kernel can let a program use particular ports, but by default it cannot), protection comes for free.
+
+**Memory-mapped I/O** (MMIO) has no special instructions. A range of physical addresses is assigned to device registers instead of memory, and ordinary loads and stores reach them: the memory system sees the address and routes the access to the device ([Harris and Harris, 2021](#references), section 9.2). RISC-V, Arm and most modern designs use only MMIO; the RARS addresses above are an example, as are the addresses at which a RISC-V board places its UART and its interrupt controller. Protection comes from [virtual memory](/notes/acos/virtual-memory): the device's physical pages are mapped only into the kernel's address space, so a program in U-mode has no virtual address that reaches them.
+
+MMIO looks like memory but does not behave like it, and two mechanisms from earlier notes must be told so:
+
+- **No caching.** A status register changes on its own, and a read of a data register has an effect (it consumes the character). If the [cache](/notes/acos/caches) kept a copy, a polling loop would read the stale copy forever, and a write to a command register might sit in a write-back cache and never reach the device. Device ranges are therefore marked uncacheable: on RISC-V by the platform's physical memory attributes, elsewhere by bits in the page-table entries.
+- **Ordering.** A driver typically fills a buffer in memory and then writes "go" to a command register. The processor may not reorder those accesses. RISC-V gives `fence` separate bits for device input and output (I and O) besides memory reads and writes (R and W), and Linux's `writel` on RISC-V issues `fence w,o` before the store, so that earlier writes to memory are visible before the device is told to look at them ([Linux, `arch/riscv/include/asm/mmio.h`](#references)).
+
+## Polling or interrupts?
+
+The driver can learn that a device is ready in two ways. With **polling** (or *programmed I/O*) it reads the status register in a loop until the ready bit appears, then moves the data itself. With **interrupt-driven I/O** it enables the device's interrupt, lets the processor do other work, and moves the data in the interrupt handler when the device signals.
+
+<aside class="callout"><strong>Key idea.</strong> Polling pays for every look, whether or not anything has arrived; interrupts pay only when something arrives, but pay more each time. Polling wins when the device is almost always ready, interrupts when it is rarely ready. When the data is large, both lose to a third way: let the device move the data into memory itself, and interrupt once at the end.</aside>
+
+<IoMethods />
+
+1. **Polling.** The processor reads the status register again and again until the device is ready.
+2. It reads the data register and stores the word into memory itself: for a 4 KiB block, 1024 times.
+3. **Interrupts.** When a word is ready, the device raises an interrupt; until then the processor runs other code.
+4. The handler reads the data register, stores the word to memory and returns: one trap per word.
+5. **DMA.** The processor writes the address of a buffer, a length and a start command into the registers of the DMA controller.
+6. The controller moves the whole block between the device and memory over the bus, without the processor.
+7. At the end of the block it raises one interrupt.
+
+To compare them, take a model with round numbers, typical in order of magnitude but not measured on any particular machine: a 2 GHz processor; a poll (a load from an uncached device register, a test and a branch) costs 100 cycles; an interrupt costs 1000 cycles, counting the trap, saving and restoring registers, the handler and the return, and the pipeline and cache disturbance around them; programmed I/O moves 4 bytes per transfer. A driver that polls must look at least 1000 times a second if it wants to notice new data within a millisecond. The CPU fraction of each method at a data rate of $r$ bytes per second is then
+
+$$
+\begin{aligned}
+\text{polling:}\quad & \frac{100 \cdot \max(1000,\ r/4)}{2 \cdot 10^9}, \\
+\text{interrupts:}\quad & \frac{1000 \cdot r/4}{2 \cdot 10^9} .
+\end{aligned}
+$$
+
+**Worked example.** A keyboard: 10 key presses a second, one 4-byte transfer each. Polling costs $100 \times 1000 / (2 \cdot 10^9) = 5 \cdot 10^{-5}$ of the processor, 0.005 %; interrupts cost $1000 \times 10 / (2 \cdot 10^9) = 5 \cdot 10^{-6}$, ten times less. Both are negligible, but polling would also add up to a millisecond of delay, and on a laptop the wake-ups of a polling loop keep the processor out of its low-power states. A disk delivering 200 MB/s: that is $5 \cdot 10^7$ transfers a second. Polling once per transfer needs $5 \cdot 10^9$ cycles a second, 2.5 processors; one interrupt per transfer needs 25. Neither works. The two costs are equal where $100 \times 1000 = 1000 \times r/4$, at $r = 400$ B/s: below that interrupts are cheaper, above it polling is, and both need a whole processor long before disk speeds, polling at 80 MB/s and interrupts at 8 MB/s.
+
+The figure after the next section draws these lines, with DMA added.
+
+## Direct memory access
+
+The fast device is not a contest between polling and interrupts: the processor should not move the bytes at all. A **DMA controller** (direct memory access), a small engine built into the device's controller or shared on the bus, copies data between the device and memory by itself ([Arpaci-Dusseau and Arpaci-Dusseau](#references), section 36.5). To read a block, the driver
+
+1. allocates a buffer in memory and writes its physical address, the length and the direction into the DMA controller's registers, then writes the start command;
+2. returns to other work while the controller moves the block, word by word, over the bus;
+3. takes one interrupt when the transfer is complete, and hands the buffer to whoever asked for it.
+
+Network adapters and NVMe SSDs go one step further: the driver puts a whole ring of such **descriptors** in memory, and the device works through them on its own, so that one register write can start many transfers.
+
+**Worked example.** In the model above, add 2000 cycles to set up each DMA transfer, plus the 1000-cycle interrupt at its end. A 4 KiB block costs 3000 cycles instead of $1024 \times 100 = 102{,}400$ for polling and $1024 \times 1000 = 1{,}024{,}000$ for interrupts. The 200 MB/s disk needs $200 \cdot 10^6 / 4096 = 48{,}828$ blocks a second, $1.46 \cdot 10^8$ cycles: 7.3 % of the processor. With 64 KiB transfers it drops to 0.46 %. In this model DMA with 4 KiB blocks would use the whole processor only at 2.73 GB/s, which is why fast devices use larger transfers, descriptor rings and fewer interrupts.
+
+<IoOverhead />
+
+DMA is not free of problems, and each of them meets an earlier note:
+
+- **Caches.** The controller reads and writes memory, not the processor's [caches](/notes/acos/caches). If the processor's cache holds a dirty copy of the buffer, the device reads stale data; if it holds an old copy after the device wrote, the processor does. Either the hardware keeps them **coherent** (the DMA traffic is checked against the caches), or the driver writes the cache back before a device reads the buffer and invalidates it before the processor reads what the device wrote.
+- **Addresses.** The controller works with physical addresses, while the buffer is contiguous only in [virtual memory](/notes/acos/virtual-memory). Drivers use physically contiguous buffers or lists of pieces, and many systems add an **IOMMU**, a page table for devices, which also stops a faulty or malicious device from writing anywhere in memory.
+- **The bus.** The controller and the processor share the path to memory; a transfer takes bandwidth that the processor's cache misses would otherwise use.
+
+## Interrupts at high rates
+
+With DMA, a network adapter still raises an interrupt per received packet unless told otherwise. At ten million small packets a second the processor would do nothing but enter handlers, and worse, the handlers would starve the code that consumes the packets, so the system can accept packets but complete none: **receive livelock** ([Mogul and Ramakrishnan, 1997](#references)). Two remedies are standard. **Interrupt coalescing** makes the device wait for several packets, or a short time, before it interrupts. **Switching to polling under load**, as Linux's NAPI does for network drivers: the first interrupt disables further interrupts, and the kernel polls the device's descriptor ring until it is empty, then enables interrupts again ([Linux, NAPI](#references)). The rule of the polling section reappears: when data is almost always there, polling is cheaper.
+
+## Buses, latency and bandwidth
+
+Devices reach the processor and memory through **buses** or point-to-point **links**. Older designs shared one set of wires between many devices, with an arbiter deciding who may use them; modern ones connect each device by its own serial link to a switch or to the processor. PCI Express is the main such link in PCs and servers: each **lane** is a pair of one-way serial connections, a device uses 1, 4, 8 or 16 lanes, and each generation doubles the rate per lane. A PCIe 4.0 lane runs at 16 GT/s (billion transfers a second) with 128b/130b encoding, so it carries $16 \cdot 10^9 \times 128/130 / 8 = 1.969$ GB/s in each direction ([PCI Express](#references)): 7.88 GB/s for an SSD on four lanes, 31.5 GB/s for a graphics card on sixteen. SATA, the older disk interface, runs at 6 Gb/s with 8b/10b encoding, which leaves 600 MB/s.
+
+The devices behind the links differ even more. Approximate figures, which vary between models and years:
+
+| Operation | Time | Source |
+| --- | --- | --- |
+| read from main memory | about 100 ns | [Norvig](#references) |
+| read a page of flash memory (inside an SSD) | about 25–75 µs | [Arpaci-Dusseau and Arpaci-Dusseau](#references), figure 44.2 |
+| disk seek, average | about 4–9 ms | [Arpaci-Dusseau and Arpaci-Dusseau](#references), figure 37.5 |
+| read 1 MB sequentially from disk | about 20 ms | [Norvig](#references) |
+| a packet from the US to Europe and back | about 150 ms | [Norvig](#references) |
+
+**Worked example.** A 7200 rpm disk turns once in $60/7200$ s $= 8.33$ ms, so on average the wanted sector is half a turn away: 4.17 ms of rotational latency. A random read of 4 KiB from a disk with a 9 ms average seek and a 105 MB/s transfer rate takes $9 + 4.17 + 4096 / (105 \cdot 10^6)$ s $\approx 13.2$ ms, almost all of it mechanical: the transfer itself takes 0.04 ms. At 2 GHz, 13.2 ms is 26 million cycles. Nothing in this note makes the disk faster; what it does is let the processor run other programs in those 26 million cycles, and that is the job of the [operating system](/notes/acos/operating-systems).
+
+<aside class="callout"><strong>Check yourself.</strong> (1) A sensor produces one 4-byte reading every 10 µs. In this note's model, should its driver poll or use interrupts, and what fraction of the 2 GHz processor does each cost? (2) Why must the page holding a device's registers be marked uncacheable, even if the program reads the register in a loop? (3) A driver writes a DMA descriptor to memory and then writes the "go" register. What can go wrong without a fence between the two writes?<details><summary>Answers</summary>(1) $10^5$ readings a second, 400 kB/s, well above the 400 B/s crossover. Polling once per reading costs $100 \times 10^5 / (2 \cdot 10^9) = 0.5$ %, interrupts $1000 \times 10^5 / (2 \cdot 10^9) = 5$ %: poll, or better, if the sensor supports it, collect readings by DMA. (2) With caching, the first load would bring the status into the cache and every later load would hit there, never seeing the device set the ready bit. (3) The device may see the "go" before the descriptor's bytes have reached memory and read an old or half-written descriptor; the fence orders the memory write before the device write.</details></aside>
+
+## What changed
+
+| | Baseline: an instruction per device | Device registers, interrupts, DMA |
+| --- | --- | --- |
+| How the processor reaches a device | special instructions | loads and stores to device registers (MMIO), or `in`/`out` ports on x86 |
+| New devices | new instructions | a new driver |
+| Protection | none | device pages mapped only for the kernel |
+| Waiting for a device | the processor stalls | polling or an interrupt |
+| Moving a 4 KiB block (model) | the processor carries every word | 102,400 cycles polled, 1,024,000 by interrupts, 3000 by DMA |
+| New concerns | | uncacheable regions, I/O ordering, cache coherence with DMA, livelock |
+
+## Limitations
+
+- **The model's cycle counts are illustrative.** Real costs of a poll, an interrupt or a DMA set-up vary by an order of magnitude between machines; the conclusions depend only on their ratios.
+- **Interrupts have latency.** A trap, a pipeline flush and the handler's prologue all happen before the first useful instruction; very fast devices are often polled for that reason.
+- **DMA needs care in software:** coherence with the caches, physical addresses, and buffers that must not move or be freed while the device uses them.
+- **Bandwidth is shared.** A link's nominal rate is a maximum; protocol overhead and other traffic take their share.
+- **Drivers are most of the kernel's code and many of its bugs,** because each one encodes the quirks of one controller.
+
+## What you should remember
+
+- A controller presents status, command and data registers; a driver is the kernel code that knows them.
+- Port-mapped I/O uses a separate address space and special instructions (x86 `in`, `out`); memory-mapped I/O uses ordinary loads and stores to reserved physical addresses (RISC-V, Arm, RARS at `0xffff0000`).
+- MMIO regions must be uncached and accesses to them ordered (`fence w,o` before a "go" write on RISC-V).
+- Polling costs per look, interrupts per event. Polling wins when data is nearly always ready; interrupts win when it is rare. In the model they cross at 400 B/s.
+- DMA moves blocks without the processor: one set-up and one interrupt per block, 3000 cycles instead of 102,400 or 1,024,000 for 4 KiB in the model.
+- Interrupt storms cause livelock; coalescing and switching to polling under load (NAPI) fix it.
+- PCIe 4.0: 1.969 GB/s per lane per direction; memory about 100 ns, flash tens of µs, a disk seek several ms.
+
+## Code
+
+A model of the cost of the three methods and the device numbers of this note, in Python; then the RARS keyboard-and-display registers in use, which the course's checker cannot run because it does not simulate devices.
+
+```python
+# The CPU cost of moving data from a device: polling, an interrupt per transfer, and DMA. The cycle counts are
+# round numbers for a model, not measurements: a poll costs 100 cycles, an interrupt 1000 (trap, save,
+# handler, restore, return), a DMA transfer 2000 to set up plus one completion interrupt.
+F = 2e9                                    # clock: 2 GHz
+POLL, IRQ, DMA_SETUP = 100, 1000, 2000     # cycles
+WORD, BLOCK = 4, 4096                      # bytes per programmed transfer, bytes per DMA transfer
+IDLE_POLLS = 1000                          # polls per second while waiting, to notice new data within 1 ms
+
+def polling(rate):                         # rate in bytes per second
+    return POLL * max(IDLE_POLLS, rate / WORD) / F
+def interrupts(rate):
+    return IRQ * rate / WORD / F
+def dma(rate, block=BLOCK):
+    return (DMA_SETUP + IRQ) * rate / block / F
+
+for name, rate in (('keyboard, 10 keys/s', 10 * WORD), ('disk, 200 MB/s', 200e6)):
+    print(f'{name:<20} polling {polling(rate):.2e}  interrupts {interrupts(rate):.2e}  '
+          f'DMA 4 KiB {dma(rate):.2e}  DMA 64 KiB {dma(rate, 65536):.2e}')
+# keyboard, 10 keys/s  polling 5.00e-05  interrupts 5.00e-06  DMA 4 KiB 1.46e-08  DMA 64 KiB 9.16e-10
+# disk, 200 MB/s       polling 2.50e+00  interrupts 2.50e+01  DMA 4 KiB 7.32e-02  DMA 64 KiB 4.58e-03
+
+# where each method needs the whole CPU (fraction 1), and where polling and interrupts cost the same
+print('100 % at', 4 * F / POLL / 1e6, 'MB/s (polling),', 4 * F / IRQ / 1e6, 'MB/s (interrupts),',
+      round(BLOCK * F / (DMA_SETUP + IRQ) / 1e9, 2), 'GB/s (DMA)')
+print('polling = interrupts at', WORD * POLL * IDLE_POLLS / IRQ, 'B/s')
+# 100 % at 80.0 MB/s (polling), 8.0 MB/s (interrupts), 2.73 GB/s (DMA)
+# polling = interrupts at 400.0 B/s
+
+# CPU cycles for one 4 KiB block
+print(BLOCK // WORD * POLL, BLOCK // WORD * IRQ, DMA_SETUP + IRQ)
+# 102400 1024000 3000
+
+# Device numbers from their specifications
+rpm, seek_ms, mb_s = 7200, 9, 105          # a 7200-rpm SATA disk (OSTEP, figure 37.5)
+rot_ms = 60e3 / rpm / 2                    # on average, half a revolution
+print(round(rot_ms, 2), round(seek_ms + rot_ms + 4096 / (mb_s * 1e6) * 1e3, 2), 'ms')
+# 4.17 13.21 ms
+for gen, gt in (('PCIe 3.0', 8), ('PCIe 4.0', 16), ('PCIe 5.0', 32)):   # GT/s per lane, 128b/130b coding
+    lane = gt * 1e9 * 128 / 130 / 8 / 1e9
+    print(gen, round(lane, 3), 'GB/s per lane,', round(4 * lane, 2), 'x4,', round(16 * lane, 2), 'x16')
+print('SATA 6 Gb/s, 8b/10b:', 6e9 * 8 / 10 / 8 / 1e6, 'MB/s')
+# PCIe 3.0 0.985 GB/s per lane, 3.94 x4, 15.75 x16
+# PCIe 4.0 1.969 GB/s per lane, 7.88 x4, 31.51 x16
+# PCIe 5.0 3.938 GB/s per lane, 15.75 x4, 63.02 x16
+# SATA 6 Gb/s, 8b/10b: 600.0 MB/s
+```
+
+The echo loop below polls the RARS keyboard and display. Open *Tools → Keyboard and Display MMIO Simulator*, press *Connect to Program*, run, and type into the lower pane: each character appears in the upper one. `.eqv` gives the register addresses names, and `li` loads them, because they do not fit in a 12-bit offset.
+
+```asm
+# Not run here: runs in RARS 1.6 with the Keyboard and Display MMIO Simulator connected.
+        .eqv   RCV_CTRL, 0xffff0000   # bit 0 = a key is ready
+        .eqv   RCV_DATA, 0xffff0004   # the key in the low byte
+        .eqv   TX_CTRL,  0xffff0008   # bit 0 = the display can take a character
+        .eqv   TX_DATA,  0xffff000c   # write a character here
+        .text
+main:
+        li     s0, RCV_CTRL
+        li     s1, TX_CTRL
+wait_key:
+        lw     t0, 0(s0)              # poll the receiver
+        andi   t0, t0, 1
+        beqz   t0, wait_key
+        lw     t1, 4(s0)              # read the key: RCV_DATA = RCV_CTRL + 4
+        li     t2, 'q'
+        beq    t1, t2, done           # q ends the program
+wait_display:
+        lw     t0, 0(s1)              # poll the transmitter
+        andi   t0, t0, 1
+        beqz   t0, wait_display
+        sw     t1, 4(s1)              # TX_DATA = TX_CTRL + 4: display the key
+        j      wait_key
+done:
+        li     a7, 10
+        ecall
+```
+
+To use interrupts instead, a program sets bit 1 of the receiver control register (`li t0, 2` then `sw t0, 0(s0)`), installs a handler in `utvec`, enables external interrupts in `uie` (bit 8) and sets `ustatus.UIE`, as in the handler of the [exceptions note](/notes/acos/exceptions-and-interrupts#code). RARS then delivers each key press as an external interrupt with `ucause = 0x80000008`, and the main program can compute while it waits ([RARS](#references), `Simulator.java`).
+
+## Next
+
+The processor of this section starts at most one instruction per cycle, stalls when a value or a branch outcome is late, and talks to devices that are millions of times slower than itself. The next section, Parallelism and Performance, asks how to get more done per cycle and per second, starting with the [instruction-level parallelism](/notes/acos/instruction-level-parallelism) inside a single core: several instructions started per cycle, out of order, with branches predicted far ahead, and exceptions still precise.
+
+## References
+
+- A. Tatarnikov. *Computer Architecture and Operating Systems* (HSE), [lecture 12: memory-mapped I/O](https://andrewt0301.github.io/hse-acos-course/part1ca/12_MMIO/lecture.html), with its workshop on the RARS device simulators.
+- R. H. Arpaci-Dusseau, A. C. Arpaci-Dusseau. *Operating Systems: Three Easy Pieces*. [Chapter 36 (I/O devices)](https://pages.cs.wisc.edu/~remzi/OSTEP/file-devices.pdf): section 36.2 (a canonical device), 36.3–36.4 (polling and interrupts), 36.5 (DMA), 36.6 (I/O instructions and memory-mapped I/O); [Chapter 37 (hard disk drives)](https://pages.cs.wisc.edu/~remzi/OSTEP/file-disks.pdf), figure 37.5; [Chapter 44 (flash-based SSDs)](https://pages.cs.wisc.edu/~remzi/OSTEP/file-ssd.pdf), figure 44.2.
+- S. L. Harris, D. M. Harris. *Digital Design and Computer Architecture, RISC-V Edition*. Morgan Kaufmann, 2021. [Chapter 9 (embedded I/O systems)](https://pages.hmc.edu/harris/ddca/ddcarv.html), online: section 9.2 (memory-mapped I/O).
+- R. E. Bryant, D. R. O'Hallaron. [*Computer Systems: A Programmer's Perspective*](https://csapp.cs.cmu.edu/), 3rd ed. Pearson, 2015. Section 6.1.2 (disk storage: connecting I/O devices, accessing disks with memory-mapped I/O and DMA).
+- A. S. Tanenbaum, H. Bos. *Modern Operating Systems*, 4th ed. Pearson, 2015. Section 5.1 (principles of I/O hardware: memory-mapped I/O, DMA, interrupts).
+- Intel Corporation. [*Intel 64 and IA-32 Architectures Software Developer's Manual*](https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html), volume 1, chapter 19 (input/output: the I/O port address space and the `in` and `out` instructions).
+- J. C. Mogul, K. K. Ramakrishnan. [Eliminating receive livelock in an interrupt-driven kernel](https://doi.org/10.1145/263326.263335). *ACM Transactions on Computer Systems*, 15(3):217–252, 1997.
+- The Linux kernel documentation, [NAPI](https://docs.kernel.org/networking/napi.html); Linux kernel source, [`arch/riscv/include/asm/mmio.h`](https://github.com/torvalds/linux/blob/master/arch/riscv/include/asm/mmio.h) (`writel` and its `fence w,o`).
+- [PCI Express](https://en.wikipedia.org/wiki/PCI_Express), comparison of versions: transfer rate per lane and line code (from the PCI-SIG specifications).
+- P. Norvig. [Teach yourself programming in ten years](https://norvig.com/21-days.html), section "Answers": approximate timing for various operations on a typical PC.
+- [RARS](https://github.com/TheThirdOne/rars), version 1.6: `src/rars/tools/KeyboardAndDisplaySimulator.java` (the device registers), `src/rars/simulator/Simulator.java` (external interrupts).

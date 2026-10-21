@@ -1,0 +1,299 @@
+---
+title: Domain-specific architectures and the TPU
+description: "Why processors are now built for one domain: the end of free speed-ups, Hennessy and Patterson's guidelines, Google's first TPU with its 256 by 256 systolic array of 8-bit multiply-accumulate units, arithmetic intensity, later TPUs and how they differ from GPUs."
+course: acos
+section: Parallelism and Performance
+order: 16
+status: published
+tags: [domain-specific-architecture, tpu, systolic-array, matrix-multiplication, arithmetic-intensity, roofline, int8, bfloat16, accelerators]
+prerequisites: [Making programs fast, "Vectors, SIMD and GPUs", Caches, Neural networks]
+---
+
+import TpuBlocks from '../../../components/figures/domain-specific-architectures/TpuBlocks.astro';
+import SystolicSteps from '../../../components/figures/domain-specific-architectures/SystolicSteps.astro';
+
+The [previous note](/notes/acos/performance-optimization) took one matrix product on one core of a general-purpose processor from 0.55 to 14.6 GFLOP/s by rewriting loops, and a vendor library reached 255 GFLOP/s. Every step fitted the computation better to hardware designed to run any program. This note goes the other way: hardware designed for one kind of program. It covers why such **domain-specific architectures** (DSAs) became attractive, the guidelines for designing one, and the best documented example, Google's first Tensor Processing Unit, whose heart is a grid of 65,536 multipliers that does nothing but matrix products. This note is a branch: the rest of the course does not depend on it.
+
+**Notation.** A layer of a neural network computes $Y = XW$: $X$ is $M \times K$ (a batch of $M$ inputs with $K$ features each), $W$ is $K \times N$ (the weights) and $Y$ is $M \times N$. A **MAC** is one multiply-accumulate, $s \leftarrow s + w x$; the product does $MKN$ of them, counted as $2MKN$ operations. TOPS means $10^{12}$ operations per second. As in the [roofline model](/notes/acos/data-level-parallelism#the-roofline-model-arithmetic-or-memory), $P$ is the peak arithmetic rate, $B$ the memory bandwidth and $I$ the arithmetic intensity, operations per byte moved.
+
+## Why specialize?
+
+For decades a program got faster without being changed: each generation of chips had more transistors, and [Dennard scaling](/notes/acos/computer-systems#how-processors-got-fast-and-why-that-changed) let them switch faster at the same power per square millimetre. That ended in the mid-2000s, when the supply voltage stopped falling. Multicore chips kept using the extra transistors, but [Amdahl's law](/notes/acos/thread-level-parallelism#how-much-faster-amdahls-law) limits what more cores give a program with any serial part, and power limits how many of them can run at full speed at once.
+
+A general-purpose core also spends most of its energy on things other than arithmetic. To execute one addition it fetches and decodes an instruction, renames registers, schedules the instruction out of order, predicts branches, and reads operands from register files and caches. A chip that does one computation can drop most of that machinery and spend the transistors and the energy on arithmetic and on memory close to it. Narrow numbers help further: an 8-bit integer multiplier takes about 6 times less energy and 6 times less area than a 16-bit floating-point one, and an 8-bit integer adder 13 times less energy and 38 times less area ([Jouppi et al., 2017](#references), §1, citing Dally).
+
+Specialization pays only for a domain that is large and regular. Deep neural networks became one around 2013. Google projected then that if people used voice search for 3 minutes a day, speech-recognition networks would require its datacenters to double ([Jouppi et al., 2017](#references), §2). It started a custom chip for inference, the use of a trained network, and deployed it 15 months later, in 2015.
+
+## Baseline: a general-purpose processor runs a neural network
+
+Most of the work of a neural network is matrix products: a fully connected layer is $Y = XW$ followed by an elementwise nonlinearity, as in the [neural-networks note](/notes/ml/neural-networks#the-multilayer-perceptron). The natural baseline is the server hardware of 2015. The TPU paper compares with an 18-core Intel Haswell server CPU (2.3 GHz, 145 W, 2.6 TOPS peak in 8-bit integers) and an NVIDIA K80 GPU die (2.8 TOPS, 160 GB/s of memory bandwidth), both deployed in the same datacenters ([Jouppi et al., 2017](#references), Table 2). The baseline breaks in two ways.
+
+- **Energy.** Each multiply-add pays for the general-purpose machinery around it, and the operands travel from caches or register files for every operation.
+- **Response time.** Inference serves users, and the application in the paper's Table 4 had to answer 99 % of requests within 7 ms. Larger batches use the hardware better, because each weight read from memory is used for more inputs, but they take longer. Within 7 ms the CPU could run batches of 16 at 42 % of its best throughput, and the GPU batches of 16 at 37 %. Caches, out-of-order execution and speculation improve the average case and make the worst case harder to predict.
+
+<aside class="callout"><strong>Key idea.</strong> Build the chip around the one operation the domain needs, a large matrix product in low precision. Spend the transistors on thousands of multipliers and on large on-chip memories, drop caches and speculation, and arrange the multipliers so that each number read from memory is used many times: in a systolic array, operands move from one multiplier to its neighbour instead of returning to memory.</aside>
+
+## Five guidelines for domain-specific architectures
+
+Hennessy and Patterson distil the designs of several DSAs into five guidelines ([Hennessy and Patterson, 2019](#references), §7.2). For each, how the first TPU follows it:
+
+| Guideline | Why | In the TPU |
+| --- | --- | --- |
+| Use dedicated memories to minimize the distance data moves | moving data costs more energy than computing on it; software knows the access pattern, so caches are not needed | a 24 MiB Unified Buffer and 4 MiB of accumulators, managed by software |
+| Spend the resources saved on more arithmetic or bigger memories | no out-of-order logic, branch predictors or caches | 65,536 MACs; control is 2 % of the die |
+| Use the easiest form of parallelism that matches the domain | matrix products are data-parallel | a 2-D array where one instruction drives every multiplier |
+| Reduce data size and type to the simplest needed | narrow integers are cheaper in energy, area and bandwidth | 8-bit integer weights and activations, 32-bit sums |
+| Use a domain-specific programming language | programs written for a CPU do not port to an unusual machine | models written in TensorFlow, compiled for the TPU |
+
+The low precision is the subject of the [quantization note](/notes/nlp/quantization#what-happens-to-a-matrix-product): an int8 × int8 product accumulated in int32 and rescaled once at the end gives almost the accuracy of floating point for inference.
+
+## The first TPU
+
+The TPU is a coprocessor on the PCIe bus of a server, like a GPU, but it fetches no instructions of its own: the host sends them. It has about a dozen instructions in the CISC style, each of which can run for thousands of cycles, and a four-stage pipeline that overlaps them so that the matrix unit is kept busy ([Jouppi et al., 2017](#references), §2). The die is made in a 28 nm process, runs at 700 MHz, and has a thermal design power of 75 W; it drew 40 W when busy (Table 2).
+
+<TpuBlocks />
+
+One layer passes through it as follows, the numbers matching the arrows of the figure:
+
+1. **Read_Host_Memory** copies the inputs from the host's memory into the 24 MiB **Unified Buffer**, which holds the activations of a whole model as they go from layer to layer.
+2. **Read_Weights** fetches a tile of $256 \times 256$ 8-bit weights, 64 KiB, from an off-chip 8 GiB DDR3 **Weight Memory** at 34 GB/s into the **Weight FIFO**, four tiles deep. Inside the matrix unit, a tile in use and the next one are held at once, so that loading a new tile, which takes 256 cycles to shift in, overlaps with work on the current one.
+3. **MatrixMultiply** streams $M$ rows of 256 activations from the buffer through the **Matrix Multiply Unit**, $256 \times 256 = 65{,}536$ MACs on 8-bit signed or unsigned integers, one row per cycle. The products are added into **accumulators**: 4 MiB, 4,096 vectors of 256 32-bit sums. With 16-bit operands the unit runs at half or a quarter of the speed.
+4. **Activate** applies the nonlinearity (ReLU, sigmoid, and also pooling) to the accumulated sums and writes the results back to the Unified Buffer, as the input of the next layer.
+5. **Write_Host_Memory** returns the final results to the host.
+
+**Worked example.** The peak is $65{,}536 \text{ MACs} \times 2 \times 700 \times 10^6\ \text{s}^{-1} = 91.75 \approx 92$ TOPS. One weight tile takes $65{,}536\ \text{B} / (34 \times 10^9\ \text{B/s}) = 1.93$ µs to fetch, which is 1,349 cycles at 700 MHz. A MatrixMultiply with a batch of $M = 200$ rows keeps the array busy for only 200 cycles. Unless a tile is reused for at least about 1,350 rows, the array waits for weights. The paper's choice of 4,096 accumulators comes from the same number: about 1,350 rows rounded up to 2,048, doubled so that one half can be filled while the other is read ([Jouppi et al., 2017](#references), §2).
+
+The die shows where the transistors went: the buffers are 37 % of its area, the computation 30 %, input and output 10 %, and control only 2 % (Figure 2 of the paper). The TPU has none of the features that make a CPU or GPU fast on average: no caches, no branch prediction, no out-of-order execution, no multithreading. Its execution time is deterministic, which suits a 99th-percentile response-time limit.
+
+## How a systolic array multiplies matrices
+
+A **systolic array** ([Kung, 1982](#references)) is a grid of identical cells, each connected only to its neighbours, through which data pulses in step with the clock, as blood does with the heartbeat. Every cell does the same small operation each cycle and passes its data on, so a number read once from memory is used by a whole row or column of cells.
+
+The TPU's array is **weight-stationary**: each cell holds one weight while activations and partial sums flow past it ([Jouppi et al., 2017](#references), §2 and §9). For $Y = XW$ on a $K \times N$ array:
+
+- Cell $(k, n)$ holds $w_{kn}$, loaded before the computation.
+- Row $k$ of the array receives column $k$ of $X$ from the left edge: $x_{mk}$ enters at cycle $m + k + 1$. Each row starts one cycle after the row above, so the inputs arrive as a staircase.
+- Each cycle, every cell takes the $x$ from its left neighbour and the partial sum $s$ from the cell above, computes $s + w_{kn} x$, and passes $x$ to the right and the new sum down.
+- Cell $(k, n)$ therefore sees $x_{mk}$ at cycle $m + k + n + 1$, together with the partial sum $\sum_{j < k} x_{mj} w_{jn}$ from above. After the bottom row, the sum is complete:
+
+$$
+\boxed{\;y_{mn} = \sum_{k=0}^{K-1} x_{mk}\, w_{kn}\quad\text{leaves column } n \text{ at cycle } m + n + K\;}
+$$
+
+**Worked example.** Take
+
+$$
+X = \begin{pmatrix} 1 & 2 & 3 \\ 4 & 5 & 6 \\ 7 & 8 & 9 \end{pmatrix}, \qquad
+W = \begin{pmatrix} 1 & 0 & 2 \\ 1 & 1 & 0 \\ 0 & 2 & 1 \end{pmatrix}, \qquad
+Y = XW = \begin{pmatrix} 3 & 8 & 5 \\ 9 & 17 & 14 \\ 15 & 26 & 23 \end{pmatrix}.
+$$
+
+Follow $y_{00}$ down column 0. At cycle 1, cell $(0, 0)$ receives $x_{00} = 1$ and computes $0 + 1 \cdot 1 = 1$. At cycle 2, cell $(1, 0)$ receives $x_{01} = 2$ (it entered row 1 one cycle later) and the sum 1 from above: $1 + 2 \cdot 1 = 3$. At cycle 3, cell $(2, 0)$ computes $3 + 3 \cdot 0 = 3$, and $y_{00} = 3$ leaves the array. Meanwhile $x_{00} = 1$ has moved right, and at cycle 2 cell $(0, 1)$ starts $y_{01}$ with $1 \cdot 0 = 0$. The number of busy cells per cycle is 1, 3, 6, 7, 6, 3, 1: the wave fills the array, crosses it and drains. The last output, $y_{22} = 23$, leaves at cycle $2 + 2 + 3 = 7 = M + N + K - 2$, after 27 MACs on 9 cells, so the cells were busy $27/63 = 43\,\%$ of the time.
+
+<SystolicSteps />
+
+The fill and the drain cost $K + N - 2$ cycles. For one operation on the $256 \times 256$ array they are 510 cycles, against $M$ cycles of steady work: a batch of $M = 200$ alone would keep the array busy only $200/710 = 28\,\%$ of the time. The TPU hides most of this by pipelining: a new tile of weights takes effect as the wave of the next block of data reaches it, so consecutive operations follow each other through the array without waiting for it to empty, and the instruction takes $M$ pipelined cycles.
+
+Why this saves energy: for $M = 200$, $K = N = 256$, the array does $MKN = 13{,}107{,}200$ MACs while reading only $MK + KN = 116{,}736$ values from its buffers, 112 MACs per value read. Each activation is read once and used by 256 cells along its row; each weight is read once and used for all $M$ rows; each partial sum stays inside the array until it is complete. A general-purpose core reads two operands from its register file or cache for every MAC.
+
+<aside class="callout"><strong>Check yourself.</strong> (1) In the worked example, at which cycle does $y_{12}$ leave the array, and how many cells are busy at cycle 4? (2) A $256 \times 256$ array streams $M = 1{,}000$ rows as one isolated operation. What fraction of cell-cycles is busy? (3) Why does the TPU keep the weights in the array, rather than the partial sums?<details><summary>Answers</summary>(1) At cycle $m + n + K = 1 + 2 + 3 = 6$; at cycle 4 the busy cells are those with $m = 3 - k - n$ between 0 and 2, all cells except $(0, 0)$ and $(2, 2)$: 7. (2) $1{,}000/(1{,}000 + 510) = 66\,\%$. (3) In inference the weights are fixed and the same tile serves every input of the batch, so keeping them in place and streaming many inputs past them reads each weight once; the inputs and the sums change with every example and have to move anyway.</details></aside>
+
+## Arithmetic intensity and the roofline of the TPU
+
+The [roofline model](/notes/acos/data-level-parallelism#the-roofline-model-arithmetic-or-memory) bounds attainable performance by $\min(P, I \cdot B)$. For the TPU the slow memory is the weight memory: the activations stay on chip in the Unified Buffer. So the paper measures intensity in operations per byte of weights read from DRAM. A fully connected layer with batch $M$ uses each 8-bit weight once per input, $M$ MACs per weight byte; a convolutional layer reuses each weight at many positions of an image and reaches much higher intensity. With $P = 65{,}536 \times 700$ MHz MACs per second and $B = 34$ GB/s, the ridge point is
+
+$$
+I^* = \frac{65{,}536 \times 700 \times 10^6\ \text{MAC/s}}{34 \times 10^9\ \text{B/s}} = 1{,}349 \ \text{MACs per weight byte},
+$$
+
+the "1350 operations per byte" of the paper, and the same 1,349 cycles that one tile takes to arrive. Below it a layer is memory-bound. The six production networks of the paper, which made up 95 % of the TPU's workload, against this roofline (intensity from Table 1, measured TOPS from Table 3; the bound is $\min(91.75, 2 \cdot I \cdot 0.034)$ TOPS):
+
+| Network | MACs per weight byte | Roofline bound | Measured | Share of the bound |
+| --- | --- | --- | --- | --- |
+| MLP0 | 200 | 13.6 TOPS | 12.3 TOPS | 90 % |
+| MLP1 | 168 | 11.4 | 9.7 | 85 % |
+| LSTM0 | 64 | 4.4 | 3.7 | 85 % |
+| LSTM1 | 96 | 6.5 | 2.8 | 43 % |
+| CNN0 | 2,888 | 91.8 | 86.0 | 94 % |
+| CNN1 | 1,750 | 91.8 | 14.1 | 15 % |
+
+The four MLPs and LSTMs, 90 % of the workload, are memory-bound: their matrix unit was active only 8–13 % of the cycles and waited for weights during about half of them (Table 3). CNN0 runs near the peak. CNN1 has the intensity to do so but uses its array badly: some of its layers are too shallow to fill the 256 rows with useful weights, and its fully connected layers are memory-bound.
+
+Even so, the TPU is far ahead. Including the host's overhead, one TPU die was 14.5 times as fast as a Haswell die on the geometric mean of the six networks and 29.2 times on the mean weighted by their share of the workload; the K80 die was 1.1 and 1.9 times (Table 6). Within the 7 ms limit, the TPU ran MLP0 with batches of 200 at 80 % of its best throughput, against batches of 16 on the CPU and the GPU (Table 4). Counting only the accelerators' power, the TPU server delivered 41 to 83 times the performance per watt of the CPU server (§5). The authors call this the "Cornucopia Corollary" to Amdahl's law: low utilization of a huge, cheap resource can still deliver high, cost-effective performance (§10).
+
+The table also says what to fix. The paper's performance model of a hypothetical TPU with the K80's faster GDDR5 memory moves the ridge point from 1,350 to 250 and speeds up the six networks by 2.6 times on the geometric mean and 3.9 on the weighted mean, while a faster clock alone gives almost nothing (§7). A larger array would not help either: a $512 \times 512$ array needs 4 steps for the $600 \times 600$ matrix of LSTM1 instead of the 9 of a $256 \times 256$ array, but each step takes four times longer, so the matrix takes 32 µs instead of 18 µs.
+
+DNN inference suits a TPU because it is dominated by large matrix products, whose intensity grows with the batch size, and the rest of the work, the activations and pooling, happens on data already on the chip. Operations with little reuse have no such escape. The softmax of attention in a Transformer reads and writes every score once and is memory-bound on any hardware, which is why the [efficient-Transformers note](/notes/nlp/efficient-transformers#where-the-time-goes-memory-traffic-not-arithmetic) reorganizes attention to keep its scores in on-chip memory.
+
+## Later TPUs: training and bfloat16
+
+The first TPU did inference only, in integers. Training needs a wider range: gradients and updates span many orders of magnitude, and 8-bit integers cannot hold them. The second (2017) and third (2018) generations were built for training and introduced **bfloat16**, a 16-bit format with float32's 8-bit exponent and a 7-bit fraction, described in the [floating-point note](/notes/acos/floating-point#narrow-formats-for-machine-learning). Their matrix units are $128 \times 128$ systolic arrays that multiply in bfloat16 and accumulate in float32 ([Google Cloud, 2019](#references)). They replaced the DDR3 weight memory by high-bandwidth memory (HBM) and connected chips into pods by a dedicated network, so that one model trains on hundreds of chips.
+
+The arithmetic of the arrays gives the peak rates of the published chips ([Jouppi et al., 2023](#references), Table 4):
+
+| | TPU v1 (2015) | TPU v3 (2018) | TPU v4 (2020) |
+| --- | --- | --- | --- |
+| Matrix units per chip | one $256 \times 256$ | 2 cores × 2 of $128 \times 128$ | 2 cores × 4 of $128 \times 128$ |
+| Number format | int8 | bf16 | bf16 or int8 |
+| Clock | 700 MHz | 940 MHz | 1,050 MHz |
+| Peak | 92 TOPS | 123 TFLOPS | 275 TFLOPS |
+| Memory | 8 GiB DDR3, 34 GB/s | 32 GiB HBM, 900 GB/s | 32 GiB HBM2, 1,200 GB/s |
+| Largest system | 4 chips per server | 1,024 chips | 4,096 chips |
+
+For example, TPU v4: $2 \cdot 4 \cdot 128^2$ MACs $\times\, 2 \times 1.05 \times 10^9\ \text{s}^{-1} = 275.3$ TFLOPS. Its ridge point against HBM is $275 / 1.2 = 229$ FLOP per byte. TPU v4 was 2.1 times faster than TPU v3 and 2.7 times better in performance per watt, and its 4,096 chips are connected through optical circuit switches that change the network topology for each job.
+
+## GPUs and TPUs
+
+A GPU, as the [data-level parallelism note](/notes/acos/data-level-parallelism#gpus-thousands-of-threads-in-groups-of-32) describes, is a general-purpose parallel processor: many streaming multiprocessors, each running thousands of threads, with caches, a large register file and memory designed for bandwidth. Since the Volta generation (2017), NVIDIA GPUs also contain **tensor cores**, small matrix-multiply units inside each streaming multiprocessor. A TPU puts a few large systolic arrays under the control of a compiler.
+
+| | GPU (e.g. NVIDIA A100) | TPU (e.g. TPU v4) |
+| --- | --- | --- |
+| Matrix hardware | tensor cores, small units in each of 108 SMs | 8 systolic arrays of $128 \times 128$ per chip |
+| Programming | threads in CUDA, plus libraries for matrix kernels | a compiler from TensorFlow, JAX or PyTorch graphs |
+| On-chip memory | caches, shared memory and registers, partly automatic | buffers managed entirely by software |
+| Hiding memory latency | switching among thousands of threads | scheduling decided ahead of time by the compiler |
+| Peak in 16-bit | 312 TFLOPS | 275 TFLOPS |
+| Memory bandwidth | 1.6–2.0 TB/s (40 or 80 GB of HBM) | 1.2 TB/s (HBM2) |
+| What else it runs | graphics, scientific computing, any parallel kernel | mainly dense tensor algebra |
+
+The peak figures say nothing about which is faster on a given model; that depends on how well the model and its compiler fill the matrix units. Google's own MLPerf comparison found TPU v4 1.2–1.7 times faster than the A100 at similar system sizes, with 1.3–1.9 times less power ([Jouppi et al., 2023](#references)); these are a vendor's measurements on its chosen benchmarks. The two designs have also converged: GPUs added matrix units and low-precision formats, and TPUs added vector units and dataflow processors for embeddings, the work around the matrix products.
+
+## What changed
+
+| | General-purpose core | TPU v1 |
+| --- | --- | --- |
+| Unit of work | one instruction, a few operations | one instruction, up to millions of MACs |
+| Arithmetic | 64-bit integers and floats, a few to tens per cycle with SIMD | 65,536 8-bit MACs per cycle |
+| On-chip memory | hardware-managed caches | software-managed buffers, 28 MiB |
+| Data movement | operands from registers or caches for every operation | each value read once, passed between neighbouring cells |
+| Speculation, out-of-order, caches | yes, for average-case speed | none; deterministic timing |
+| What it runs | any program | neural-network inference |
+
+## Limitations
+
+- **Narrow by design.** A DSA runs its domain well and little else. If the domain changes (sparse models, new layer types, larger embeddings), the chip ages fast; later TPUs added hardware for embeddings for this reason.
+- **Memory-bound most of the time.** The first TPU's large array waited for weights on most of its workload; the peak rate is rarely the achieved rate, and the roofline must be checked for each model.
+- **Dependence on the software stack.** A DSA is usable only through a compiler and a framework that map the model onto it; without them it is idle silicon.
+- **Cost.** A custom chip needs a large, stable market to repay its design. Google could justify the TPU by the size of its own datacenters.
+- **Evidence from the vendor.** Most published TPU numbers come from Google's own papers, on Google's chosen workloads.
+
+## What you should remember
+
+- With Dennard scaling gone and Amdahl's law limiting multicore, large gains come from hardware specialized for a domain that is big and regular.
+- Hennessy and Patterson's guidelines: dedicated memories, resources into arithmetic and memory, the simplest parallelism that fits, the narrowest data types that suffice, a domain-specific language.
+- TPU v1: a PCIe coprocessor with a $256 \times 256$ array of 8-bit MACs (92 TOPS at 700 MHz), a 24 MiB Unified Buffer, 4 MiB of 32-bit accumulators and weights streamed from 8 GiB of DDR3 at 34 GB/s.
+- A weight-stationary systolic array computes $y_{mn} = \sum_k x_{mk} w_{kn}$ with activations moving right and partial sums moving down; an $M$-row operation on a $K \times N$ array takes $M + K + N - 2$ cycles alone, and each value read from the buffers serves many MACs.
+- The roofline with the TPU's ridge point of about 1,350 MACs per weight byte explains why its MLPs and LSTMs were memory-bound and its CNNs compute-bound.
+- Later TPUs train in bfloat16 with float32 accumulation on $128 \times 128$ arrays fed by HBM, in pods of thousands of chips. GPUs reach similar peaks with tensor cores inside a general-purpose design.
+
+## Code
+
+The systolic array, simulated one clock cycle at a time for the worked example: it prints the multiply-accumulates of each cycle and the outputs that leave the array, then the product, a check against the definition, and the cycle count (Python, standard library):
+
+```python
+def systolic(X, W):
+    """Y = X W on a K x N weight-stationary systolic array, simulated one clock cycle at a time.
+
+    Cell (k, n) holds the weight W[k][n]. Row k of X enters the array from the left, skewed by k cycles;
+    activations move one cell right per cycle and partial sums one cell down. Returns Y and the cycle count."""
+    M, K, N = len(X), len(W), len(W[0])
+    x = [[None] * N for _ in range(K)]            # activation register of each cell
+    s = [[None] * N for _ in range(K)]            # partial-sum register of each cell: (m, value)
+    Y = [[None] * N for _ in range(M)]
+    t = macs = 0
+    while any(v is None for row in Y for v in row):
+        t += 1
+        new_x = [[None] * N for _ in range(K)]
+        new_s = [[None] * N for _ in range(K)]
+        for k in range(K):
+            for n in range(N):
+                if n == 0:                        # the left edge reads X[m][k] at cycle m + k + 1
+                    m = t - 1 - k
+                    new_x[k][n] = (m, X[m][k]) if 0 <= m < M else None
+                else:                             # otherwise the value the left neighbour held last cycle
+                    new_x[k][n] = x[k][n - 1]
+                if new_x[k][n] is None:
+                    continue
+                m, xv = new_x[k][n]
+                above = 0 if k == 0 else s[k - 1][n][1]   # the partial sum the cell above held last cycle
+                new_s[k][n] = (m, above + W[k][n] * xv)   # one multiply-accumulate
+                macs += 1
+                if k == K - 1:
+                    Y[m][n] = new_s[k][n][1]      # the bottom row emits a finished output
+        x, s = new_x, new_s
+        active = sum(v is not None for row in s for v in row)
+        print(f'cycle {t}: {active} MACs', 'outputs:', [(m, n, Y[m][n]) for m in range(M) for n in range(N)
+                                                        if Y[m][n] is not None and m + n + K == t])
+    return Y, t, macs
+
+X = [[1, 2, 3], [4, 5, 6], [7, 8, 9]]            # three inputs (rows) of three features
+W = [[1, 0, 2], [1, 1, 0], [0, 2, 1]]            # weights: 3 features in, 3 outputs
+Y, cycles, macs = systolic(X, W)
+# cycle 1: 1 MACs outputs: []
+# cycle 2: 3 MACs outputs: []
+# cycle 3: 6 MACs outputs: [(0, 0, 3)]
+# cycle 4: 7 MACs outputs: [(0, 1, 8), (1, 0, 9)]
+# cycle 5: 6 MACs outputs: [(0, 2, 5), (1, 1, 17), (2, 0, 15)]
+# cycle 6: 3 MACs outputs: [(1, 2, 14), (2, 1, 26)]
+# cycle 7: 1 MACs outputs: [(2, 2, 23)]
+print(Y, Y == [[sum(X[m][k] * W[k][n] for k in range(3)) for n in range(3)] for m in range(3)])
+# [[3, 8, 5], [9, 17, 14], [15, 26, 23]] True
+print(cycles, 'cycles,', macs, 'MACs on', 9, 'cells:', f'{macs / (9 * cycles):.0%} busy')
+# 7 cycles, 27 MACs on 9 cells: 43% busy
+for M in (3, 200, 2000):                         # rows streamed through a 256 x 256 array, fill and drain included
+    print(M, M + 256 + 256 - 2, f'{M / (M + 510):.0%}')
+# 3 513 1% | 200 710 28% | 2000 2510 80%
+```
+
+The numbers of the TPU sections: peak and ridge point, the time to fetch a weight tile, the roofline against the measured rates of the six networks, the reuse in the array, and the peaks of later chips:
+
+```python
+# The first TPU, from Jouppi et al. (2017): 256 x 256 MACs at 700 MHz, weights from DDR3 at 34 GB/s
+macs, clock, bw = 256 * 256, 700e6, 34e9
+print(macs, round(2 * macs * clock / 1e12, 2), round(macs * clock / bw))   # peak TOPS (2 ops per MAC); ridge in MACs per weight byte
+# 65536 91.75 1349
+tile = 256 * 256                                                            # one tile of 8-bit weights, bytes
+print(tile // 1024, round(tile / bw * 1e6, 2), round(tile / bw * clock))    # KiB, microseconds and cycles to fetch it
+# 64 1.93 1349
+
+# roofline: an FC layer with batch size B does B MACs per byte of weights; attainable = min(peak, 2 * I * bandwidth)
+apps = {'MLP0': (200, 12.3), 'MLP1': (168, 9.7), 'LSTM0': (64, 3.7), 'LSTM1': (96, 2.8), 'CNN0': (2888, 86.0), 'CNN1': (1750, 14.1)}
+for name, (intensity, measured) in apps.items():                           # intensity: MACs per weight byte (Table 1); measured TOPS (Table 3)
+    bound = min(2 * macs * clock, 2 * intensity * bw) / 1e12
+    print(f'{name:5} {intensity:5} {bound:6.1f} {measured:5.1f} {measured / bound:4.0%}')
+# MLP0    200   13.6  12.3  90%
+# MLP1    168   11.4   9.7  85%
+# LSTM0    64    4.4   3.7  85%
+# LSTM1    96    6.5   2.8  43%
+# CNN0   2888   91.8  86.0  94%
+# CNN1   1750   91.8  14.1  15%
+
+# reads from the buffers for Y = X W, X of M x K, W of K x N, on a weight-stationary array
+M, K, N = 200, 256, 256
+print(M * K * N, M * K + K * N, round(M * K * N / (M * K + K * N)))       # MACs; values read; MACs per value read
+# 13107200 116736 112
+
+# later chips: peak 16-bit TFLOPS from the array sizes, and the ridge point against HBM
+for name, cores, mxus, mhz, hbm in (('TPU v3', 2, 2, 940, 900e9), ('TPU v4', 2, 4, 1050, 1200e9)):
+    peak = cores * mxus * 128 * 128 * 2 * mhz * 1e6
+    print(name, round(peak / 1e12, 1), round(peak / hbm))                   # TFLOPS, FLOP per byte of HBM
+# TPU v3 123.2 137
+# TPU v4 275.3 229
+```
+
+## Next
+
+The TPU ends the hardware half of the course where it started: with the cost of moving data. Caches, pipelines, vector units and systolic arrays all exist to keep arithmetic fed. So far every program has had the machine to itself. A real computer runs many programs at once, each believing it owns the processor and the memory, and something has to share the hardware among them, protect them from each other and give them access to devices. The [next note](/notes/acos/operating-systems) opens the second half of the course with that program: the operating system.
+
+## References
+
+- A. Tatarnikov. *Computer Architecture and Operating Systems* (HSE), [lecture 16: domain-specific architectures and the Tensor Processing Unit](https://andrewt0301.github.io/hse-acos-course/part1ca/16_TPU/lecture.html).
+- N. P. Jouppi, C. Young, N. Patil, D. Patterson et al. [In-datacenter performance analysis of a tensor processing unit](https://arxiv.org/abs/1704.04760). *ISCA*, 2017 ([doi:10.1145/3079856.3080246](https://doi.org/10.1145/3079856.3080246)). §1 (energy of narrow arithmetic), §2 and Figures 1, 2, 4 (architecture, systolic data flow), Tables 1–4 and 6 (workload, platforms, utilization, response time, relative performance), §5 (performance per watt), §7 (alternative designs), §10 (the Cornucopia Corollary).
+- J. L. Hennessy, D. A. Patterson. *Computer Architecture: A Quantitative Approach*, 6th ed. Morgan Kaufmann, 2019. Chapter 7: §7.2 (guidelines for DSAs), §7.3 (deep neural networks), §7.4 (the TPU).
+- J. L. Hennessy, D. A. Patterson. [A new golden age for computer architecture](https://doi.org/10.1145/3282307). *Communications of the ACM*, 62(2), 2019.
+- H. T. Kung. [Why systolic architectures?](https://doi.org/10.1109/MC.1982.1653825) *Computer*, 15(1), 1982.
+- S. Williams, A. Waterman, D. Patterson. [Roofline: an insightful visual performance model for multicore architectures](https://doi.org/10.1145/1498765.1498785). *Communications of the ACM*, 52(4), 2009.
+- N. P. Jouppi, D. H. Yoon, G. Kurian, S. Li, N. Patil, J. Laudon, C. Young, D. Patterson. [A domain-specific supercomputer for training deep neural networks](https://doi.org/10.1145/3360307). *Communications of the ACM*, 63(7), 2020 (TPU v2 and v3).
+- N. P. Jouppi et al. [TPU v4: an optically reconfigurable supercomputer for machine learning with hardware support for embeddings](https://arxiv.org/abs/2304.01433). *ISCA*, 2023 ([doi:10.1145/3579371.3589350](https://doi.org/10.1145/3579371.3589350)). Abstract and §2 (TPU v4 chip and comparison with A100), Table 4 (TPU v3 and v4).
+- Google Cloud. [BFloat16: the secret to high performance on Cloud TPUs](https://cloud.google.com/blog/products/ai-machine-learning/bfloat16-the-secret-to-high-performance-on-cloud-tpus), 2019 (bf16 multiplication and float32 accumulation in the $128 \times 128$ matrix units of TPU v2 and v3).
+- R. H. Dennard et al. [Design of ion-implanted MOSFET's with very small physical dimensions](https://doi.org/10.1109/JSSC.1974.1050511). *IEEE Journal of Solid-State Circuits*, 9(5), 1974.

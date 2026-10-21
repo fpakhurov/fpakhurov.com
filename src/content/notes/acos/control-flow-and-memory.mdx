@@ -1,0 +1,480 @@
+---
+title: Branches, loops and memory access
+description: "How assembly programs choose and repeat, and how they reach memory: conditional branches and jumps, if/else and loops compiled by hand, loads and stores of bytes, halves and words with sign or zero extension, arrays, strings, pseudo-instructions and RARS macros."
+course: acos
+section: RISC-V Assembly
+order: 5
+status: published
+tags: [risc-v, branches, loops, control-flow, loads-and-stores, sign-extension, arrays, strings, macros]
+prerequisites: [RISC-V instructions and their encoding]
+---
+
+import CollatzFlow from '../../../components/figures/control-flow-and-memory/CollatzFlow.astro';
+import LoadExtension from '../../../components/figures/control-flow-and-memory/LoadExtension.astro';
+
+The [previous note](/notes/acos/risc-v-instructions) took the computational instructions apart down to their bits. Every program built from them so far runs straight from its first instruction to its last and keeps all its data in 32 registers. That is enough for a calculator and not for a program: there is no way to repeat a step a number of times known only at run time, to choose between two actions, or to work on more data than fits in registers. This note adds the two missing pieces. Branches and jumps change `pc`, and with them we compile `if`, `while` and `for` by hand. Loads and stores move bytes, halves and words between registers and memory, which gives us arrays and strings. The note ends with the conveniences that make longer programs bearable: pseudo-instructions, named constants, macros and include files.
+
+**Notation.** `label` is an address in the program. $x[r]$ is the value in register $r$ and $M[a]$ the byte at address $a$. $\operatorname{sext}$ and $\operatorname{zext}$ widen a value to 32 bits by copying its sign bit or by adding zeros. A **halfword** is 2 bytes and a **word** 4 bytes.
+
+## Baseline: straight-line code
+
+Take the task of adding the six numbers 12, −7, 30, 5, −2 and 19. With what we have, the program is six `li` instructions and five `add`s, one per number. It works, and it fails in every way that matters:
+
+- the program grows with the data: a thousand numbers take two thousand instructions;
+- the number of values is fixed when the program is written, not when it runs;
+- every value must fit in a register at once, and there are 31 usable registers;
+- the program cannot react to its data: it cannot stop at a zero, skip a negative number or pick the larger of two.
+
+Two mechanisms fix this. **Control flow**: instructions that set `pc` to something other than the next instruction, so that code can be skipped or repeated. **Memory access**: instructions that read and write memory at an address computed at run time, so that the same instructions can visit element after element.
+
+## Branches and jumps
+
+A **conditional branch** compares two registers and, if the condition holds, jumps to a label; otherwise execution falls through to the next instruction:
+
+| Instruction | Jumps when |
+| --- | --- |
+| `beq rs1, rs2, label` | $x[rs1] = x[rs2]$ |
+| `bne rs1, rs2, label` | $x[rs1] \ne x[rs2]$ |
+| `blt rs1, rs2, label` | $x[rs1] < x[rs2]$ as signed numbers |
+| `bge rs1, rs2, label` | $x[rs1] \ge x[rs2]$ as signed numbers |
+| `bltu rs1, rs2, label` | $x[rs1] < x[rs2]$ as unsigned numbers |
+| `bgeu rs1, rs2, label` | $x[rs1] \ge x[rs2]$ as unsigned numbers |
+
+The label is stored as an offset from the branch itself, in the B format of the [previous note](/notes/acos/risc-v-instructions#encoding-by-hand), so a branch reaches ±4 KiB around itself. The unconditional jump `jal rd, label` reaches ±1 MiB and writes the address of the next instruction into `rd`; with `rd` = `zero` that address is thrown away and only the jump remains, which the assembler offers as `j label`. Keeping the return address is what makes procedures possible, the subject of the [next note](/notes/acos/procedures-and-the-stack).
+
+Six branches are enough, because the others are the same tests with the operands swapped: $a > b$ is $b < a$, so `bgt a, b, L` is the pseudo-instruction for `blt b, a, L`, and `ble a, b, L` is `bge b, a, L`. Comparisons with zero use `zero` as the second operand: `beqz t0, L` is `beq t0, zero, L`, and similarly `bnez`, `bltz`, `bgez`, `blez`, `bgtz`.
+
+**Worked example.** Let `t0` = −1, the word `0xffffffff`, and `t1` = 1. `blt t0, t1, L` jumps, because $-1 < 1$. `bltu t0, t1, L` does not, because as an unsigned number `t0` is 4,294,967,295. The bits are the same; the instruction decides what they mean, exactly as with `slt` and `sltu`. The unsigned reading has a practical use: for an index `i` and a length `n` ≥ 0, the single instruction `bgeu i, n, out_of_range` catches both `i` ≥ `n` and a negative `i`, because a negative `i` is a huge unsigned number.
+
+## if/else and loops in assembly
+
+<aside class="callout"><strong>Key idea.</strong> Every structured statement becomes conditional branches on the opposite condition plus unconditional jumps. An `if` branches *around* its then-part when the condition is false; an `else` adds a jump over itself at the end of the then-part; a loop is an `if` whose last instruction jumps back to its test.</aside>
+
+The patterns, written with the condition `a < b`:
+
+| C | Assembly |
+| --- | --- |
+| `if (a < b) S1;` | `bge a, b, end` · S1 · `end:` |
+| `if (a < b) S1; else S2;` | `bge a, b, else` · S1 · `j end` · `else:` S2 · `end:` |
+| `while (a < b) S;` | `loop: bge a, b, end` · S · `j loop` · `end:` |
+| `do S; while (a < b);` | `loop:` S · `blt a, b, loop` |
+| `for (i = 0; i < n; i++) S;` | `li i, 0` · `loop: bge i, n, end` · S · `addi i, i, 1` · `j loop` · `end:` |
+
+In the `while` loop each iteration executes two control instructions, the test at the top and the `j` at the bottom. Compilers usually rotate the loop so that the test is at the bottom, `do`-style, with one extra test in front to skip a loop that must not run at all; then each iteration has a single branch. The array sum below does exactly that.
+
+**Worked example.** The Collatz iteration: while $n \ne 1$, halve an even $n$ and replace an odd $n$ by $3n + 1$, counting the steps and keeping the largest value seen. It has a loop, an if/else inside it, and a second `if` for the maximum:
+
+```riscv
+loop:   beq  t0, t3, done           # while (n != 1): leave when n == 1 (t3 holds 1)
+        andi t4, t0, 1              # t4 = lowest bit of n
+        bnez t4, odd                # if n is odd, skip the then-part
+        srli t0, t0, 1              # then: n = n / 2
+        j    next                   # and jump over the else-part
+odd:    slli t4, t0, 1              # else: n = 3n + 1, computed as 2n + n + 1
+        add  t0, t0, t4
+        addi t0, t0, 1
+next:   addi t1, t1, 1              # steps++
+        ble  t0, t2, loop           # if (n > max) max = n ...
+        mv   t2, t0
+        j    loop                   # ... and back to the test
+```
+
+<CollatzFlow />
+
+1. The loop test comes first; when `t0` = 1 the `beq` leaves the loop for `done`.
+2. The `if` tests the lowest bit with `andi`, and `bnez` jumps over the then-part when the number is odd: the branch tests the opposite of the C condition.
+3. The then-part halves $n$ with a shift and ends with `j next`, a jump over the else-part.
+4. The else-part needs no jump: it falls through into `next`, where both paths meet.
+5. `next` counts the step; `ble` jumps back to the test when the new $n$ is not larger than the maximum, and otherwise `mv` records it and `j loop` returns.
+
+Starting from $n = 27$, the loop runs 111 times and the largest value is 9232. The whole program, with its setup and output, executes 864 instructions (the Code section prints the two numbers).
+
+## Loads and stores: bytes, halves and words
+
+Memory is an array of bytes, and an address names one byte. A **load** copies bytes from memory into a register; a **store** copies them from a register into memory. RISC-V has one addressing mode: the address is a register plus a 12-bit signed offset, written `offset(base)`:
+
+$$
+\text{address} = x[rs1] + \operatorname{sext}(imm), \qquad -2048 \le imm \le 2047 .
+$$
+
+| Instruction | Effect |
+| --- | --- |
+| `lw rd, imm(rs1)` | $x[rd]$ = the 4 bytes at the address |
+| `lh rd, imm(rs1)`, `lhu rd, imm(rs1)` | $x[rd]$ = $\operatorname{sext}$ or $\operatorname{zext}$ of the 2 bytes at the address |
+| `lb rd, imm(rs1)`, `lbu rd, imm(rs1)` | $x[rd]$ = $\operatorname{sext}$ or $\operatorname{zext}$ of the byte at the address |
+| `sw rs2, imm(rs1)` | the 4 bytes at the address = $x[rs2]$ |
+| `sh rs2, imm(rs1)`, `sb rs2, imm(rs1)` | the low 2 bytes or the low byte of $x[rs2]$ go to the address |
+
+A register always holds 32 bits, so a load of fewer bytes must decide what goes into the rest. The signed loads `lb` and `lh` copy the top bit of the value read into every upper bit, which preserves a negative number; `lbu` and `lhu` fill with zeros, which preserves an unsigned one. Stores need no such choice: they write only the low bytes of the register. Multi-byte values are stored least significant byte first, the little-endian [byte order](/notes/acos/data-representation#byte-order), and widening follows the rules of [sign and zero extension](/notes/acos/data-representation#sign-and-zero-extension).
+
+<LoadExtension />
+
+**Worked example.** Four bytes at address `w`: `f6 00 80 ff`, and `t0` = `w`.
+
+| Load | Bytes read | 32-bit result | Value |
+| --- | --- | --- | --- |
+| `lb a0, 0(t0)` | `f6` | `0xfffffff6` | −10 |
+| `lbu a0, 0(t0)` | `f6` | `0x000000f6` | 246 |
+| `lh a0, 2(t0)` | `80 ff` | `0xffffff80` | −128 |
+| `lhu a0, 2(t0)` | `80 ff` | `0x0000ff80` | 65,408 |
+| `lw a0, 0(t0)` | `f6 00 80 ff` | `0xff8000f6` | −8,388,362 |
+
+`sb` of the value `0x7f` to `3(t0)` changes only the top byte; the next `lw` returns `0x7f8000f6`. The choice of load matters exactly when the top bit of the value read is 1: a character with a code above 127 read with `lb` becomes negative.
+
+**Alignment.** A word access should use an address that is a multiple of 4, and a halfword access a multiple of 2. The specification lets the execution environment decide what happens otherwise ([RISC-V Unprivileged ISA](#references), load and store instructions): some processors perform the access slowly, others trap. RARS stops the program with an address-misaligned error, and so does the examples' checker, so data is placed at aligned addresses.
+
+## Data in memory: directives and alignment
+
+The data segment is filled by directives, in order, starting at `0x10010000` in RARS. `.byte`, `.half` and `.word` emit 1, 2 and 4 bytes per value, `.asciz` the bytes of a string and a zero, `.space n` reserves `n` zero bytes, and `.align k` moves to the next multiple of $2^k$ bytes. RARS aligns `.half` and `.word` data by itself; writing `.align` makes the gap visible.
+
+**Worked example.**
+
+| Line | Address | Size |
+| --- | --- | --- |
+| `a: .byte 1` | `0x10010000` | 1 |
+| `.align 1` then `b: .half 2` | `0x10010002` (one byte skipped) | 2 |
+| `.align 2` then `c: .word 3` | `0x10010004` | 4 |
+| `s: .asciz "hi"` | `0x10010008` | 3 |
+| `.align 2` then `d: .word 4` | `0x1001000c` (one byte skipped) | 4 |
+
+`.eqv NAME, value` gives a constant a name without allocating memory: every later use of `NAME` is replaced by `value`. A label in `.word` stores the label's address, so `.word a, b, c` builds a table of addresses, which the Code section prints.
+
+## Arrays and address arithmetic
+
+An array of words is a run of consecutive words; element $i$ of an array that starts at `base` sits at
+
+$$
+\text{address}(a[i]) = \text{base} + 4i ,
+$$
+
+and in general $\text{base} + i \cdot \text{size}$ for elements of `size` bytes. The multiplication by 4 is a shift left by 2. Two ways to walk an array follow from this formula.
+
+**Index form.** Keep `i`, and recompute the address in every iteration: `slli t3, t1, 2`, `add t3, t0, t3`, `lw t4, 0(t3)`. With the test at the top this is the direct translation of `for (i = 0; i < n; i++) sum += a[i];`.
+
+**Pointer form.** Keep the address itself in a register `p`, and add the element size after each element; stop when `p` reaches `end` = base + 4n, the address one past the last element:
+
+```riscv
+sum:    lw   t4, 0(t0)              # t4 = *p
+        add  a0, a0, t4
+        addi t0, t0, 4              # p++ moves by 4 bytes, one word
+        bne  t0, t2, sum            # repeat while p != end
+```
+
+**Worked example.** For the six numbers of the baseline, 12, −7, 30, 5, −2 and 19, both forms print 57. The index form with the test at the top executes 7 instructions per element plus a final test, 43 for six elements; the pointer form with the test at the bottom executes 4 per element, 24. The pointer form is what a C compiler typically produces from either way of writing the loop.
+
+A **string** in C and in RARS is an array of bytes ending with a zero byte. Its length is found by walking with a byte pointer until the zero:
+
+```riscv
+strl:   lbu  t2, 0(t1)              # t2 = *p, one byte, zero-extended
+        beqz t2, strend             # the zero byte ends the string
+        addi t1, t1, 1              # p++ moves by 1 byte
+        j    strl
+strend: sub  a0, t1, t0             # length = p - start
+```
+
+For `"RISC-V assembly"` it gives 15. The pointer moves by 1 here, because the elements are bytes; using `lbu` rather than `lb` keeps characters above 127 positive, although only the comparison with zero matters in this loop.
+
+<aside class="callout"><strong>Check yourself.</strong> (1) An array of halfwords starts at `0x10010010`. Where is element 5? (2) Which load reads it so that the value 40,000 comes back correctly? (3) Why does the pointer-form sum need a test before the loop?<details><summary>Answers</summary>(1) `0x10010010` + 2 · 5 = `0x1001001a`. (2) `lhu`: 40,000 is above 32,767, so `lh` would sign-extend `0x9c40` to −25,536. (3) With the test at the bottom the body runs at least once; for an empty array `p` = `end` from the start, and without the test the loop would read the word at `end` and run past it, because `bne` would never see `p` = `end` again.</details></aside>
+
+## Pseudo-instructions, macros and includes
+
+**Pseudo-instructions** are names the assembler accepts and expands into real instructions. The ones used so far:
+
+| Pseudo-instruction | Expansion |
+| --- | --- |
+| `li rd, c` | `addi rd, zero, c` if $-2048 \le c \le 2047$; otherwise `lui` + `addi` |
+| `la rd, label` | `auipc rd, hi` + `addi rd, rd, lo` |
+| `lw rd, label` | `auipc rd, hi` + `lw rd, lo(rd)` |
+| `mv rd, rs` | `addi rd, rs, 0` |
+| `not rd, rs`, `neg rd, rs` | `xori rd, rs, -1`, `sub rd, zero, rs` |
+| `j label` | `jal zero, label` |
+| `beqz rs, label`, `bnez rs, label` | `beq rs, zero, label`, `bne rs, zero, label` |
+| `bgt a, b, label`, `ble a, b, label` | `blt b, a, label`, `bge b, a, label` |
+| `nop` | `addi zero, zero, 0` |
+
+A **macro** goes one step further: a named piece of source text with parameters, pasted in by the assembler wherever its name is used. In RARS a macro is defined between `.macro` and `.end_macro`, with parameters written `%name`; `.include "file"` pastes in another file, typically a library of macros ([RARS](#references), assembler directives). Printing an integer and a character then takes one line each:
+
+```riscv
+# macros.s: not run here (the examples' checker has no .macro or .include); runs in RARS
+        .macro print_int (%reg)     # print the integer in register %reg
+        li   a7, 1
+        mv   a0, %reg
+        ecall
+        .end_macro
+
+        .macro print_char (%c)      # print the character constant %c
+        li   a7, 11
+        li   a0, %c
+        ecall
+        .end_macro
+```
+
+```riscv
+# main.s: not run here; runs in RARS with macros.s in the same folder
+        .include "macros.s"
+        .text
+        .globl main
+main:
+        li   t1, 57
+        print_int (t1)              # becomes: li a7, 1 / mv a0, t1 / ecall
+        print_char ('\n')           # becomes: li a7, 11 / li a0, 10 / ecall
+        li   a7, 10
+        ecall
+# Output in RARS: 57
+```
+
+A macro saves typing, not instructions: each use pastes its whole body again, so ten uses of `print_int` add 30 instructions to the program. It also cannot call itself, and the registers it uses (`a0` and `a7` here) are silently overwritten at every use. RARS renames the labels defined inside a macro at each expansion, so a macro may contain a loop. A piece of code that exists once and is *jumped to* from many places is a procedure, the subject of the next note.
+
+## What changed
+
+| | Baseline: straight-line code | Branches, jumps, loads and stores |
+| --- | --- | --- |
+| Repetition | one copy of the code per repetition | a loop: one copy, a back edge |
+| Decisions | none | `if`/`else` as branches on the opposite condition |
+| Data size | at most 31 values, all in registers | any amount, in memory, reached by address |
+| Number of elements | fixed when the program is written | known at run time |
+| Cost per element (array sum) | 2 instructions, but the code grows with the data | 4 instructions in a pointer loop, fixed code size |
+
+## Limitations
+
+- **Nothing checks addresses.** A load from `end` or from a stale pointer reads whatever is there; only a misaligned or unmapped address stops the program. Out-of-bounds access is the classic bug of assembly and C.
+- **Signed or unsigned is the programmer's choice at every instruction**: `blt` or `bltu`, `lb` or `lbu`. The wrong one works for small positive values and fails on the rest.
+- **Branches have limited reach**: ±4 KiB for conditional branches. A larger function needs a branch over a `j`, which the assembler does not always insert by itself.
+- **Branches cost time.** On a pipelined processor a taken branch disturbs the flow of instructions, which the [pipelining note](/notes/acos/pipelining) analyses; loop layout and branch-free code are part of tuning.
+- **Macros duplicate code** and clobber registers without saying so; they do not replace procedures.
+
+## What you should remember
+
+- Six conditional branches, `beq`, `bne`, `blt`, `bge`, `bltu`, `bgeu`, with offsets of ±4 KiB; `jal` (and `j`) for unconditional jumps of ±1 MiB. The other comparisons are these with swapped operands.
+- `if` branches around the then-part on the opposite condition; `else` adds a `j` over itself; loops jump back to their test. Putting the test at the bottom leaves one branch per iteration.
+- Loads and stores use `offset(base)` addresses. `lb`/`lh` sign-extend, `lbu`/`lhu` zero-extend; stores write the low bytes. Words are little-endian and should be 4-byte aligned.
+- Element $i$ of an array of `size`-byte elements is at base + $i \cdot$ size. Walking with a pointer to a precomputed end is the cheap loop: 4 instructions per word in the sum.
+- A string is a byte array ending in zero; its length is the distance from its start to that zero.
+- Pseudo-instructions expand into one or two real instructions; macros paste text at every use; `.include` pastes files; `.eqv` names constants.
+
+## Code
+
+The Collatz loop with its setup and output:
+
+```riscv
+        .text
+        .globl main
+main:
+        li   t0, 27                 # n
+        li   t1, 0                  # steps
+        mv   t2, t0                 # largest value seen so far
+        li   t3, 1
+loop:   beq  t0, t3, done           # while (n != 1): leave when n == 1
+        andi t4, t0, 1              # t4 = lowest bit of n
+        bnez t4, odd                # if (n is even) ... else goto odd
+        srli t0, t0, 1              # then: n = n / 2
+        j    next                   # skip the else part
+odd:    slli t4, t0, 1              # else: n = 3n + 1, computed as 2n + n + 1
+        add  t0, t0, t4
+        addi t0, t0, 1
+next:   addi t1, t1, 1              # steps++
+        ble  t0, t2, loop           # if (n > max) max = n; then back to the test
+        mv   t2, t0
+        j    loop
+done:   mv   a0, t1
+        li   a7, 1
+        ecall                       # prints 111
+        li   a0, ' '
+        li   a7, 11
+        ecall
+        mv   a0, t2
+        li   a7, 1
+        ecall                       # prints 9232
+        li   a7, 10
+        ecall
+# Output: 111 9232
+# (864 instructions executed)
+```
+
+One word read by five loads, then changed by a byte store. As in the previous note, the values are printed by a short subroutine `show`, reached with `jal ra, show` and left with `ret`:
+
+```riscv
+        .data
+w:      .byte 0xf6, 0x00, 0x80, 0xff    # the word 0xff8000f6, least significant byte first
+
+        .text
+        .globl main
+main:
+        la   t0, w
+        lb   a0, 0(t0)              # byte 0xf6, sign-extended
+        jal  ra, show               # -10 0xfffffff6
+        lbu  a0, 0(t0)              # byte 0xf6, zero-extended
+        jal  ra, show               # 246 0x000000f6
+        lh   a0, 2(t0)              # half 0xff80 (bytes 0x80, 0xff), sign-extended
+        jal  ra, show               # -128 0xffffff80
+        lhu  a0, 2(t0)              # the same half, zero-extended
+        jal  ra, show               # 65408 0x0000ff80
+        lw   a0, 0(t0)              # all four bytes
+        jal  ra, show               # -8388362 0xff8000f6
+        li   t1, 0x7f
+        sb   t1, 3(t0)              # overwrite only the most significant byte
+        lw   a0, 0(t0)
+        jal  ra, show               # 2139095286 0x7f8000f6
+        li   a7, 10
+        ecall
+
+show:                               # print a0 in decimal and in hex on one line
+        mv   t6, a0
+        li   a7, 1
+        ecall
+        li   a0, ' '
+        li   a7, 11
+        ecall
+        mv   a0, t6
+        li   a7, 34
+        ecall
+        li   a0, 10
+        li   a7, 11
+        ecall
+        ret
+# Output:
+# -10 0xfffffff6
+# 246 0x000000f6
+# -128 0xffffff80
+# 65408 0x0000ff80
+# -8388362 0xff8000f6
+# 2139095286 0x7f8000f6
+```
+
+The array sum in both forms and the string length:
+
+```riscv
+        .data
+arr:    .word 12, -7, 30, 5, -2, 19
+n:      .word 6
+str:    .asciz "RISC-V assembly"
+
+        .text
+        .globl main
+main:
+        # for (i = 0; i < n; i++) sum += arr[i];   index form, test at the top
+        la   t0, arr                # t0 = address of arr[0]
+        lw   t2, n                  # t2 = n
+        li   t1, 0                  # t1 = i
+        li   a0, 0                  # a0 = sum
+for:    bge  t1, t2, endfor         # leave when i >= n
+        slli t3, t1, 2              # t3 = 4 * i, the byte offset of arr[i]
+        add  t3, t0, t3             # t3 = &arr[i]
+        lw   t4, 0(t3)              # t4 = arr[i]
+        add  a0, a0, t4
+        addi t1, t1, 1              # i++
+        j    for
+endfor: li   a7, 1
+        ecall                       # prints 57
+        li   a0, ' '
+        li   a7, 11
+        ecall
+
+        # the same sum with a pointer that walks to the end; the test is at the bottom
+        la   t0, arr                # t0 = p = &arr[0]
+        lw   t2, n
+        slli t2, t2, 2
+        add  t2, t0, t2             # t2 = end = &arr[n], one past the last element
+        li   a0, 0
+        beq  t0, t2, endsum         # an empty array skips the loop
+sum:    lw   t4, 0(t0)              # t4 = *p
+        add  a0, a0, t4
+        addi t0, t0, 4              # p++ moves by 4 bytes, one word
+        bne  t0, t2, sum            # repeat while p != end
+endsum: li   a7, 1
+        ecall                       # prints 57
+        li   a0, ' '
+        li   a7, 11
+        ecall
+
+        # strlen: count bytes up to the terminating zero
+        la   t0, str                # t0 = start
+        mv   t1, t0                 # t1 = p
+strl:   lbu  t2, 0(t1)              # t2 = *p, one byte, zero-extended
+        beqz t2, strend             # the zero byte ends the string
+        addi t1, t1, 1              # p++ moves by 1 byte
+        j    strl
+strend: sub  a0, t1, t0             # length = p - start
+        li   a7, 1
+        ecall                       # prints 15
+        li   a7, 10
+        ecall
+# Output: 57 57 15
+```
+
+Where the data directives put things:
+
+```riscv
+        .data
+a:      .byte 1                     # 1 byte
+        .align 1
+b:      .half 2                     # 2 bytes, at an even address
+        .align 2
+c:      .word 3                     # 4 bytes, at a multiple of 4
+s:      .asciz "hi"                 # 3 bytes: 'h', 'i', 0
+        .align 2
+d:      .word 4
+        .eqv  NLABELS, 5            # a named constant
+
+        .text
+        .globl main
+main:
+        la   t0, addrs              # print the five addresses stored in the table below
+        li   t1, NLABELS
+next:   lw   a0, 0(t0)
+        li   a7, 34
+        ecall
+        li   a0, 10                 # newline
+        li   a7, 11
+        ecall
+        addi t0, t0, 4
+        addi t1, t1, -1
+        bnez t1, next
+        li   a7, 10
+        ecall
+
+        .data
+addrs:  .word a, b, c, s, d         # a .word may hold the address of a label
+# Output:
+# 0x10010000
+# 0x10010002
+# 0x10010004
+# 0x10010008
+# 0x1001000c
+```
+
+The same numbers computed in Python, as a cross-check:
+
+```python
+n, steps, largest = 27, 0, 27
+while n != 1:
+    n = n // 2 if n % 2 == 0 else 3 * n + 1
+    steps += 1
+    largest = max(largest, n)
+print(steps, largest)                                   # 111 9232
+
+arr = [12, -7, 30, 5, -2, 19]
+print(sum(arr), len('RISC-V assembly'))                 # 57 15
+
+w = bytes([0xf6, 0x00, 0x80, 0xff])                     # memory at w, w+1, w+2, w+3
+print(int.from_bytes(w[0:1], 'little', signed=True),    # lb  0(t0)
+      w[0],                                             # lbu 0(t0)
+      int.from_bytes(w[2:4], 'little', signed=True),    # lh  2(t0)
+      int.from_bytes(w[2:4], 'little'),                 # lhu 2(t0)
+      int.from_bytes(w, 'little', signed=True))         # lw  0(t0)
+# -10 246 -128 65408 -8388362
+```
+
+## Next
+
+Every program so far is one block of code. The `show` routine above was reached with `jal ra, show` and left with `ret`, and it worked because it used only `t6`, `a0` and `a7` and called nothing else. The [next note](/notes/acos/procedures-and-the-stack) makes that a discipline: how `jal` and `jalr` call and return, which registers a procedure may change and which it must preserve, and how the stack gives every call, including a recursive one, its own place in memory.
+
+## References
+
+- A. Tatarnikov. *Computer Architecture and Operating Systems* (HSE), [lecture 5: pseudo-instructions, macros and includes; conditions, loops, loads and stores](https://andrewt0301.github.io/hse-acos-course/part1ca/05_MacrosBranchesArrays/lecture.html).
+- RISC-V International. [*The RISC-V Instruction Set Manual, Volume I: Unprivileged ISA*](https://github.com/riscv/riscv-isa-manual/releases/latest). The RV32I chapter: control transfer instructions (branch range and offsets) and load and store instructions (sign and zero extension, misaligned accesses).
+- D. A. Patterson, J. L. Hennessy. *Computer Organization and Design, RISC-V Edition*, 2nd ed. Morgan Kaufmann, 2020. Sections 2.7 (instructions for making decisions), 2.9 (communicating with people: bytes and strings) and 2.14 (arrays versus pointers).
+- S. L. Harris, D. M. Harris. *Digital Design and Computer Architecture, RISC-V Edition*. Morgan Kaufmann, 2021. Section 6.3 (programming: branching, conditional statements, loops, arrays).
+- R. E. Bryant, D. R. O'Hallaron. *Computer Systems: A Programmer's Perspective*, 3rd ed. Pearson, 2016. Sections 3.6 (control: conditional branches and loops, including loop rotation) and 3.8 (array allocation and access), for the same ideas on x86-64.
+- [RARS: RISC-V Assembler and Runtime Simulator](https://github.com/TheThirdOne/rars), the wiki page on assembler directives (`.macro`, `.end_macro`, `.include`, `.eqv`, `.align`).
+- J. Lagarias. [The 3x + 1 problem and its generalizations](https://doi.org/10.2307/2322189). *American Mathematical Monthly*, 92(1):3–23, 1985, for the Collatz iteration used as the example.

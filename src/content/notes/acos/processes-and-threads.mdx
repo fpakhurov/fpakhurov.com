@@ -1,0 +1,397 @@
+---
+title: Processes and threads
+description: "How an operating system runs many programs on few processors: the process and its control block, its life through fork, exec, exit and wait, zombies and orphans, threads sharing one address space, scheduling policies, and the cost of a context switch."
+course: acos
+section: Processes and Concurrency
+order: 22
+status: published
+tags: [process, pcb, fork, exec, wait, zombie, orphan, threads, pthreads, scheduling, round-robin, mlfq, cfs, context-switch]
+prerequisites: [Dynamic memory allocation and strings, System calls, Virtual memory, Exceptions and interrupts]
+---
+
+import ProcessStates from '../../../components/figures/processes-and-threads/ProcessStates.astro';
+import ForkExecWait from '../../../components/figures/processes-and-threads/ForkExecWait.astro';
+import SchedulingGantt from '../../../components/figures/processes-and-threads/SchedulingGantt.astro';
+
+The [previous note](/notes/acos/memory-allocation) managed the heap of one program as if nothing else ran on the machine. A real system runs a shell, an editor, a compiler and dozens of background services at once, on a handful of cores. Each must believe it has the processor and the memory to itself, none may read or corrupt another's heap, and all must make progress. The operating system achieves this with one abstraction, the **process**: a running program together with everything needed to stop it and resume it later. This note defines the process, follows one through its life from `fork` to `wait`, adds **threads**, which let one program run on several cores over one shared heap, and then turns to the **scheduler**, the part of the kernel that decides who runs next, and to the price of switching between them.
+
+**Notation.** In the scheduling sections, job $i$ arrives at time $a_i$, needs $b_i$ milliseconds of processor time (its *burst*), runs for the first time at $s_i$ and finishes at $c_i$. Its **turnaround time** is $T_i = c_i - a_i$, its **waiting time** $W_i = T_i - b_i$ (time spent ready but not running), and its **response time** $R_i = s_i - a_i$.
+
+## Baseline: one program at a time
+
+The earliest systems ran one job from start to finish, then the next. A program, however, does not compute all the time: it reads a file, waits for the disk, waits for a key press. While it waits, the processor has nothing to do. A job that computes for 10 ms and then waits 40 ms for the disk keeps the processor busy $10 / (10 + 40) = 20\,\%$ of the time.
+
+**Multiprogramming** keeps several jobs in memory and gives the processor to another one whenever the current one waits. With five such jobs, each waiting while the others compute, the processor could in the best case be busy all the time. **Time sharing** adds a timer: even a job that never waits is interrupted after a few milliseconds, so that every user at a terminal sees a response quickly. Both need the same thing from the hardware and the kernel: a way to stop a running program at any instruction, keep it intact, run another, and later continue the first as if nothing had happened. And they need protection, since jobs that share one memory must not be able to overwrite each other.
+
+## The process
+
+<aside class="callout"><strong>Key idea.</strong> A process is a program in execution together with the state needed to pause and resume it: a private address space, the saved registers in a control block in the kernel, and the open files. <code>fork</code> copies that state into a new process, <code>exec</code> replaces the program inside a process, <code>exit</code> and <code>wait</code> end it and hand its status to the parent. A thread is one more set of registers and one more stack inside the same address space.</aside>
+
+### The address space
+
+Each process has its own virtual address space: code at the bottom, then initialized and zeroed data, the heap growing upwards, shared libraries and other mappings in the middle, and the stack growing down from the top. [Virtual memory](/notes/acos/virtual-memory) makes it private: the same virtual address in two processes is translated through two different page tables to two different physical frames, and a process has no way to name memory it was not given. Two runs of the same program are two processes with the same code and separate data.
+
+### The process control block
+
+Everything the kernel knows about a process lives in a kernel data structure, the **process control block** (PCB); in Linux it is `struct task_struct`. It holds:
+
+- the **process identifier** (PID) and the PID of the parent;
+- the **state** (below);
+- the **saved registers**, including the program counter and the stack pointer, valid while the process is not running;
+- the **memory map**: the page-table root and the list of mapped regions;
+- the table of **open files**, indexed by file descriptor;
+- scheduling information (priority, time used), credentials (user and group), signal settings, accounting.
+
+### States
+
+A process is in one of a few states. It is **running** while a core executes it, **ready** when it could run but no core is free, and **blocked** (also called waiting or sleeping) while it waits for an event: a disk read, a key press, a child's exit. A timer interrupt moves a running process back to ready; a system call that must wait moves it to blocked; the event, signalled by an interrupt, moves it back to ready. At the start, a process being created is **new**; at the end, a process that has exited but whose parent has not yet collected its status is a **zombie**, the state that Unix calls terminated.
+
+<ProcessStates />
+
+The transitions in and out of running are where the kernel gets control. It never "watches" a running process: it runs only when the process makes a system call or when an [interrupt or exception](/notes/acos/exceptions-and-interrupts) arrives. The timer interrupt is what guarantees that it gets control back even from a program stuck in an infinite loop.
+
+## Creating a process: fork, exec and wait
+
+Unix creates processes in two steps that are separate system calls ([Ritchie and Thompson, 1974](#references); [Kerrisk, 2010](#references), chapters 24–27).
+
+- **`fork()`** creates a child that is a copy of the caller: the same program, the same memory contents, the same open files, the same registers. It returns twice, once in each process: in the parent it returns the child's PID, in the child it returns 0. That return value is the only difference, and the program branches on it.
+- **`exec(path, argv, ...)`** (a family: `execl`, `execvp`, `execve` and others) replaces the program inside the calling process. The kernel discards the old address space, loads the new executable as the [loader](/notes/acos/linking-and-loading) does and starts it at its entry point. The PID stays the same, and so do the open file descriptors, unless they were marked close-on-exec. A successful `exec` never returns: the code that called it no longer exists.
+- **`exit(status)`** ends the process. The kernel closes its files and frees its memory, but keeps its PCB with the exit status.
+- **`wait(&status)`** or **`waitpid(pid, &status, 0)`** blocks the parent until a child exits, then returns the child's PID and status (`WEXITSTATUS(status)` for a normal exit, `WTERMSIG(status)` for a child killed by a signal) and lets the kernel free the child's PCB.
+
+<ForkExecWait />
+
+1. The parent calls `fork`. The kernel allocates a PCB and a PID for the child and copies the parent's file table and memory map.
+2. Both processes return from `fork`: the parent gets the child's PID, the child gets 0.
+3. The child calls `exec`. Its address space is replaced by the new program; the PID and the open files survive.
+4. The child calls `exit` and becomes a zombie that holds only its exit status.
+5. The parent, blocked in `waitpid`, wakes up with the status, and the kernel removes the zombie.
+
+**Copying is mostly avoided.** Copying a large address space on every `fork`, only to throw it away at the next `exec`, would be wasteful. The kernel instead copies the page tables and marks every writable page read-only in both processes: this is **copy-on-write**. As long as neither process writes, they share the physical frames. The first write to a page causes a page fault, and the kernel then copies that one page and makes both copies writable. A `fork` followed by `exec` copies almost nothing.
+
+**Why two steps.** Between `fork` and `exec`, the child runs the parent's code with its own copy of the file table, so it can rearrange its files before the new program starts. A shell runs `ls > out.txt` by forking, opening `out.txt` in the child, duplicating that descriptor onto descriptor 1 (standard output) with `dup2`, and then calling `exec("ls")`. `ls` writes to descriptor 1 as always and never learns where its output goes. The [inter-process communication note](/notes/acos/inter-process-communication) connects two programs the same way with a pipe.
+
+**Worked example.** The first program in the Code section has a global `counter = 100`. The child adds 1 and prints 101, then execs `echo`. The parent, after `waitpid`, prints 100: the child changed its own copy of the page, which copy-on-write separated from the parent's at the first write. The `echo` process has the child's PID but none of its memory.
+
+### Zombies and orphans
+
+A process that has exited stays in the process table as a **zombie** until its parent calls `wait`, because the exit status must be kept somewhere until someone asks for it. In the Code section a child exits immediately while its parent sleeps for a second; `ps` reports its state as `Z` until the parent's `waitpid` returns the exit code 7, after which the PID no longer exists. One zombie costs only a table entry, but a server that forks children and never waits for them accumulates zombies until it runs out of PIDs.
+
+An **orphan** is a process whose parent exits first. The kernel gives it a new parent: PID 1 (`init` or `systemd` on Linux, `launchd` on macOS), or on Linux the nearest ancestor that has declared itself a *subreaper*. The new parent calls `wait` for every child it inherits, so orphans do not stay zombies. In the Code section a grandchild outlives its parent and then reports its new parent PID as 1. All processes therefore form one tree rooted at PID 1.
+
+## Threads
+
+A process runs one sequence of instructions at a time. To use several cores, or to keep computing while one task waits for the network, a program can create several **threads**. A thread is an independent flow of control inside a process: it has its own program counter, registers and stack, and shares everything else with the other threads of the process: the code, the global data, the heap, the open files ([Arpaci-Dusseau, 2018](#references), chapter 26).
+
+| | Separate processes | Threads of one process |
+| --- | --- | --- |
+| Address space | one each, private | one, shared |
+| Created with | `fork` (copies page tables) | `pthread_create` (allocates a stack) |
+| Communicate through | the kernel: pipes, files, shared-memory objects | ordinary variables |
+| A crash or wild write | kills one process | kills or corrupts the whole process |
+| Switch between them | changes the page table | keeps the page table |
+| Own per thread | everything | registers, stack, thread-local variables |
+
+POSIX threads (pthreads) are the C interface ([Kerrisk, 2010](#references), chapter 29). `pthread_create(&t, NULL, f, arg)` starts a thread that runs `f(arg)`; `pthread_join(t, &result)` waits for it to return and collects its result, as `wait` does for a process; `pthread_detach` lets a thread's resources be freed when it ends without anyone joining it. On Linux and macOS each pthread is a thread of the kernel, scheduled on its own; on Linux both threads and processes are created by one system call, `clone`, with flags that say what the new task shares with its creator.
+
+**Worked example.** In the second program of the Code section, two threads each add their number (1 and 2) to a global `counter = 100`, and each keeps a local variable on its own stack. After joining both, `main` prints `counter=103`: unlike the `fork` example, every thread wrote the same variable. To keep this example correct the second thread is started only after the first has finished. Two threads updating one variable at the same time is the subject of the [next note](/notes/acos/synchronization), and the reason threads are harder to program than processes.
+
+## Scheduling: who runs next
+
+The kernel separates **mechanism** from **policy**. The mechanism, the context switch below, can stop any process and resume any other. The **scheduler** is the policy that picks which ready process runs next and for how long. Its goals conflict: a short turnaround time for batch work, a short response time for interactive programs, fairness, and little time lost to switching.
+
+Four jobs make the differences concrete:
+
+| Job | Arrives (ms) | Burst (ms) |
+| --- | --- | --- |
+| A | 0 | 6 |
+| B | 1 | 3 |
+| C | 2 | 7 |
+| D | 4 | 2 |
+
+- **First come, first served** (FIFO) runs jobs to completion in order of arrival: A 0–6, B 6–9, C 9–16, D 16–18. D, the shortest job, waits 12 ms behind the long ones. That is the *convoy effect*: short jobs queue behind long ones, as cars behind a truck.
+- **Shortest job first** (SJF) also runs each job to completion, but when the processor frees up it picks the ready job with the shortest burst: A 0–6, then D 6–8 (at time 6 the ready jobs are B with 3, C with 7 and D with 2), B 8–11, C 11–18. If all jobs arrive together, running the shortest first minimizes the average waiting time: moving a shorter job before a longer one reduces the shorter job's wait by more than it increases the longer one's.
+- **Shortest time to completion first** (STCF, preemptive SJF) re-decides whenever a job arrives: A runs 0–1, B arrives with 3 ms against A's remaining 5 and takes over 1–4, then D 4–6, A 6–11, C 11–18.
+- **Round robin** (RR) gives each ready job a **quantum** of 2 ms in turn and puts it at the back of the queue if it is not done (here a job that arrives during a quantum joins the queue before the job being preempted): A 0–2, B 2–4, C 4–6, A 6–8, D 8–10, B 10–11, C 11–13, A 13–15, C 15–18.
+
+<SchedulingGantt />
+
+| Policy | Average turnaround (ms) | Average waiting (ms) | Average response (ms) |
+| --- | --- | --- | --- |
+| FIFO | 10.5 | 6.0 | 6.0 |
+| SJF | 9.0 | 4.5 | 4.5 |
+| STCF | 8.0 | 3.5 | 2.25 |
+| RR, quantum 2 ms | 11.75 | 7.25 | 1.75 |
+
+Round robin has the worst turnaround and the best response: every job runs within a few milliseconds of arriving, which is what a user at a keyboard notices, but every job also finishes late because it shares the processor until the end. The quantum sets the trade-off. A long quantum makes RR behave like FIFO; a short one improves response but switches more often, and each switch costs time (the last section). SJF and STCF need the burst lengths in advance, which a general-purpose system does not know.
+
+### The multi-level feedback queue
+
+The **multi-level feedback queue** (MLFQ), first used in the CTSS time-sharing system in the early 1960s, learns the burst lengths by watching ([Arpaci-Dusseau, 2018](#references), chapter 8). It keeps several queues of decreasing priority and follows a few rules:
+
+1. A ready job in a higher-priority queue always runs before one in a lower queue; jobs in the same queue share the processor round robin.
+2. A new job enters the highest queue, so it gets a short response time and is treated as interactive until it proves otherwise.
+3. A job that uses up its time allotment at one level, in one stretch or across several, moves one level down. Jobs that compute for long stretches sink; jobs that run briefly and then wait for input stay on top.
+4. Periodically every job is moved back to the top, so that long jobs are not starved forever and a job that turned interactive is noticed again.
+
+MLFQ approximates STCF without knowing the future: short and interactive jobs stay in the fast queues, and long computations run when nothing more urgent is ready. Counting the allotment across several stretches (rule 3) closes a loophole: otherwise a program could stay on top by giving up the processor just before its quantum ends.
+
+### Fair sharing: CFS and EEVDF
+
+Linux took a different approach in 2007 with the **Completely Fair Scheduler** (CFS). Each task has a **virtual run time** that grows while it runs, at a rate inversely proportional to its weight; the scheduler always runs the task with the smallest virtual run time, kept in a red-black tree ordered by it ([Linux CFS documentation](#references)). Weights come from the task's *nice* value: 1024 for nice 0, 820 for nice 1, 335 for nice 5, each step about 1.25 times the next ([Linux `sched_prio_to_weight`](#references)). Two always-ready tasks at nice 0 and nice 5 share a core in the ratio of their weights, $1024 / (1024 + 335) = 75.3\,\%$ against $24.7\,\%$, and over 100 ms both virtual run times advance by the same 75.3 ms: the one that ran three times longer has a weight three times larger. A task that sleeps does not accumulate virtual run time, so when it wakes up it has the smallest value and runs soon, which favours interactive tasks without any explicit classification. Since version 6.6 the kernel has been moving to **EEVDF** (earliest eligible virtual deadline first), which keeps the weights and the virtual run time and adds a deadline to each task, so that tasks with short time slices can get the processor sooner ([Linux EEVDF documentation](#references)).
+
+## Context switches
+
+Switching the processor from one process to another is a **context switch**. It happens inside the kernel, after a timer interrupt or a blocking system call has brought control there:
+
+1. the trap has already saved the user registers of the old process; the kernel stores them, with the kernel stack pointer, in the old process's PCB;
+2. the scheduler picks the next process;
+3. the kernel switches to the new process's kernel stack and loads its saved registers;
+4. it switches the address space: on RISC-V by writing the root of the new page table into the `satp` register, whose address-space identifier (ASID) field lets the TLB keep entries of several processes apart instead of flushing them;
+5. it returns to user mode, and the new process continues where it was stopped.
+
+A switch between two threads of the same process skips step 4. The direct cost is a few microseconds. On the machine used here (Apple M1, macOS 26, clang `-O0`) two processes passing one byte back and forth through two pipes took 3.3 to 4.1 μs per round trip in nine runs; each round trip includes four system calls (an empty system call, `getppid`, took about 0.12 μs on the same machine) and two wake-ups of a blocked process, possibly on different cores, so it measures the whole hand-off rather than the switch alone. The indirect cost is often larger: the new process finds the caches and the TLB filled with the old one's data and runs slowly until it has refilled them. That is why the quantum is milliseconds and not microseconds.
+
+<aside class="callout"><strong>Check yourself.</strong> (1) A program calls <code>fork()</code> twice in a row, without checking the return values. How many processes exist afterwards, counting the original? (2) Why does a child's change to a global variable not show in the parent, while a thread's change does? (3) In the four-job example, what is D's response time under round robin with a quantum of 2 ms, and why is it larger than B's?<details><summary>Answers</summary>(1) Four: the first <code>fork</code> makes two processes, and each of them executes the second <code>fork</code>. (2) After <code>fork</code> the child has its own address space; copy-on-write gives it a private copy of the page at its first write. Threads share one address space, so there is only one copy of the variable. (3) D arrives at 4 and first runs at 8, so $R = 4$ ms; B first runs at 2, one ms after arriving. When D arrives at 4, C and A are already in the queue (C since it arrived at 2, A since its quantum ended at 2), so D waits for their two quanta, 4–8.</details></aside>
+
+## What changed
+
+| | One program at a time | Processes | Threads |
+| --- | --- | --- | --- |
+| Processor while a program waits | idle | runs another ready process | runs another thread of any process |
+| Memory | the whole machine | a private address space each | shared by the threads of a process |
+| Creation | load and run | `fork` + `exec`, copy-on-write | `pthread_create` |
+| Who decides who runs | the operator | the scheduler, preempting on a timer | the same scheduler |
+| Cost of a switch | none | registers, page table, cold caches and TLB | registers, cold caches |
+
+## Limitations
+
+- **The scheduler knows little.** It sees only past behaviour; MLFQ and CFS are heuristics, and both can be gamed or misled (a task that sleeps briefly and often looks interactive).
+- **Context switches are not free.** Fine-grained time slicing and many threads per core spend time in the kernel and in refilling caches.
+- **Sharing breaks isolation.** Threads give up the protection of separate address spaces: a bug in one thread corrupts the data of all.
+- **More than one core.** This note scheduled one processor. Real schedulers keep a run queue per core, balance load between them and try to keep a task on the core whose cache holds its data; [multicore processors](/notes/acos/thread-level-parallelism) bring their own costs.
+
+## What you should remember
+
+- A process is a program in execution: a private address space, a PCB with the saved registers and state, and a table of open files.
+- States: new, ready, running, blocked, zombie. Only an interrupt or a system call gives the kernel control; the timer interrupt guarantees it.
+- `fork` returns twice (child PID in the parent, 0 in the child) and shares memory copy-on-write; `exec` replaces the program and keeps the PID and the open files; `wait` collects the exit status and removes the zombie.
+- An exited child stays a zombie until its parent waits; an orphan is adopted by PID 1 or a subreaper, which waits for it.
+- Threads share the address space, the heap and the files, and own only registers and a stack. They are cheaper to create and switch, and they can race.
+- FIFO suffers from convoys, SJF and STCF need burst lengths, round robin trades turnaround for response; MLFQ learns which jobs are interactive, CFS and EEVDF share the processor in proportion to weights through a virtual run time.
+- A context switch saves and loads registers and switches page tables; its direct cost is microseconds, and cold caches add more.
+
+## Code
+
+The life of a process: `fork`, `exec` and `waitpid`, then a zombie as `ps` sees it, then an orphan that reports its new parent. Compile and run with `clang -std=c17 -Wall -Wextra -O0 proc.c -o proc && ./proc`:
+
+```c
+#include <stdio.h>
+#include <string.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+int counter = 100;                                   /* after fork, each process has its own copy */
+
+static void show_state(pid_t pid, const char *when) {
+    char cmd[64], st[16] = "";
+    snprintf(cmd, sizeof cmd, "ps -o stat= -p %d", (int)pid);
+    FILE *ps = popen(cmd, "r");
+    if (ps && fgets(st, sizeof st, ps)) st[strcspn(st, " \n")] = '\0';
+    if (ps) pclose(ps);
+    printf("%s: state %s\n", when, st[0] ? st : "(gone)");
+}
+
+int main(void) {
+    /* 1. fork, exec, wait */
+    pid_t pid = fork();
+    if (pid < 0) { perror("fork"); return 1; }
+    if (pid == 0) {                                  /* child: fork returned 0 */
+        counter += 1;
+        printf("child:  counter=%d\n", counter);
+        fflush(stdout);                              /* exec discards unflushed stdio buffers */
+        execlp("echo", "echo", "child:  now running echo in the same process", (char *)NULL);
+        perror("execlp");                            /* reached only if exec failed */
+        _exit(127);
+    }
+    int status;
+    waitpid(pid, &status, 0);                        /* parent: fork returned the child's pid */
+    printf("parent: counter=%d, child exit code %d\n", counter, WEXITSTATUS(status));
+
+    /* 2. a zombie: the child has exited, the parent has not waited yet */
+    pid_t z = fork();
+    if (z == 0) _exit(7);
+    sleep(1);
+    show_state(z, "zombie before wait");
+    waitpid(z, &status, 0);
+    show_state(z, "after wait");
+    printf("exit code collected: %d\n", WEXITSTATUS(status));
+
+    /* 3. an orphan: the middle process exits before its own child */
+    int fd[2];
+    pipe(fd);
+    pid_t mid = fork();
+    if (mid == 0) {
+        pid_t me = getpid();
+        if (fork() == 0) {
+            int before = getppid() == me;
+            sleep(1);                                /* the middle process exits meanwhile */
+            dprintf(fd[1], "orphan: parent was the middle process: %s; new parent pid: %d\n", before ? "yes" : "no", (int)getppid());
+            _exit(0);
+        }
+        _exit(0);
+    }
+    waitpid(mid, NULL, 0);
+    close(fd[1]);
+    char buf[96];
+    ssize_t n = read(fd[0], buf, sizeof buf - 1);    /* blocks until the orphan writes */
+    if (n > 0) { buf[n] = '\0'; fputs(buf, stdout); }
+    return 0;
+}
+/* Output (macOS 26; on Linux the new parent can be a subreaper instead of 1):
+child:  counter=101
+child:  now running echo in the same process
+parent: counter=100, child exit code 0
+zombie before wait: state Z
+after wait: state (gone)
+exit code collected: 7
+orphan: parent was the middle process: yes; new parent pid: 1
+*/
+```
+
+Two threads share one global variable, and each has its own stack:
+
+```c
+#include <pthread.h>
+#include <stdio.h>
+
+int counter = 100;                                   /* one copy, shared by every thread of the process */
+
+static void *worker(void *arg) {
+    int id = *(int *)arg;
+    int local = id * 10;                             /* on this thread's own stack */
+    counter += id;                                   /* the threads run one after another below, so no race */
+    printf("thread %d: local=%d\n", id, local);
+    return NULL;
+}
+
+int main(void) {
+    pthread_t t[2];
+    int ids[2] = {1, 2};
+    for (int i = 0; i < 2; i++) {
+        pthread_create(&t[i], NULL, worker, &ids[i]);
+        pthread_join(t[i], NULL);                    /* wait for each before starting the next */
+    }
+    printf("main: counter=%d\n", counter);           /* 100 + 1 + 2: both threads wrote the same variable */
+    return 0;
+}
+/* Output:
+thread 1: local=10
+thread 2: local=20
+main: counter=103
+*/
+```
+
+The scheduling example and the CFS shares (`python3 sched.py`):
+
+```python
+jobs = [('A', 0, 6), ('B', 1, 3), ('C', 2, 7), ('D', 4, 2)]   # name, arrival, burst (ms)
+
+def fifo(jobs):
+    t, g = 0, []
+    for n, a, b in sorted(jobs, key=lambda j: j[1]):
+        t = max(t, a); g.append((n, t, t + b)); t += b
+    return g
+
+def sjf(jobs):                                   # non-preemptive: the shortest job among those that have arrived
+    left, t, g = list(jobs), 0, []
+    while left:
+        ready = [j for j in left if j[1] <= t] or [min(left, key=lambda j: j[1])]
+        n, a, b = min(ready, key=lambda j: (j[2], j[1]))
+        t = max(t, a); g.append((n, t, t + b)); t += b; left.remove((n, a, b))
+    return g
+
+def stcf(jobs):                                  # preemptive: shortest remaining time, decided every 1 ms
+    rem = {n: b for n, _, b in jobs}; arr = {n: a for n, a, _ in jobs}; t, g = 0, []
+    while any(rem.values()):
+        ready = [n for n in rem if rem[n] and arr[n] <= t]
+        if not ready: t += 1; continue
+        n = min(ready, key=lambda n: (rem[n], arr[n]))
+        g[-1:] = [(n, g[-1][1], t + 1)] if g and g[-1][0] == n and g[-1][2] == t else g[-1:] + [(n, t, t + 1)]
+        rem[n] -= 1; t += 1
+    return g
+
+def rr(jobs, q):                                 # a job arriving during a quantum queues before the preempted one
+    rem = {n: b for n, _, b in jobs}; pending = sorted(jobs, key=lambda j: j[1]); queue, t, g = [], 0, []
+    def admit():
+        while pending and pending[0][1] <= t: queue.append(pending.pop(0)[0])
+    admit()
+    while queue or pending:
+        if not queue: t = pending[0][1]; admit(); continue
+        n = queue.pop(0); run = min(q, rem[n])
+        g[-1:] = [(n, g[-1][1], t + run)] if g and g[-1][0] == n else g[-1:] + [(n, t, t + run)]
+        t += run; rem[n] -= run; admit()
+        if rem[n]: queue.append(n)
+    return g
+
+for name, g in (('FIFO', fifo(jobs)), ('SJF', sjf(jobs)), ('STCF', stcf(jobs)), ('RR q=2', rr(jobs, 2))):
+    T = W = R = 0
+    for n, a, b in jobs:
+        segs = [s for s in g if s[0] == n]
+        T += segs[-1][2] - a; W += segs[-1][2] - a - b; R += segs[0][1] - a
+    print(f"{name:7}", ' '.join(f'{n}{s}-{e}' for n, s, e in g), '| turnaround', T / 4, 'waiting', W / 4, 'response', R / 4)
+# FIFO    A0-6 B6-9 C9-16 D16-18 | turnaround 10.5 waiting 6.0 response 6.0
+# SJF     A0-6 D6-8 B8-11 C11-18 | turnaround 9.0 waiting 4.5 response 4.5
+# STCF    A0-1 B1-4 D4-6 A6-11 C11-18 | turnaround 8.0 waiting 3.5 response 2.25
+# RR q=2  A0-2 B2-4 C4-6 A6-8 D8-10 B10-11 C11-13 A13-15 C15-18 | turnaround 11.75 waiting 7.25 response 1.75
+
+w0, w5 = 1024, 335                               # Linux weights of nice 0 and nice 5
+share = w0 / (w0 + w5)
+ran0, ran5 = 100 * share, 100 * (1 - share)       # ms of a 100 ms interval
+print(round(share, 3), round(ran0, 1), round(ran5, 1), round(ran0 * 1024 / w0, 1), round(ran5 * 1024 / w5, 1))
+# 0.753 75.3 24.7 75.3 75.3: unequal real time, equal virtual run time
+```
+
+The hand-off between two processes through two pipes. The time varies between machines and runs; the comment quotes one run:
+
+```c
+#include <stdio.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+
+#define ROUNDS 100000
+
+static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
+
+int main(void) {
+    int ab[2], ba[2];
+    pipe(ab); pipe(ba);
+    char c = 'x';
+    if (fork() == 0) {                               /* child: echo every byte back */
+        for (int i = 0; i < ROUNDS; i++) { read(ab[0], &c, 1); write(ba[1], &c, 1); }
+        _exit(0);
+    }
+    double t0 = now();
+    for (int i = 0; i < ROUNDS; i++) { write(ab[1], &c, 1); read(ba[0], &c, 1); }
+    double t1 = now();
+    wait(NULL);
+    printf("round trip: %.1f us\n", (t1 - t0) / ROUNDS * 1e6);
+    return 0;
+}
+/* One run on an Apple M1, macOS 26, clang -O0: round trip: 3.6 us (3.3 to 4.1 in nine runs) */
+```
+
+## Next
+
+The thread example above was correct only because its two threads never ran at the same time. When they do, an update as simple as `counter++` can lose increments, and the result changes from run to run. The [next note](/notes/acos/synchronization) shows why, at the level of the three instructions behind `counter++`, and builds the tools that make concurrent updates safe: atomic instructions, mutexes, condition variables and semaphores.
+
+## References
+
+- R. H. Arpaci-Dusseau, A. C. Arpaci-Dusseau. [*Operating Systems: Three Easy Pieces*](https://pages.cs.wisc.edu/~remzi/OSTEP/). Arpaci-Dusseau Books, 2018. Chapters 4 (the process), 5 (process API), 6 (limited direct execution and context switches), 7 (scheduling), 8 (the multi-level feedback queue), 9 (proportional share and CFS), 26 (concurrency and threads), 27 (thread API).
+- R. E. Bryant, D. R. O'Hallaron. [*Computer Systems: A Programmer's Perspective*](https://csapp.cs.cmu.edu/), 3rd ed. Pearson, 2016. §8.2 (processes), §8.4 (process control: fork, exec, wait, zombies), §12.3 (threads).
+- M. Kerrisk. [*The Linux Programming Interface*](https://man7.org/tlpi/). No Starch Press, 2010. Chapter 6 (processes), chapters 24–27 (process creation, termination, monitoring children, program execution), chapter 29 (threads).
+- A. S. Tanenbaum, H. Bos. *Modern Operating Systems*, 4th ed. Pearson, 2015. Chapter 2 (processes and threads, scheduling).
+- D. M. Ritchie, K. Thompson. [The UNIX time-sharing system](https://doi.org/10.1145/361011.361061). *Communications of the ACM*, 17(7), 1974. The section on processes and images (fork, exec, wait).
+- [CFS scheduler](https://docs.kernel.org/scheduler/sched-design-CFS.html) and [EEVDF scheduler](https://docs.kernel.org/scheduler/sched-eevdf.html), Linux kernel documentation; the nice-to-weight table `sched_prio_to_weight` in [`kernel/sched/core.c`](https://github.com/torvalds/linux/blob/master/kernel/sched/core.c).
+- A. Tatarnikov. *Computer Architecture and Operating Systems* (HSE), [lecture 6: processes and threads](https://andrewt0301.github.io/hse-acos-course/part2os/06_Processes/lecture.html).

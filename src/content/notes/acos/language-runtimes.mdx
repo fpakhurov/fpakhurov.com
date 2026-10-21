@@ -1,0 +1,282 @@
+---
+title: High-level languages and the operating system
+description: "What a high-level language runtime asks of the operating system, with CPython as the example: the bytecode interpreter loop, reference counting and the cycle collector, the global interpreter lock and why it exists, how os and subprocess reach the kernel, and JIT compilation."
+course: acos
+section: Languages and Compilers
+order: 30
+status: published
+tags: [language-runtime, cpython, bytecode, interpreter, reference-counting, garbage-collection, gil, threads, signals, subprocess, jit]
+prerequisites: [System calls, Dynamic memory allocation and strings, Processes and threads, Synchronization, Sockets]
+---
+
+import PythonToKernel from '../../../components/figures/language-runtimes/PythonToKernel.astro';
+import GilTimeline from '../../../components/figures/language-runtimes/GilTimeline.astro';
+
+Every program in the course since the [system-calls note](/notes/acos/system-calls) has been written in C, and the [previous note](/notes/acos/sockets) ended with the observation that most programs are not. A Python, Java or JavaScript program never calls `malloc` or `free`, creates objects whose size it does not know, and runs on any operating system unchanged. Something stands between such a program and the kernel: the language's **runtime**, a large program, usually written in C or C++, that implements the language's promises with the same system calls a C program makes. This note asks what a runtime needs from the operating system, and answers it for one runtime in detail, CPython, the standard implementation of Python: how it executes code, how it manages memory, why its threads do not run Python code in parallel, and how its library reaches the kernel. It ends with just-in-time compilation, the technique that makes other runtimes much faster.
+
+## Baseline: a C program and the kernel
+
+A C program is compiled ahead of time into machine code for one processor and one operating system. At run time almost nothing stands between it and the kernel: the C library wraps the system calls, `malloc` manages a heap that the program frees by hand, a thread is a POSIX thread, and a signal handler is a C function the kernel calls directly. This is the fastest arrangement, and it leaves every difficult job to the programmer. Memory freed too early or never freed, a data race between threads, a handler that touches a structure that the interrupted code was halfway through updating: each is a bug that the language does nothing to prevent.
+
+A high-level language takes those jobs over. It promises that objects live as long as they are used, that the same program runs on Linux, macOS and Windows, that an error raises an exception instead of corrupting memory. Each promise is code in the runtime, and each costs time.
+
+## What a runtime asks of the operating system
+
+<aside class="callout"><strong>Key idea.</strong> A runtime is a program between the language and the kernel. It implements the language's abstractions, objects, automatic memory, threads, exceptions, with the same few services every process uses: memory from `mmap` or `brk`, threads from the kernel's thread support, I/O from `read`, `write` and an event-notification call, signals from `sigaction`, processes from `fork`, `exec` and `wait`. Every abstraction of the language ends in a system call, and the runtime decides when, how often and with which locks held it is made.</aside>
+
+| The language promises | The runtime implements it with | The kernel provides |
+| --- | --- | --- |
+| objects that are freed automatically | an allocator for small objects and a garbage collector | pages of memory: `mmap`, `munmap`, `brk` |
+| threads | one kernel thread per language thread, plus a lock or a thread-safe heap | `clone` on Linux, POSIX threads |
+| files and sockets as objects | wrapper objects around descriptors, buffering | `open`, `read`, `write`, `close`, `socket` |
+| asynchronous I/O | an event loop | `epoll` on Linux, `kqueue` on macOS and the BSDs |
+| handlers for signals and errors | a low-level handler that sets a flag, run later as language code | `sigaction` |
+| starting other programs | a process API | `fork`, `exec` or `posix_spawn`, `waitpid` |
+| speed, by compiling hot code at run time | a JIT compiler | memory that can be made executable: `mmap`, `mprotect` |
+
+## CPython: from source to system call
+
+CPython compiles each module, when it is first imported, into **bytecode**: instructions for a virtual stack machine, kept in memory and cached on disk in `.pyc` files. It never compiles Python to machine code. Instead, a loop written in C reads the bytecode one instruction at a time and executes it. The standard module `dis` prints the bytecode. For one line, in CPython 3.12:
+
+```text
+>>> import dis
+>>> dis.dis('os.write(1, b"hello, world\\n")')
+  0           0 RESUME                   0
+  1           2 LOAD_NAME                0 (os)
+              4 LOAD_ATTR                3 (NULL|self + write)
+             24 LOAD_CONST               0 (1)
+             26 LOAD_CONST               1 (b'hello, world\n')
+             28 CALL                     2
+             36 POP_TOP
+             38 RETURN_CONST             2 (None)
+```
+
+`LOAD_NAME` pushes the module `os` onto the evaluation stack, `LOAD_ATTR` replaces it by its function `write`, the two `LOAD_CONST` push the arguments, and `CALL 2` calls the function with two arguments and leaves its result on the stack. The gaps in the offsets, from 4 to 24 and from 28 to 36, are inline caches: since CPython 3.11 the interpreter rewrites instructions in place into specialised versions once it has seen the types they operate on ([PEP 659](#references)), and the caches hold what the specialised versions need. The instruction set changes between versions; CPython 3.9 compiles the same line to `LOAD_METHOD` and `CALL_METHOD`.
+
+The line writes the same 13 bytes as the hello-world program of the [first note](/notes/acos/computer-systems), and the figure follows it down to the kernel:
+
+<PythonToKernel />
+
+1. The compiler turns the line into bytecode once, when the module is loaded.
+2. The bytecode is five instructions for the call itself, plus two that discard the result and end the module.
+3. The interpreter loop, the C function `_PyEval_EvalFrameDefault`, fetches each instruction and jumps to the C code for it. `CALL` finds that `os.write` is a function implemented in C and calls it.
+4. That function, `os_write_impl` in `Modules/posixmodule.c`, converts the Python `int` and `bytes` objects into a C `int` and a pointer and length, then calls `_Py_write`, which releases the global interpreter lock (below) around the system call.
+5. From here on the path is the C program's: the C library's `write` puts the system-call number and the arguments in registers and executes the trap instruction (`svc` on arm64, `syscall` on x86-64, `ecall` on RISC-V).
+6. The kernel copies 13 bytes to descriptor 1 and returns 13. On the way back `_Py_write` takes the lock again, and the 13 becomes a Python `int` object on the evaluation stack.
+
+**Worked example (measured).** A countdown loop, `while n: n -= 1`, executes seven bytecode instructions per iteration in CPython 3.12. Two runs of 20 million iterations take 0.72 s on an Apple M1 (CPython 3.12.7 for arm64, the Code section has the script), 18 ns per iteration. The same loop in C, compiled by Apple clang 21 with `-O0`, takes 0.0262 s, 0.65 ns per iteration: the interpreter is about 27 times slower here. Each bytecode instruction costs an indirect jump, stack traffic and type checks on objects; `n` is an object on the heap, and `n - 1` makes a new one. With `-O2` the C compiler removes the loop altogether, as the [next note](/notes/acos/compilers-and-llvm) shows, and the timer reads zero.
+
+## Memory: reference counting and a cycle collector
+
+Every CPython object starts with a header that holds a **reference count** and a pointer to the object's type. Storing a reference to an object increments its count (`Py_INCREF` in the C code); dropping a reference decrements it (`Py_DECREF`). When the count reaches zero the object is freed at once, and its own references are dropped in turn. Memory comes back as soon as it stops being used, and so do other resources: a file object closes its descriptor when the last reference to it disappears.
+
+**Worked example.** `sys.getrefcount(x)` returns the count, which includes one extra reference held by the call's own argument. After `x = object()` it returns 2. After `y = x` and `items = [x]` it returns 4: the names `x` and `y`, the slot of the list, and the argument. After `del y, items` it returns 2 again. Small integers, `None`, `True` and `False` are **immortal** since CPython 3.12 ([PEP 683](#references)): their count is fixed at a large value and never changes, so that threads and processes that share them never write to them.
+
+Reference counting has one blind spot: a **cycle**. An object that refers to itself, or two objects that refer to each other, keep each other's counts above zero after the program has dropped every reference to them. CPython adds a **cycle collector** that runs from time to time over the objects that can hold references (containers: lists, dictionaries, class instances). It finds the objects that are referenced only from inside the set it examines ([Python documentation, `gc`](#references)):
+
+1. Copy each object's reference count into a scratch field.
+2. For every reference from one examined object to another, decrement the target's scratch count. What remains counts the references from outside.
+3. Objects with a positive remainder are reachable from outside, and so is everything they refer to. The rest is garbage, and the collector frees it.
+
+**Worked example.** Objects `a` and `b` refer to each other, and the name `x` refers to `a`. The counts are 2 for `a` (from `b` and `x`) and 1 for `b` (from `a`). Step 2 subtracts the two internal references: `a` keeps 1, `b` drops to 0, but `b` is reachable from `a`, so both live. After `del x`, step 2 leaves both at 0, and both are freed.
+
+To keep the cost down, the collector is generational: new containers start in generation 0, which is collected when allocations minus deallocations since the last collection exceed a threshold; survivors move to an older generation that is collected less often. `gc.get_threshold()` returns `(700, 10, 10)` in CPython 3.12: generation 0 after a net 700 new containers, generation 1 after every 10 collections of generation 0, generation 2 after every 10 of generation 1, with extra conditions that keep the oldest generation from being examined too often. The details change between versions.
+
+Below the objects sits an allocator built for them. Most Python objects are small: `sys.getsizeof(1)` is 28 bytes on a 64-bit machine (an 8-byte count, an 8-byte type pointer, 8 bytes of size and sign, and one 4-byte digit). CPython serves requests of up to 512 bytes from its own allocator, **pymalloc**, which carves pools of equal-sized blocks out of **arenas** of 1 MiB obtained from the kernel with `mmap` on 64-bit systems, and passes larger requests to the C library's `malloc` ([Python documentation, memory management](#references)). These are the size classes and free lists of the [memory-allocation note](/notes/acos/memory-allocation), specialised for one workload.
+
+Other runtimes choose differently. The JVM, Go and JavaScript engines use **tracing** collectors: instead of counting references they periodically find everything reachable from the roots (the stacks and globals) and reclaim the rest. They pay nothing per pointer assignment and handle cycles naturally, but memory is reclaimed later and in batches, and a collection can pause the program ([Jones, Hosking and Moss](#references), ch. 2 and 5).
+
+## Threads and the global interpreter lock
+
+A Python thread is a real kernel thread, created with `pthread_create`. Yet two Python threads never execute bytecode at the same moment. CPython has one **global interpreter lock** (GIL), and a thread must hold it to execute bytecode or to touch any Python object.
+
+**Why it exists.** Every bytecode instruction changes reference counts, and the interpreter's own structures (the allocator's free lists, the type caches, the dictionaries of modules) are shared by all threads. Two threads that increment the same count without synchronization lose updates, the race of the [synchronization note](/notes/acos/synchronization), and an object whose count is wrong is freed while still in use. Making every count update atomic, or putting a lock around every shared structure, slows down every program, including the great majority that use one thread. One lock around the whole interpreter is the cheapest correct answer for a single thread, and it makes C extensions simple to write: their code runs with the GIL held and needs no locks of its own.
+
+**How it is shared.** A thread releases the GIL around any operation that may block: a system call such as `read`, `recv` or `sleep`, as in step 4 of the figure, and long computations in C libraries such as compression or hashing of large buffers. A thread that runs pure bytecode keeps the GIL until another thread asks for it; the waiting thread waits one **switch interval**, 5 ms by default (`sys.getswitchinterval()`), and then sets a flag that makes the running thread drop the lock at its next instruction boundary.
+
+<GilTimeline />
+
+**Worked example (measured).** The countdown loop of 20 million iterations, run twice, on an Apple M1 with 4 performance cores, CPython 3.12.7:
+
+| Two countdowns | Time | Relative to one after the other |
+| --- | --- | --- |
+| one after the other, in one thread | 0.72 s | 1 |
+| at the same time, in two threads | 0.71 s | 1.00 |
+| at the same time, in two processes | 0.37 s | 0.52 |
+
+Two threads take as long as one thread doing both: the GIL lets only one of them run, and the [speed-up of parallel execution](/notes/acos/thread-level-parallelism) is lost. Two processes each have their own interpreter and their own GIL, and they run on two cores in parallel; the ratio is 0.52 rather than 0.50 because of the cost of handing the work to the worker processes and collecting the results. For I/O-bound work the picture is different: a thread that waits in `recv` holds no GIL, as in the lower half of the figure, and threads overlap their waiting well.
+
+The GIL is being removed. [PEP 703](#references) added an optional **free-threaded** build of CPython in version 3.13, in which reference counts are updated with biased reference counting (cheap for the thread that owns an object, atomic for the others), objects carry their own fine-grained locks, and immortal objects are never written; [PEP 779](#references) made that build officially supported in 3.14. The default build still has the GIL, and C extensions must be adapted before they are safe without it.
+
+## Calling the system: os, subprocess and signals
+
+**`os`.** Most functions of the module `os` are thin wrappers around one system call each, `os.getpid`, `os.fork`, `os.pipe`, `os.write`, implemented in `Modules/posixmodule.c`. A failure raises `OSError` with the `errno` of the call. A system call interrupted by a signal is retried automatically after the signal's Python handler has run ([PEP 475](#references)), so that Python code does not see `EINTR`.
+
+**`subprocess`.** `subprocess.run(['echo', 'hello, world'], capture_output=True)` creates a pipe for the child's output, starts the child, reads the pipe and waits for the exit status: the `pipe`, `fork`, `exec` and `waitpid` of the [processes note](/notes/acos/processes-and-threads). The fork and exec happen in a C helper, `_posixsubprocess`, which uses `vfork` or `posix_spawn` instead of `fork` where they are safe, because copying the page tables of a large interpreter only to replace them at once by `exec` is wasted work. The module `multiprocessing`, used in the measurement above, starts its workers in one of three ways: `fork`, `spawn` (a fresh interpreter that imports the main module again) or `forkserver`. `spawn` is the default on macOS and Windows, and `forkserver` on Linux since Python 3.14; with both, the main module is imported again in every worker, which is why the script guards its work with `if __name__ == '__main__'`.
+
+**Signals.** A Python signal handler is not run by the kernel directly. CPython installs a small C handler with `sigaction` that only records which signal arrived; the interpreter loop checks that record between bytecode instructions and runs the Python handler in the main thread ([Python documentation, `signal`](#references)). A C handler may call only async-signal-safe functions, and Python code, which allocates and takes the GIL, is anything but, so the handler is deferred to a point where running it is safe. **Worked example.** With a timer that sends `SIGALRM` after 0.1 s, a `time.sleep(0.3)` is interrupted in the kernel; the Python handler runs in the main thread, the sleep resumes for the remaining time, and the call returns after at least 0.3 s in all. The price of deferral is latency: a signal that arrives while a single C call runs for a minute is handled after that minute.
+
+**Asynchronous I/O.** The `asyncio` event loop is the event-driven server of the [sockets note](/notes/acos/sockets#serving-many-clients) in library form: its `selectors` module uses `epoll` on Linux and `kqueue` on macOS, and coroutines take the place of the per-connection state.
+
+## Just-in-time compilation, briefly
+
+The interpreter's overhead comes from doing the same work again on every execution of an instruction: decoding it, checking the types of its operands, boxing every result in a new object. A **just-in-time (JIT) compiler** watches the program run, picks the code that runs often, and compiles it into machine code specialised for what it has seen.
+
+- The **HotSpot JVM** starts by interpreting Java bytecode while counting how often each method runs. Hot methods are compiled by a fast compiler, C1, into code that also collects profiles, and the hottest ones are recompiled by an optimizing compiler, C2, using those profiles; this is **tiered compilation**, introduced in Java 7 and on by default in the server VM ([Oracle](#references)). If an assumption behind compiled code stops holding, for example a class is loaded that overrides a method the compiler had inlined, the code is **deoptimized** and execution continues in the interpreter.
+- **PyPy**, an alternative implementation of Python, uses a **tracing JIT**: it records the operations of one iteration of a hot loop, with guards that check the types it saw, and compiles that trace ([Bolz et al., 2009](#references)). For the countdown loop, a trace that has seen only small integers reduces to a decrement, a test and a branch, close to what the C compiler emits.
+- CPython 3.13 has an experimental JIT, off by default, that stitches together precompiled machine-code templates for its specialised instructions, a technique called **copy-and-patch** ([Xu and Kjolstad, 2021](#references); [PEP 744](#references)).
+
+A JIT needs one more service from the operating system: memory it can first write machine code into and then execute. Systems that enforce **W^X** (a page is writable or executable, never both, a defence against injected code) make the JIT switch protections with `mprotect` between writing and running, a use of the page permissions of the [virtual-memory note](/notes/acos/virtual-memory); macOS on Apple silicon gives JITs special `MAP_JIT` mappings whose write permission is switched per thread.
+
+<aside class="callout"><strong>Check yourself.</strong> (1) After `a = []; b = [a]; a.append(b); del a`, how many references does each list have, and when is each freed? What changes after `del b`? (2) A program downloads 100 web pages with 10 threads and then parses them with 10 threads. Which half does the GIL slow down, and what would you use for it instead? (3) Why does a Python handler for `SIGINT` not run while a single long C call, such as a huge matrix product in a C extension, is in progress?<details><summary>Answers</summary>(1) After `del a`, the first list is referenced only by the second (count 1), and the second by the name `b` and by the first (count 2); nothing is freed. After `del b` the counts are 1 and 1, both from inside the cycle, so reference counting frees nothing; the next collection that examines them subtracts the internal references, finds 0 for both, and frees both. (2) The downloads wait in `recv` and release the GIL, so threads overlap them well. The parsing is CPU-bound bytecode and runs one thread at a time; use processes (`multiprocessing` or `concurrent.futures.ProcessPoolExecutor`), or a free-threaded build. (3) The C handler only records the signal; the Python handler runs when the interpreter loop next checks the record between bytecode instructions, which happens only after the C call returns.</details></aside>
+
+## What changed
+
+| | C program (the baseline) | CPython program |
+| --- | --- | --- |
+| Execution | machine code, compiled ahead of time | bytecode, interpreted by a C loop; about 27 times slower on the countdown loop |
+| Memory | `malloc` and `free` by hand | reference counts, a cycle collector, pymalloc on `mmap`ed arenas |
+| Threads | parallel on all cores; races are the programmer's problem | kernel threads, but one runs bytecode at a time under the GIL |
+| System calls | direct, through the C library | through C wrappers in `os` that release the GIL and retry on `EINTR` |
+| Signals | handler runs at once, restricted to async-signal-safe calls | C handler sets a flag; Python handler runs later in the main thread |
+| Getting faster | a better compiler, ahead of time | a JIT, at run time (PyPy, the JVM, CPython 3.13's experimental JIT) |
+
+## Limitations
+
+- The note follows CPython, and mostly version 3.12. The bytecode, the specialisation, the collector's thresholds and the start method of `multiprocessing` all change between versions; the free-threaded build changes the threading story altogether.
+- One measurement on one machine is an illustration, not a benchmark: the ratio of interpreter to C time depends on the code, and an interpreter is much closer to C when the work happens inside C libraries such as NumPy.
+- Other runtimes make other trade-offs: tracing garbage collectors, green threads scheduled by the runtime (Go's goroutines, Erlang's processes), ahead-of-time compilation of managed languages. The questions are the same: memory, threads, I/O, signals, and when to compile.
+- Garbage collection algorithms (mark–sweep, copying, generational and concurrent collectors) are a subject of their own and are only named here.
+
+## What you should remember
+
+- A runtime implements a language's promises with ordinary system calls: memory from `mmap`, threads from the kernel, I/O through descriptors and an event loop, signals through `sigaction`, processes through `fork`, `exec` or `posix_spawn`.
+- CPython compiles Python to bytecode for a stack machine and runs it in a C loop; `dis` shows the bytecode. Interpretation costs about an order of magnitude or more against compiled C on simple loops.
+- Memory: a reference count in every object, freed at zero; a generational cycle collector for cycles; pymalloc for objects up to 512 bytes.
+- The GIL lets one thread run bytecode at a time. It exists because reference counts and interpreter state are shared and unsynchronized; it is released around blocking system calls. Threads help I/O-bound Python, processes help CPU-bound Python.
+- Python signal handlers run later, in the main thread, between bytecode instructions; interrupted system calls are retried.
+- A JIT compiles hot code at run time with the types it has observed, and needs writable-then-executable memory from the kernel.
+
+## Code
+
+The script prints what each section of the note claims. It needs only the standard library; run it with `python3 -I runtime.py`. The timings are machine-dependent and are given as one run with its setup; every other output is the same on any 64-bit CPython from 3.9 on.
+
+```python
+import gc, os, signal, subprocess, sys, threading, time, weakref
+from multiprocessing import Pool
+
+class Node:
+    pass
+
+def count(n):                        # pure bytecode work: no I/O, no C call that releases the GIL
+    while n:
+        n -= 1
+
+def timed(run, repeats=3):           # best of three, to skip a slow first run
+    best = float('inf')
+    for _ in range(repeats):
+        t = time.perf_counter()
+        run()
+        best = min(best, time.perf_counter() - t)
+    return best
+
+def two_threads(n):
+    ts = [threading.Thread(target=count, args=(n,)) for _ in range(2)]
+    for t in ts: t.start()
+    for t in ts: t.join()
+
+if __name__ == '__main__':          # needed: multiprocessing re-imports this file in its workers
+    # 1. os.write is a thin wrapper around the write system call
+    sys.stdout.flush()               # print() buffers inside the runtime; os.write goes straight to the kernel
+    n = os.write(1, b'hello, world\n')                          # hello, world
+    print(n)                         # 13
+
+    # 2. Reference counts: getrefcount sees one extra reference, its own argument
+    x = object()
+    print(sys.getrefcount(x))        # 2: the name x, and the argument
+    y = x
+    items = [x]
+    print(sys.getrefcount(x))        # 4: x, y, the list slot, the argument
+    del y, items
+    print(sys.getrefcount(x))        # 2
+
+    # 3. A cycle keeps its count above zero; only the cycle collector frees it
+    gc.collect()
+    a = Node()
+    a.me = a                         # a refers to itself
+    alive = weakref.ref(a)
+    del a                            # no name refers to it any more
+    print(alive() is not None)       # True: the self-reference keeps the count at 1
+    gc.collect()
+    print(alive() is None)           # True: the collector found the unreachable cycle
+
+    # 4. A Python signal handler runs later, in the main thread; the interrupted sleep resumes (PEP 475)
+    caught = []
+    signal.signal(signal.SIGALRM, lambda signum, frame: caught.append(threading.current_thread() is threading.main_thread()))
+    signal.setitimer(signal.ITIMER_REAL, 0.1)                   # SIGALRM in 0.1 s
+    t = time.perf_counter(); time.sleep(0.3); slept = time.perf_counter() - t
+    print(caught, slept >= 0.3)      # [True] True
+
+    # 5. subprocess: a new process with fork and exec (or posix_spawn), a pipe for its output, wait for its exit
+    r = subprocess.run(['echo', 'hello, world'], capture_output=True)
+    print(r.returncode, r.stdout)    # 0 b'hello, world\n'
+
+    # 6. CPU-bound work, twice: in a row, in two threads, in two processes
+    N = 20_000_000
+    seq = timed(lambda: (count(N), count(N)))
+    thr = timed(lambda: two_threads(N))
+    with Pool(2) as pool:
+        proc = timed(lambda: pool.map(count, [N, N]))
+    print(f'in a row {seq:.2f} s, 2 threads {thr:.2f} s, 2 processes {proc:.2f} s')
+    print(f'threads / in a row {thr / seq:.2f}, processes / in a row {proc / seq:.2f}')
+    # one run, Apple M1 (4 performance cores), macOS, CPython 3.12.7 for arm64:
+    # in a row 0.72 s, 2 threads 0.71 s, 2 processes 0.37 s
+    # threads / in a row 1.00, processes / in a row 0.52
+```
+
+The same countdown in C, for the comparison in the text; compile it with `clang -std=c17 -Wall -Wextra -O0 count.c -o count && ./count`, then again with `-O2`:
+
+```c
+// The countdown loop of the Python script in C: two runs of 20 million iterations.
+#define _DEFAULT_SOURCE                   // glibc: declare clock_gettime under -std=c17
+#include <stdio.h>
+#include <time.h>
+
+static long count(long n) {
+    while (n) n -= 1;
+    return n;
+}
+
+int main(void) {
+    struct timespec a, b;
+    clock_gettime(CLOCK_MONOTONIC, &a);
+    long r = count(20000000) + count(20000000);
+    clock_gettime(CLOCK_MONOTONIC, &b);
+    printf("result %ld, %.4f s\n", r, (double)(b.tv_sec - a.tv_sec) + (double)(b.tv_nsec - a.tv_nsec) / 1e9);
+    return 0;
+}
+// one run each, Apple M1, macOS, Apple clang 21:
+// -O0: result 0, 0.0262 s
+// -O2: result 0, 0.0000 s   (the compiler removed the loop)
+```
+
+## Next
+
+CPython turns source code into bytecode and interprets it; a JIT turns hot bytecode into machine code while the program runs. The C programs of this course took the third road: a compiler turned them into machine code before they ran, and with `-O2` it was clever enough to delete a loop whose result it could compute. The [last note](/notes/acos/compilers-and-llvm) opens that compiler: its front end, its intermediate representation, its optimizer and its back end, with LLVM as the example.
+
+## References
+
+- Python documentation (3.12): [`dis`](https://docs.python.org/3.12/library/dis.html), [`gc`](https://docs.python.org/3.12/library/gc.html), [`sys`](https://docs.python.org/3.12/library/sys.html) (`getrefcount`, `getswitchinterval`), [`signal`](https://docs.python.org/3.12/library/signal.html) (execution of Python signal handlers), [`subprocess`](https://docs.python.org/3.12/library/subprocess.html), [`multiprocessing`](https://docs.python.org/3.12/library/multiprocessing.html) (start methods), and [Memory management](https://docs.python.org/3.12/c-api/memory.html) (the pymalloc allocator).
+- CPython source, branch 3.12: [`Python/ceval.c`](https://github.com/python/cpython/blob/3.12/Python/ceval.c) (the interpreter loop), [`Modules/posixmodule.c`](https://github.com/python/cpython/blob/3.12/Modules/posixmodule.c) (`os_write_impl`), [`Python/fileutils.c`](https://github.com/python/cpython/blob/3.12/Python/fileutils.c) (`_Py_write`).
+- M. Shannon. [PEP 659 — Specializing Adaptive Interpreter](https://peps.python.org/pep-0659/). 2021.
+- E. Snow, E. Elizondo. [PEP 683 — Immortal Objects, Using a Fixed Refcount](https://peps.python.org/pep-0683/). 2022.
+- C.-F. Natali, V. Stinner. [PEP 475 — Retry system calls failing with EINTR](https://peps.python.org/pep-0475/). 2014.
+- S. Gross. [PEP 703 — Making the Global Interpreter Lock Optional in CPython](https://peps.python.org/pep-0703/). 2023.
+- T. Wouters, M. Page, S. Gross. [PEP 779 — Criteria for supported status for free-threaded Python](https://peps.python.org/pep-0779/). 2025.
+- B. Bucher, S. Ostrowski. [PEP 744 — JIT Compilation](https://peps.python.org/pep-0744/). 2024.
+- C. F. Bolz, A. Cuni, M. Fijałkowski, A. Rigo. [Tracing the Meta-Level: PyPy's Tracing JIT Compiler](https://doi.org/10.1145/1565824.1565827). ICOOOLPS, 2009.
+- H. Xu, F. Kjolstad. [Copy-and-Patch Compilation: A Fast Compilation Algorithm for High-Level Languages and Bytecode](https://doi.org/10.1145/3485513). Proceedings of the ACM on Programming Languages, 5 (OOPSLA), 2021.
+- Oracle. [Java HotSpot Virtual Machine Performance Enhancements](https://docs.oracle.com/en/java/javase/21/vm/java-hotspot-virtual-machine-performance-enhancements.html): tiered compilation. Java SE 21 documentation.
+- R. Jones, A. Hosking, E. Moss. *The Garbage Collection Handbook: The Art of Automatic Memory Management*. CRC Press, 2011. Ch. 2 (mark–sweep), ch. 5 (reference counting), ch. 9 (generational collection).
+- M. Kerrisk. *The Linux Programming Interface*. No Starch Press, 2010. §21.1.2 (async-signal-safe functions), ch. 24–28 (process creation and execution).
+- A. Tatarnikov. [Computer Architecture and Operating Systems, Lecture 14: High-level Languages and Operating System](https://andrewt0301.github.io/hse-acos-course/part2os/14_Python/lecture.html). HSE University.

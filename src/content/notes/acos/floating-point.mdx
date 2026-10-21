@@ -1,0 +1,431 @@
+---
+title: Floating-point numbers
+description: "How computers approximate real numbers: the IEEE 754 formats and decoding a float bit by bit, rounding and machine epsilon, why 0.1 plus 0.2 is not 0.3, order-dependent sums, special values, narrow machine-learning formats and RISC-V floating-point instructions."
+course: acos
+section: Foundations
+order: 2
+status: published
+tags: [floating-point, ieee-754, rounding, machine-epsilon, subnormals, nan, bfloat16, fp8, risc-v-f-extension]
+prerequisites: ["Bits, integers and byte order"]
+---
+
+import Float32Fields from '../../../components/figures/floating-point/Float32Fields.astro';
+import NumberLine from '../../../components/figures/floating-point/NumberLine.astro';
+
+The [previous note](/notes/acos/data-representation) represented integers exactly: 32 bits hold every integer from about $-2.1 \times 10^9$ to $2.1 \times 10^9$, spaced 1 apart. Science and engineering need something else: numbers as small as $10^{-30}$ and as large as $10^{30}$, with a few significant digits each, and fractions such as $0.1$. This note builds the representation every processor uses for them, the IEEE 754 floating-point formats: how a float is laid out in bits, how to decode one by hand, how results are rounded and how large the error can be, why familiar laws of arithmetic fail, what the special values mean, the narrow formats that machine learning runs on, and the RISC-V instructions that operate on floats.
+
+**Notation.** A floating-point number is $x = (-1)^s \cdot m \cdot 2^{e}$ with sign bit $s$, significand $m$ and exponent $e$. In the stored format, $E$ is the exponent field read as an unsigned integer, $f$ the fraction field, $\text{bias}$ the constant subtracted from $E$, and $p$ the precision: the number of significand bits including the hidden one ($p = 24$ for single, $53$ for double). $\mathrm{fl}(x)$ is $x$ rounded to the nearest representable number, $\operatorname{ulp}(x)$ the gap between neighbouring representable numbers around $x$, $\varepsilon = 2^{1-p}$ the machine epsilon and $u = \varepsilon/2 = 2^{-p}$ the unit roundoff.
+
+## Baseline: fixed point
+
+The simplest way to store fractions is to keep integers and agree on a scale. In the **Q16.16** fixed-point format a 32-bit two's complement integer $q$ stands for $q / 2^{16}$: 16 bits before the binary point and 16 after. Addition and subtraction are plain integer instructions, and the spacing is $2^{-16} \approx 1.5 \times 10^{-5}$ everywhere.
+
+**Worked example.** $0.1$ becomes $q = \operatorname{round}(0.1 \cdot 65{,}536) = 6554$, which stands for $6554/65{,}536 = 0.100006$, an error of 0.006 %. The largest value is $(2^{31} - 1)/2^{16} \approx 32{,}768$.
+
+It breaks at both ends of the scale. The *absolute* error is fixed, so the *relative* error grows as numbers shrink: $10^{-5}$ is stored as $1 \cdot 2^{-16}$, 53 % too large, and anything below $2^{-17}$ becomes 0. And the range stops at 32,768, so a product of two moderate numbers overflows. Fixed point survives where the range is known in advance, in signal processing and in the integer codes of [quantized neural networks](/notes/nlp/quantization#the-affine-map); for general computation the scale has to travel with the number.
+
+## Scientific notation in base 2
+
+<aside class="callout"><strong>Key idea.</strong> Store a number as a sign, an exponent and a fixed number of significant bits, as in scientific notation: $x = \pm 1.f \times 2^{e}$. The exponent moves the binary point, so the same number of bits gives the same *relative* precision at every scale, from $10^{-38}$ to $10^{38}$ in 32 bits. The price is that the gaps between representable numbers grow with their size.</aside>
+
+Any nonzero real number can be written as $\pm m \times 2^e$ with $1 \le m < 2$: shift the binary point until exactly one 1 stands before it. This is the **normalized** form. For example
+
+$$
+\begin{aligned}
+6.5 &= 110.1_2 = 1.101_2 \times 2^2 , \\
+-12.5 &= -1100.1_2 = -1.1001_2 \times 2^3 , \\
+0.1 &= 0.000110011001100\ldots_2 = 1.100110011\ldots_2 \times 2^{-4} .
+\end{aligned}
+$$
+
+The last line has no end: $1/10$ has an infinite binary expansion, just as $1/3$ has an infinite decimal one, because 10 has the prime factor 5 and 2 does not. A float keeps only the first $p$ significant bits, so $0.1$ is never stored exactly.
+
+Since the leading bit of a normalized significand is always 1, it need not be stored. This **hidden bit** gives one extra bit of precision for free.
+
+## The IEEE 754 formats
+
+The IEEE 754 standard, first published in 1985 and revised in 2008 and 2019, fixed the layout and the arithmetic so that the same program gives the same results on every conforming machine ([IEEE 754-2019](#references)). A binary format has three fields, from the most significant bit:
+
+| Format | Sign | Exponent field $E$ | Fraction field $f$ | Bias | Precision $p$ |
+| --- | --- | --- | --- | --- | --- |
+| single (`float`, binary32) | 1 | 8 bits | 23 bits | 127 | 24 |
+| double (`double`, binary64) | 1 | 11 bits | 52 bits | 1023 | 53 |
+
+For an exponent field strictly between all zeros and all ones, the value is
+
+$$
+\boxed{\,x = (-1)^s \times 1.f \times 2^{E - \text{bias}}\,} \qquad 1.f = 1 + \frac{f}{2^{p-1}} .
+$$
+
+The two extreme values of $E$ are reserved for zero, subnormal numbers, infinities and NaN, described below. The exponent is stored with a **bias** rather than in two's complement so that the fields, read as one unsigned integer, are ordered like the values: for two positive floats, the one with the larger bit pattern is the larger number, and an integer comparator can sort them.
+
+The range follows from the extreme exponents, $E = 1$ and $E = 254$ for single precision:
+
+| | Single | Double |
+| --- | --- | --- |
+| smallest positive normal | $2^{-126} \approx 1.18 \times 10^{-38}$ | $2^{-1022} \approx 2.23 \times 10^{-308}$ |
+| largest finite | $(2 - 2^{-23}) \times 2^{127} \approx 3.40 \times 10^{38}$ | $(2 - 2^{-52}) \times 2^{1023} \approx 1.80 \times 10^{308}$ |
+| machine epsilon $\varepsilon = 2^{1-p}$ | $2^{-23} \approx 1.19 \times 10^{-7}$ | $2^{-52} \approx 2.22 \times 10^{-16}$ |
+| decimal digits, about $p \log_{10} 2$ | 7 | 16 |
+
+### Decoding a float bit by bit
+
+<Float32Fields />
+
+**Worked example.** The single-precision pattern `0xC1480000`:
+
+1. Write out the bits: `1 10000010 10010000000000000000000`. The sign bit is 1, so the number is negative.
+2. The exponent field is $1000\,0010_2 = 130$, so $e = 130 - 127 = 3$.
+3. The fraction field starts $1001$ and is zero after that; with the hidden bit, the significand is $1.1001_2 = 1 + \tfrac12 + \tfrac1{16} = 1.5625$.
+4. The value is $(-1)^1 \times 1.5625 \times 2^3 = -12.5$.
+
+Encoding runs the same steps backwards: $-12.5 = -1.1001_2 \times 2^3$ gives $s = 1$, $E = 3 + 127 = 130$, and $f$ the bits after the binary point, padded with zeros to 23 bits. For $0.1 = 1.1001\,1001\ldots_2 \times 2^{-4}$, $E = 123$ and the fraction is the repeating pattern $1001\,1001\ldots$ cut to 23 bits and rounded, `0x3DCCCCCD`. That float equals exactly $0.100000001490116119384765625$; the nearest double to $0.1$ is $0.1000000000000000055511151231257827\ldots$, closer but still not $0.1$.
+
+## Rounding, ulp and machine epsilon
+
+Between two neighbouring powers of two, $[2^e, 2^{e+1})$, a format with precision $p$ has $2^{p-1}$ equally spaced numbers. The spacing is
+
+$$
+\operatorname{ulp}(x) = 2^{e - p + 1} \qquad \text{for } 2^e \le |x| < 2^{e+1} ,
+$$
+
+the value of one **unit in the last place**. The spacing doubles at every power of two: the representable numbers are dense near zero and sparse far from it, while the *relative* spacing stays between $2^{-p}$ and $2^{1-p}$. The **machine epsilon** $\varepsilon = \operatorname{ulp}(1) = 2^{1-p}$ is the gap between 1 and the next float.
+
+<NumberLine />
+
+Every arithmetic operation in IEEE 754 is **correctly rounded**: the result is the exact mathematical result rounded to a representable number, as if computed with infinite precision first. The default rule is **round to nearest, ties to even**: take the nearest representable number, and when the exact result lies exactly halfway between two, take the one whose last significand bit is 0. Ties to even rather than ties away from zero because it rounds up and down equally often on average, so sums of many rounded values do not drift. The other modes round toward zero, toward $+\infty$ and toward $-\infty$; interval arithmetic uses the last two to bound a result from both sides.
+
+**How large is the error?** Let $2^e \le |x| < 2^{e+1}$, inside the normal range. The neighbours of $x$ are $\operatorname{ulp}(x)$ apart, so
+
+$$
+\begin{aligned}
+|\mathrm{fl}(x) - x| &\le \tfrac12 \operatorname{ulp}(x) = 2^{e-p} && \text{the nearest neighbour is at most half a gap away} \\
+\frac{|\mathrm{fl}(x) - x|}{|x|} &\le \frac{2^{e-p}}{2^{e}} = 2^{-p} && |x| \ge 2^e \\
+&= u = \frac{\varepsilon}{2} . &&
+\end{aligned}
+$$
+
+Every operation therefore satisfies $\mathrm{fl}(a \circ b) = (a \circ b)(1 + \delta)$ with $|\delta| \le u$: about $6 \times 10^{-8}$ for single and $1.1 \times 10^{-16}$ for double. This one inequality is the starting point of all rounding-error analysis ([Goldberg, 1991](#references); [Higham, 2002](#references), §2.2).
+
+**Worked example.** Above $2^{24} = 16{,}777{,}216$ single-precision numbers are 2 apart, because $\operatorname{ulp} = 2^{24 - 24 + 1} = 2$. The integer $16{,}777{,}217$ lies exactly halfway between $16{,}777{,}216$ and $16{,}777{,}218$. Their significands end in 0 and in 1 respectively, so ties to even gives $16{,}777{,}216$. The next tie, $16{,}777{,}219$, lies between $16{,}777{,}218$ (significand ending in 1) and $16{,}777{,}220$ (ending in 0) and rounds up to $16{,}777{,}220$. A `float` counter therefore stops at $16{,}777{,}216$: adding 1 gives a tie, which rounds back down.
+
+## Why 0.1 + 0.2 is not 0.3
+
+In double precision, `0.1 + 0.2 == 0.3` is false. Three roundings explain it, and the last one is a tie.
+
+1. `0.1` is stored as $0.1000000000000000055511\ldots$, slightly too large.
+2. `0.2` is stored as $0.2000000000000000111022\ldots$, slightly too large, exactly twice the stored `0.1`.
+3. Their exact sum is $0.3000000000000000166533\ldots$. In $[0.25, 0.5)$ doubles are $2^{-54} \approx 5.55 \times 10^{-17}$ apart, and the sum lies *exactly halfway* between the two neighbours $0.2999999999999999888978\ldots$ and $0.3000000000000000444089\ldots$: it equals $10{,}808{,}639{,}105{,}689{,}191 \times 2^{-55}$, an odd multiple of half a gap. Ties go to the even significand, which is the upper neighbour. The result is $0.30000000000000004$.
+4. The literal `0.3` is stored as the lower neighbour, $0.2999999999999999888978\ldots$, the double nearest to $0.3$. The two differ by one ulp.
+
+Nothing went wrong: each step was the best possible rounding. The decimal inputs were simply never representable. In single precision the same sum happens to round to the same float as `0.3f`, so `0.1f + 0.2f == 0.3f` is true; that is luck of the bit patterns, not a property of floats. The lesson is to compare computed floats with a tolerance relative to their size, as Python's `math.isclose` does, never with `==`, and to use integers (cents, not dollars) or decimal arithmetic for money.
+
+## Order matters: floating-point addition is not associative
+
+Rounding happens after every operation, so the grouping of a sum changes its result:
+
+$$
+(10^{20} + (-10^{20})) + 1 = 1, \qquad 10^{20} + (-10^{20} + 1) = 0 ,
+$$
+
+because $-10^{20} + 1$ rounds back to $-10^{20}$: near $10^{20}$, doubles are $2^{14} = 16{,}384$ apart.
+
+**Worked example (summation order).** Sum $1/k$ for $k = 1, \dots, 10^7$ in single precision (C on an Apple M1, `clang -O0`; IEEE arithmetic gives these digits on any conforming machine):
+
+| Order | Result |
+| --- | --- |
+| largest terms first, $k = 1, 2, \dots$ | 15.4036827 |
+| smallest terms first, $k = 10^7, \dots, 1$ | 16.6860313 |
+| largest first with Kahan's compensation | 16.6953106 |
+| double precision, for reference | 16.6953114 |
+
+The forward sum is wrong in the second digit. Once the running sum passes 8, single-precision numbers are $\operatorname{ulp} = 2^{3-23} = 2^{-20}$ apart, and any term below half of that, $2^{-21}$, is rounded away entirely. The terms $1/k$ reach $2^{-21}$ at $k = 2^{21} = 2{,}097{,}152$; that term is an exact tie, which rounds back to the running sum because its significand is even, and from there on the sum stays at 15.4036827: the remaining eight million terms change nothing. Adding the small terms first lets them accumulate into something large enough to survive. **Kahan summation** keeps a second float with the low-order part lost at each addition and feeds it back into the next one, and gets within one ulp of the correctly rounded result without sorting ([Higham, 2002](#references), §4.3).
+
+Non-associativity has consequences beyond accuracy. A compiler may not reorder floating-point operations unless told it may (`-ffast-math`), because reordering changes results. A parallel sum split across threads or GPU blocks adds in a different order from a sequential one and gives slightly different answers, and different numbers of threads give different answers again. That is why the tiled attention of FlashAttention matches a standard implementation only up to rounding ([NLP course](/notes/nlp/efficient-transformers#exact-not-approximate)).
+
+## Special values
+
+The reserved exponent fields encode values that keep a computation going when it leaves the normal range:
+
+| Exponent field | Fraction | Meaning |
+| --- | --- | --- |
+| all zeros | zero | $\pm 0$ |
+| all zeros | nonzero | subnormal: $(-1)^s \times 0.f \times 2^{1 - \text{bias}}$ |
+| neither all zeros nor all ones | any | normal: $(-1)^s \times 1.f \times 2^{E - \text{bias}}$ |
+| all ones | zero | $\pm\infty$ |
+| all ones | nonzero | NaN, "not a number" |
+
+- **Signed zero.** $+0$ and $-0$ compare equal, but $1/{+0} = +\infty$ and $1/{-0} = -\infty$. The sign records from which side a result underflowed to zero.
+- **Infinities** come from overflow ($3.4 \times 10^{38} \times 2$ in single precision) and from division of a nonzero number by zero. They obey the expected rules: $\infty + 1 = \infty$, $1/\infty = 0$.
+- **NaN** is the result of an operation with no meaningful value: $0/0$, $\infty - \infty$, $\sqrt{-1}$. Any arithmetic with a NaN gives NaN, so an error propagates to the output instead of being silently replaced. A NaN compares unequal to everything, including itself: `x != x` is the classic test for NaN.
+- **Subnormal numbers** fill the gap between 0 and the smallest normal number $2^{1 - \text{bias}}$. With $E = 0$ the hidden bit becomes 0 and the exponent stays at $1 - \text{bias}$, so subnormals are evenly spaced with the same gap as the lowest normal binade, down to the smallest positive single, $2^{-149} \approx 1.4 \times 10^{-45}$. Without them, the difference of two distinct small numbers could round to zero; with them, $x - y = 0$ holds only when $x = y$. This is **gradual underflow**: precision fades bit by bit near zero instead of vanishing at once. Some processors handle subnormals in slow microcode, and many offer a "flush to zero" mode that trades this guarantee for speed.
+
+Invalid operations, division by zero, overflow, underflow and inexact results also set **exception flags** that a program can test. By default they do not interrupt the program; RISC-V, as the standard allows, does not trap on them at all.
+
+<aside class="callout"><strong>Check yourself.</strong> (1) Decode the single-precision pattern `0x40490FDB`. (2) What is $\operatorname{ulp}(1000)$ in single precision, and how many correct decimal places does a float near 1000 have? (3) Why does `while (x != 1.0) x += 0.1;` starting from `x = 0.0` never stop in double precision?<details><summary>Answers</summary>(1) `0x40490FDB` $= 0\ 10000000\ 10010010000111111011011_2$: $s = 0$, $E = 128$ so $e = 1$, and $1.f = 1.5707963\ldots$, so $x = 3.14159274\ldots$, the float nearest $\pi$. (2) $2^9 \le 1000 < 2^{10}$, so $\operatorname{ulp} = 2^{9 - 23} = 2^{-14} \approx 6.1 \times 10^{-5}$: about four correct decimal places. (3) Ten additions of the stored $0.1$ give $0.9999999999999999$, one ulp below 1, not 1, so the loop steps past 1 and continues; loop conditions on floats should use an integer counter or `<`.</details></aside>
+
+## Narrow formats for machine learning
+
+Neural networks tolerate low precision, and halving the bits of every number halves memory and memory traffic and multiplies the throughput of matrix units. Three narrow formats dominate:
+
+| Format | Sign, exponent, fraction | Bias | Largest finite | Smallest normal | $\varepsilon$ |
+| --- | --- | --- | --- | --- | --- |
+| fp16 (binary16) | 1, 5, 10 | 15 | 65,504 | $2^{-14} \approx 6.1 \times 10^{-5}$ | $2^{-10} \approx 9.8 \times 10^{-4}$ |
+| bf16 (bfloat16) | 1, 8, 7 | 127 | $\approx 3.39 \times 10^{38}$ | $2^{-126}$ | $2^{-7} \approx 7.8 \times 10^{-3}$ |
+| fp8 E4M3 | 1, 4, 3 | 7 | 448 | $2^{-6}$ | $2^{-3}$ |
+| fp8 E5M2 | 1, 5, 2 | 15 | 57,344 | $2^{-14}$ | $2^{-2}$ |
+
+- **fp16** is the IEEE half-precision format. Its range is narrow: gradients smaller than about $6 \times 10^{-8}$, the smallest subnormal, become zero, so mixed-precision training multiplies the loss by a scale factor before the backward pass and divides it out afterwards ([Micikevicius et al., 2018](#references)).
+- **bf16** keeps the 8-bit exponent of single precision and cuts the fraction to 7 bits: it is the top half of a float32. Conversion is a rounding of the low 16 bits, the range is that of float32, and no loss scaling is needed. Precision is low, about 2–3 decimal digits, but training is insensitive to it ([Kalamkar et al., 2019](#references)). Google introduced the format for its TPUs.
+- **fp8** comes in two variants ([Micikevicius et al., 2022](#references)). E4M3 has more precision and is used for weights and activations; it gives up infinities and keeps a single NaN pattern per sign to extend its range to 448. E5M2 follows the IEEE conventions and its wider range suits gradients.
+
+**Worked example.** $0.1$ in fp16 is `0x2E66` $= 0.0999755859375$, and in bf16 `0x3DCD` $= 0.10009765625$: the upper 16 bits of the float32 `0x3DCCCCCD`, rounded up because the discarded half `0xCCCD` is more than half of `0x10000`. The relative errors are $2.4 \times 10^{-4}$ and $9.8 \times 10^{-4}$, within each format's $u = \varepsilon/2$. Values above 65,504 overflow fp16 but fit easily in bf16.
+
+Below 8 bits, the [quantization note](/notes/nlp/quantization) of the NLP course switches from floating point to integer codes with a scale, the fixed-point idea of the baseline applied per block of weights.
+
+## Floating point in RISC-V
+
+Floating point is an optional extension of RISC-V: **F** for single precision and **D** for double ([RISC-V Unprivileged ISA](#references), F and D chapters). Both follow IEEE 754.
+
+- **Registers.** 32 floating-point registers `f0`–`f31`, separate from the integer registers, each FLEN bits wide (32 with F, 64 with D). A single-precision value in a 64-bit register is *NaN-boxed*: the upper 32 bits are all ones. The calling convention names them like the integer registers: `ft0`–`ft11` temporaries, `fs0`–`fs11` saved, `fa0`–`fa7` arguments and results.
+- **Loads and stores** move bits unchanged: `flw`/`fsw` and `fld`/`fsd`.
+- **Arithmetic**: `fadd.s`, `fsub.s`, `fmul.s`, `fdiv.s`, `fsqrt.s`, `fmin.s`, `fmax.s`, and the `.d` forms for double. The **fused multiply-add** `fmadd.s rd, rs1, rs2, rs3` computes $rs1 \times rs2 + rs3$ with a single rounding, more accurate than a multiply followed by an add.
+- **Comparisons** `feq.s`, `flt.s`, `fle.s` write 0 or 1 into an *integer* register, and an ordinary branch then tests it. Comparisons with a NaN give 0.
+- **Conversions**: `fcvt.w.s` (float to signed integer), `fcvt.s.w` (integer to float), `fcvt.s.d` and `fcvt.d.s` between precisions. `fmv.x.w` and `fmv.w.x` copy the 32 bits between an integer and a floating-point register without converting.
+- **Control and status.** The `fcsr` register holds the rounding mode `frm` (round to nearest even by default; also toward zero, down, up, and nearest with ties away from zero) and the accrued exception flags `fflags`: invalid (NV), divide by zero (DZ), overflow (OF), underflow (UF), inexact (NX). Each arithmetic instruction can also name its own rounding mode.
+
+Floating-point arithmetic is slower than integer arithmetic. An addition must align the binary points of its operands by shifting the significand of the one with the smaller exponent, add, renormalize and round, so floating-point units take several cycles per operation and are pipelined ([Patterson and Hennessy, 2020](#references), §3.5).
+
+## What changed
+
+| | Fixed point Q16.16 (baseline) | Single-precision float |
+| --- | --- | --- |
+| Bits | 32 | 32 |
+| Range | about $\pm 3.3 \times 10^{4}$ | about $\pm 3.4 \times 10^{38}$ |
+| Smallest positive | $2^{-16} \approx 1.5 \times 10^{-5}$ | $2^{-149} \approx 1.4 \times 10^{-45}$ |
+| Error | absolute, at most $2^{-17}$ | relative, at most $u = 2^{-24}$ for normal numbers |
+| Spacing | constant | doubles at each power of two |
+| Hardware | the integer ALU | a separate floating-point unit, several cycles per operation |
+| Laws of arithmetic | exact addition, associative (until overflow) | every operation rounds; not associative |
+| Special values | none | $\pm 0$, $\pm\infty$, NaN, subnormals |
+
+## Limitations
+
+- **Every operation rounds.** Errors accumulate, and subtracting two nearly equal numbers cancels their leading digits and leaves mostly rounding error (*catastrophic cancellation*). The bound $|\delta| \le u$ holds per operation, not per program.
+- **Not associative, not distributive.** Results depend on evaluation order, so parallel and sequential code, or two compilers, can disagree in the last bits.
+- **Decimal fractions are inexact.** $0.1$, $0.2$ and $0.3$ are approximations; money belongs in integers or decimal types.
+- **Integers are exact only up to $2^p$.** Above $2^{24}$ in single and $2^{53}$ in double, not every integer is representable.
+- **NaN breaks ordinary logic.** `x == x` is false for NaN, and sorting or taking a maximum with NaNs present needs care.
+
+## What you should remember
+
+- $x = (-1)^s \times 1.f \times 2^{E - \text{bias}}$. Single: 1 + 8 + 23 bits, bias 127. Double: 1 + 11 + 52 bits, bias 1023. The leading 1 is hidden.
+- Spacing doubles at every power of two; $\operatorname{ulp}(x) = 2^{e-p+1}$; $\varepsilon = 2^{1-p}$ ($1.19 \times 10^{-7}$ single, $2.22 \times 10^{-16}$ double).
+- Operations are correctly rounded, by default to nearest with ties to even: $\mathrm{fl}(a \circ b) = (a \circ b)(1 + \delta)$, $|\delta| \le u = \varepsilon/2$.
+- $0.1 + 0.2 \ne 0.3$ in double because no decimal fraction among them is representable; compare floats with a relative tolerance.
+- Floating-point addition is not associative: summing small terms first, or with Kahan's compensation, is more accurate.
+- Special encodings: $E = 0$ gives zeros and subnormals, $E$ all ones gives infinities and NaN; NaN is unequal to itself.
+- fp16 has a narrow range, bf16 has float32's range with 8 significant bits, fp8 comes as E4M3 and E5M2.
+- RISC-V F and D: separate registers `f0`–`f31`, `flw`/`fld`, `fadd.s`/`fadd.d`, comparisons into integer registers, `fcsr` with the rounding mode and exception flags.
+
+## Code
+
+A decoder for single-precision floats in Python. `struct` converts between a Python float (a double) and the bytes of a C `float`; everything else is shifts and masks:
+
+```python
+import math
+import struct
+from decimal import Decimal
+from fractions import Fraction
+
+def bits32(x):                            # the 32 bits of x rounded to single precision
+    return struct.unpack('>I', struct.pack('>f', x))[0]
+
+def fields32(x):                          # sign, exponent field, fraction field
+    b = bits32(x)
+    return b >> 31, (b >> 23) & 0xFF, b & 0x7FFFFF
+
+def decode32(s, E, f):                    # the value, by the formulas of the note
+    if E == 255:
+        return math.nan if f else (-1) ** s * math.inf
+    if E == 0:                            # subnormal: no hidden 1, exponent fixed at -126
+        return (-1) ** s * (f / 2**23) * 2.0**-126
+    return (-1) ** s * (1 + f / 2**23) * 2.0**(E - 127)
+
+for x in (-12.5, 0.1, 1.0, 2.0**-149, math.inf):
+    s, E, f = fields32(x)
+    print(f'{x!r:>8} {bits32(x):08X} s={s} E={E:3d} f={f:06X} -> {decode32(s, E, f)!r}')
+#    -12.5 C1480000 s=1 E=130 f=480000 -> -12.5
+#      0.1 3DCCCCCD s=0 E=123 f=4CCCCD -> 0.10000000149011612
+#      1.0 3F800000 s=0 E=127 f=000000 -> 1.0
+# 1.401298464324817e-45 00000001 s=0 E=  0 f=000001 -> 1.401298464324817e-45
+#      inf 7F800000 s=0 E=255 f=000000 -> inf
+
+print(Decimal(struct.unpack('>f', struct.pack('>f', 0.1))[0]))   # 0.100000001490116119384765625: the float nearest 0.1
+print(Decimal(0.1))                                             # 0.1000000000000000055511151231257827021181583404541015625: the double
+
+# 0.1 + 0.2 in double: three roundings, and the last one is a tie
+a, b = Fraction(0.1), Fraction(0.2)
+exact = a + b                                                   # the exact sum of the two doubles
+lo, hi = Fraction(0.3), Fraction(0.30000000000000004)           # the two doubles around it
+print(exact - lo == hi - exact, 0.1 + 0.2 == 0.30000000000000004, 0.1 + 0.2 == 0.3)   # True True False
+print(exact * 2**55, lo * 2**54, hi * 2**54)                    # 10808639105689191 5404319552844595 5404319552844596: the tie goes to the even neighbour
+print(math.isclose(0.1 + 0.2, 0.3))                             # True: compare with a relative tolerance
+
+# rounding to nearest, ties to even, at 2^24 where float spacing becomes 2
+f32 = lambda x: struct.unpack('>f', struct.pack('>f', x))[0]
+print([int(f32(2**24 + k)) for k in range(5)])                  # [16777216, 16777216, 16777218, 16777220, 16777220]
+
+# machine epsilon: the gap between 1 and the next number
+print(math.ulp(1.0) == 2.0**-52, f32(1 + 2.0**-23) > 1, f32(1 + 2.0**-24) == 1)   # True True True
+print(math.nextafter(1.0, 2) - 1, 2.0**-23)                     # 2.220446049250313e-16 1.1920928955078125e-07
+
+# narrow formats: fp16 via struct's 'e' code; bf16 = the top 16 bits of a float32, rounded to nearest even
+def bf16(x):
+    b = bits32(x)
+    b = (b + 0x7FFF + ((b >> 16) & 1)) >> 16                    # round the low 16 bits away, ties to even
+    return b, struct.unpack('>f', struct.pack('>I', b << 16))[0]
+h = struct.unpack('>H', struct.pack('>e', 0.1))[0]
+print(f'{h:04X}', struct.unpack('>e', struct.pack('>e', 0.1))[0])   # 2E66 0.0999755859375
+print(f'{bf16(0.1)[0]:04X}', bf16(0.1)[1])                      # 3DCD 0.10009765625
+print((2 - 2**-10) * 2**15, (2 - 2**-7) * 2**127)                # 65504.0 3.3895313892515355e+38: largest fp16 and bf16
+try:
+    struct.pack('>e', 70000.0)
+except OverflowError as err:
+    print('fp16:', err)                                         # fp16: float too large to pack with e format
+
+# fixed point Q16.16, the baseline
+q = round(0.1 * 2**16)
+print(q, q / 2**16, (2**31 - 1) / 2**16, 2**-16)                # 6554 0.100006103515625 32767.99998474121 1.52587890625e-05
+```
+
+Summation order and special values in C, compiled with `clang -std=c17 -Wall -Wextra -O0`. The sums are determined by IEEE 754 arithmetic; the spelling of `nan` and `inf` in the output is the C library's (macOS here):
+
+```c
+#include <float.h>
+#include <math.h>
+#include <stdio.h>
+
+int main(void) {
+    /* the same sum of 1/k for k = 1..10^7, in three orders and two precisions */
+    int n = 10000000;
+    float fwd = 0.0f, bwd = 0.0f, kahan = 0.0f, c = 0.0f;
+    double ref = 0.0;
+    for (int k = 1; k <= n; k++) fwd += 1.0f / (float)k;           /* largest terms first */
+    for (int k = n; k >= 1; k--) bwd += 1.0f / (float)k;           /* smallest terms first */
+    for (int k = 1; k <= n; k++) {                                 /* Kahan: carry the lost low part along */
+        float y = 1.0f / (float)k - c, t = kahan + y;
+        c = (t - kahan) - y;
+        kahan = t;
+    }
+    for (int k = n; k >= 1; k--) ref += 1.0 / k;
+    printf("%.7f %.7f %.7f %.7f\n", fwd, bwd, kahan, ref);         /* 15.4036827 16.6860313 16.6953106 16.6953114 */
+
+    float s = 0.0f; int k = 1;
+    while (s + 1.0f / (float)k != s) s += 1.0f / (float)k++;       /* when does the forward sum stop growing? */
+    printf("%d %.7f\n", k, s);                                     /* 2097152 15.4036827: 1/2^21 is half a gap at 15.4 */
+
+    printf("%d %d\n", 0.1 + 0.2 == 0.3, 0.1f + 0.2f == 0.3f);      /* 0 1: true in float, false in double */
+    printf("%g %g\n", (1e20 + -1e20) + 1.0, 1e20 + (-1e20 + 1.0)); /* 1 0: addition is not associative */
+
+    volatile double zero = 0.0;                                    /* volatile: computed at run time */
+    double inf = 1.0 / zero, nan = zero / zero;
+    printf("%g %g %g %g\n", inf, -inf, nan, inf - inf);            /* inf -inf nan nan */
+    printf("%d %d %d\n", nan == nan, 0.0 == -0.0, isnan(nan));     /* 0 1 1 */
+    printf("%g %g\n", 1.0 / zero, 1.0 / -zero);                    /* inf -inf: the sign of zero matters */
+    printf("%g %g %g\n", FLT_EPSILON, FLT_MIN, FLT_TRUE_MIN);      /* 1.19209e-07 1.17549e-38 1.4013e-45 */
+    printf("%g %g\n", FLT_MAX, DBL_MAX);                           /* 3.40282e+38 1.79769e+308 */
+    printf("%g\n", FLT_MAX * 2.0f);                                /* inf: overflow */
+    return 0;
+}
+```
+
+Taking a float apart needs only integer instructions, so it runs on RV32I (RARS syntax):
+
+```asm
+# Take the float -12.5 apart with integer instructions only
+        .data
+x:      .word 0xC1480000        # the bits of -12.5f
+        .text
+main:
+        lw   t0, x
+        srli a0, t0, 31         # sign: bit 31
+        li   a7, 1
+        ecall                   # prints 1
+        li   a0, 32
+        li   a7, 11
+        ecall
+        srli a0, t0, 23         # exponent field: bits 30..23
+        andi a0, a0, 0xFF
+        addi a0, a0, -127       # remove the bias
+        li   a7, 1
+        ecall                   # prints 3
+        li   a0, 32
+        li   a7, 11
+        ecall
+        li   t1, 0x7FFFFF       # fraction field: bits 22..0
+        and  a0, t0, t1
+        li   t1, 0x800000       # put back the hidden 1
+        or   a0, a0, t1
+        li   a7, 34
+        ecall                   # prints 0x00c80000: 1.1001 binary, scaled by 2^23
+        li   a7, 10
+        ecall
+```
+
+The same sums with the F and D extensions. This excerpt is **not run here; it runs in RARS** (which implements RV32 with F and D, and whose system calls 2 and 3 print `fa0` as a float and as a double):
+
+```asm
+# 0.1 + 0.2 in single and in double precision (RARS, RV32IMFD)
+        .data
+f01:    .float 0.1
+f02:    .float 0.2
+f03:    .float 0.3
+        .align 3                # doubles on an 8-byte boundary
+d01:    .double 0.1
+d02:    .double 0.2
+        .text
+main:
+        la      t0, f01
+        flw     ft0, 0(t0)      # ft0 = 0.1f
+        flw     ft1, 4(t0)      # ft1 = 0.2f
+        flw     ft2, 8(t0)      # ft2 = 0.3f
+        fadd.s  fa0, ft0, ft1   # rounded to nearest, ties to even (the default in fcsr)
+        feq.s   a0, fa0, ft2    # comparison result goes to an integer register
+        li      a7, 1
+        ecall                   # prints 1: in single precision the sum equals 0.3f
+        li      a0, 10
+        li      a7, 11
+        ecall
+        fmv.x.w a0, fa0         # copy the bits, unconverted, to an integer register
+        li      a7, 34
+        ecall                   # prints 0x3e99999a
+        li      a0, 10
+        li      a7, 11
+        ecall
+        la      t0, d01
+        fld     ft0, 0(t0)
+        fld     ft1, 8(t0)
+        fadd.d  fa0, ft0, ft1   # the same sum in double precision
+        li      a7, 3
+        ecall                   # prints 0.30000000000000004
+        li      a7, 10
+        ecall
+```
+
+## Next
+
+The Foundations section is complete: we know what a stored-program computer does, and how its memory represents integers, characters and real numbers as bits. The next section turns to the instructions that operate on those bits. The [next note](/notes/acos/processor-and-isa) describes the processor as a programmer sees it, its registers, memory and instructions, and the instruction set architecture as the contract between hardware and software, using RISC-V and the RARS simulator.
+
+## References
+
+- A. Tatarnikov. *Computer Architecture and Operating Systems* (HSE), [lecture 7: floating-point format](https://andrewt0301.github.io/hse-acos-course/part1ca/07_FP/lecture.html).
+- IEEE. [*IEEE Standard for Floating-Point Arithmetic*, IEEE Std 754-2019](https://doi.org/10.1109/IEEESTD.2019.8766229). §3.4 (binary interchange format encodings), §4.3 (rounding-direction attributes), §6 (infinity, NaNs and the sign bit), §7 (exceptions).
+- D. Goldberg. [What every computer scientist should know about floating-point arithmetic](https://doi.org/10.1145/103162.103163). *ACM Computing Surveys*, 23(1), 1991. §1.2 (relative error and ulps), §1.3–1.4 (guard digits, cancellation), §2 (the IEEE standard).
+- N. J. Higham. [*Accuracy and Stability of Numerical Algorithms*](https://doi.org/10.1137/1.9780898718027), 2nd ed. SIAM, 2002. §2.2 (the standard model of floating-point arithmetic), §4.3 (compensated summation).
+- R. E. Bryant, D. R. O'Hallaron. *Computer Systems: A Programmer's Perspective*, 3rd ed. Pearson, 2016. §2.4 (floating point).
+- D. A. Patterson, J. L. Hennessy. *Computer Organization and Design, RISC-V Edition*, 2nd ed. Morgan Kaufmann, 2020. §3.5 (floating point, including the RISC-V F and D instructions).
+- A. Waterman, K. Asanović (eds.). [*The RISC-V Instruction Set Manual, Volume I: Unprivileged ISA*](https://github.com/riscv/riscv-isa-manual). RISC-V International. Chapters on the F extension (registers, `fcsr`, rounding modes, NaN generation, subnormals, fused multiply-add, `fmv.x.w`) and the D extension (NaN boxing).
+- P. Micikevicius et al. [Mixed precision training](https://arxiv.org/abs/1710.03740). *ICLR*, 2018. §3.2 (loss scaling).
+- D. Kalamkar et al. [A study of BFLOAT16 for deep learning training](https://arxiv.org/abs/1905.12322). arXiv:1905.12322, 2019.
+- P. Micikevicius et al. [FP8 formats for deep learning](https://arxiv.org/abs/2209.05433). arXiv:2209.05433, 2022. Table 1 (E4M3 and E5M2).

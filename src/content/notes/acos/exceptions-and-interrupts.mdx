@@ -1,0 +1,303 @@
+---
+title: Exceptions and interrupts
+description: "How a processor stops a program when an instruction fails, the program calls the kernel or a device needs attention: RISC-V privilege modes, the trap registers, the trap sequence and mret, direct and vectored handlers, ecall as a system call, and precise exceptions."
+course: acos
+section: Inside the Processor
+order: 10
+status: published
+tags: [exceptions, interrupts, traps, privilege-modes, csr, mret, ecall, precise-exceptions, risc-v]
+prerequisites: [The datapath and pipelining, "Procedures, the stack and calling conventions", Virtual memory]
+---
+
+import TrapPath from '../../../components/figures/exceptions-and-interrupts/TrapPath.astro';
+import PreciseException from '../../../components/figures/exceptions-and-interrupts/PreciseException.astro';
+
+The [pipelining note](/notes/acos/pipelining) built a processor that keeps five instructions in flight and assumed that each of them finishes normally. Some do not. A load names a page that the [virtual-memory](/notes/acos/virtual-memory) system has not mapped; a word in the instruction stream is not an instruction at all; a program needs the kernel to write to a file; the timer fires or a key is pressed while the program is in the middle of a loop. In every case the processor must stop the current instruction stream, run some other code, and usually come back as if nothing had happened. This note builds that mechanism for RISC-V: the **privilege modes** that separate the code that handles such events from the code that causes them, the **control and status registers** that record what happened, the **trap sequence** the hardware performs, the `mret` instruction that undoes it, and the extra work a pipeline must do so that the stop is **precise**.
+
+**Notation.** A **hart** is a hardware thread, one stream of instructions with its own registers and PC. The **CSRs** (control and status registers) are special registers read and written with the instructions `csrrw`, `csrrs` and `csrrc` (and the pseudo-instructions `csrr` and `csrw`). Names starting with `m` are the machine-mode CSRs; the supervisor-mode copies start with `s`. Fields of a CSR are written `mstatus.MIE`. Addresses are 32-bit hexadecimal, as in the RISC-V Assembly notes.
+
+## Baseline: a program that checks everything itself
+
+Without any hardware support, a program would have to check for every unusual event itself. After each division it tests the divisor; before each load it checks that the address is valid; to notice a key press it reads the keyboard's status register again and again in its main loop. Some of this works: RISC-V itself does not trap on integer division by zero (`div` returns all ones), and the program can test the divisor first. But the approach breaks in three places.
+
+- **Some failures cannot be checked by the program.** If the instruction at PC is not a valid instruction, the program cannot run code to find out, because that code is the thing that cannot run. A load from a page that is not in memory cannot be "checked" in software either: only the hardware, during translation, knows.
+- **Devices need attention at times the program does not choose.** Reading a status register in a loop wastes the processor when nothing happens and reacts late when the loop is long. The [next note](/notes/acos/input-and-output) puts a number on it.
+- **There is no protection.** If any code may touch the devices and the page tables, any program can take over the machine. A protected system needs a gate: a way for a program to ask the kernel for a service without being able to run kernel code of its own choosing.
+
+## Exceptions, interrupts and traps
+
+The RISC-V specification fixes three words ([RISC-V Unprivileged ISA](#references), section 1.6):
+
+- an **exception** is an unusual condition at run time *associated with an instruction* of the current hart: an illegal instruction, a misaligned or faulting memory access, a page fault, a breakpoint, an `ecall`;
+- an **interrupt** is an *external, asynchronous* event that may cause the hart to transfer control unexpectedly: a timer, a device, another hart;
+- a **trap** is the transfer of control to a **trap handler** caused by either of them.
+
+Exceptions are **synchronous**: run the same program on the same data and they happen at the same instruction. Interrupts are **asynchronous**: they arrive between two instructions that have nothing to do with them. Other books divide the same ground differently. Bryant and O'Hallaron call all such events *exceptions* and split them into four classes: interrupts, traps (intentional, like a system call), faults (possibly recoverable, like a page fault) and aborts (unrecoverable) ([Bryant and O'Hallaron, 2015](#references), section 8.1); Patterson and Hennessy use *exception* for both and *interrupt* for the external kind ([Patterson and Hennessy, 2020](#references), section 4.10). The mechanism is the same in all of them.
+
+What a handler does with the trap depends on its cause. A page fault is **restartable**: the kernel loads the page and returns to the same instruction, which now succeeds. An `ecall` is a **request**: the kernel performs it and returns to the next instruction. An illegal instruction in a user program usually ends the program. An interrupt is **transparent**: the handler serves the device and returns to the instruction that had not yet started, and the program never notices.
+
+## Privilege modes
+
+A RISC-V hart always runs in one of three privilege modes ([RISC-V Privileged ISA](#references), section 1.2): **M-mode** (machine, encoded 3), **S-mode** (supervisor, 1) and **U-mode** (user, 0). M-mode is the only mandatory one and has full access to the hardware. A small embedded system may have only M-mode, or M and U; a system that runs Linux has all three, with firmware in M, the kernel in S and programs in U. An instruction or CSR access that the current mode does not allow raises an exception, and the trap takes the hart to a more privileged mode, never to a less privileged one. Traps are therefore the only way up, and the return instructions `mret` and `sret` the only way down. The [operating-systems note](/notes/acos/operating-systems) shows what the kernel builds on this; this note follows the hardware.
+
+To keep the mechanism visible, the examples below use a system with M- and U-mode only: the trap goes to M-mode and is handled with the machine-mode CSRs. A system with S-mode works the same way one level lower, as the section on system calls shows.
+
+## The trap registers
+
+These machine-mode CSRs take part in traps ([RISC-V Privileged ISA](#references), section 3.1):
+
+| CSR | What it holds |
+| --- | --- |
+| `mtvec` | where traps go: bits 31–2 hold BASE, the handler address (a multiple of 4); bits 1–0 hold MODE, 0 for direct and 1 for vectored |
+| `mepc` | the address of the instruction that was interrupted or that raised the exception |
+| `mcause` | bit 31 is 1 for an interrupt and 0 for an exception; the rest is the exception or interrupt code |
+| `mtval` | extra information: the faulting address for a memory fault, otherwise often 0 |
+| `mstatus` | among other fields, **MIE** (bit 3), the global interrupt enable in M-mode; **MPIE** (bit 7), the previous MIE; **MPP** (bits 12–11), the previous privilege mode |
+| `mie`, `mip` | one enable bit and one pending bit per interrupt: software (bit 3), timer (bit 7), external (bit 11) for M-mode |
+
+One more, `mscratch`, holds nothing the hardware uses: it is a spare register for the handler, usually a pointer to a save area or a kernel stack. The exception codes of `mcause` that this course meets are 0 (instruction address misaligned), 2 (illegal instruction), 3 (breakpoint), 4 and 6 (load and store address misaligned), 5 and 7 (load and store access fault), 8, 9 and 11 (environment call from U-, S- and M-mode), 12, 13 and 15 (instruction, load and store page fault). The interrupt codes are 3, 7 and 11 for the machine software, timer and external interrupts, and 1, 5 and 9 for their supervisor versions.
+
+## The trap sequence step by step
+
+<aside class="callout"><strong>Key idea.</strong> On a trap the hardware does the minimum that software cannot do for itself, in one indivisible step: it saves the PC and the cause, disables interrupts, raises the privilege, and jumps to an address the kernel chose in advance. Everything else, saving registers, deciding what to do, returning, is the handler's job, and <code>mret</code> undoes exactly what the hardware did.</aside>
+
+When a trap is taken into M-mode from privilege mode $y$, the hardware performs these steps at once ([RISC-V Privileged ISA](#references), sections 3.1.6 and 3.1.14–3.1.16):
+
+1. `mepc` ← the address of the instruction that raised the exception, or of the first instruction that had not run when the interrupt arrived;
+2. `mcause` ← the cause, and `mtval` ← the faulting address or other information (0 if none);
+3. `mstatus.MPIE` ← `mstatus.MIE`, then `mstatus.MIE` ← 0, so the handler starts with interrupts disabled;
+4. `mstatus.MPP` ← $y$, and the mode becomes M;
+5. `pc` ← BASE of `mtvec` (or BASE $+ 4 \times$ cause for an interrupt in vectored mode).
+
+Nothing else changes: the 31 general-purpose registers still hold the program's values. The handler must save every register it uses before using it, which is a problem when every register holds a program value. `mscratch` solves it: `csrrw sp, mscratch, sp` swaps the program's `sp` with the kernel stack pointer kept in `mscratch`, in one instruction, and from then on the handler can store the other registers on its own stack.
+
+`mret` reverses steps 3 and 4 and resumes: the mode becomes `mstatus.MPP`, `mstatus.MIE` ← `mstatus.MPIE`, `mstatus.MPIE` ← 1, `mstatus.MPP` ← U (the least privileged mode the hart has), and `pc` ← `mepc`. The handler decides where to return by writing `mepc` before `mret`.
+
+<TrapPath />
+
+1. The program in U-mode executes `ecall` at `0x00010074`.
+2. The hardware writes `mepc = 0x00010074`, `mcause = 8` (environment call from U-mode) and `mtval = 0`.
+3. It copies `MIE = 1` into `MPIE`, clears `MIE`, records the old mode U in `MPP` and switches to M-mode.
+4. The PC becomes `mtvec = 0x80000100`; the handler swaps in its stack, saves registers and reads `mcause`.
+5. The handler performs the system call, puts the result in `a0` and adds 4 to `mepc`.
+6. `mret` restores U-mode and `MIE = 1` and jumps to `mepc = 0x00010078`, the instruction after the `ecall`.
+
+**Worked example.** Before the `ecall`, `mstatus` has `MIE = 1`, `MPIE = 1`, `MPP = U`: the value $2^3 + 2^7 = 136 =$ `0x88` in its low bits. On trap entry `MIE` becomes 0 and `MPP` stays 00 for U, so `mstatus` reads `0x80`, and the hart jumps to `0x80000100`. Step 5 matters: by step 2, `mepc` points at the `ecall` itself, not after it ([RISC-V Privileged ISA](#references), section 3.3.1). Without the `+ 4`, `mret` would return to the `ecall`, which would trap again, forever. For a page fault the handler does the opposite and leaves `mepc` alone, so the load runs again once the page is mapped. The Code section runs this sequence in a model of the hart.
+
+<aside class="callout"><strong>Check yourself.</strong> (1) A handler forgets to save `t0` before using it, and the trap was a timer interrupt. What goes wrong, and why would the same bug in a system-call handler sometimes go unnoticed? (2) Why must the hardware clear `MIE` on trap entry rather than leave it to the first instruction of the handler? (3) After `mret` from a trap taken from U-mode, what is `mstatus.MPP`?<details><summary>Answers</summary>(1) The interrupted program had a live value in `t0` at an arbitrary point and finds it changed after the return: a bug that appears at random, wherever the timer happens to hit. A system call is a call that the program makes on purpose, and by the calling convention it does not expect temporaries such as `t0` to survive a call, so the clobbered `t0` often does no harm. (2) An interrupt could arrive between the trap and that first instruction, and the second trap would overwrite `mepc`, `mcause` and `MPP` before the handler had saved them; the first trap's return address would be lost. (3) U, the least privileged mode the hart supports: `mret` sets it so that a stray second `mret` cannot return to M-mode by accident.</details></aside>
+
+## Direct and vectored trap handling
+
+The two bits of `mtvec.MODE` choose how the handler is found ([RISC-V Privileged ISA](#references), section 3.1.7). In **direct** mode (0) every trap jumps to BASE, and the handler reads `mcause` and branches to the code for that cause. In **vectored** mode (1) exceptions still go to BASE, but an interrupt with code $c$ jumps to $\text{BASE} + 4c$. Each of those addresses holds one instruction, normally a jump to the handler for that interrupt: a **vector table**.
+
+**Worked example.** With `mtvec = 0x80000101`, BASE is `0x80000100` and MODE is 1. A machine timer interrupt (code 7) jumps to `0x80000100 + 4 × 7 = 0x8000011c`, a machine external interrupt (code 11) to `0x8000012c`, and a load page fault (an exception) to `0x80000100` itself. In direct mode all three would land at `0x80000100`, and the handler would spend a few instructions reading `mcause`, testing the interrupt bit and indexing a table of handler addresses before it reached the timer code.
+
+Vectored mode saves those instructions on every interrupt, which matters most where interrupts are frequent and must be served fast, as in microcontrollers that react to sensors. How much do a few instructions matter? A timer that fires 1000 times a second with a handler of 2000 cycles costs $2 \times 10^6$ cycles per second, 0.1 % of a 2 GHz core; skipping ten dispatch instructions per interrupt changes the total cost by less than 1 % of that. The point of vectoring is the **latency** to the first useful instruction, not the throughput.
+
+## How ecall becomes a system call
+
+`ecall` is the gate of the baseline section. It is an instruction that *always* raises an exception: code 8 from U-mode, 9 from S-mode, 11 from M-mode. A program cannot jump into the kernel, because kernel pages are not accessible in U-mode, but it can trap into it, and the trap goes only to the address the kernel stored in its trap-vector register. The rest is a convention between the program and the kernel. On Linux for RISC-V the program puts the system call number in `a7` and up to six arguments in `a0`–`a5`, executes `ecall`, and finds the result in `a0` ([Linux man-pages, syscall(2)](#references)). `write` is call 64 and `exit` is 93 in the kernel's generic table.
+
+On a real Linux system the trap does not go to M-mode. M-mode firmware (OpenSBI on most RISC-V boards) sets bits in the **delegation registers** `medeleg` and `mideleg`, and a trap whose bit is set goes straight to S-mode instead ([RISC-V Privileged ISA](#references), section 3.1.8). OpenSBI delegates the environment call from U-mode, page faults and the supervisor interrupts, among others. The kernel then handles the trap with the S-mode copies of the same registers, `stvec`, `sepc`, `scause`, `stval` and `sstatus`, and returns with `sret`. Its handler for code 8 does what step 5 of the figure does: it adds 4 to the saved PC, reads the call number from `a7`, calls the function for that number from a table, and stores its return value in `a0` ([Linux, `arch/riscv/kernel/traps.c`](#references)). M-mode remains for what the kernel cannot do itself, such as programming the timer on some platforms: the kernel asks the firmware with its own `ecall` from S-mode, code 9.
+
+RARS works differently again. Its `ecall` services (print an integer with `a7 = 1`, exit with `a7 = 10`, and the others used in this course) are implemented by the simulator itself, in Java, and do not run any trap handler. A few numbers agree with Linux (57 close, 63 read, 64 write, 93 exit with a code); the rest are RARS's own. The [system-calls note](/notes/acos/system-calls) follows the same path from the kernel's side: the table, the arguments, and what a C library function such as `write` does around the `ecall`.
+
+## Interrupts: enabled, pending, taken
+
+An interrupt source raises a **pending** bit in `mip`: the timer sets MTIP when its counter passes the compare value, a device sets MEIP through the interrupt controller. The hart takes a machine interrupt with code $c$ when three conditions hold together ([RISC-V Privileged ISA](#references), section 3.1.9):
+
+- bit $c$ of `mip` is set (it is pending);
+- bit $c$ of `mie` is set (this source is enabled);
+- the hart runs in a mode below M, or it runs in M-mode with `mstatus.MIE = 1`.
+
+The third condition means that a program in U-mode cannot block machine interrupts: they are always enabled below M-mode. Inside a handler, `MIE` is 0 since step 3 of the trap, so a second interrupt waits as pending until `mret` restores `MIE`, or until the handler has saved `mepc`, `mcause` and `mstatus` and sets `MIE` itself to allow nested interrupts. The interrupt is taken between two instructions, and `mepc` holds the address of the first instruction that has not run.
+
+**Worked example.** A program runs in U-mode with `mie.MTIE = 1` when the timer sets `mip.MTIP`. The third condition holds because the mode is below M, so the hart traps: `mcause = 0x80000007` (bit 31 for interrupt, code 7), `mepc` the next instruction, and with vectored `mtvec = 0x80000101` the PC becomes `0x8000011c`. In the handler, `MIE = 0`, so the same pending bit no longer causes a trap; the handler must clear the cause at the source (here by writing a new compare value to the timer), or the interrupt would be taken again right after `mret`.
+
+## Precise exceptions in a pipeline
+
+The trap sequence assumes that one instruction is "the" faulting instruction and that everything before it has finished and nothing after it has started. In the pipeline of the previous note, five instructions are in flight, and an exception can be detected in several stages: an illegal instruction in ID, a misaligned or faulting load or store in MEM, an instruction page fault in IF. An exception is **precise** if the state the handler sees is exactly the state of a sequential machine stopped at that instruction: every earlier instruction has completed, the faulting one and every later one have changed nothing, and `mepc` points at the faulting one ([Smith and Pleszkun, 1988](#references)). Restartable exceptions, page faults above all, need this: the kernel fixes the cause and resumes at `mepc`, and that only works if no later instruction has already run.
+
+The pipeline makes exceptions precise in three moves ([Patterson and Hennessy, 2020](#references), section 4.10):
+
+- **Record, do not act.** When a stage detects an exception, it marks the instruction in its pipeline register with the cause and turns it into a bubble that writes nothing; the mark travels down the pipeline with the instruction.
+- **Decide in order.** The trap is taken when a marked instruction reaches the commit point (here the end of MEM, before anything is written back or stored), and that is always the oldest marked instruction, because instructions reach that point in program order.
+- **Flush the rest.** The faulting instruction and everything behind it become bubbles, `mepc` and `mcause` are written, and IF fetches from `mtvec`. Nothing in the flushed instructions had changed a register or memory, because those writes happen only in MEM and WB.
+
+<PreciseException />
+
+1. `addi` passes every stage and completes in cycle 5.
+2. In cycle 4, ID finds that `.word 0` is illegal (the all-zero word is defined to be an illegal instruction) and only marks it.
+3. In cycle 5 the `lw` reaches MEM and its address hits an unmapped page: it is the oldest marked instruction, and the trap is taken now.
+4. The `lw`, the illegal word, `add` and `sw` are flushed; `mepc = 0x00400104`, `mcause = 13`, `mtval = 0x10040000`.
+5. In cycle 6 IF fetches the first handler instruction from `mtvec`.
+
+**Worked example.** The illegal instruction was detected first, in cycle 4, but it is younger than the `lw`. Had the pipeline trapped in cycle 4, the handler would see `mepc = 0x00400108` with cause 2 and terminate the program for an illegal instruction, while the program had really first faulted on a page that the kernel could have mapped. With the in-order rule, the kernel maps the page and returns to `0x00400104`; the `lw` succeeds, and the illegal instruction is fetched again and raises its own exception then, in the right order. The cost of precision is small in this pipeline: the exception waits at most until the end of MEM, and the flush is the same hardware as a branch misprediction.
+
+Precision gets hard when instructions can finish out of order. A division that takes 20 cycles and a following `add` that takes one may complete in the wrong order, and if the division then faults, the `add` has already written its register. Some early high-performance machines simply reported such exceptions as **imprecise** and left the handler to work out what had completed ([Smith and Pleszkun, 1988](#references)). Modern out-of-order processors keep them precise with a reorder buffer that commits results in program order, the subject of the [instruction-level parallelism note](/notes/acos/instruction-level-parallelism).
+
+## What changed
+
+| | Baseline: the program checks for itself | Traps |
+| --- | --- | --- |
+| Illegal instruction, page fault | cannot be detected by the program | exception: the hardware stops at the instruction and calls a handler |
+| Device events | polled in the program's loop | interrupt between any two instructions |
+| Kernel services | a jump into the kernel, if any code may run there | `ecall`: a trap to an address the kernel chose |
+| Protection | none | privilege modes; traps are the only way up |
+| State saved by hardware | | `mepc`, `mcause`, `mtval`, `MPIE`, `MPP`, mode |
+| In a pipeline | | precise: record, decide in program order at commit, flush |
+
+## Limitations
+
+- **Traps are expensive.** A trap flushes the pipeline, and the handler saves and restores registers; with the kernel's own work, a system call costs hundreds of cycles or more, which is why programs buffer their I/O.
+- **Interrupts at a high rate can starve the program,** or even the kernel: a network card that raises an interrupt per packet can keep a core busy with nothing but handlers. The [next note](/notes/acos/input-and-output) shows the remedies.
+- **Nested interrupts need care:** the handler must save `mepc`, `mcause` and `mstatus` before it sets `MIE` again, or a second interrupt destroys them.
+- **Precision costs hardware** in out-of-order processors: a reorder buffer and the logic to commit in order.
+- **Simulators differ from hardware.** RARS implements an older user-level trap extension, described in the Code section, not the M-mode registers of this note.
+
+## What you should remember
+
+- An exception belongs to an instruction (synchronous); an interrupt comes from outside (asynchronous); a trap is the transfer to a handler caused by either.
+- Modes: M (3), S (1), U (0). Traps go up, `mret` and `sret` go down.
+- On a trap into M-mode the hardware writes `mepc`, `mcause`, `mtval`, saves `MIE` in `MPIE` and the old mode in `MPP`, clears `MIE`, enters M-mode and jumps to `mtvec`. `mret` restores the mode and `MIE` and jumps to `mepc`.
+- `mepc` points at the faulting instruction; for `ecall` the handler adds 4 before returning, for a page fault it does not.
+- `mtvec.MODE`: direct sends every trap to BASE; vectored sends interrupt $c$ to BASE $+ 4c$ and exceptions to BASE.
+- `ecall` with the number in `a7` and arguments in `a0`–`a5` is the system-call gate; on Linux it is delegated to the S-mode kernel.
+- Precise exceptions: record in the pipeline register, take the trap for the oldest instruction at the commit point, flush the rest.
+
+## Code
+
+Two pieces. The first is a runnable model of the trap sequence in Python, which checks the worked examples. The second is a real trap handler for RARS; it cannot run in the course's checker, which has no CSRs.
+
+```python
+# A model of RISC-V trap entry and mret for a hart with M- and U-mode (RV32), following the privileged
+# specification: what the hardware does on a trap, and what mret undoes.
+U, S, M = 0, 1, 3
+EXC = {0: 'instruction address misaligned', 1: 'instruction access fault', 2: 'illegal instruction',
+       3: 'breakpoint', 4: 'load address misaligned', 5: 'load access fault', 6: 'store address misaligned',
+       7: 'store access fault', 8: 'ecall from U-mode', 9: 'ecall from S-mode', 11: 'ecall from M-mode',
+       12: 'instruction page fault', 13: 'load page fault', 15: 'store page fault'}
+INT = {1: 'supervisor software', 3: 'machine software', 5: 'supervisor timer', 7: 'machine timer',
+       9: 'supervisor external', 11: 'machine external'}
+
+class Hart:
+    def __init__(self, pc, mtvec):
+        self.pc, self.priv, self.mtvec = pc, U, mtvec
+        self.MIE, self.MPIE, self.MPP = 1, 1, U           # fields of mstatus: bits 3, 7 and 12:11
+        self.mepc = self.mcause = self.mtval = 0
+        self.mie = self.mip = 0                           # per-interrupt enable and pending bits
+
+    def mstatus(self):
+        return self.MIE << 3 | self.MPIE << 7 | self.MPP << 11
+
+    def trap(self, code, interrupt=False, tval=0):
+        self.mepc = self.pc                               # the faulting or the next unexecuted instruction
+        self.mcause = (1 << 31 if interrupt else 0) | code
+        self.mtval = tval                                 # bad address, or 0
+        self.MPIE, self.MIE = self.MIE, 0                 # remember and disable interrupts
+        self.MPP, self.priv = self.priv, M                # remember the mode, enter M-mode
+        base, mode = self.mtvec & ~3, self.mtvec & 3
+        self.pc = base + 4 * code if mode == 1 and interrupt else base
+
+    def mret(self):
+        self.priv, self.MIE, self.MPIE, self.MPP = self.MPP, self.MPIE, 1, U
+        self.pc = self.mepc
+
+    def interrupt_taken(self, code):                      # would interrupt `code` be taken now?
+        enabled = self.priv < M or self.MIE               # M-mode interrupts are always on below M-mode
+        return bool(enabled and self.mie >> code & 1 and self.mip >> code & 1)
+
+def show(h, what):
+    print(f'{what:<13} priv={"USxM"[h.priv]} pc={h.pc:#010x} mepc={h.mepc:#010x} mcause={h.mcause:#010x} '
+          f'mstatus={h.mstatus():#06x} (MIE={h.MIE} MPIE={h.MPIE} MPP={"USxM"[h.MPP]})')
+
+def decode(mcause):
+    return (INT if mcause >> 31 else EXC)[mcause & 0x7fffffff]
+
+# 1. A system call: ecall in U-mode at 0x00010074, direct mode, handler at 0x80000100
+h = Hart(pc=0x00010074, mtvec=0x80000100)
+show(h, 'before')
+h.trap(8)
+show(h, 'trap entry')
+print('cause:', decode(h.mcause))
+h.mepc += 4                                               # the handler skips the ecall before returning
+h.mret()
+show(h, 'after mret')
+# before        priv=U pc=0x00010074 mepc=0x00000000 mcause=0x00000000 mstatus=0x0088 (MIE=1 MPIE=1 MPP=U)
+# trap entry    priv=M pc=0x80000100 mepc=0x00010074 mcause=0x00000008 mstatus=0x0080 (MIE=0 MPIE=1 MPP=U)
+# cause: ecall from U-mode
+# after mret    priv=U pc=0x00010078 mepc=0x00010078 mcause=0x00000008 mstatus=0x0088 (MIE=1 MPIE=1 MPP=U)
+
+# 2. A machine timer interrupt with vectored mtvec: the handler is at BASE + 4 * 7
+h = Hart(pc=0x00010080, mtvec=0x80000101)
+h.mie = h.mip = 1 << 7                                    # MTIE enabled, MTIP pending
+print('taken in U-mode:', h.interrupt_taken(7))
+h.trap(7, interrupt=True)
+show(h, 'timer entry')
+print('cause:', decode(h.mcause), '| taken again inside the handler:', h.interrupt_taken(7))
+# taken in U-mode: True
+# timer entry   priv=M pc=0x8000011c mepc=0x00010080 mcause=0x80000007 mstatus=0x0080 (MIE=0 MPIE=1 MPP=U)
+# cause: machine timer | taken again inside the handler: False
+
+# 3. A load page fault: mtval holds the faulting address, and an exception goes to BASE even in vectored mode
+h = Hart(pc=0x00400104, mtvec=0x80000101)
+h.trap(13, tval=0x10040000)
+show(h, 'page fault')
+print('cause:', decode(h.mcause), '| mtval:', hex(h.mtval))
+# page fault    priv=M pc=0x80000100 mepc=0x00400104 mcause=0x0000000d mstatus=0x0080 (MIE=0 MPIE=1 MPP=U)
+# cause: load page fault | mtval: 0x10040000
+```
+
+RARS 1.6 implements traps with the user-level CSRs of the N extension, a draft that let U-mode handle its own traps and that was removed from the privileged specification in version 1.12 ([RISC-V Privileged ISA](#references), preface). The registers mirror the machine-mode ones one level down: `ustatus` with UIE and UPIE, `utvec`, `uscratch`, `uepc`, `ucause`, `utval`, and the return instruction `uret`. In RARS a trap goes to the handler only if `ustatus.UIE` is set; otherwise the simulator stops with an error. The handler below records the cause and the faulting address of a load from address 0, which RARS reports as a load access fault (code 5), and skips the instruction. It is written with the base CSR instructions only, so it does not depend on the operand order of RARS's CSR pseudo-instructions.
+
+```asm
+# Not run here: runs in RARS 1.6 (no CSRs in the course's checker). Expected output: 5
+        .data
+save:   .space 12                   # handler save area: t1, ucause, utval
+        .text
+main:
+        la     t0, handler
+        csrrw  zero, utvec, t0      # handler address, direct mode
+        la     t0, save
+        csrrw  zero, uscratch, t0   # uscratch points to the save area
+        csrrsi zero, ustatus, 1     # UIE = 1: traps go to the handler instead of stopping RARS
+        lw     t1, 0(zero)          # address 0 is not mapped: load access fault, ucause = 5
+        la     t0, save
+        lw     a0, 4(t0)            # the cause recorded by the handler
+        li     a7, 1
+        ecall                       # print it
+        li     a7, 10
+        ecall
+handler:
+        csrrw  t0, uscratch, t0     # swap: t0 = save area, uscratch = the program's t0
+        sw     t1, 0(t0)            # free t1 as well
+        csrrs  t1, ucause, zero     # read the cause
+        sw     t1, 4(t0)
+        csrrs  t1, utval, zero      # read the faulting address (0 here)
+        sw     t1, 8(t0)
+        csrrs  t1, uepc, zero       # skip the faulting instruction: uepc += 4
+        addi   t1, t1, 4
+        csrrw  zero, uepc, t1
+        lw     t1, 0(t0)            # restore t1
+        csrrw  t0, uscratch, t0     # restore t0; uscratch points to the save area again
+        uret                        # pc = uepc, UIE = UPIE
+```
+
+The `csrrw t0, uscratch, t0` at the start and the end is the same swap as `csrrw sp, mscratch, sp` in the figure: it gives the handler one free register without losing any of the program's.
+
+## Next
+
+A trap lets a device interrupt the processor, but the interrupt only says "look at me". The [next note](/notes/acos/input-and-output) asks how the processor talks to the device at all: device registers that look like memory, waiting for a device by polling against waiting for its interrupt, with the cost of each in cycles, and direct memory access, which lets a device move a whole block into memory while the processor does something else.
+
+## References
+
+- A. Tatarnikov. *Computer Architecture and Operating Systems* (HSE), [lecture 11: exceptions and interrupts](https://andrewt0301.github.io/hse-acos-course/part1ca/11_Exceptions/lecture.html), with its workshop on CSRs and handlers in RARS.
+- [The RISC-V Instruction Set Manual, Volume I: Unprivileged ISA](https://github.com/riscv/riscv-isa-manual/releases/latest). RISC-V International. Section 1.6 (exceptions, traps and interrupts).
+- [The RISC-V Instruction Set Manual, Volume II: Privileged Architecture](https://github.com/riscv/riscv-isa-manual/releases/latest), version 1.12 and later. RISC-V International. Preface (removal of the N extension), Section 1.2 (privilege levels), Section 3.1 (machine-level CSRs: `mstatus`, `mtvec`, `medeleg` and `mideleg`, `mip` and `mie`, `mscratch`, `mepc`, `mcause`, `mtval`), Section 3.3 (`ecall`, `mret`).
+- D. A. Patterson, J. L. Hennessy. [*Computer Organization and Design RISC-V Edition*](https://shop.elsevier.com/books/computer-organization-and-design-risc-v-edition/patterson/978-0-12-820331-6), 2nd ed. Morgan Kaufmann, 2020. Section 4.10 (exceptions, and exceptions in a pipelined implementation).
+- R. E. Bryant, D. R. O'Hallaron. [*Computer Systems: A Programmer's Perspective*](https://csapp.cs.cmu.edu/), 3rd ed. Pearson, 2015. Section 8.1 (exceptions: interrupts, traps, faults and aborts).
+- R. H. Arpaci-Dusseau, A. C. Arpaci-Dusseau. [*Operating Systems: Three Easy Pieces*](https://pages.cs.wisc.edu/~remzi/OSTEP/cpu-mechanisms.pdf). Chapter 6 (limited direct execution: system calls, the trap table, timer interrupts).
+- J. E. Smith, A. R. Pleszkun. [Implementing precise interrupts in pipelined processors](https://doi.org/10.1109/12.4607). *IEEE Transactions on Computers*, 37(5):562–573, 1988.
+- [syscall(2)](https://man7.org/linux/man-pages/man2/syscall.2.html), Linux man-pages: the registers of the system-call convention on each architecture.
+- Linux kernel source, [`arch/riscv/kernel/traps.c`](https://github.com/torvalds/linux/blob/master/arch/riscv/kernel/traps.c), function `do_trap_ecall_u`; [OpenSBI](https://github.com/riscv-software-src/opensbi), `lib/sbi/sbi_hart.c` (the exceptions delegated to S-mode).
+- [RARS](https://github.com/TheThirdOne/rars), the RISC-V assembler and runtime simulator, version 1.6: `src/rars/simulator/Simulator.java` (trap and interrupt handling with the user-level CSRs).

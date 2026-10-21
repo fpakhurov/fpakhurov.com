@@ -1,0 +1,368 @@
+---
+title: Inter-process communication
+description: "How processes that share no memory exchange data and events through the kernel: pipes and FIFOs, signals and what a handler may safely do, shared memory guarded by a semaphore, message queues, and how to choose among them."
+course: acos
+section: Processes and Concurrency
+order: 24
+status: published
+tags: [ipc, pipe, fifo, dup2, signals, sigaction, async-signal-safety, shared-memory, shm-open, mmap, semaphore, message-queues]
+prerequisites: [Processes and threads, Synchronization, Virtual memory]
+---
+
+import PipeFlow from '../../../components/figures/inter-process-communication/PipeFlow.astro';
+import SharedMapping from '../../../components/figures/inter-process-communication/SharedMapping.astro';
+
+The [previous note](/notes/acos/synchronization) made threads that share one address space take turns with locks. Processes start from the opposite end. Each has a private address space, so no process can corrupt another's data, and for the same reason no process can simply hand another a value: there is no variable they both see. Every channel between processes therefore goes through the kernel, which owns the only resources that several processes can name. This note covers the classic channels on Unix: pipes and FIFOs for streams of bytes, signals for events, shared memory for bulk data with a semaphore to coordinate it, and message queues for discrete messages, and ends with how to choose among them.
+
+## Baseline: communicating through a file
+
+Two processes can already talk through the file system. A producer writes its results to `results.txt`; a consumer reads the file. It works, and it is how many batch pipelines pass data, but as a channel between running processes it fails in four ways:
+
+- **No end-of-message signal.** The consumer cannot tell whether the producer has finished writing or is halfway through a line; it must poll, and it may read a partial result.
+- **No waiting.** A consumer that finds the file empty can only sleep and try again, wasting time or adding delay.
+- **Names and cleanup.** Two runs that pick the same name overwrite each other, and a crashed producer leaves the file behind.
+- **Cost.** Every byte goes through the file system, and possibly to the disk, although it is needed only once, by one reader, a moment later.
+
+What the processes need is a channel that the kernel keeps in memory, that blocks a reader until data is there, that tells the reader when the writer is done, and that disappears when the processes do.
+
+<aside class="callout"><strong>Key idea.</strong> Processes share nothing by default, so every channel between them is an object in the kernel. Either the kernel copies the bytes from the sender's memory into its own buffer and out again into the receiver's (pipes, message queues and sockets), and then it can also make the receiver wait; or it maps the same physical pages into both address spaces (shared memory), which copies nothing and leaves all coordination to the processes.</aside>
+
+## Pipes
+
+`pipe(fd)` creates a buffer in the kernel and returns two file descriptors: `fd[0]` reads from the buffer and `fd[1]` writes to it ([Kerrisk, 2010](#references), chapter 44). Data comes out in the order it went in, as a stream of bytes. The kernel does the waiting: `read` on an empty pipe blocks until some data arrives, and `write` to a full pipe blocks until the reader has made room. When every write end is closed, `read` returns 0, the end of file. When every read end is closed, `write` fails with `EPIPE` and the kernel sends the writer the signal `SIGPIPE`, whose default action ends the process: that is why `yes | head -1` terminates.
+
+A pipe has no name, so it connects only processes that inherit its descriptors: a process creates the pipe and then forks, and the [processes note](/notes/acos/processes-and-threads) showed that `fork` copies the file table. To give the pipe one direction, each process closes the end it does not use.
+
+<PipeFlow />
+
+1. The parent calls `pipe(fd)`. The kernel creates the buffer; the parent gets descriptors 3 (read end) and 4 (write end).
+2. The parent forks. The child's file table is a copy, so both processes now hold both ends.
+3. The child closes the write end, uses `dup2(3, 0)` to make the read end its standard input, closes 3, and executes `tr a-z A-Z`. The parent closes the read end.
+4. The parent writes `bytes through a pipe\n`. The kernel copies the 21 bytes into its buffer; `tr` reads them from descriptor 0 as it would read a terminal, and prints `BYTES THROUGH A PIPE`.
+5. The parent closes the write end. It was the last one open, so `tr`'s next `read` returns 0, and `tr` exits.
+
+Closing the unused ends is not housekeeping. If the child kept its own copy of the write end, the pipe would never lose its last writer, `tr` would wait for input forever, and so would the parent in `waitpid`.
+
+This is how a shell runs `ls | wc -l`: it creates a pipe, forks twice, makes the write end the standard output of the child that executes `ls` and the read end the standard input of the child that executes `wc`, and closes both ends in itself. Neither program knows that it talks to the other.
+
+**How much a pipe holds.** On the Apple M1 used here (macOS 26), a writer that never reads could put 65,536 bytes into a pipe before a non-blocking `write` failed with `EAGAIN` (the Code section). Linux gives a pipe 16 pages, 65,536 bytes with 4 KiB pages, by default ([pipe(7)](#references)). Programs must not rely on either number: a writer simply blocks while the pipe is full. A related guarantee does matter. A write of at most `PIPE_BUF` bytes is atomic: when several processes write into one pipe, such a write is never interleaved with the bytes of another. POSIX requires `PIPE_BUF` to be at least 512; it is 512 on macOS and 4,096 on Linux.
+
+**A stream, not messages.** Two writes of 10 bytes may be read as one read of 20, and a write of 100 may arrive in two reads of 50. A program that sends records over a pipe must mark their boundaries itself: a newline after each line, or a length before each record.
+
+### FIFOs: pipes with a name
+
+A **FIFO**, or named pipe, is a pipe with an entry in the file system. `mkfifo("/tmp/jobs", 0600)` creates it; afterwards any process with permission can `open` it, one for reading and another for writing, without being related. Opening a FIFO for reading blocks until some process opens it for writing, and the other way round, which makes the two processes meet. The data never touches the disk: the name is just a way to find the kernel's buffer. In a shell, `mkfifo /tmp/f; wc -c < /tmp/f & ls > /tmp/f` connects two programs that were started separately.
+
+## Signals
+
+A **signal** is a notification that the kernel delivers to a process asynchronously, at whatever instruction the process happens to be executing ([Kerrisk, 2010](#references), chapters 20–22; [Bryant and O'Hallaron, 2016](#references), §8.5). It carries no data beyond its number. Signals come from three places:
+
+- **Other processes**, through `kill(pid, sig)` (and the `kill` command): `SIGTERM` asks a process to terminate, `SIGKILL` forces it, `SIGUSR1` and `SIGUSR2` mean whatever the program decides.
+- **The terminal**: Ctrl-C sends `SIGINT`, Ctrl-Z `SIGTSTP`.
+- **The kernel itself**: `SIGSEGV` for an invalid memory access and `SIGFPE` for an arithmetic error, each the user-visible end of an [exception](/notes/acos/exceptions-and-interrupts); `SIGCHLD` when a child exits; `SIGPIPE` for a write to a pipe with no reader.
+
+Each signal has a default action: terminate the process (most of them), terminate and write a core dump (`SIGSEGV`, `SIGQUIT`), ignore (`SIGCHLD`), stop (`SIGTSTP`, `SIGSTOP`) or continue (`SIGCONT`). A process can replace the action with **ignore** or with a **handler**, a function the kernel calls when the signal arrives, except for `SIGKILL` and `SIGSTOP`, which always take effect.
+
+**How a handler runs.** A signal sent to a process is first marked *pending* in its PCB. When the process next returns from the kernel to user mode, after a system call, an interrupt or a time slice, the kernel checks for pending signals that are not *blocked*. For each one with a handler it saves the process's registers on the user stack, arranges for execution to continue at the handler, and makes the handler's return enter the kernel through `sigreturn`, which restores the saved registers. The interrupted code then continues as if nothing had happened. A system call that was blocked when the signal arrived, such as a `read` on an empty pipe, returns $-1$ with `errno` set to `EINTR` unless the handler was installed with `SA_RESTART`.
+
+**Install handlers with `sigaction`**, which states exactly what happens; the older `signal` function behaves differently between systems. `sigprocmask` blocks and unblocks signals: a blocked signal stays pending until it is unblocked. Standard signals are not queued: pending is a single bit per signal. In the Code section a process blocks `SIGUSR1`, sends it to itself three times, and unblocks it; the handler runs once.
+
+**Async-signal safety.** A handler can interrupt the main program at any instruction, including in the middle of `malloc` updating its free list or `printf` filling its buffer. If the handler then calls `malloc` or `printf` itself, it works on a data structure that is half updated, and the program can crash or deadlock on a lock that the interrupted code holds. POSIX therefore lists the functions that are **async-signal-safe**, safe to call from a handler: `write`, `read`, `_exit`, `kill`, `sigaction` and others, but not `printf`, `malloc` or `exit` ([signal-safety(7)](#references)). The usual pattern does almost nothing in the handler: it sets a flag of type `volatile sig_atomic_t`, which can be written in one step, and the main loop checks the flag and does the real work.
+
+```c
+static volatile sig_atomic_t stop = 0;
+static void on_term(int sig) { (void)sig; stop = 1; }     /* only set the flag */
+/* main loop: while (!stop) { serve_one_request(); }  then clean up and exit */
+```
+
+## Shared memory
+
+A pipe copies every byte twice: `write` copies it from the sender's buffer into the kernel, `read` copies it from the kernel into the receiver's buffer. For large data, such as video frames or a database's cache, those copies dominate. **Shared memory** removes them: the kernel maps the same physical pages into two address spaces, and a store by one process is visible to a load by the other ([Kerrisk, 2010](#references), chapter 54).
+
+The POSIX interface uses the same calls as files and [memory-mapped files](/notes/acos/files-and-io):
+
+1. `int fd = shm_open("/acos-demo", O_CREAT | O_RDWR, 0600)` creates or opens a shared-memory object by name.
+2. `ftruncate(fd, size)` sets its size; a new object is empty.
+3. `void *p = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0)` maps it. `MAP_SHARED` is what makes stores visible to other processes; with `MAP_PRIVATE` each process would get copy-on-write pages of its own.
+4. `close(fd)`; the mapping stays valid. `munmap` removes the mapping, and `shm_unlink` removes the name. The object itself disappears when the name is gone and no process maps it.
+
+Another process that opens the same name and maps it sees the same bytes. Related processes can skip the name: an anonymous mapping created with `MAP_SHARED | MAP_ANONYMOUS` before `fork` is shared by parent and child.
+
+<SharedMapping />
+
+The two mappings usually start at different virtual addresses, since each process's `mmap` picks a free range in its own address space. A pointer stored in the shared region by one process is therefore meaningless to the other; shared data structures store offsets from the start of the region instead.
+
+**Shared memory needs synchronization.** The kernel does nothing after the mapping is set up: no copying, but also no waiting and no mutual exclusion. Two processes that increment a shared counter race exactly as the threads of the previous note did, and a reader can see a record that the writer has half written. A **named semaphore** coordinates them: `sem_open("/acos-lock", O_CREAT, 0600, 1)` gives every process that opens the same name the same semaphore. In the Code section a parent and a child each increment a counter in shared memory 100,000 times under a semaphore initialized to 1, used as a lock, and the total is exactly 200,000; a second semaphore, initialized to 0, lets the child tell the parent that a message is ready, so the parent sleeps in `sem_wait` instead of polling. (A process-shared mutex, `pthread_mutexattr_setpshared` with `PTHREAD_PROCESS_SHARED`, placed in the shared region, does the same job where it is supported.)
+
+## Message queues
+
+A **message queue** keeps discrete messages instead of a byte stream: each `send` adds one message, each `receive` removes one whole message, and the boundaries are preserved. POSIX message queues ([Kerrisk, 2010](#references), chapter 52) are opened by name with `mq_open`, and every message carries a priority: `mq_receive` returns the oldest message of the highest priority ([mq_receive(3)](#references)). On Linux a queue created without attributes holds at most 10 messages of up to 8,192 bytes each ([mq_overview(7)](#references)); a sender blocks when the queue is full and a receiver when it is empty.
+
+```c
+/* POSIX message queues. Linux only (macOS has no <mqueue.h>); run in a Debian 13 container, glibc 2.41, arm64.
+   Compile with -lrt on older glibc. */
+#include <fcntl.h>
+#include <mqueue.h>
+#include <stdio.h>
+#include <string.h>
+
+int main(void) {
+    struct mq_attr attr = { .mq_maxmsg = 10, .mq_msgsize = 64 };
+    mqd_t q = mq_open("/acos-q", O_CREAT | O_RDWR, 0600, &attr);
+    mq_send(q, "low",  strlen("low") + 1, 1);
+    mq_send(q, "high", strlen("high") + 1, 7);
+    mq_send(q, "mid",  strlen("mid") + 1, 4);
+    char buf[64]; unsigned prio;
+    for (int i = 0; i < 3; i++) {
+        mq_receive(q, buf, sizeof buf, &prio);      /* the oldest message of the highest priority */
+        printf("%s (%u)\n", buf, prio);             /* high (7), mid (4), low (1) */
+    }
+    mq_close(q);
+    mq_unlink("/acos-q");
+    return 0;
+}
+```
+
+The older System V interface (`msgget`, `msgsnd`, `msgrcv`) exists on both Linux and macOS ([Kerrisk, 2010](#references), chapter 46). Its messages carry a positive *type* instead of a priority, and a receiver can ask for the first message of a given type, so several kinds of request can share one queue. The runnable example in the Code section uses it. Its objects are identified by numeric keys rather than names and outlive the processes until they are removed explicitly, which makes them easy to leak.
+
+## Choosing among them
+
+| Channel | Data | Boundaries | Who can use it | Waiting built in | Copies per byte |
+| --- | --- | --- | --- | --- | --- |
+| Pipe | bytes, one direction | none | related processes (inherited descriptors) | yes | 2 |
+| FIFO | bytes, one direction | none | any process that can open the path | yes | 2 |
+| Signal | a number | one event | any process with permission to `kill` | handler runs asynchronously | — |
+| Shared memory | anything | defined by the processes | any process that can open the name | no: add a semaphore | 0 |
+| Message queue | messages | preserved | any process that can open the name | yes | 2 |
+| Socket | bytes or datagrams | depends on the type | processes on this or another machine | yes | 2 |
+
+Some rules of thumb follow from the table. A pipe is the default for a stream from one process to another, and the shell builds pipelines out of nothing else. Signals are for events, not data: stop, reload the configuration, a child has exited. Shared memory is for large data that several processes read and update in place, and only with a synchronization protocol designed together with the data layout. Message queues suit requests and replies of moderate size where each message matters on its own. And when the processes may run on different machines, or the program should be ready for that, [sockets](/notes/acos/sockets) offer the same `read`/`write` interface over a network.
+
+<aside class="callout"><strong>Check yourself.</strong> (1) A parent creates a pipe, forks, writes three lines and closes its write end, but forgets to close the read end. Does the child that reads the pipe ever see end of file? And if instead the child forgets to close its own write end? (2) A handler for <code>SIGINT</code> calls <code>printf("bye\n")</code> and <code>exit(0)</code>. What can go wrong? (3) Two processes share a structure through <code>shm_open</code>, and one stores a pointer to another field of it. Why does the other process crash when it follows the pointer?<details><summary>Answers</summary>(1) Yes: end of file needs every write end closed, and the parent closed its write end; a forgotten read end only means that a writer never gets <code>SIGPIPE</code>. In the second case no: the child itself still holds a write end, so its <code>read</code> blocks forever after the data is consumed. (2) If the signal arrives while the main program is inside <code>printf</code> or <code>malloc</code>, the handler re-enters the same buffer or lock; neither function is async-signal-safe, and <code>exit</code> flushes stdio buffers too. Use <code>write</code> and <code>_exit</code>, or set a flag. (3) The region is mapped at different virtual addresses in the two processes, so the stored address points somewhere else, often to unmapped memory. Store offsets from the start of the region.</details></aside>
+
+## What changed
+
+| | Communicating through a file | Kernel channels |
+| --- | --- | --- |
+| Where the data lives | the file system, possibly the disk | a kernel buffer, or pages mapped into both processes |
+| Waiting for data | polling | `read` and `mq_receive` block; a semaphore for shared memory |
+| End of data | unknown | end of file when the last writer closes |
+| Events | none | signals |
+| Cleanup | files left behind | pipes vanish with the processes; named objects need `unlink` |
+| Copies | write and read through the page cache | 2 for pipes and queues, 0 for shared memory |
+
+## Limitations
+
+- **Pipes and FIFOs carry bytes without structure.** The processes must agree on a framing, and a FIFO with several writers interleaves anything longer than `PIPE_BUF`.
+- **Signals are coarse and fragile.** One bit per standard signal, no data, handlers restricted to async-signal-safe calls, and system calls interrupted with `EINTR`.
+- **Shared memory puts correctness on the programmer.** It needs a synchronization protocol, offsets instead of pointers, and care when a process dies while holding the lock.
+- **Named objects persist.** A crashed program leaves shared-memory objects, semaphores and System V queues behind until they are unlinked or the machine reboots.
+- **Portability.** macOS lacks POSIX message queues and unnamed semaphores; System V queues behave slightly differently between systems.
+
+## What you should remember
+
+- Processes share nothing, so they communicate through kernel objects: buffers that the kernel copies through, or pages it maps into both.
+- `pipe` returns a read end and a write end; after `fork` each process closes the end it does not use. `read` returns 0 only when every write end is closed; a write with no reader raises `SIGPIPE`.
+- A shell pipeline is `pipe`, `fork`, `dup2` onto descriptors 0 and 1, and `exec`. A FIFO is a pipe with a name for unrelated processes.
+- A pipe is a byte stream; writes up to `PIPE_BUF` bytes are atomic. Capacity is 64 KiB on the macOS machine here and by default on Linux, but programs should not rely on it.
+- A signal is an asynchronous event with a default action; `sigaction` installs a handler, `sigprocmask` blocks. Standard signals do not queue. A handler may call only async-signal-safe functions: set a `volatile sig_atomic_t` flag.
+- Shared memory (`shm_open`, `ftruncate`, `mmap` with `MAP_SHARED`) avoids copies and needs a semaphore or a process-shared mutex.
+- Message queues preserve message boundaries; POSIX queues add priorities and exist on Linux, System V queues on both systems.
+
+## Code
+
+A pipe from a parent to a child that runs `tr`, then the capacity of a pipe. Compile and run with `clang -std=c17 -Wall -Wextra -O0 pipe.c -o pipe && ./pipe`:
+
+```c
+#include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+int main(void) {
+    /* 1. parent | tr a-z A-Z: the parent writes, a child running tr reads */
+    int fd[2];
+    if (pipe(fd) < 0) { perror("pipe"); return 1; }  /* fd[0] is the read end, fd[1] the write end */
+    pid_t pid = fork();
+    if (pid == 0) {
+        close(fd[1]);                                /* the reader keeps only the read end */
+        dup2(fd[0], STDIN_FILENO);                   /* tr reads its stdin from the pipe */
+        close(fd[0]);
+        execlp("tr", "tr", "a-z", "A-Z", (char *)NULL);
+        _exit(127);
+    }
+    close(fd[0]);                                    /* the writer keeps only the write end */
+    const char *msg = "bytes through a pipe\n";
+    write(fd[1], msg, strlen(msg));
+    close(fd[1]);                                    /* last write end closed: tr sees end of file */
+    waitpid(pid, NULL, 0);
+
+    /* 2. how much a pipe holds before a writer would block */
+    pipe(fd);
+    fcntl(fd[1], F_SETFL, O_NONBLOCK);               /* fail with EAGAIN instead of blocking */
+    char page[4096] = {0};
+    long total = 0;
+    ssize_t n;
+    while ((n = write(fd[1], page, sizeof page)) > 0) total += n;
+    printf("capacity: %ld bytes (%s)\n", total, errno == EAGAIN ? "then EAGAIN" : strerror(errno));
+    return 0;
+}
+/* Output (the capacity on macOS 26, Apple M1; Linux also gives 65536 by default):
+BYTES THROUGH A PIPE
+capacity: 65536 bytes (then EAGAIN)
+*/
+```
+
+Signals: a handler installed with `sigaction`, three signals sent while blocked, and a child terminated by `SIGTERM`:
+
+```c
+#include <signal.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+static volatile sig_atomic_t hits = 0;
+
+static void on_usr1(int sig) {
+    (void)sig;
+    hits++;                                          /* only async-signal-safe work here */
+    write(STDOUT_FILENO, "  handler ran\n", 14);     /* write is async-signal-safe; printf is not */
+}
+
+int main(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = on_usr1;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGUSR1, &sa, NULL);
+
+    sigset_t block, old;
+    sigemptyset(&block);
+    sigaddset(&block, SIGUSR1);
+    sigprocmask(SIG_BLOCK, &block, &old);            /* hold SIGUSR1 pending */
+    for (int i = 0; i < 3; i++) kill(getpid(), SIGUSR1);
+    printf("sent 3 while blocked, hits=%d\n", (int)hits);
+    fflush(stdout);
+    sigprocmask(SIG_SETMASK, &old, NULL);            /* unblock: the pending signal is delivered */
+    printf("after unblocking, hits=%d (standard signals do not queue)\n", (int)hits);
+
+    pid_t child = fork();
+    if (child == 0) { pause(); _exit(0); }           /* sleeps until a signal arrives */
+    sleep(1);
+    kill(child, SIGTERM);                            /* no handler in the child: default action, terminate */
+    int status;
+    waitpid(child, &status, 0);
+    printf("child terminated by SIGTERM: %s\n", WIFSIGNALED(status) && WTERMSIG(status) == SIGTERM ? "yes" : "no");
+    return 0;
+}
+/* Output:
+sent 3 while blocked, hits=0
+  handler ran
+after unblocking, hits=1 (standard signals do not queue)
+child terminated by SIGTERM: yes
+*/
+```
+
+Shared memory between a parent and a child, with one named semaphore as a lock and another as a signal:
+
+```c
+#include <fcntl.h>
+#include <semaphore.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+struct shared { long counter; char text[64]; };      /* the layout both processes agree on */
+#define N 100000
+
+int main(void) {
+    int fd = shm_open("/acos-demo", O_CREAT | O_RDWR, 0600);
+    if (fd < 0) { perror("shm_open"); return 1; }
+    ftruncate(fd, sizeof(struct shared));            /* a new object has size 0 */
+    struct shared *s = mmap(NULL, sizeof *s, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    close(fd);                                       /* the mapping stays valid */
+    memset(s, 0, sizeof *s);
+
+    sem_t *lock = sem_open("/acos-lock", O_CREAT, 0600, 1);   /* 1: a binary semaphore used as a lock */
+    sem_t *ready = sem_open("/acos-ready", O_CREAT, 0600, 0); /* 0: nothing posted yet */
+    if (lock == SEM_FAILED || ready == SEM_FAILED) { perror("sem_open"); return 1; }
+
+    pid_t pid = fork();
+    for (int i = 0; i < N; i++) {                    /* parent and child both run this loop */
+        sem_wait(lock);
+        s->counter++;
+        sem_post(lock);
+    }
+    if (pid == 0) {
+        snprintf(s->text, sizeof s->text, "hello from the child");
+        sem_post(ready);                             /* tell the parent the text is there */
+        _exit(0);
+    }
+    sem_wait(ready);                                 /* sleeps until the child posts */
+    printf("text: %s\n", s->text);
+    waitpid(pid, NULL, 0);
+    printf("counter=%ld (expected %d)\n", s->counter, 2 * N);
+
+    munmap(s, sizeof *s);
+    shm_unlink("/acos-demo");                        /* remove the names; the objects go when unused */
+    sem_close(lock); sem_close(ready);
+    sem_unlink("/acos-lock"); sem_unlink("/acos-ready");
+    return 0;
+}
+/* Output:
+text: hello from the child
+counter=200000 (expected 200000)
+*/
+```
+
+A System V message queue, which runs on both Linux and macOS: messages keep their boundaries, and a receiver can pick a message by type:
+
+```c
+#include <stdio.h>
+#include <string.h>
+#include <sys/ipc.h>
+#include <sys/msg.h>
+
+struct note { long type; char text[32]; };          /* the type must be positive */
+
+int main(void) {
+    int q = msgget(IPC_PRIVATE, IPC_CREAT | 0600);   /* a new queue, known only to this process tree */
+    if (q < 0) { perror("msgget"); return 1; }
+    const char *texts[] = {"job 1", "status?", "job 2"};
+    long types[] = {1, 2, 1};                        /* 1 = job, 2 = query */
+    for (int i = 0; i < 3; i++) {
+        struct note m = { types[i], "" };
+        strcpy(m.text, texts[i]);
+        msgsnd(q, &m, strlen(m.text) + 1, 0);
+    }
+    struct note m;
+    msgrcv(q, &m, sizeof m.text, 2, 0);              /* the first message of type 2, ahead of the jobs */
+    printf("type %ld: %s\n", m.type, m.text);
+    while (msgrcv(q, &m, sizeof m.text, 0, IPC_NOWAIT) >= 0)   /* type 0: the oldest message */
+        printf("type %ld: %s\n", m.type, m.text);
+    msgctl(q, IPC_RMID, NULL);                       /* System V queues persist until removed */
+    return 0;
+}
+/* Output:
+type 2: status?
+type 1: job 1
+type 1: job 2
+*/
+```
+
+## Next
+
+Every channel in this note lives only as long as the processes and the kernel that hold it: a pipe vanishes when its last descriptor is closed, and shared memory when it is unlinked and unmapped. The pipe, though, already looked like a file: a small integer passed to `read` and `write`. The [next note](/notes/acos/files-and-io) turns to real files, data that outlives the program that wrote it: what a descriptor refers to inside the kernel, why buffering matters, and how a file system finds the bytes of a file by its name.
+
+## References
+
+- M. Kerrisk. [*The Linux Programming Interface*](https://man7.org/tlpi/). No Starch Press, 2010. Chapters 20–22 (signals), 43 (overview of inter-process communication), 44 (pipes and FIFOs), 46 (System V message queues), 52 (POSIX message queues), 53 (POSIX semaphores), 54 (POSIX shared memory).
+- R. E. Bryant, D. R. O'Hallaron. [*Computer Systems: A Programmer's Perspective*](https://csapp.cs.cmu.edu/), 3rd ed. Pearson, 2016. §8.5 (signals, safe signal handling), §10.9 (I/O redirection with `dup2`).
+- A. S. Tanenbaum, H. Bos. *Modern Operating Systems*, 4th ed. Pearson, 2015. §2.3 (interprocess communication).
+- Linux manual pages: [pipe(7)](https://man7.org/linux/man-pages/man7/pipe.7.html) (capacity, `PIPE_BUF`), [signal-safety(7)](https://man7.org/linux/man-pages/man7/signal-safety.7.html), [mq_overview(7)](https://man7.org/linux/man-pages/man7/mq_overview.7.html), [mq_receive(3)](https://man7.org/linux/man-pages/man3/mq_receive.3.html), [shm_overview(7)](https://man7.org/linux/man-pages/man7/shm_overview.7.html).
+- A. Tatarnikov. *Computer Architecture and Operating Systems* (HSE), [lecture 9: inter-process communication](https://andrewt0301.github.io/hse-acos-course/part2os/09_IPC/lecture.html), and the pipe example of [lecture 6](https://andrewt0301.github.io/hse-acos-course/part2os/06_Processes/lecture.html).
