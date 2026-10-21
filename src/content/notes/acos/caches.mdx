@@ -1,0 +1,401 @@
+---
+title: Caches
+description: "Why a small fast memory in front of DRAM hides most of its latency: locality, how a cache splits an address into tag, index and offset, associativity, replacement and write policies, the three kinds of misses, average access time, and cache-friendly loops."
+course: acos
+section: Memory Hierarchy
+order: 7
+status: published
+tags: [caches, memory-hierarchy, locality, associativity, lru, write-back, amat, blocking]
+prerequisites: ["Branches, loops and memory access", "Procedures, the stack and calling conventions"]
+---
+
+import CacheLookup from '../../../components/figures/caches/CacheLookup.astro';
+import MissRate from '../../../components/figures/caches/MissRate.astro';
+
+The [previous note](/notes/acos/procedures-and-the-stack) completed the picture of a program in RISC-V: values in use sit in 32 registers, and everything else, arrays, strings and the stack frames of procedures, lives in memory and is reached with loads and stores. Those notes treated memory as one long array of bytes in which every address costs the same. Real memory does not behave like that. A register is read within the instruction that uses it, while a load that has to go all the way to the DRAM chips waits for a hundred cycles or more. This note explains how processors hide most of that wait with **caches**, small fast memories that keep copies of recently used data, and what a program can do to help them.
+
+**Notation.** Addresses have $m$ bits. A cache stores data in **blocks** (also called *lines*) of $B = 2^b$ bytes, arranged in $S = 2^s$ **sets** of $E$ blocks each; $E$ is the **associativity**, the number of **ways**. The capacity is $C = S \cdot E \cdot B$ bytes, and an address splits into $t = m - s - b$ tag bits, $s$ index bits and $b$ offset bits. For performance, $T_{\text{hit}}$ is the hit time, $M$ the miss rate (misses per access) and $P$ the miss penalty, the extra time a miss costs.
+
+## Baseline: every load goes to DRAM
+
+The simplest memory system connects the processor straight to main memory, which is built from DRAM chips. Every instruction fetch, every `lw` and every `sw` is a request to DRAM. This works, and it is how early microprocessors ran: in 1985 a DRAM access took about 200 ns and a cycle of an Intel 80286 about 166 ns, so an access cost about one cycle ([Bryant and O'Hallaron](#references), §6.1.4).
+
+It stops working when processors become faster than memory. By 2015 the cycle time of a Core i7 had fallen to 0.33 ns, 500 times shorter than in 1985, while the DRAM access time had fallen 10 times, to 20 ns (same table). One access now lasted about 60 cycles of the chip's own latency, and a miss that goes through the memory controller to DRAM costs 50–200 cycles ([Bryant and O'Hallaron, lecture slides](#references)). A loop that loads one value every few instructions would spend almost all of its time waiting. [Wulf and McKee (1995)](#references) named this widening gap the **memory wall**: as long as processor speed grows faster than memory speed, memory accesses eventually decide how fast programs run.
+
+## How far away is memory?
+
+Every level of storage trades size for speed. Typical latencies, for the Intel Core i7 described by [Bryant and O'Hallaron](#references) and for flash memory:
+
+| Level | Typical size | Latency | Managed by |
+| --- | --- | --- | --- |
+| Registers | 32 registers of 4 or 8 bytes | 0 cycles: read within the instruction | the compiler |
+| L1 cache | 32 KiB per core | 4 cycles | hardware |
+| L2 cache | 256 KiB per core | 10 cycles | hardware |
+| L3 cache | 8 MiB, shared by the cores | 40–75 cycles | hardware |
+| Main memory (DRAM) | gigabytes | 50–200 cycles | hardware and operating system |
+| Flash (SSD) | terabytes | 25–75 µs to read a page, about $10^5$ cycles at 3 GHz | operating system |
+
+The cache figures are those of the Core i7 in [Bryant and O'Hallaron](#references) (§6.4.6 and the lecture slides); the flash figure is the raw read time of one flash page, 25 µs for chips storing one bit per cell and about 75 µs for three bits per cell ([Arpaci-Dusseau and Arpaci-Dusseau](#references), Fig. 44.2), before any software overhead. These values vary between processors and generations and are only orders of magnitude. The Apple M1 on which the timings of this note were taken reports (through `sysctl`) a 128 KiB L1 data cache per performance core, a 12 MiB L2 cache shared by its four performance cores and 128-byte lines, where the Core i7 above has 32 KiB, 256 KiB per core and 64-byte blocks. The pattern is what matters: each level is several times slower than the one above it and many times larger.
+
+## Locality: why a small memory is enough
+
+A small memory can stand in for a large one only if a program does not use its data uniformly. Programs do not, in two ways ([Bryant and O'Hallaron](#references), §6.2):
+
+- **Temporal locality**: a location used now is likely to be used again soon. Loop counters, accumulators, the instructions of a loop body and the top of the stack are used over and over.
+- **Spatial locality**: when a location is used, nearby locations are likely to be used soon. Arrays are walked element by element, instructions are fetched one after another, and the fields of a structure sit side by side.
+
+**Worked example.** Summing an array of 1,024 ints, `for (i = 0; i < 1024; i++) sum += a[i];`. The counter `i` and the sum `sum` live in registers, and the four or five instructions of the loop body are fetched 1,024 times each: temporal locality. The array is 4 KiB, read in address order. If memory is moved in 64-byte blocks, each block holds 16 ints, so the first access to a block misses and the next 15 hit: 64 misses for 1,024 loads, a hit rate of $15/16 = 93.75\,\%$, without any element being read twice. That is spatial locality.
+
+<aside class="callout"><strong>Key idea.</strong> Keep copies of recently used blocks in a small, fast memory next to the processor. Look up every access there first, and go to the slower level only on a miss; when you do, bring in the whole block around the address, because its neighbours are likely to be needed next. Locality makes most accesses hits, so the average access costs close to the fast memory's time while the capacity is that of the slow one. Stacking several such levels gives the memory hierarchy.</aside>
+
+## How a cache finds a block
+
+### Blocks, sets and ways
+
+Memory is divided into blocks of $B$ bytes; the block that holds address $a$ has number $\lfloor a / B \rfloor$. A cache holds $C / B$ blocks. Next to each stored block it keeps a **valid bit** $V$, which says whether the slot holds anything, and a **tag**, which says which memory block it holds. The block number decides where a block may be placed: in set $\lfloor a/B \rfloor \bmod S$, in any of that set's $E$ ways. The choice of $E$ gives three organizations ([Patterson and Hennessy](#references), §5.3–5.4):
+
+- **direct-mapped**: $E = 1$, so every block has exactly one possible place;
+- **$E$-way set-associative**: $1 < E < C/B$, so a block can go into any of $E$ places in its set;
+- **fully associative**: $S = 1$, so a block can go anywhere, and a lookup must check every tag.
+
+### Splitting an address: tag, index and offset
+
+Because $B$ and $S$ are powers of two, dividing and taking remainders are just bit fields of the address. The low $b$ bits are the **offset** of the byte inside its block, the next $s$ bits are the **index** of the set, and the remaining $t = m - s - b$ high bits are the **tag**:
+
+$$
+\boxed{\;\text{offset} = a \bmod 2^b, \qquad \text{index} = \left\lfloor a / 2^b \right\rfloor \bmod 2^s, \qquad \text{tag} = \left\lfloor a / 2^{b+s} \right\rfloor .\;}
+$$
+
+The index is not stored: every block in set 47 has index 47. The tag together with the index identifies the block, so the tag is all that needs to be stored and compared.
+
+**Worked example.** A 16 KiB, 4-way set-associative cache with 64-byte blocks and 32-bit addresses has $S = 16384 / (4 \cdot 64) = 64$ sets, so $b = 6$, $s = 6$ and $t = 32 - 6 - 6 = 20$. Take the load address `0x1234ABCC`. Its low 12 bits are `0xBCC` $= 1011\,1100\,1100_2$:
+
+- offset: the low 6 bits, $001100_2 = 12$;
+- index: the next 6 bits, $101111_2 = 47$;
+- tag: the remaining 20 bits, `0x1234A`.
+
+The 32 KiB, 8-way L1 cache of the Core i7 above also has $32768 / (8 \cdot 64) = 64$ sets of 64-byte blocks, so it splits addresses at the same places and differs only in having 8 ways.
+
+<CacheLookup />
+
+1. The address is split into its three fields.
+2. The index selects one set, and all of its ways are read out at once.
+3. Each way's stored tag is compared with the address tag, all in parallel; a match counts only if the way's valid bit is 1.
+4. One way matches, so the access is a **hit**, and a multiplexer passes that way's block.
+5. The offset selects the requested bytes inside the block: bytes 12–15, the word that `lw` writes to its register.
+
+If no way matches, the access is a **miss**: the cache asks the next level for the whole 64-byte block, places it in one of the four ways of set 47 (the next section says which), sets $V = 1$ and the tag, and then completes the load as in steps 4 and 5.
+
+### Why not always direct-mapped, or always fully associative?
+
+For the same 16 KiB of data in 64-byte blocks (256 blocks) and 32-bit addresses, the three organizations differ in what a lookup needs:
+
+| | Direct-mapped | 4-way | Fully associative |
+| --- | --- | --- | --- |
+| Sets $S$ | 256 | 64 | 1 |
+| Index bits $s$ | 8 | 6 | 0 |
+| Tag bits $t$ | 18 | 20 | 26 |
+| Tag comparisons per lookup | 1 | 4 | 256 |
+| Tag storage, $256 \cdot t$ | 4,608 bits | 5,120 bits | 6,656 bits |
+
+A direct-mapped cache is the simplest and fastest: one comparison, and the data can be read before the comparison finishes. Its weakness is that two blocks with the same index evict each other even when the rest of the cache is empty. **Worked example.** Computing `s += a[k] * b[k]` over two int arrays of 1,024 elements that lie exactly 16 KiB apart: `a[k]` and `b[k]` have the same index in a 16 KiB direct-mapped cache, so each load evicts the block the next one needs, and all 2,048 loads miss. A 2-way cache of the same size keeps both blocks in one set and misses only on the first touch of each block, 128 times (64 blocks per array); the Code section runs both. A fully associative cache never suffers this, but it needs a comparator per block, which is affordable only for small structures, such as the translation buffers of the next note. Real caches sit in between: in the Core i7 above, the L1 and L2 caches are 8-way and the L3 cache 16-way.
+
+## Which block to evict: replacement
+
+On a miss in a set whose ways are all valid, one block must go. A direct-mapped cache has no choice. With $E > 1$ ways the usual policy is **least recently used (LRU)**: evict the way whose last access is the oldest, betting on temporal locality.
+
+**Worked example.** One set of a 2-way cache, and blocks A, B and C that all map to it, accessed in the order A, B, A, C, A, B:
+
+| Access | A | B | A | C | A | B |
+| --- | --- | --- | --- | --- | --- | --- |
+| Result | miss | miss | hit | miss, evict B | hit | miss, evict C |
+| Set afterwards, oldest first | A | A, B | B, A | A, C | C, A | A, B |
+
+When C arrives, A was used more recently than B, so LRU keeps A and gets a hit on the next access. A first-in-first-out policy would evict A, the older arrival, and miss on it. Exact LRU must track the order of the $E$ ways, one of $E!$ orderings per set: 5 bits for 4 ways, 16 bits for 8 ways. Hardware for high associativity therefore approximates it, or picks a victim at random, which costs little in miss rate for large caches ([Patterson and Hennessy](#references), §5.8).
+
+## What happens on a write?
+
+A store changes data, and the cache must decide when the next level learns about it ([Bryant and O'Hallaron](#references), §6.4.5):
+
+- **Write-through**: every store updates both the cache and the next level. The next level is always up to date, but every store costs traffic; a small write buffer lets the processor continue without waiting.
+- **Write-back**: a store updates only the cache and sets the block's **dirty bit**. The block is written to the next level once, when it is evicted, and only if it is dirty.
+
+And on a store that misses:
+
+- **Write-allocate**: bring the block into the cache, then write it, betting that nearby data will be written again soon.
+- **No-write-allocate**: send the write to the next level and leave the cache alone.
+
+The usual pairs are write-back with write-allocate, common in today's caches and especially at the lower levels, and write-through with no-write-allocate.
+
+**Worked example.** A loop increments a counter in memory 1,000 times (`lw`, `addi`, `sw` on the same word). Every access after the first is a hit. With write-through, each `sw` also writes 4 bytes to the next level: 1,000 writes, 4,000 bytes. With write-back, the next level sees one 64-byte block, once, when the block is finally evicted. The price of write-back is that the next level can hold stale data, which matters when another core or a device reads memory directly; keeping copies consistent is the subject of [cache coherence](/notes/acos/thread-level-parallelism).
+
+## Why misses happen: the three Cs
+
+Every miss falls into one of three kinds ([Hill and Smith, 1989](#references); [Patterson and Hennessy](#references), §5.8), defined by comparing the real cache with two idealized ones:
+
+- **Compulsory** (or cold) misses: the first access to a block. An infinite cache would still have them.
+- **Capacity** misses: the blocks the program is actively using do not fit. These are the misses of a fully associative LRU cache of the same size, minus the compulsory ones.
+- **Conflict** misses: too many active blocks map to the same set, although other sets have room. These are the misses of the real cache beyond those of the fully associative one.
+
+The classification says which remedy helps: larger blocks reduce compulsory misses (fewer blocks to bring in, but each costs more to fetch); a larger cache reduces capacity misses, at a longer hit time; more ways reduce conflict misses, at more comparisons per lookup; and changing the program's access order can reduce all three.
+
+**Worked example.** A 64 × 64 matrix of 4-byte ints, 16 KiB stored row by row, so each 256-byte row fills 4 blocks of 64 bytes, and 256 blocks in all. Reading it row by row touches each block 16 times in a row: 256 misses for 4,096 reads, all compulsory, whatever the cache. Reading it column by column, consecutive reads are 256 bytes apart, and a block is needed again only after the 64 blocks of a whole column have been touched:
+
+- A fully associative cache of 2 KiB holds 32 blocks, fewer than 64, so with LRU every read misses: 4,096 misses, of which 256 are compulsory and 3,840 capacity misses.
+- A fully associative cache of 4 KiB holds the 64 blocks of a column: only the 256 compulsory misses remain.
+- A direct-mapped cache of 8 KiB is twice that size and still misses on every read: 256 compulsory and 3,840 conflict misses. Blocks 256 bytes apart have block numbers 4 apart, so they fall into only every fourth set, and only a quarter of the capacity can be used. A 2-way or 4-way cache does no better here; it needs 16 KiB.
+
+<MissRate />
+
+## Average memory access time
+
+Each access costs the hit time, and the fraction $M$ of accesses that miss pays the miss penalty on top. Averaging over accesses, by linearity of expectation,
+
+$$
+\boxed{\;\text{AMAT} = T_{\text{hit}} + M \cdot P .\;}
+$$
+
+With a hit time of 4 cycles and a penalty of 200 cycles, a miss rate of 3 % gives $4 + 0.03 \cdot 200 = 10$ cycles and a miss rate of 1 % gives $4 + 0.01 \cdot 200 = 6$ cycles: a hit rate two points higher cuts the average time by 40 %. That is why caches are judged by their miss rate rather than their hit rate.
+
+**Several levels.** The penalty of an L1 miss is the time the L2 cache takes to answer, which is itself an average over its hits and misses. Applying the formula to each level from the inside out,
+
+$$
+\begin{aligned}
+\text{AMAT} &= T_{\text{L1}} + M_{\text{L1}} \cdot P_{\text{L1}} && \text{the formula for L1} \\
+&= T_{\text{L1}} + M_{\text{L1}} \left( T_{\text{L2}} + M_{\text{L2}} \cdot P_{\text{mem}} \right) && P_{\text{L1}} \text{ is the AMAT of L2,}
+\end{aligned}
+$$
+
+where $M_{\text{L2}}$ is the **local** miss rate of L2: its misses divided by the accesses that reach it, which are only L1's misses. The fraction of all accesses that go to memory is the **global** miss rate $M_{\text{L1}} M_{\text{L2}}$.
+
+**Worked example (toy numbers in the range of the table).** L1: hit time 4 cycles, miss rate 5 %. L2: hit time 12 cycles, local miss rate 25 %. Memory: 200 cycles.
+
+$$
+\text{AMAT} = 4 + 0.05 \cdot (12 + 0.25 \cdot 200) = 4 + 0.05 \cdot 62 = 7.1 \text{ cycles}.
+$$
+
+Without the L2 cache, every L1 miss would go to memory: $4 + 0.05 \cdot 200 = 14$ cycles, about twice as long. The global miss rate is $0.05 \cdot 0.25 = 1.25\,\%$: one access in 80 reaches DRAM. A local miss rate of 25 % looks poor, but L2 sees only the accesses that L1 could not serve, which are the hard ones.
+
+## Writing cache-friendly code
+
+### Row-major and column-major traversal
+
+C stores a two-dimensional array row by row (**row-major** order): `a[i][j]` of an `N` by `N` int array lies at byte offset $4(iN + j)$. A loop with `j` innermost reads consecutive addresses and uses every byte of every block it brings in. A loop with `i` innermost jumps $4N$ bytes at every step and uses 4 bytes of each block before moving on ([Bryant and O'Hallaron](#references), §6.5).
+
+**Measured.** The C program in the Code section sums a 4,096 × 4,096 int matrix (64 MiB) both ways. On an Apple M1 (macOS 26.5, Apple clang 21.0.0, `-O0`), one run took 0.021 s by rows and 0.137 s by columns, 6.5 times longer; three runs gave ratios from 6.1 to 6.8. The times vary with the machine and the run; the ratio is the point. Both loops execute the same instructions on the same data and print the same sum: only the order of the addresses differs. With $N = 4096$ the column loop's stride is 16 KiB, so every read touches a new 128-byte line, and a column touches 4,096 lines, 512 KiB, far more than the 128 KiB L1 cache holds; by the time the next column needs a line, it has been evicted. The column loop is not 32 times slower, although it uses one int of each 128-byte line instead of 32: most of its misses are served by the 12 MiB L2 cache, and the processor can work on several misses at once.
+
+### Blocking
+
+Some computations cannot be reordered into a single pass along rows. In the matrix product $C = AB$ with the loop order $i, j, k$, the inner loop walks along a row of $A$ and down a column of $B$. Count misses for $N \times N$ doubles in 64-byte blocks (8 doubles each), for a cache that cannot keep the $N$ blocks of a column of $B$ from one $j$ to the next:
+
+- a row of $A$: 1 miss per 8 elements, $N^3/8$ in all;
+- a column of $B$: 1 miss per element, $N^3$ in all;
+- about $\frac98 N^3$ misses, plus a few for $C$.
+
+**Blocking** (or tiling) splits the matrices into $b \times b$ tiles and multiplies tile by tile, choosing $b$ so that three tiles fit in the cache at once. A tile of $A$ and a tile of $B$ are then each loaded once per tile product, $2 \cdot b^2/8$ misses, and there are $(N/b)^3$ tile products:
+
+$$
+\left(\frac{N}{b}\right)^3 \cdot \frac{2 b^2}{8} = \frac{N^3}{4b} \quad\text{misses, against}\quad \frac98 N^3 ,
+$$
+
+about $4.5\,b$ times fewer. The same arithmetic is done; each loaded block is just used $b$ times before it is evicted, instead of once ([Bryant and O'Hallaron](#references), web aside MEM:BLOCKING; [Patterson and Hennessy](#references), §5.15).
+
+**Worked example (simulated).** $N = 64$ and a fully associative LRU cache of 2 KiB (32 blocks), with $b = 8$, so three tiles take $3 \cdot 8 \cdot 8 \cdot 8 = 1{,}536$ bytes. The formulas predict $\frac98 \cdot 64^3 = 294{,}912$ misses for the plain loop plus $64^2 = 4{,}096$ for $C$, which is evicted between consecutive $j$, so 299,008; and $64^3/32 = 8{,}192$ plus $64^2/8 = 512$ for $C$, so 8,704, for the blocked one. The simulator in the Code section counts exactly these numbers: blocking removes 97 % of the misses.
+
+The same idea runs one level further down on a GPU: [FlashAttention](/notes/nlp/efficient-transformers#where-the-time-goes-memory-traffic-not-arithmetic) computes attention in [tiles](/notes/nlp/efficient-transformers#tiling-attention-one-block-at-a-time) that stay in the small on-chip SRAM instead of passing through the large, slower HBM.
+
+<aside class="callout"><strong>Check yourself.</strong> (1) A 32 KiB, 8-way cache with 64-byte blocks serves 48-bit addresses. How many sets, and how many index and tag bits? (2) L1: 2 cycles, miss rate 10 %; L2: 10 cycles, local miss rate 50 %; memory: 100 cycles. What is the AMAT, and what is the global miss rate? (3) A program reads a 1 MiB array twice from start to end, with a 32 KiB cache. What kind are the misses of the first pass, and of the second?<details><summary>Answers</summary>(1) $S = 32768 / (8 \cdot 64) = 64$, so 6 index bits, 6 offset bits and $48 - 12 = 36$ tag bits. (2) $2 + 0.1 \cdot (10 + 0.5 \cdot 100) = 2 + 6 = 8$ cycles; the global miss rate is $0.1 \cdot 0.5 = 5\,\%$. (3) The first pass misses once per block, compulsory misses. In the second pass, the beginning of the array was evicted long ago, since 1 MiB does not fit in 32 KiB, so it misses again once per block: capacity misses. A fully associative cache of 32 KiB would miss just as often.</details></aside>
+
+## What changed
+
+| | Baseline: every access goes to DRAM | A cache hierarchy |
+| --- | --- | --- |
+| Time of a load | 50–200 cycles, always | 4 cycles on an L1 hit; 7.1 cycles on average in the worked example |
+| Unit of transfer from memory | the word requested | a block, here 64 bytes |
+| What the hardware adds | nothing | tags, valid and dirty bits, comparators, replacement state |
+| What the program controls | nothing | the order of accesses, the layout of data, tile sizes |
+| Performance model | a constant per access | $T_{\text{hit}} + M \cdot P$ at every level |
+
+## Limitations
+
+- **No locality, no benefit.** Following pointers through a large linked structure, or reading a large table at random, can miss on nearly every access.
+- **AMAT is a model.** Out-of-order processors overlap several misses, and hardware prefetchers fetch regular strides ahead of time, so measured times can be better than the formula suggests; only measurement decides.
+- **Conflicts depend on addresses.** Power-of-two sizes and strides are the worst case, as in the figure. On an 8-way cache of 2 KiB, the blocked matrix product of the worked example misses 299,008 times against 275,584 for the plain loop: rows 512 bytes apart send the tiles into a few sets, and blocking stops helping. [Lam, Rothberg and Wolf (1991)](#references) analysed this self-interference; the remedies are a different tile size, padded rows or copying each tile into a contiguous buffer.
+- **Copies must agree.** With several cores, each with its own caches, a store in one cache must become visible to the others; this is cache coherence, in the [multicore note](/notes/acos/thread-level-parallelism).
+- **Timing leaks information.** Whether a load hits can be measured, so a cache reveals which addresses were used recently. Side-channel attacks such as Spectre exploit this ([Kocher et al., 2019](#references)).
+- **Which addresses?** All addresses in this note were physical. Programs use virtual addresses, and the translation between the two interacts with the cache, as the next note shows.
+
+## What you should remember
+
+- A memory access to DRAM costs 50–200 cycles against about 4 for an L1 hit; the gap is the memory wall.
+- Temporal and spatial locality let a small cache serve most accesses; data moves in blocks, typically 64 bytes.
+- An address splits into tag, index and offset: offset $= a \bmod B$, index $= \lfloor a/B \rfloor \bmod S$, tag $= \lfloor a/(BS) \rfloor$. For 16 KiB, 4-way, 64-byte blocks: 6 offset bits, 6 index bits, 20 tag bits.
+- Direct-mapped caches are simple and suffer conflicts; fully associative ones need a comparator per block; set-associative caches sit in between.
+- LRU evicts the least recently used way; write-back with write-allocate sends a dirty block to the next level once, at eviction.
+- Misses are compulsory, capacity or conflict, defined against an infinite and a fully associative cache.
+- $\text{AMAT} = T_{\text{hit}} + M \cdot P$, applied level by level; $4 + 0.05 \cdot (12 + 0.25 \cdot 200) = 7.1$ cycles.
+- Traverse arrays in the order they are stored, and block computations that reuse data so that each loaded block is used many times.
+
+## Code
+
+A cache simulator with LRU replacement. It prints the address split of the worked example, the LRU trace, the hit rates of the two traversals of the 64 × 64 matrix, the three Cs, the conflict between two arrays 16 KiB apart, the AMAT of the worked example and the misses of the plain and blocked matrix products:
+
+```python
+from collections import OrderedDict
+
+class Cache:
+    """A set-associative cache with LRU replacement; ways=None makes it fully associative."""
+    def __init__(self, size, block=64, ways=None):
+        self.block = block
+        self.ways = ways or size // block
+        self.nsets = size // (block * self.ways)
+        self.sets = [OrderedDict() for _ in range(self.nsets)]   # per set: tags, least recently used first
+        self.hits = self.misses = 0
+
+    def split(self, addr):
+        blk = addr // self.block                               # drop the offset
+        return blk // self.nsets, blk % self.nsets, addr % self.block   # tag, index, offset
+
+    def access(self, addr):
+        tag, index, _ = self.split(addr)
+        s = self.sets[index]
+        if tag in s:
+            s.move_to_end(tag)                                 # now the most recently used
+            self.hits += 1
+            return True
+        self.misses += 1
+        if len(s) == self.ways:
+            s.popitem(last=False)                              # evict the least recently used
+        s[tag] = True
+        return False
+
+def run(trace, size, ways):
+    c = Cache(size, 64, ways)
+    for a in trace:
+        c.access(a)
+    return c
+
+# the address split of the worked example: 16 KiB, 4 ways, 64-byte blocks
+tag, index, offset = Cache(16384, 64, 4).split(0x1234ABCC)
+print(hex(tag), index, offset)                                # 0x1234a 47 12
+
+# LRU in a single 2-way set: blocks A, B, A, C, A, B
+c = Cache(128, 64, 2)
+print(''.join('h' if c.access(64 * blk) else 'm' for blk in (0, 1, 0, 2, 0, 1)))   # mmhmhm
+
+# two traversals of a 64 x 64 matrix of 4-byte ints (16 KiB), stored row by row
+N = 64
+row = [(i * N + j) * 4 for i in range(N) for j in range(N)]
+col = [(i * N + j) * 4 for j in range(N) for i in range(N)]
+for name, trace in (('row-major', row), ('column-major', col)):
+    for size, ways in ((2048, None), (4096, None), (8192, 1), (16384, 1)):
+        c = run(trace, size, ways)
+        print(f'{name:12} {size:5} B {"full" if ways is None else ways:>4}  hit rate {c.hits / len(trace):.4f}')
+# row-major     2048 B full  hit rate 0.9375
+# row-major     4096 B full  hit rate 0.9375
+# row-major     8192 B    1  hit rate 0.9375
+# row-major    16384 B    1  hit rate 0.9375
+# column-major  2048 B full  hit rate 0.0000
+# column-major  4096 B full  hit rate 0.9375
+# column-major  8192 B    1  hit rate 0.0000
+# column-major 16384 B    1  hit rate 0.9375
+
+# the three Cs: compulsory (an infinite cache), capacity (a fully associative one of the same size), conflict (the rest)
+def three_cs(trace, size, ways):
+    compulsory = len({a // 64 for a in trace})
+    full = run(trace, size, None).misses
+    return compulsory, full - compulsory, run(trace, size, ways).misses - full
+print(three_cs(col, 2048, 1), three_cs(col, 8192, 1))         # (256, 3840, 0) (256, 0, 3840)
+
+# a[k] * b[k] with the arrays exactly 16 KiB apart: direct-mapped against 2-way, both 16 KiB
+ab = [x for k in range(1024) for x in (4 * k, 16384 + 4 * k)]
+print(run(ab, 16384, 1).misses, run(ab, 16384, 2).misses)     # 2048 128
+
+# average memory access time, from L1 outwards: (hit time, local miss rate) per level, then memory
+def amat(levels, memory):
+    t = memory
+    for hit, miss in reversed(levels):
+        t = hit + miss * t
+    return round(t, 2)
+print(amat([(4, 0.05), (12, 0.25)], 200), amat([(4, 0.05)], 200))   # 7.1 14.0
+
+# C = A B for 64 x 64 doubles, in b x b tiles (b = 64 is the plain i-j-k loop), on a 2 KiB cache
+def matmul(N, b):
+    A, B, C = 0, 8 * N * N, 16 * N * N                        # the three matrices one after another
+    for ii in range(0, N, b):
+        for jj in range(0, N, b):
+            for kk in range(0, N, b):
+                for i in range(ii, ii + b):
+                    for j in range(jj, jj + b):
+                        for k in range(kk, kk + b):
+                            yield A + 8 * (i * N + k)
+                            yield B + 8 * (k * N + j)
+                        yield C + 8 * (i * N + j)
+for ways in (None, 8):
+    print([run(matmul(64, b), 2048, ways).misses for b in (64, 8)])
+# [299008, 8704]     fully associative: blocking removes 97 % of the misses
+# [275584, 299008]   8-way: the tiles collide in a few sets, and blocking does not help
+```
+
+The traversal timing in C. The sums are the same on every machine; the times are not, so the output below is one example run, on an Apple M1 with macOS 26.5 and Apple clang 21.0.0, compiled with `clang -std=c17 -Wall -Wextra -O0`:
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+
+#define N 4096                       /* a 4096 x 4096 matrix of int: 64 MiB, far larger than any cache */
+
+static double now(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec + t.tv_nsec * 1e-9;
+}
+
+int main(void) {
+    int *a = malloc(sizeof(int) * N * N);   /* row-major: a[i][j] is at a[i * N + j] */
+    if (!a) return 1;
+    for (long k = 0; k < (long)N * N; k++) a[k] = (int)(k % 7);
+
+    double t0 = now();
+    long row = 0;
+    for (int i = 0; i < N; i++)              /* row by row: consecutive addresses */
+        for (int j = 0; j < N; j++)
+            row += a[(long)i * N + j];
+    double t1 = now();
+    long col = 0;
+    for (int j = 0; j < N; j++)              /* column by column: a stride of N * 4 = 16 KiB */
+        for (int i = 0; i < N; i++)
+            col += a[(long)i * N + j];
+    double t2 = now();
+
+    printf("sums %ld %ld equal: %d\n", row, col, row == col);
+    printf("row-major    %.3f s\n", t1 - t0);
+    printf("column-major %.3f s\n", t2 - t1);
+    printf("ratio %.1f\n", (t2 - t1) / (t1 - t0));
+    free(a);
+    return 0;
+}
+/* One run (Apple M1, -O0); the sums are fixed, the times vary:
+   sums 50331645 50331645 equal: 1
+   row-major    0.021 s
+   column-major 0.137 s
+   ratio 6.5 */
+```
+
+## Next
+
+Every address in this note was a physical address, the number of a byte in the DRAM chips. But RARS places the data of every RISC-V program of the earlier notes at the same address, `0x10010000`, and two such programs could not run side by side if that were a physical address. The [next note](/notes/acos/virtual-memory) gives every program its own **virtual** address space and lets the hardware translate each address on the fly, with page tables in memory and a small cache of translations, the TLB, built exactly like the caches of this note.
+
+## References
+
+- D. A. Patterson, J. L. Hennessy. *Computer Organization and Design RISC-V Edition: The Hardware/Software Interface*, 2nd ed. Morgan Kaufmann, 2020. Chapter 5: §5.3 (the basics of caches), §5.4 (measuring and improving cache performance, multilevel caches), §5.8 (a common framework for memory hierarchy: placement, replacement, write policies, the three Cs), §5.15 (cache blocking and matrix multiply).
+- R. E. Bryant, D. R. O'Hallaron. *Computer Systems: A Programmer's Perspective*, 3rd ed. Pearson, 2016. Chapter 6: §6.1.4 (storage technology trends), §6.2 (locality), §6.4 (cache memories; §6.4.5 writes, §6.4.6 the Core i7 hierarchy), §6.5 (writing cache-friendly code), §6.6.2 (rearranging loops); web aside [MEM:BLOCKING](https://csapp.cs.cmu.edu/3e/waside/waside-blocking.pdf).
+- R. E. Bryant, D. R. O'Hallaron. Lecture slides for 15-213, Carnegie Mellon University, Fall 2015: [The Memory Hierarchy](https://www.cs.cmu.edu/afs/cs/academic/class/15213-f15/www/lectures/11-memory-hierarchy.pdf) (latencies of the levels) and [Cache Memories](https://www.cs.cmu.edu/afs/cs/academic/class/15213-f15/www/lectures/12-cache-memories.pdf) (the Core i7 caches, miss penalties).
+- D. M. Harris, S. L. Harris. *Digital Design and Computer Architecture, RISC-V Edition*. Morgan Kaufmann, 2021. Chapter 8 (memory systems), §8.3 (caches).
+- R. H. Arpaci-Dusseau, A. C. Arpaci-Dusseau. *Operating Systems: Three Easy Pieces*. [Chapter 44, Flash-based SSDs](https://pages.cs.wisc.edu/~remzi/OSTEP/file-ssd.pdf), Fig. 44.2 (raw flash latencies).
+- W. A. Wulf, S. A. McKee. [Hitting the memory wall: implications of the obvious](https://doi.org/10.1145/216585.216588). ACM SIGARCH Computer Architecture News, 23(1), 1995.
+- M. D. Hill, A. J. Smith. [Evaluating associativity in CPU caches](https://doi.org/10.1109/12.40842). IEEE Transactions on Computers, 38(12), 1989. The three Cs.
+- M. S. Lam, E. E. Rothberg, M. E. Wolf. [The cache performance and optimizations of blocked algorithms](https://doi.org/10.1145/106973.106981). ASPLOS IV, 1991.
+- P. Kocher et al. [Spectre Attacks: Exploiting Speculative Execution](https://arxiv.org/abs/1801.01203). IEEE Symposium on Security and Privacy, 2019.
+- A. Tatarnikov. [Memory and caches](https://andrewt0301.github.io/hse-acos-course/part1ca/08_Caches/lecture.html), lecture 8 of *Computer Architecture and Operating Systems*, HSE University.

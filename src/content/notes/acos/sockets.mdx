@@ -1,0 +1,470 @@
+---
+title: Sockets
+description: "The system calls a program uses to talk over a network: socket, bind, listen, accept, connect, send, recv and close, a TCP echo server and client in C, network byte order, UDP datagrams, and four ways for one server to serve many clients."
+course: acos
+section: Networking
+order: 29
+status: published
+tags: [sockets, tcp, udp, echo-server, byte-order, htons, select, poll, epoll, fork, threads, system-calls]
+prerequisites: [Computer networks, Files and input/output, Processes and threads, "Bits, integers and byte order"]
+---
+
+import SocketSequence from '../../../components/figures/sockets/SocketSequence.astro';
+
+The [previous note](/notes/acos/networking) left the network inside the kernel: the kernel builds the headers, runs the TCP handshake, retransmits what is lost and slows down when a router is full. A program sees none of it. It sees a **socket**: a file descriptor for one end of a connection, created and driven by a handful of system calls. This note goes through those calls, writes a TCP echo server and its client in C, shows where byte order matters, sends UDP datagrams, and ends with the question every real server faces: how one program serves many clients at once.
+
+## Baseline: a pipe between two processes
+
+The note on [inter-process communication](/notes/acos/inter-process-communication) joined two processes with a pipe: `pipe()` returns two descriptors, `fork()` gives one to each process, and bytes written to one end come out of the other. A pipe works well, and it fails in three ways as a network channel:
+
+1. **It has no address.** Only processes that inherit the descriptors from a common parent can use a pipe. A named FIFO has a path, but a path in one machine's file system.
+2. **It is one-way.** Two-way talk needs two pipes.
+3. **It lives in one kernel.** The descriptors refer to a buffer in the memory of one machine; nothing carries the bytes to another.
+
+A socket keeps what is good about a pipe, a descriptor that `read` and `write` work on, and fixes all three: it can have a network address, it is two-way, and the kernel's TCP/IP code carries its bytes to another machine.
+
+## The socket API
+
+<aside class="callout"><strong>Key idea.</strong> A server creates a socket, binds it to a well-known address and marks it as listening. From then on the kernel completes TCP handshakes on the server's behalf and queues the finished connections; `accept` takes one from the queue and returns a **new** descriptor for it, so that the listening socket stays free for the next client. A client creates a socket and calls `connect`, which runs the handshake. After that the two connected descriptors behave like a two-way pipe between two machines.</aside>
+
+The interface was designed at Berkeley in the early 1980s and is now part of POSIX ([Bryant and O'Hallaron](#references), §11.4). Every call is a system call or a thin wrapper around one.
+
+| Call | Called by | What it does | Blocks? |
+| --- | --- | --- | --- |
+| `socket(domain, type, 0)` | both | creates an unconnected socket and returns its descriptor; `AF_INET` with `SOCK_STREAM` means TCP over IPv4, with `SOCK_DGRAM` UDP | no |
+| `bind(fd, addr, len)` | server | attaches a local address and port | no |
+| `listen(fd, backlog)` | server | makes the socket passive: the kernel accepts handshakes for it and queues up to about `backlog` finished connections | no |
+| `accept(fd, addr, len)` | server | takes one finished connection off the queue and returns a new descriptor for it | while the queue is empty |
+| `connect(fd, addr, len)` | client | picks an ephemeral local port and runs the three-way handshake | until the handshake ends |
+| `send(fd, buf, n, 0)`, `write` | both | copies bytes into the kernel's send buffer; TCP transmits them when it can | while the send buffer is full |
+| `recv(fd, buf, n, 0)`, `read` | both | copies whatever has arrived, up to `n` bytes; returns 0 at the end of the stream | while nothing has arrived |
+| `close(fd)` | both | releases the descriptor; for TCP, the last close sends a FIN | no |
+
+Two more calls translate between names and addresses: `getaddrinfo` asks DNS (and the hosts file) for the addresses of a name, and `getsockname` tells a program which address and port its own socket was given.
+
+### Addresses: struct sockaddr
+
+The socket calls work for many address families, so they take a pointer to a generic `struct sockaddr` and a length. A program fills in the structure of its family and casts the pointer; the API predates `void *` in C, which is why the cast is needed ([Bryant and O'Hallaron](#references), §11.4.1). For IPv4 the structure is `struct sockaddr_in`, with three fields that matter: the family `sin_family = AF_INET`, the port `sin_port` and the address `sin_addr.s_addr`. Both the port and the address are stored in **network byte order**, big-endian, as they will appear in the packet headers.
+
+**Worked example.** To describe `127.0.0.1`, port 8080:
+
+```c
+struct sockaddr_in addr;
+memset(&addr, 0, sizeof addr);
+addr.sin_family = AF_INET;
+addr.sin_port = htons(8080);                      // bytes 1f 90
+addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);    // 127.0.0.1: bytes 7f 00 00 01
+connect(fd, (struct sockaddr *)&addr, sizeof addr);
+```
+
+$8080 = \texttt{0x1F90}$, so the port occupies the two bytes `1f 90`, and $127.0.0.1 = \texttt{0x7F000001}$ occupies `7f 00 00 01`. The section on byte order below explains `htons` and `htonl`.
+
+### One connection, call by call
+
+The echo program of the Code section runs a server and a client on one machine, over the loopback address. Their system calls and the segments the two kernels exchange because of them:
+
+<SocketSequence />
+
+1. The server calls `socket`, `bind` and `listen`, then `accept`, which blocks: there is no connection yet.
+2. The client calls `socket` and `connect`. Its kernel picks an ephemeral port and sends a SYN; `connect` blocks.
+3. The server's kernel answers with SYN+ACK, and the client's kernel with ACK. Now `connect` returns 0 in the client, and the server's kernel puts the finished connection on the listening socket's queue, where `accept` finds it and returns a new descriptor. The processes did not take part in the handshake: they only waited for it.
+4. The client sends 14 bytes; the server's `recv` returns them, and the server sends them back.
+5. The client calls `close`, and its kernel sends a FIN. When the FIN arrives, the server's `recv` returns 0, the end of the stream, exactly as `read` on a pipe returns 0 when every writer has closed. The server closes its side, and its kernel sends its own FIN.
+
+Three details of the kernel's part show up in practice. A connection is completed and queued even while the server is busy elsewhere, so a slow server makes clients wait in the queue rather than fail; the `backlog` argument bounds that queue, and on Linux it is capped by a system setting whose default has been 4096 since Linux 5.4 ([`listen(2)`](#references)). If nothing listens on a port, the server's kernel answers the SYN with a reset, and `connect` fails with `ECONNREFUSED`. And after a connection closes, the side that closed first keeps its address–port pair in the `TIME_WAIT` state for a few minutes, so that late segments of the old connection die out; a restarted server would then fail to `bind` its port with `EADDRINUSE`, which is why servers set the `SO_REUSEADDR` option before `bind`.
+
+### A stream has no message boundaries
+
+TCP delivers a stream of bytes, not a sequence of messages. Two calls of `send` with 100 bytes each may come out as one `recv` of 200 bytes, as three, or as 200 calls of one byte each; `send` itself may accept fewer bytes than it was given when the send buffer is nearly full. Two consequences follow for every TCP program:
+
+- **Loop.** Call `send` until every byte is accepted, and `recv` until every expected byte has arrived:
+
+  ```c
+  // Send all n bytes, however many calls it takes.
+  static int send_all(int fd, const char *buf, size_t n) {
+      while (n > 0) {
+          ssize_t k = send(fd, buf, n, 0);
+          if (k < 0) return -1;
+          buf += k;
+          n -= (size_t)k;
+      }
+      return 0;
+  }
+  ```
+
+- **Frame.** The program must mark where its messages end, with a delimiter (HTTP/1.1 ends its header lines with `\r\n`) or with a length prefix.
+
+**Worked example.** A length-prefixed message `hello` is sent as nine bytes: the length 5 as a 4-byte big-endian number, then the text, `00 00 00 05 68 65 6c 6c 6f`. The reader loops until it has 4 bytes, converts them with `ntohl` to 5, then loops until it has 5 more. However TCP splits or merges the bytes on the way, the reader recovers the message exactly.
+
+One more trap: writing to a connection that the peer has already closed raises the signal `SIGPIPE`, whose default action ends the process. Servers ignore the signal and check for the error `EPIPE` instead, or ask not to receive it per call (the `MSG_NOSIGNAL` flag on Linux) or per socket (the `SO_NOSIGPIPE` option on macOS and the BSDs).
+
+## Byte order: htons and htonl
+
+Protocol headers store multi-byte numbers big-endian, most significant byte first. Most processors today, x86-64, ARM and RISC-V among them, run little-endian ([the byte-order note](/notes/acos/data-representation) compares the two). Four functions convert, and on a big-endian machine they do nothing:
+
+- `htons` and `htonl`: host to network order, for 16-bit values (ports) and 32-bit values (IPv4 addresses);
+- `ntohs` and `ntohl`: network to host order.
+
+**Worked example.** The port $8080 = \texttt{0x1F90}$ is stored on a little-endian machine as the bytes `90 1f`. `htons(8080)` gives the bytes `1f 90`, which is what the TCP header must contain. A program that forgets `htons` puts `90 1f` into the header, and every other machine reads that as $\texttt{0x901F} = 36{,}895$: it listens on, or connects to, the wrong port, without any error. The address `192.168.10.77` converted by `inet_pton` is the bytes `c0 a8 0a 4d` on every machine, and `ntohl` turns them into the number $\texttt{0xC0A80A4D}$.
+
+The rule is mechanical: every number that goes into a `sockaddr` or a header goes through `hton*`, and every number read from one goes through `ntoh*`. Data in the payload is the program's own business, but it needs the same care when two machines of different byte order exchange binary numbers, as the length prefix above does.
+
+## UDP sockets
+
+A UDP socket is created with `SOCK_DGRAM`. It has no `listen`, no `accept` and no handshake. The sender names the destination in each call with `sendto`, and the receiver learns who sent each datagram from `recvfrom`:
+
+```c
+sendto(fd, buf, n, 0, (struct sockaddr *)&dest, sizeof dest);
+recvfrom(fd, buf, sizeof buf, 0, (struct sockaddr *)&from, &fromlen);
+```
+
+Each `sendto` produces exactly one datagram and each `recvfrom` returns exactly one, so message boundaries survive. **Worked example.** A sender sends `ab`, then `cde`, then 10 bytes; the receiver's first two calls return 2 and 3 bytes, never 5. Its third call, with a 4-byte buffer, returns 4 bytes, and the other 6 bytes of that datagram are discarded. Nothing guarantees delivery: over loopback nothing is lost in practice, but over a network a UDP program sets a timeout and resends, as DNS clients do. A UDP payload can be at most $65{,}535 - 20 - 8 = 65{,}507$ bytes over IPv4, but a datagram larger than the path's MTU, $1{,}500 - 28 = 1{,}472$ bytes of payload on Ethernet, is cut into IP fragments, and losing any fragment loses the whole datagram. Calling `connect` on a UDP socket only fixes a default destination, so that plain `send` and `recv` work; no packet is sent.
+
+## Serving many clients
+
+The echo server of the Code section serves one client and stops. A server that loops around `accept` still serves one client at a time: while it sits in `recv` waiting for client A, client B's connection waits in the queue, however little B wants. There are four standard answers ([Kerrisk](#references), ch. 60 and 63; [Stevens et al.](#references), ch. 6 and 30).
+
+**One process per connection.** After `accept`, the server forks. The child serves the client and exits; the parent closes its copy of the connected descriptor and goes back to `accept`. Clients are isolated from each other, since a crash in one child does not touch the others, and the price is a process per client.
+
+```c
+// Process per connection: the accept loop of a forking server (fragment).
+signal(SIGCHLD, SIG_IGN);              // the kernel reaps finished children: no zombies
+for (;;) {
+    int cfd = accept(lfd, NULL, NULL);
+    if (fork() == 0) {                 // child: serve this client, then exit
+        close(lfd);
+        serve(cfd);
+        exit(0);
+    }
+    close(cfd);                        // parent: its copy of the connection is not needed
+}
+```
+
+**One thread per connection.** The same loop, with `pthread_create` in place of `fork`. Threads are cheaper to create and share memory, so a cache or a counter shared by all clients needs the locks of the [synchronization note](/notes/acos/synchronization). Each thread still has its own stack and is scheduled by the kernel, so tens of thousands of mostly idle connections cost tens of thousands of threads.
+
+```c
+// Thread per connection (fragment): serve_thread calls serve on the descriptor it is given.
+for (;;) {
+    int cfd = accept(lfd, NULL, NULL);
+    pthread_t t;
+    pthread_create(&t, NULL, serve_thread, (void *)(intptr_t)cfd);
+    pthread_detach(t);                 // nobody joins it; its resources are freed when it ends
+}
+```
+
+**I/O multiplexing with `select` or `poll`.** One thread keeps all connections and asks the kernel which of them are ready. `poll` takes an array of descriptors and the events of interest, sleeps until at least one is ready, and marks the ready ones; the thread then calls `accept` or `recv` only on those, and these calls do not block. The Code section serves three clients this way in one thread. `select` does the same with bit sets whose size is fixed at compile time, `FD_SETSIZE`, 1024 on Linux ([`select(2)`](#references)), so it cannot watch a descriptor numbered 1024 or above. Both calls pass the whole list to the kernel on every call, and the kernel checks every entry: the cost of one call grows with the number of connections, not with the number of ready ones.
+
+**Event notification with `epoll` or `kqueue`.** Linux's `epoll` (since Linux 2.5.44, [`epoll(7)`](#references)) and the BSD and macOS `kqueue` split the two jobs: a program registers each descriptor once, and each wait returns only the descriptors that became ready. An excerpt of the event loop, for Linux:
+
+```c
+// Linux only. The event loop of an epoll echo server; run in a Debian 13 container (glibc 2.41, arm64)
+// inside a small server whose forked client sent three connections, all echoed.
+int ep = epoll_create1(0);
+struct epoll_event ev = { .events = EPOLLIN, .data.fd = lfd };
+epoll_ctl(ep, EPOLL_CTL_ADD, lfd, &ev);              // register the listening socket once
+struct epoll_event ready[64];
+for (;;) {
+    int n = epoll_wait(ep, ready, 64, -1);           // returns only descriptors that are ready
+    for (int i = 0; i < n; i++) {
+        int fd = ready[i].data.fd;
+        if (fd == lfd) {                              // a new connection: register it too
+            int cfd = accept(lfd, NULL, NULL);
+            ev = (struct epoll_event){ .events = EPOLLIN, .data.fd = cfd };
+            epoll_ctl(ep, EPOLL_CTL_ADD, cfd, &ev);
+        } else {                                      // data from a client, or its FIN
+            char buf[512];
+            ssize_t k = recv(fd, buf, sizeof buf, 0);
+            if (k > 0) send(fd, buf, (size_t)k, 0);
+            else close(fd);                           // the last close also leaves the epoll set
+        }
+    }
+}
+```
+
+**Worked example.** A chat server holds 10,000 connections, and at a typical moment 10 of them have data. Each `poll` call copies 10,000 entries into the kernel, which checks all 10,000 and reports 10; each `epoll_wait` call reports the 10 and touches nothing else. Per wake-up, `poll` does about a thousand times the bookkeeping, and the gap grows with the number of idle connections. Serving ten thousand clients on one machine was a recognised problem around 1999, the "C10K problem" ([Kegel](#references)), and this kind of interface was the answer.
+
+| Design | Cost per connection | Isolation | Scales to many idle connections | Shared state |
+| --- | --- | --- | --- | --- |
+| process per connection | a process | full | poorly | needs IPC |
+| thread per connection | a thread and its stack | none | poorly | shared memory, needs locks |
+| `select` or `poll` loop | an entry in an array | none | the cost of every call grows with all connections | one thread, no locks |
+| `epoll` or `kqueue` loop | a registration in the kernel | none | well | one thread, no locks |
+
+Event loops are what high-performance servers such as nginx use, usually one loop per core, and what the asynchronous libraries of high-level languages, such as Python's `asyncio`, are built on.
+
+<aside class="callout"><strong>Check yourself.</strong> (1) A server on a little-endian machine forgets `htons` and binds `sin_port = 80`. Which port does it actually listen on? (2) A TCP client calls `send` with `abc` and then with `def`; the server calls `recv` once with a 64-byte buffer. What can it get? What if the sockets are UDP and the server calls `recvfrom`? (3) Why does `accept` return a new descriptor instead of turning the listening socket into the connection?<details><summary>Answers</summary>(1) $80 = \texttt{0x0050}$ is stored as the bytes `50 00`; read in network order they mean $\texttt{0x5000} = 20{,}480$. (2) With TCP, any prefix of `abcdef` from 1 to 6 bytes: often `abc` or `abcdef`, never anything out of order; the rest comes in later calls. With UDP, exactly the first datagram, `abc`. (3) The listening socket must stay available for the next client while the first one is being served: one descriptor names the address on which clients arrive, the others name one conversation each, identified by both address–port pairs.</details></aside>
+
+## What changed
+
+| | Pipe (the baseline) | TCP socket | UDP socket |
+| --- | --- | --- | --- |
+| Who can connect | processes that inherit the descriptor | any process that knows the address and port | any process that knows the address and port |
+| Direction | one way | both ways | both ways |
+| Reach | one kernel | any machine on the network | any machine on the network |
+| Setup | `pipe`, `fork` | `socket`, `bind`, `listen`, `accept`; `socket`, `connect` | `socket`, `bind`; `sendto`, `recvfrom` |
+| Unit | byte stream | byte stream, framed by the program | datagram |
+| End of data | `read` returns 0 | `recv` returns 0 after the peer's FIN | none: datagrams just stop |
+| Many peers | one pipe each | `accept` per client, then processes, threads or an event loop | one socket for all peers |
+
+## Limitations
+
+- The examples omit most error handling a production server needs: a `recv` or `accept` interrupted by a signal fails with `EINTR` and must be retried; `connect` can time out; every call can fail.
+- The code is IPv4-only. A program that calls `getaddrinfo` and uses whatever address family it returns works with IPv4 and IPv6 alike ([Bryant and O'Hallaron](#references), §11.4.7).
+- Sockets add no security: the bytes cross the network in clear text. Encryption and authentication come from a TLS library layered on top of the socket.
+- Event loops need **non-blocking** sockets (`O_NONBLOCK`), so that a `send` into a full buffer returns `EAGAIN` instead of stopping the whole loop, and that bookkeeping is left out here. Newer Linux kernels also offer `io_uring`, which submits and completes I/O through rings of requests shared with the kernel.
+- Unix domain sockets (`AF_UNIX`) use the same API with a file-system path as the address, between processes on one machine; they appear in the IPC note and not here.
+
+## What you should remember
+
+- Server: `socket`, `bind`, `listen`, then `accept` in a loop; each `accept` returns a new descriptor for one connection. Client: `socket`, `connect`. Then `send` and `recv` (or `write` and `read`), and `close`.
+- The kernels perform the TCP handshake; `connect` and `accept` only wait for it. `recv` returning 0 means the peer closed its side.
+- TCP is a byte stream with no message boundaries: loop on `send` and `recv`, and frame messages with a length or a delimiter. UDP keeps boundaries and guarantees nothing.
+- Ports and addresses in a `sockaddr` are big-endian: `htons` and `htonl` on the way in, `ntohs` and `ntohl` on the way out.
+- One server, many clients: a process or a thread per connection is simple; `select` and `poll` serve many connections from one thread at a cost proportional to all of them; `epoll` and `kqueue` at a cost proportional to the ready ones.
+
+## Code
+
+Three C programs, each compiled and run with `clang -std=c17 -Wall -Wextra -O0 file.c -o a.out && ./a.out`. Each one runs its server and its clients in one program, over the loopback address `127.0.0.1`, and asks the kernel for a free port, so nothing needs to be started first. They were run on macOS (arm64, Apple clang 21); the `_DEFAULT_SOURCE` line makes glibc on Linux declare the same POSIX calls under `-std=c17`. The outputs in the comments do not depend on the machine, except where a comment says so.
+
+The TCP echo server and its client, as in the figure:
+
+```c
+// A TCP echo server and its client in one program: the parent serves, a forked child connects.
+#define _DEFAULT_SOURCE                   // glibc: declare POSIX and BSD calls under -std=c17
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#define CHECK(x) do { if ((x) < 0) { perror(#x); exit(1); } } while (0)
+
+static void client(const struct sockaddr_in *srv) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    CHECK(fd);
+    CHECK(connect(fd, (const struct sockaddr *)srv, sizeof *srv));   // the three-way handshake
+    const char *msg = "hello, sockets";
+    size_t len = strlen(msg);
+    CHECK(send(fd, msg, len, 0));
+    char buf[64];
+    size_t got = 0;
+    while (got < len) {                               // a stream: the echo may come back in pieces
+        ssize_t n = recv(fd, buf + got, sizeof buf - 1 - got, 0);
+        CHECK(n);
+        if (n == 0) break;
+        got += (size_t)n;
+    }
+    buf[got] = '\0';
+    printf("client: got %zu bytes back: %s\n", got, buf);
+    close(fd);                                        // sends FIN: the server's recv returns 0
+}
+
+int main(void) {
+    int lfd = socket(AF_INET, SOCK_STREAM, 0);        // 1. a TCP socket
+    CHECK(lfd);
+    int one = 1;
+    CHECK(setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one));
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof addr);
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);    // 127.0.0.1, in network byte order
+    addr.sin_port = htons(0);                         // port 0: let the kernel choose a free one
+    CHECK(bind(lfd, (struct sockaddr *)&addr, sizeof addr));          // 2. give it an address
+    CHECK(listen(lfd, 16));                           // 3. accept connections, queue up to 16
+    socklen_t alen = sizeof addr;
+    CHECK(getsockname(lfd, (struct sockaddr *)&addr, &alen));         // which port did we get?
+    printf("server: listening on 127.0.0.1, port chosen: %s\n", ntohs(addr.sin_port) ? "yes" : "no");
+    fflush(stdout);                                   // flush before fork, or the child prints it again
+
+    pid_t pid = fork();
+    CHECK(pid);
+    if (pid == 0) { close(lfd); client(&addr); return 0; }
+
+    int cfd = accept(lfd, NULL, NULL);                // 4. a new socket for this one connection
+    CHECK(cfd);
+    char buf[64];
+    ssize_t n, total = 0;
+    while ((n = recv(cfd, buf, sizeof buf, 0)) > 0) { // 5. echo until the client closes
+        CHECK(send(cfd, buf, (size_t)n, 0));
+        total += n;
+    }
+    CHECK(n);
+    waitpid(pid, NULL, 0);
+    printf("server: echoed %zd bytes, then recv returned 0: the client closed\n", total);
+    close(cfd);
+    close(lfd);
+    return 0;
+}
+// server: listening on 127.0.0.1, port chosen: yes
+// client: got 14 bytes back: hello, sockets
+// server: echoed 14 bytes, then recv returned 0: the client closed
+```
+
+Byte order, and UDP datagrams keeping their boundaries:
+
+```c
+// Byte order of socket addresses, and UDP datagrams over the loopback interface.
+#define _DEFAULT_SOURCE                   // glibc: declare POSIX and BSD calls under -std=c17
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#define CHECK(x) do { if ((x) < 0) { perror(#x); exit(1); } } while (0)
+
+static void dump(const char *what, const void *p, size_t n) {
+    printf("%-22s", what);
+    for (size_t i = 0; i < n; i++) printf(" %02x", ((const unsigned char *)p)[i]);
+    printf("\n");
+}
+
+int main(void) {
+    // 1. Byte order: the bytes in memory, first byte first
+    uint16_t port = 8080;                             // 0x1f90
+    uint16_t nport = htons(port);
+    dump("8080, host order", &port, 2);               // 90 1f on a little-endian machine
+    dump("htons(8080)", &nport, 2);                   // 1f 90 on every machine
+    struct in_addr a;
+    inet_pton(AF_INET, "192.168.10.77", &a);          // text -> 32 bits in network order
+    dump("192.168.10.77", &a.s_addr, 4);              // c0 a8 0a 4d on every machine
+    printf("ntohl gives 0x%08x\n", ntohl(a.s_addr));  // 0xc0a80a4d: the number itself
+
+    // 2. UDP: every sendto is one datagram, and every recvfrom returns one datagram
+    int rx = socket(AF_INET, SOCK_DGRAM, 0), tx = socket(AF_INET, SOCK_DGRAM, 0);
+    CHECK(rx); CHECK(tx);
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof addr);
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    CHECK(bind(rx, (struct sockaddr *)&addr, sizeof addr));
+    socklen_t alen = sizeof addr;
+    CHECK(getsockname(rx, (struct sockaddr *)&addr, &alen));
+    const char *msgs[] = {"ab", "cde", "0123456789"};
+    for (int i = 0; i < 3; i++)                       // no connect, no listen: just send
+        CHECK(sendto(tx, msgs[i], strlen(msgs[i]), 0, (struct sockaddr *)&addr, sizeof addr));
+    char buf[64];
+    for (int i = 0; i < 2; i++) {
+        ssize_t n = recvfrom(rx, buf, sizeof buf, 0, NULL, NULL);
+        CHECK(n);
+        printf("datagram %d: %zd bytes\n", i + 1, n); // 2, then 3: the boundaries are kept
+    }
+    ssize_t n = recvfrom(rx, buf, 4, 0, NULL, NULL);  // a buffer smaller than the datagram
+    CHECK(n);
+    printf("datagram 3: %zd of 10 bytes, the rest is discarded\n", n);
+    close(rx); close(tx);
+    return 0;
+}
+// 8080, host order       90 1f      (on a little-endian machine; 1f 90 on a big-endian one)
+// htons(8080)            1f 90
+// 192.168.10.77          c0 a8 0a 4d
+// ntohl gives 0xc0a80a4d
+// datagram 1: 2 bytes
+// datagram 2: 3 bytes
+// datagram 3: 4 of 10 bytes, the rest is discarded
+```
+
+One thread serving three clients with `poll`. Each client holds its connection open for 20 to 60 ms before sending, so the three connections overlap:
+
+```c
+// One thread serves several clients at once with poll(): an echo server and three forked clients.
+#define _DEFAULT_SOURCE                   // glibc: declare POSIX and BSD calls under -std=c17
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#define CHECK(x) do { if ((x) < 0) { perror(#x); exit(1); } } while (0)
+#define NCLIENTS 3
+
+static int client(const struct sockaddr_in *srv, int k) {     // returns 0 if the echo matches
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    CHECK(fd);
+    CHECK(connect(fd, (const struct sockaddr *)srv, sizeof *srv));
+    char msg[32], buf[32];
+    int len = snprintf(msg, sizeof msg, "message from client %d", k);
+    usleep(20000 * (NCLIENTS + 1 - k));               // hold the connection open 20-60 ms: they overlap
+    CHECK(send(fd, msg, (size_t)len, 0));
+    int got = 0;
+    while (got < len) {
+        ssize_t n = recv(fd, buf + got, sizeof buf - (size_t)got, 0);
+        if (n <= 0) break;
+        got += (int)n;
+    }
+    close(fd);
+    return got == len && memcmp(msg, buf, (size_t)len) == 0 ? 0 : 1;
+}
+
+int main(void) {
+    int lfd = socket(AF_INET, SOCK_STREAM, 0);
+    CHECK(lfd);
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof addr);
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    CHECK(bind(lfd, (struct sockaddr *)&addr, sizeof addr));
+    CHECK(listen(lfd, 16));
+    socklen_t alen = sizeof addr;
+    CHECK(getsockname(lfd, (struct sockaddr *)&addr, &alen));
+    for (int k = 1; k <= NCLIENTS; k++) {
+        pid_t pid = fork();
+        CHECK(pid);
+        if (pid == 0) { close(lfd); exit(client(&addr, k)); }
+    }
+
+    struct pollfd fds[1 + NCLIENTS];                  // slot 0: the listening socket
+    int nfds = 1, closed = 0, most = 0;
+    fds[0] = (struct pollfd){ .fd = lfd, .events = POLLIN };
+    while (closed < NCLIENTS) {
+        CHECK(poll(fds, (nfds_t)nfds, -1));           // sleep until some socket is ready
+        if (fds[0].revents & POLLIN) {                // a connection is waiting: accept it
+            int cfd = accept(lfd, NULL, NULL);
+            CHECK(cfd);
+            fds[nfds++] = (struct pollfd){ .fd = cfd, .events = POLLIN };
+            if (nfds - 1 - closed > most) most = nfds - 1 - closed;
+        }
+        for (int i = 1; i < nfds; i++) {
+            if (fds[i].fd < 0 || !(fds[i].revents & (POLLIN | POLLHUP))) continue;
+            char buf[64];
+            ssize_t n = recv(fds[i].fd, buf, sizeof buf, 0);     // ready: this recv does not block
+            if (n > 0) { CHECK(send(fds[i].fd, buf, (size_t)n, 0)); continue; }
+            close(fds[i].fd);                         // 0 (or an error): the client is gone
+            fds[i].fd = -1;                           // poll ignores negative descriptors
+            closed++;
+        }
+    }
+    int ok = 0, status;
+    while (wait(&status) > 0) ok += WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    printf("one thread served %d clients; %d of them got their echo back\n", closed, ok);
+    printf("connections open at the same time: %s\n", most > 1 ? "more than one" : "one");
+    close(lfd);
+    return 0;
+}
+// one thread served 3 clients; 3 of them got their echo back
+// connections open at the same time: more than one
+```
+
+## Next
+
+Everything in this course since the [system-calls note](/notes/acos/system-calls) has been written in C, the language the kernel itself speaks. Most programs are not. A Python program that opens a socket calls the same `socket`, `connect` and `send`, through layers that the language brings with it: an interpreter, a memory manager with a garbage collector, its own rules for threads. The [next note](/notes/acos/language-runtimes) looks at what such a runtime asks of the operating system, with CPython as the example.
+
+## References
+
+- R. E. Bryant, D. R. O'Hallaron. *Computer Systems: A Programmer's Perspective*, 3rd ed. Pearson, 2016. §11.4 (the sockets interface; §11.4.1 socket address structures, §11.4.7 host and service conversion, §11.4.9 an echo client and server), §12.2 (concurrent programming with I/O multiplexing).
+- W. R. Stevens, B. Fenner, A. M. Rudoff. *UNIX Network Programming, Volume 1: The Sockets Networking API*, 3rd ed. Addison-Wesley, 2004. Ch. 4 (elementary TCP sockets), ch. 6 (I/O multiplexing: select and poll), ch. 8 (elementary UDP sockets), ch. 30 (client/server design alternatives).
+- M. Kerrisk. *The Linux Programming Interface*. No Starch Press, 2010. Ch. 56 (sockets: introduction), ch. 59 (Internet domain sockets), ch. 60 (server design), ch. 63 (alternative I/O models: select, poll, epoll).
+- Linux manual pages: [`listen(2)`](https://man7.org/linux/man-pages/man2/listen.2.html) (backlog and `somaxconn`), [`select(2)`](https://man7.org/linux/man-pages/man2/select.2.html) (`FD_SETSIZE`), [`epoll(7)`](https://man7.org/linux/man-pages/man7/epoll.7.html), [`socket(7)`](https://man7.org/linux/man-pages/man7/socket.7.html).
+- D. Kegel. [The C10K problem](http://www.kegel.com/c10k.html). 1999, revised later.
+- A. Tatarnikov. [Computer Architecture and Operating Systems, Lecture 13: Sockets](https://andrewt0301.github.io/hse-acos-course/part2os/13_Sockets/lecture.html). HSE University.

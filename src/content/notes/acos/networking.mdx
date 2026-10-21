@@ -1,0 +1,301 @@
+---
+title: Computer networks
+description: "How bytes travel between machines: protocol layers and encapsulation, Ethernet and MAC addresses, IP addresses with subnets and routing, ports, UDP and TCP with its handshake and its flow and congestion control, DNS, and why latency and bandwidth limit transfers differently."
+course: acos
+section: Networking
+order: 28
+status: published
+tags: [networking, osi-model, tcp-ip, encapsulation, ethernet, mac-address, ip-address, cidr, routing, ports, tcp, udp, dns, latency, bandwidth]
+prerequisites: ["Bits, integers and byte order", Inter-process communication, Virtual machines and containers]
+---
+
+import Encapsulation from '../../../components/figures/networking/Encapsulation.astro';
+import SubnetBits from '../../../components/figures/networking/SubnetBits.astro';
+import TransferTime from '../../../components/figures/networking/TransferTime.astro';
+
+The [previous note](/notes/acos/virtual-machines-and-containers) gave a container its own view of the machine, down to its own network interfaces, and left open what those interfaces connect to. Every channel the course has built so far, [pipes, shared memory and local sockets](/notes/acos/inter-process-communication), joins processes that share one kernel. A network joins processes on different machines, which share nothing but a medium that carries bits: a cable, a fibre, a radio channel. This note follows one message from a process on one machine to a process on another: the layers it passes through, the address each layer uses, the two transport protocols, how a name becomes an address, and what limits how fast the message arrives. The [next note](/notes/acos/sockets) writes the programs at both ends.
+
+**Notation.** A message has $S$ bytes. A link has **bandwidth** $B$ in bits per second and one-way **latency** $L$ in seconds; the **round-trip time** $\mathrm{RTT}$ is the time for a message to go and an answer to come back, about $2L$. An IPv4 address with a **prefix length** $n$ is written `a.b.c.d/n`. $1\ \text{kB} = 10^3$ bytes, $1\ \text{MB} = 10^6$ bytes, and $1\ \text{Mbit/s} = 10^6$ bits per second.
+
+## Baseline: one wire between two machines
+
+The simplest network is two computers joined by one cable. One side drives a signal, the other samples it, and bits cross. For two machines and one program on each, this works. It breaks in six ways as soon as the network grows:
+
+1. **More than two machines on one medium.** Every machine sees every signal. A frame needs the address of the machine it is for.
+2. **Errors.** Noise flips bits. The receiver needs a way to notice that a frame arrived damaged.
+3. **Many networks.** No cable reaches the whole world. A message must cross intermediate machines that decide where to send it next, and it needs an address that makes sense beyond the local cable.
+4. **Many programs per machine.** A machine runs a web server and a mail server; the message must say which program it is for.
+5. **Loss and reordering.** Across a path of many links, messages get dropped, duplicated and overtaken. Many programs need every byte, in order.
+6. **Names.** People remember `example.org`, not a 32-bit number.
+
+Each problem is solved once, by one layer of software, and the layers are stacked.
+
+## Layers: who solves which problem
+
+<aside class="callout"><strong>Key idea.</strong> Split the job into layers. Each layer solves one problem and uses only the service of the layer below it. On the way out, each layer wraps what it receives from above in its own header: this is **encapsulation**. On the way in, each layer reads and removes only its own header and passes the rest up. Because a layer never looks inside the headers of the others, Ethernet can be replaced by Wi-Fi without changing TCP, and a web browser never sees an Ethernet frame.</aside>
+
+Two layer models are in use. The **OSI reference model** of ISO and the ITU ([X.200](#references)) has seven layers; the **Internet model** of [RFC 1122](#references) has four. The Internet's protocols won, but OSI's numbers survived in everyday speech: a "layer 2 switch" works with Ethernet frames, a "layer 7 load balancer" with HTTP requests.
+
+| OSI layer | Internet layer | Unit of data | Address | Examples |
+| --- | --- | --- | --- | --- |
+| 7 application, 6 presentation, 5 session | application | message | name, URL | HTTP, DNS, SSH |
+| 4 transport | transport | segment (TCP), datagram (UDP) | port | TCP, UDP |
+| 3 network | internet | packet | IP address | IPv4, IPv6, ICMP |
+| 2 data link | link | frame | MAC address | Ethernet, Wi-Fi |
+| 1 physical | below the link layer | bits | none | cable, fibre, radio |
+
+The layers also map onto the parts of a computer that the course has met. The link layer lives in the network adapter, an [I/O device](/notes/acos/input-and-output) that moves frames to and from memory by DMA and raises an interrupt when one arrives, and in its driver. The internet and transport layers live in the kernel. The application layer is ordinary user code in a process. The boundary between the transport layer in the kernel and the application is a system-call interface, the socket API of the next note.
+
+### Encapsulation: headers around a payload
+
+**Worked example.** An application sends 1,460 bytes over TCP on Ethernet.
+
+<Encapsulation />
+
+1. The application hands 1,460 bytes to TCP.
+2. TCP adds a 20-byte header (without options): source and destination ports, a sequence number, an acknowledgement number, a window and a checksum. The result is a 1,480-byte **segment**.
+3. IP adds a 20-byte header: source and destination IP addresses, a time-to-live counter, the number of the protocol inside (6 for TCP) and a header checksum. The result is a 1,500-byte **packet**, exactly the largest payload an Ethernet frame may carry, its **MTU** (maximum transmission unit).
+4. Ethernet adds a 14-byte header (destination MAC address, source MAC address, and a 2-byte type, `0x0800` for IPv4) and a 4-byte **frame check sequence**, a CRC-32 of the frame. The result is a 1,518-byte **frame**.
+5. The receiver checks the CRC and strips the Ethernet header, then the IP header, then the TCP header, and hands the 1,460 bytes to the receiving process.
+
+On the wire, each frame is also preceded by an 8-byte preamble and start delimiter and followed by a 12-byte gap of silence, so it occupies $1{,}538$ byte times, of which $1{,}460 / 1{,}538 = 94.9\,\%$ is data. Headers are cheap for large messages and expensive for small ones. A single byte of data gives a 41-byte IP packet; Ethernet pads its payload to the 46-byte minimum, so the frame has the minimum size of 64 bytes and occupies 84 byte times, of which $1/84 = 1.2\,\%$ is data.
+
+## The link layer: Ethernet and MAC addresses
+
+Every Ethernet or Wi-Fi adapter has a 48-bit **MAC address** (medium access control), written as six bytes in hexadecimal, for example `02:1a:2b:3c:4d:5e`. Manufacturers get blocks of addresses from the IEEE, whose first three bytes identify the manufacturer, so every adapter leaves the factory with a unique address. Two bits of the first byte have meanings of their own: bit 0 marks a group (multicast) address, and bit 1 a locally administered one, set by software rather than burned in at the factory; the `02` of the example has bit 1 set. The address `ff:ff:ff:ff:ff:ff` is the **broadcast** address: a frame sent to it goes to every machine on the local network.
+
+A **switch** joins the cables of a local network. It reads the source address of every frame it receives and remembers which port that address came from; it then forwards each frame only out of the port where its destination lives, and floods a frame to all ports while the destination is still unknown. A receiver that finds a CRC mismatch drops the frame silently. Ethernet detects errors but does not repair them: retransmission, when a program needs it, is the job of a higher layer.
+
+MAC addresses work only on one local network. To send an IP packet to a neighbour, a host must first learn the neighbour's MAC address, and the **Address Resolution Protocol** ([ARP, RFC 826](#references)) does that: the host broadcasts "who has 192.168.10.1? tell 192.168.10.77", the owner of that IP address answers with its MAC address, and the answer is cached for a while.
+
+## The network layer: IP addresses, subnets and routing
+
+An **IPv4 address** is 32 bits, written as four bytes in decimal: `192.168.10.77` is `0xC0A80A4D`. Every IP header stores it, like every multi-byte number in a protocol header, in big-endian **network byte order**, whatever the byte order of the machine ([the byte-order note](/notes/acos/data-representation) explains the two orders). $2^{32}$ is about 4.3 billion addresses, fewer than the devices that want one; two answers to the shortage are NAT, below, and IPv6, whose addresses have 128 bits ([RFC 8200](#references)). This note uses IPv4 throughout.
+
+### Subnets and CIDR
+
+An IP address has two parts: a **network prefix**, shared by every host on one local network, and a **host part** that tells the hosts apart. Since **CIDR** (classless inter-domain routing, [RFC 4632](#references)) the split can fall after any bit. The prefix length $n$ is written after a slash, and the **netmask** is $n$ ones followed by $32 - n$ zeros.
+
+**Worked example.** Take `192.168.10.77/26`. The first three bytes are all network bits; the split falls inside the last byte.
+
+- The mask is 26 ones and 6 zeros: `255.255.255.192`, since the last byte is $11000000_2 = 192$.
+- The last byte of the address is $77 = 01001101_2$. The **network address** is the bitwise AND of address and mask: $01001101 \mathbin{\&} 11000000 = 01000000 = 64$, so the network is `192.168.10.64/26`.
+- The **broadcast address** sets every host bit to one: $01111111_2 = 127$, so `192.168.10.127`.
+- The host part has $2^6 = 64$ values. The all-zeros one names the network and the all-ones one is the broadcast address, which leaves $64 - 2 = 62$ hosts, `192.168.10.65` to `192.168.10.126`.
+
+<SubnetBits />
+
+The mask decides how a host sends a packet. If the destination has the same network address as the host, it is on the same local network: the host finds its MAC address by ARP and sends the frame directly. Otherwise the host sends the frame to its **default gateway**, a router on the local network. From `192.168.10.77/26`, the destination `192.168.10.130` has last byte $10000010_2$, network address $10000000_2 = 128 \ne 64$, so the packet goes to the router even though the first three bytes match.
+
+### Routing: longest-prefix match
+
+A **router** is a machine with interfaces on several networks. For each packet it looks up the destination address in a **forwarding table** of prefixes, picks the entry with the **longest prefix** that matches, and sends the packet to that entry's next hop.
+
+**Worked example.** A router has three entries (the address `203.0.113.1` is from a block reserved for documentation, [RFC 5737](#references)):
+
+| Prefix | Next hop |
+| --- | --- |
+| `0.0.0.0/0` | upstream router `203.0.113.1` |
+| `192.168.10.0/24` | interface `eth0` |
+| `192.168.10.64/26` | interface `eth1` |
+
+The destination `192.168.10.77` matches all three entries, and `/26` is the longest, so the packet leaves through `eth1`. The destination `192.168.10.5` matches `/24` and `/0` and leaves through `eth0`. The destination `198.51.100.7` matches only `/0`, the **default route**, and goes upstream. Each router on the way repeats the lookup with its own table; none of them knows the whole path.
+
+IP delivery is **best effort**: a router whose queue is full drops packets, two packets can take different paths and arrive out of order, and nothing tells the sender. Each router decrements the header's time-to-live (TTL) counter and drops a packet whose counter reaches zero, sending an ICMP "time exceeded" message back; this ends routing loops, and the `traceroute` tool uses it to list the routers on a path.
+
+Two ranges are special. The **private** ranges `10.0.0.0/8`, `172.16.0.0/12` and `192.168.0.0/16` ([RFC 1918](#references)) are reused inside many homes and companies and are never routed on the Internet; a **NAT** router rewrites their addresses and ports into its own public address on the way out. The **loopback** range `127.0.0.0/8` never leaves the machine: a packet to `127.0.0.1` is delivered by the kernel to a process on the same host, which is how the next note tests a client and a server on one computer.
+
+## Ports: which process on the host
+
+An IP address names a host. A **port**, a 16-bit number in the TCP and UDP headers, names an endpoint inside the host, and the kernel delivers each arriving segment to the socket bound to its destination port. A TCP connection is identified by five values, the protocol and both address–port pairs, so a server on port 443 can hold thousands of connections at once: they differ in the client's address or port.
+
+[RFC 6335](#references) divides the range into three parts:
+
+- **system** (well-known) ports, 0 to 1023, assigned to standard services: 22 for SSH, 53 for DNS, 80 for HTTP, 443 for HTTPS;
+- **user** (registered) ports, 1024 to 49151, assigned on request, such as 5432 for PostgreSQL;
+- **dynamic** ports, 49152 to 65535, never assigned, for temporary use.
+
+A client rarely chooses its port: the kernel gives it an **ephemeral port** from a configured range (on Linux 32768 to 60999 by default). On Linux, binding a port below 1024 needs root or a capability, a privilege check of the kind described in the note on [users and permissions](/notes/acos/users-and-permissions): an ordinary user should not be able to pose as a system service by taking its port.
+
+## The transport layer: UDP and TCP
+
+IP moves packets between hosts, unreliably. The transport layer turns that into a service for processes, and the Internet offers two.
+
+### UDP: one datagram, no promises
+
+**UDP** ([RFC 768](#references)) adds an 8-byte header to IP: source port, destination port, length and checksum. Each send produces one **datagram**, delivered whole or not at all; nothing is retransmitted, ordered or acknowledged, and there is no connection to set up. A UDP header for 12 bytes of data from port 5000 to port 53 is the eight bytes `13 88 00 35 00 14 00 00`: the two ports and the length $8 + 12 = 20$ in big-endian, and a checksum left at zero, which IPv4 allows. UDP suits short request–reply exchanges where a lost message can simply be resent (DNS), and real-time traffic where a late packet is useless (voice, video, games). QUIC, which carries HTTP/3, builds its own reliability on top of UDP in user space.
+
+### TCP: a reliable byte stream
+
+**TCP** ([RFC 9293](#references)) gives two processes a **connection**: a reliable, ordered, two-way stream of bytes. It has no message boundaries: two `send` calls of 100 bytes may arrive as one read of 200 bytes, or as three reads. It builds this on top of IP with four mechanisms.
+
+**The three-way handshake.** Each side picks an **initial sequence number** (ISN), random to make old or forged segments unlikely to fit, and must learn the other's.
+
+1. The client sends a segment with the SYN flag and its ISN, say $x = 1000$.
+2. The server answers with SYN and ACK set, its own ISN $y = 5000$, and the acknowledgement $x + 1 = 1001$, the next byte it expects.
+3. The client acknowledges with ACK $y + 1 = 5001$.
+
+A SYN counts as one byte of sequence space, which is why the acknowledgements are $x + 1$ and $y + 1$. If the client now sends 100 bytes, the segment carries sequence number 1001, and the server's acknowledgement is 1101. Two messages would not be enough: after a two-way exchange the server would not know whether the client received its ISN. The handshake costs one round trip before any data can flow. Closing takes a FIN from each side, each acknowledged; the next note draws the whole exchange next to the system calls that cause it.
+
+**Reliability.** Sequence numbers count bytes. The receiver acknowledges cumulatively, "everything up to byte $k$ has arrived", puts out-of-order segments back in order, and discards duplicates. The sender keeps every unacknowledged byte and retransmits it when a timer expires; the timeout follows a smoothed estimate of the round-trip time, and [RFC 6298](#references) recommends that it never fall below one second. Three duplicate acknowledgements of the same byte also trigger a retransmission, without waiting for the timer (fast retransmit). The checksum covers header and data.
+
+**Flow control.** The receiver advertises a **window**: how many more bytes its buffer can hold. The sender keeps at most that many unacknowledged bytes in flight, so a fast sender cannot overrun a slow reader. The window field has 16 bits, so it says at most 65,535 bytes, unless both sides agree on a **window scale** option that multiplies it by up to $2^{14}$ ([RFC 7323](#references)).
+
+**Congestion control.** The bottleneck may be neither the sender nor the receiver but a router in between. Each sender keeps a **congestion window** and sends at most the smaller of the two windows. It starts with 10 segments ([RFC 6928](#references)) and doubles the congestion window every round trip (**slow start**), then grows it by one segment per round trip (**congestion avoidance**); a loss is read as a sign of congestion, and the window is cut, by half in the classic scheme ([Jacobson, 1988](#references); [RFC 5681](#references)). Additive increase and multiplicative decrease make competing connections converge to a fair share. Linux uses CUBIC by default, which grows the window as a cubic function of the time since the last loss but keeps the same structure.
+
+**Worked example.** From 10 segments of 1,460 bytes, 14,600 bytes, slow start reaches a window of 1 MB after $\lceil \log_2(10^6 / 14{,}600) \rceil = \lceil 6.1 \rceil = 7$ round trips, if no loss interrupts it. On a path with an RTT of 80 ms that is more than half a second before the connection can use its full speed.
+
+| | UDP | TCP |
+| --- | --- | --- |
+| Connection | none | three-way handshake, one RTT |
+| Unit | datagram, boundaries kept | byte stream, no boundaries |
+| Delivery | maybe, in any order | every byte, in order, or an error |
+| Rate | as fast as the sender sends | limited by the receiver's window and the congestion window |
+| Header | 8 bytes | 20 bytes and more |
+| Typical use | DNS, voice and video, games, QUIC | web, mail, SSH, file transfer |
+
+## DNS: from names to addresses
+
+The **Domain Name System** ([RFC 1034 and 1035](#references)) is a distributed database that maps names to records. Names form a tree read from right to left: the root, a top-level domain such as `org`, a domain such as `example.org`, a host such as `www.example.org`. Each zone of the tree is served by its own **authoritative** servers, which know its records: `A` for an IPv4 address, `AAAA` for IPv6, `CNAME` for an alias, `MX` for a mail server, `NS` for the servers of a sub-zone.
+
+A program asks through the C library, by calling `getaddrinfo`. The library first reads the local hosts file, where `localhost` is defined as `127.0.0.1`, and otherwise sends a query, usually one UDP datagram to port 53, to a **recursive resolver** configured on the machine, often run by the network provider. The resolver walks the tree on the program's behalf: it asks a root server where the `org` servers are, asks an `org` server where the `example.org` servers are, asks one of those for the address, and returns it. Every answer carries a **time to live**, and the resolver caches it for that long, so popular names are answered without walking the tree at all.
+
+**Worked example.** Let the program reach its resolver in an RTT of 2 ms, and the resolver reach the root, the `org` server and the authoritative server in RTTs of 20, 30 and 40 ms. With an empty cache, the lookup takes $2 + 20 + 30 + 40 = 92$ ms, longer than the transfer of a small web page; with the answer cached at the resolver, it takes 2 ms. This is why DNS answers are cached at every level, in the resolver, the operating system and the browser.
+
+## Latency versus bandwidth
+
+How long does a message take? A simple model, for one message on an open path with no loss, is
+
+$$
+\boxed{T = L + \frac{8S}{B}} ,
+$$
+
+the latency before the first bit arrives plus the time to push all $8S$ bits through the link. Latency itself is a sum: propagation (light in fibre covers about 200 km per millisecond, so 2,000 km cost 10 ms each way), plus time spent waiting in router queues, plus processing. Bandwidth can be bought; propagation cannot ([Patterson, 2004](#references)).
+
+**Worked example.** Link A is near and slow: $L = 2$ ms, $B = 100$ Mbit/s. Link B is far and fast: $L = 38$ ms, $B = 1$ Gbit/s.
+
+- A 1 kB message: $T_A = 2 + 0.08 = 2.08$ ms and $T_B = 38 + 0.008 = 38.008$ ms. Latency dominates, and the slow link is 18 times faster.
+- A 1 GB message: $T_A = 0.002 + 80 = 80.002$ s and $T_B = 0.038 + 8 = 8.038$ s. Bandwidth dominates, and the fast link is 10 times faster.
+- The two times are equal when $L_A + 8S/B_A = L_B + 8S/B_B$, that is, at $8S = (L_B - L_A) / (1/B_A - 1/B_B) = 0.036 / (9 \times 10^{-9}) = 4 \times 10^6$ bits, $S = 500$ kB, where both take 42 ms.
+
+<TransferTime />
+
+TCP adds round trips to the model. The handshake costs one before the first byte; slow start costs several before the window is large; and the window must be large enough to fill the path. The number of bytes that are on their way at any moment on a full path is the **bandwidth–delay product** $B \cdot \mathrm{RTT}$.
+
+**Worked example.** At 100 Mbit/s and an RTT of 80 ms, $B \cdot \mathrm{RTT} = 10^8 \times 0.08 = 8 \times 10^6$ bits, 1 MB. A sender limited to the unscaled maximum window of 65,535 bytes sends one window per round trip, so its throughput is at most $65{,}535 \times 8 / 0.08 = 6.55$ Mbit/s, 6.6 % of the link, however fast the link is. Window scaling exists for exactly this case.
+
+For small transfers, then, the number of round trips matters more than the bandwidth. This is why browsers reuse connections, why TLS 1.3 shortened its handshake, and why content is served from machines near the reader.
+
+<aside class="callout"><strong>Check yourself.</strong> (1) What are the network address, the broadcast address and the number of hosts of `10.1.2.200/28`? (2) A router's table has `10.0.0.0/8 → A`, `10.1.0.0/16 → B` and `10.1.2.0/24 → C`. Where does it send `10.1.3.4`? (3) A link has $B = 1$ Gbit/s and $\mathrm{RTT} = 20$ ms. How large must a TCP window be to fill it, and is the unscaled maximum enough?<details><summary>Answers</summary>(1) The mask has 28 ones, so the last byte keeps its top 4 bits: $200 = 11001000_2$, AND $11110000_2$ gives $11000000_2 = 192$. The network is `10.1.2.192/28`, the broadcast address `10.1.2.207`, and there are $2^4 - 2 = 14$ hosts. (2) `10.1.3.4` matches `/8` and `/16` but not `10.1.2.0/24`, whose third byte is 2, so the longest match is `/16` and the packet goes to B. (3) $10^9 \times 0.02 = 2 \times 10^7$ bits, 2.5 MB. The unscaled 65,535 bytes are 38 times too small: they would allow at most $65{,}535 \times 8 / 0.02 = 26$ Mbit/s.</details></aside>
+
+## What changed
+
+| Problem on one wire | Solved by | Mechanism |
+| --- | --- | --- |
+| Which machine on the medium? | link layer | 48-bit MAC address, switch learning, ARP |
+| Damaged bits | link layer, then TCP | CRC drops bad frames; TCP retransmits |
+| Many networks | internet layer | IP addresses, prefixes, longest-prefix routing |
+| Which program on the machine? | transport layer | 16-bit ports |
+| Loss, duplication, reordering | TCP | sequence numbers, acknowledgements, timers |
+| A fast sender, a slow reader or a full router | TCP | receive window, congestion window |
+| Human names | application layer | DNS, cached by time to live |
+
+## Limitations
+
+- The four layers are cleaner on paper than in practice. NAT rewrites transport ports inside a network-layer device; TLS sits between TCP and the application; QUIC moves reliability and congestion control into a user-space library over UDP; tunnels and VPNs carry whole packets, even whole frames, inside other packets.
+- $T = L + 8S/B$ ignores queues, losses, handshakes and windows. Real throughput is measured, not computed, and it changes from minute to minute.
+- The note uses IPv4. IPv6 has 128-bit addresses, no broadcast, and the Neighbor Discovery Protocol in place of ARP; its ideas of prefixes and routing are the same.
+- None of IP, UDP, TCP or classic DNS authenticates anything: a machine on the path can read, change or forge packets. TLS, and DNSSEC for names, add that protection above.
+- Wireless links lose packets for reasons other than congestion, which misleads loss-based congestion control; this is one motivation for newer schemes such as BBR.
+
+## What you should remember
+
+- Layers solve one problem each and talk only to their neighbours; on the way out each wraps the data in its header, on the way in each strips its own. A full Ethernet frame carries 1,460 bytes of TCP data in 1,518 bytes.
+- A MAC address names an adapter on one local network; an IP address names a host anywhere; a port names an endpoint inside the host. ARP maps IP to MAC on the local network.
+- A prefix `/n` splits an address into network and host bits. Network address = address AND mask; a `/n` network has $2^{32-n} - 2$ hosts. Routers forward by the longest matching prefix.
+- UDP: datagrams, no connection, no guarantees. TCP: a connection opened by a three-way handshake, a reliable ordered byte stream with no message boundaries, a receive window for flow control and a congestion window for the network.
+- DNS maps names to addresses through a tree of servers, walked by a recursive resolver and cached by time to live.
+- $T = L + 8S/B$: small messages are limited by latency, large ones by bandwidth. Filling a path needs a window of $B \cdot \mathrm{RTT}$ bytes in flight.
+
+## Code
+
+The numbers of the note, recomputed with the Python standard library. Every output is printed by the code and copied into the comments.
+
+```python
+import ipaddress, math, socket, struct
+
+# 1. Encapsulation: a full 1,460-byte segment and a 1-byte one
+def frame(payload):
+    packet = payload + 20 + 20                  # TCP header + IPv4 header, no options
+    frame = 14 + max(packet, 46) + 4            # Ethernet header, payload padded to 46, FCS
+    return packet, frame, frame + 8 + 12        # + preamble and start delimiter, + interframe gap
+for p in (1460, 1):
+    packet, f, wire = frame(p)
+    print(p, packet, f, wire, f'{p / wire:.1%}')
+# 1460 1500 1518 1538 94.9% | 1 41 64 84 1.2%
+
+# 2. A /26 subnet, by hand and with ipaddress
+addr = int(ipaddress.IPv4Address('192.168.10.77'))
+mask = (0xFFFFFFFF << (32 - 26)) & 0xFFFFFFFF
+net, bcast = addr & mask, addr | (~mask & 0xFFFFFFFF)
+print(hex(addr), ipaddress.IPv4Address(mask), ipaddress.IPv4Address(net), ipaddress.IPv4Address(bcast))
+# 0xc0a80a4d 255.255.255.192 192.168.10.64 192.168.10.127
+n = ipaddress.ip_network('192.168.10.64/26')
+print(n.num_addresses, n.num_addresses - 2, ipaddress.ip_address('192.168.10.130') in n)   # 64 62 False
+
+# 3. Longest-prefix match
+table = {'0.0.0.0/0': 'upstream 203.0.113.1', '192.168.10.0/24': 'eth0', '192.168.10.64/26': 'eth1'}
+def route(dst):
+    hits = [ipaddress.ip_network(p) for p in table if ipaddress.ip_address(dst) in ipaddress.ip_network(p)]
+    return table[str(max(hits, key=lambda h: h.prefixlen))]
+print([route(d) for d in ('192.168.10.77', '192.168.10.5', '198.51.100.7')])
+# ['eth1', 'eth0', 'upstream 203.0.113.1']
+
+# 4. A UDP header in network byte order: ports 5000 -> 53, 12 bytes of data
+print(struct.pack('!HHHH', 5000, 53, 8 + 12, 0).hex(' '))   # 13 88 00 35 00 14 00 00
+
+# 5. Transfer time T = L + 8S/B on two links, and where they cross
+links = {'A': (0.002, 100e6), 'B': (0.038, 1e9)}       # one-way latency in s, bandwidth in bit/s
+for size in (1e3, 1e9):                                  # bytes
+    print(size, {k: round(L + 8 * size / B, 6) for k, (L, B) in links.items()})
+# 1000.0 {'A': 0.00208, 'B': 0.038008} | 1000000000.0 {'A': 80.002, 'B': 8.038}
+(LA, BA), (LB, BB) = links['A'], links['B']
+print(round((LB - LA) / (1 / BA - 1 / BB) / 8))          # 500000 bytes: below this, A is faster
+
+# 6. Bandwidth-delay product and the 64 KiB window, then slow start from 10 segments
+B, rtt = 100e6, 0.080
+print(B * rtt / 8, round(65535 * 8 / rtt / 1e6, 2))     # 1000000.0 bytes in flight; 6.55 Mbit/s at most
+print(math.ceil(math.log2(1e6 / (10 * 1460))))           # 7 round trips to grow a window of 14,600 B to 1 MB
+
+# 7. The name localhost resolves to the loopback address without asking any server
+print('127.0.0.1' in {ai[4][0] for ai in socket.getaddrinfo('localhost', 80, socket.AF_INET)})   # True
+```
+
+## Next
+
+The kernel now knows how to carry bytes to a process on another machine: it builds the headers, runs the handshake, retransmits what is lost and slows down when the network is full. What a program sees of all this is a file descriptor. The [next note](/notes/acos/sockets) opens that descriptor with the socket API, writes a TCP server and client in C, and shows how one server handles many clients at once.
+
+## References
+
+- R. Braden (ed.). [Requirements for Internet Hosts — Communication Layers](https://www.rfc-editor.org/rfc/rfc1122). RFC 1122, 1989. §1.1.3 (the four layers).
+- ITU-T Recommendation X.200 (identical to ISO/IEC 7498-1). [Information technology — Open Systems Interconnection — Basic Reference Model: The basic model](https://www.itu.int/rec/T-REC-X.200-199407-I/en). 1994.
+- D. Plummer. [An Ethernet Address Resolution Protocol](https://www.rfc-editor.org/rfc/rfc826). RFC 826, 1982.
+- J. Postel. [Internet Protocol](https://www.rfc-editor.org/rfc/rfc791). RFC 791, 1981. §3.1 (the header).
+- V. Fuller, T. Li. [Classless Inter-domain Routing (CIDR)](https://www.rfc-editor.org/rfc/rfc4632). RFC 4632, 2006.
+- Y. Rekhter et al. [Address Allocation for Private Internets](https://www.rfc-editor.org/rfc/rfc1918). RFC 1918, 1996.
+- J. Arkko, M. Cotton, L. Vegoda. [IPv4 Address Blocks Reserved for Documentation](https://www.rfc-editor.org/rfc/rfc5737). RFC 5737, 2010.
+- S. Deering, R. Hinden. [Internet Protocol, Version 6 (IPv6) Specification](https://www.rfc-editor.org/rfc/rfc8200). RFC 8200, 2017.
+- M. Cotton et al. [Internet Assigned Numbers Authority (IANA) Procedures for the Management of the Service Name and Transport Protocol Port Number Registry](https://www.rfc-editor.org/rfc/rfc6335). RFC 6335, 2011. §6 (port ranges).
+- J. Postel. [User Datagram Protocol](https://www.rfc-editor.org/rfc/rfc768). RFC 768, 1980.
+- W. Eddy (ed.). [Transmission Control Protocol (TCP)](https://www.rfc-editor.org/rfc/rfc9293). RFC 9293, 2022. §3.5 (connection establishment), §3.8 (data communication).
+- V. Paxson, M. Allman, J. Chu, M. Sargent. [Computing TCP's Retransmission Timer](https://www.rfc-editor.org/rfc/rfc6298). RFC 6298, 2011. §2 (the one-second minimum).
+- D. Borman, B. Braden, V. Jacobson, R. Scheffenegger (ed.). [TCP Extensions for High Performance](https://www.rfc-editor.org/rfc/rfc7323). RFC 7323, 2014. §2 (window scale).
+- J. Chu, N. Dukkipati, Y. Cheng, M. Mathis. [Increasing TCP's Initial Window](https://www.rfc-editor.org/rfc/rfc6928). RFC 6928, 2013.
+- M. Allman, V. Paxson, E. Blanton. [TCP Congestion Control](https://www.rfc-editor.org/rfc/rfc5681). RFC 5681, 2009. §3.1 (slow start and congestion avoidance), §3.2 (fast retransmit).
+- V. Jacobson. [Congestion Avoidance and Control](https://doi.org/10.1145/52324.52356). SIGCOMM, 1988.
+- P. Mockapetris. [Domain Names — Concepts and Facilities](https://www.rfc-editor.org/rfc/rfc1034) and [Domain Names — Implementation and Specification](https://www.rfc-editor.org/rfc/rfc1035). RFC 1034 and 1035, 1987.
+- D. A. Patterson. [Latency Lags Bandwidth](https://doi.org/10.1145/1022594.1022596). Communications of the ACM, 47(10), 2004.
+- R. E. Bryant, D. R. O'Hallaron. *Computer Systems: A Programmer's Perspective*, 3rd ed. Pearson, 2016. §11.1–11.3 (the client–server model, networks, the global IP Internet).
+- M. Kerrisk. *The Linux Programming Interface*. No Starch Press, 2010. Ch. 58 (fundamentals of TCP/IP networks).
+- A. S. Tanenbaum, H. Bos. *Modern Operating Systems*, 4th ed. Pearson, 2015. §8.3.1–8.3.2 (network hardware, network services and protocols).
+- A. Tatarnikov. [Computer Architecture and Operating Systems, Lecture 12: Basics of Networking](https://andrewt0301.github.io/hse-acos-course/part2os/12_Networking/lecture.html). HSE University.

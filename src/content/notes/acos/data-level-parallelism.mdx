@@ -1,0 +1,327 @@
+---
+title: Vectors, SIMD and GPUs
+description: "One instruction for many data elements: SIMD registers, vector processors and the RISC-V Vector extension with strip mining, a loop vectorized by the compiler and timed, GPUs with their warps and memory hierarchy, and the roofline model that tells arithmetic limits from memory limits."
+course: acos
+section: Parallelism and Performance
+order: 14
+status: published
+tags: [data-level-parallelism, simd, vector, risc-v-vector, strip-mining, vectorization, saxpy, gpu, simt, warp, roofline, arithmetic-intensity]
+prerequisites: [Floating-point numbers, Caches, Multicore processors and thread-level parallelism]
+---
+
+import StripMining from '../../../components/figures/data-level-parallelism/StripMining.astro';
+import Roofline from '../../../components/figures/data-level-parallelism/Roofline.astro';
+
+The [previous note](/notes/acos/thread-level-parallelism) gave a program several instruction streams, one per core, at the price of dividing the work and keeping private caches coherent. Much of the arithmetic a computer does is simpler than that: the same operation on every element of a long array. Brightening an image adds a constant to every pixel; a layer of a neural network multiplies a matrix by a matrix; a physics code updates every cell of a grid by one formula. A core that fetches, decodes, renames and schedules one instruction per element spends most of its energy on bookkeeping that is identical for every element. **Data-level parallelism** removes that bookkeeping: one instruction operates on many data elements at once. This note follows it from the SIMD registers of a CPU through vector processors and the RISC-V Vector extension to GPUs, measures what it gains on one loop, and ends with the roofline model, which says when the arithmetic is the limit and when memory is.
+
+**Notation.** The running example is **saxpy**, $y_i \leftarrow a\,x_i + y_i$ for $i = 0, \dots, n - 1$, on 32-bit floating-point numbers ("single-precision $a$ times $x$ plus $y$"). For the RISC-V Vector extension, VLEN is the number of bits in one vector register, SEW the width of one element in bits, LMUL the number of registers grouped into one operand, and $\mathrm{VLMAX} = \mathrm{LMUL} \cdot \mathrm{VLEN}/\mathrm{SEW}$ the largest number of elements one instruction can process; $\mathit{vl}$ is the number it actually processes, and AVL the number the program still has to process. For the roofline, $P$ is a machine's peak arithmetic rate in FLOP/s, $B$ its memory bandwidth in bytes/s, and $I$ the **arithmetic intensity** of a computation: floating-point operations per byte moved to or from memory.
+
+## Baseline: one element per instruction
+
+Scalar code processes one element per instruction. The integer version of the loop for RARS (the Code section runs it on ten elements) is
+
+```asm
+loop: lw   t0, 0(a2)      # t0 = x[i]
+      lw   t1, 0(a3)      # t1 = y[i]
+      mul  t0, t0, a1     # t0 = a * x[i]
+      add  t1, t1, t0     # t1 = a * x[i] + y[i]
+      sw   t1, 0(a3)      # y[i] = t1
+      addi a2, a2, 4      # advance the pointers and the counter
+      addi a3, a3, 4
+      addi a0, a0, -1
+      bnez a0, loop
+```
+
+Nine instructions per element, of which two do the arithmetic and three move data; the other four are loop overhead. Every one of them is fetched, decoded and, on the out-of-order core of the [instruction-level parallelism note](/notes/acos/instruction-level-parallelism), renamed, queued, woken up and retired. A four-wide core needs at least $9/4 = 2.25$ cycles per element even if no instruction ever waits. The work per element does not change from one element to the next, and nothing in the hardware takes advantage of that.
+
+Flynn's classification of computers names the alternatives ([Patterson and Hennessy, 2020](#references), §6.3): a single instruction stream on a single data stream (**SISD**) is the scalar core; multiple instruction streams on multiple data (**MIMD**) are the cores of the previous note; and a **single instruction on multiple data (SIMD)** is the subject of this note. Most parallel programs on MIMD hardware are written as one program that every core runs on its part of the data, the SPMD style (single program, multiple data).
+
+## SIMD instructions: several numbers in one register
+
+A **SIMD extension** adds wide registers that hold several numbers side by side, and instructions that operate on all of them at once. A 128-bit register holds four 32-bit floats, and one instruction multiplies or adds all four pairs. The four lanes are independent copies of a floating-point unit, controlled by one decoded instruction. ARM's NEON and x86's SSE use 128-bit registers, AVX and AVX2 256-bit, AVX-512 512-bit.
+
+**Worked example.** Saxpy on 128-bit registers handles four elements per iteration: load four $x$ values, load four $y$ values, one fused multiply-add for all four, store four $y$ values, then the loop overhead. That is about eight instructions per four elements, two per element instead of the scalar loop's nine.
+
+SIMD extensions fix the width in the instruction set. A wider register needs new instructions and new compiled code: x86 went from 64-bit MMX through 128-bit SSE and 256-bit AVX to 512-bit AVX-512, and a program compiled for one width does not use the next. Arrays whose length is not a multiple of the width need a separate scalar loop for the last few elements, and loads of a full register are fastest when the address is a multiple of its size. Programs use SIMD in three ways: through a compiler that vectorizes loops automatically, through intrinsics (C functions that map to single SIMD instructions), or through libraries written with them.
+
+### What the compiler needs to vectorize a loop
+
+A compiler vectorizes a loop when it can prove that executing four iterations at once gives the same result as executing them one after another. For saxpy, clang at `-O3` on the M1 reports `vectorized loop (vectorization width: 4, interleaved count: 4)` (the flag `-Rpass=loop-vectorize` prints it): four floats per 128-bit NEON register, and four such registers per iteration, sixteen elements, to give the out-of-order core independent work. Three things commonly prevent it:
+
+- **A loop-carried dependence.** In `y[i] = y[i - 1] + x[i]`, each iteration needs the result of the previous one, so four iterations cannot run at once.
+- **Possible aliasing.** If `x` and `y` might overlap, storing four `y` values could change `x` values a later group reads. The `restrict` qualifier promises that they do not; without it the compiler adds a run-time overlap check or gives up. The [next note](/notes/acos/performance-optimization#aliasing) treats aliasing in detail.
+- **Control flow and calls.** Branches inside the body must be turned into selects with a mask, and calls to functions the compiler cannot see stop it altogether.
+
+**Worked example (measured).** The saxpy program of the Code section, one thread on an Apple M1 (macOS 26.5, Apple clang 21), with $2^{28}$ element updates in total. With $n = 4{,}096$ the two arrays take 32 KB and stay in the 128 KB first-level cache; with $n = 2^{24}$ they take 128 MB and come from main memory on every pass. One run of each build gave, in GFLOP/s (two operations per element):
+
+| Build | $n = 4{,}096$, in cache | $n = 2^{24}$, from memory |
+| --- | --- | --- |
+| `-O0` | 1.45 | 1.39 |
+| `-O3 -fno-vectorize -fno-slp-vectorize` (scalar) | 6.02 | 3.41 |
+| `-O3` (SIMD, 4 lanes) | 31.12 | 8.21 |
+
+The machine was shared with other jobs, and eight runs of the `-O3` build on different occasions ranged from 15.6 to 31.4 GFLOP/s in cache and from 5.4 to 8.2 from memory; the ratios below come from the single run in the table, in which the three builds ran one after another. Turning off optimization altogether costs a factor of about 20 in cache, mostly through loads and stores of the loop counter and pointers. Vectorization on top of an optimized scalar loop gains a factor of 5.2 when the data is in the cache, but only 2.4 when it comes from memory. At $n = 2^{24}$ the vectorized loop moves $12$ bytes per element (load $x$, load $y$, store $y$) at 8.21 GFLOP/s, which is 49 GB/s: the loop now waits for memory, and wider registers would not make it faster. The roofline model below makes this precise.
+
+## Vector processors and the RISC-V Vector extension
+
+A **vector architecture** takes the idea further. Its registers hold many elements, typically tens to hundreds, and the hardware streams them through pipelined functional units, often several lanes wide. A vector instruction states up front that its element operations are independent, so the hardware does not need to check dependences between them, and one fetched instruction keeps the units busy for many cycles. Vector loads also accept a stride or a list of indices (a *gather*), so a column of a matrix or an indirect access is one instruction ([Hennessy and Patterson, 2019](#references), Chapter 4).
+
+The **RISC-V Vector extension** (RVV) has 32 vector registers, `v0`–`v31`, each VLEN bits long. VLEN is a property of the implementation, not of the instruction set: the V extension requires at least 128, and a large machine may have 1,024 or more. Programs never assume a value. Instead, every loop asks the hardware how many elements it may process in this pass:
+
+```asm
+vsetvli rd, rs1, e32, m1, ta, ma   # rs1 = AVL; sets vl, writes it to rd
+```
+
+`e32` sets SEW to 32 bits, `m1` sets LMUL to 1, and `ta, ma` say that elements past $\mathit{vl}$ and masked-off elements may be left with any value. The instruction computes $\mathrm{VLMAX} = \mathrm{LMUL} \cdot \mathrm{VLEN}/\mathrm{SEW}$ and sets $\mathit{vl}$ by the rules of the specification ([RISC-V International, 2021](#references)): $\mathit{vl} = \mathrm{AVL}$ if $\mathrm{AVL} \le \mathrm{VLMAX}$; $\mathit{vl} = \mathrm{VLMAX}$ if $\mathrm{AVL} \ge 2\,\mathrm{VLMAX}$; and in between, any value with $\lceil \mathrm{AVL}/2 \rceil \le \mathit{vl} \le \mathrm{VLMAX}$, so that an implementation may split the last two passes evenly.
+
+<aside class="callout"><strong>Key idea.</strong> Let the hardware choose how many elements one instruction processes. A loop asks for "up to AVL elements", processes the $\mathit{vl}$ elements it is granted, advances its pointers by $\mathit{vl}$, and repeats until nothing is left. The same binary runs on a 128-bit and a 1,024-bit implementation, and needs no separate loop for the leftover elements.</aside>
+
+This loop is called **strip mining**: the array is cut into strips of at most VLMAX elements. In RVV, saxpy is the following loop. RARS does not implement the vector extension, so it is shown as an excerpt (not run here; it runs on a RISC-V machine or simulator with the V extension):
+
+```asm
+# saxpy: y[i] = a * x[i] + y[i] for i < n, with the RISC-V Vector extension
+# arguments: a0 = n, fa0 = a, a1 = address of x, a2 = address of y
+saxpy:
+    vsetvli   t0, a0, e32, m1, ta, ma   # t0 = vl, the elements of this pass
+    vle32.v   v1, (a1)                  # v1 = x[0 .. vl-1]
+    vle32.v   v2, (a2)                  # v2 = y[0 .. vl-1]
+    vfmacc.vf v2, fa0, v1               # v2 = a * v1 + v2, element by element
+    vse32.v   v2, (a2)                  # y[0 .. vl-1] = v2
+    sub       a0, a0, t0                # n = n - vl
+    slli      t1, t0, 2                 # 4 bytes per element
+    add       a1, a1, t1                # advance x
+    add       a2, a2, t1                # advance y
+    bnez      a0, saxpy                 # until no elements are left
+    ret
+```
+
+**Worked example.** With VLEN = 128, SEW = 32 and LMUL = 1, $\mathrm{VLMAX} = 128/32 = 4$. For $n = 10$, $a = 2$, $x = (1, 2, \dots, 10)$ and every $y_i = 10$:
+
+<StripMining />
+
+1. **Pass 1.** AVL = 10 is at least $2 \cdot 4$, so $\mathit{vl} = 4$. Elements 0–3 are computed: $y = (12, 14, 16, 18)$. Ten minus four leaves 6.
+2. **Pass 2.** AVL = 6 lies between 4 and 8, so the specification allows $\mathit{vl} = 3$ or $4$; an implementation that always grants the maximum takes 4, and elements 4–7 become $(20, 22, 24, 26)$. Two are left.
+3. **Pass 3.** AVL = 2 is at most 4, so $\mathit{vl} = 2$: elements 8 and 9 become $(28, 30)$, and the other two lanes are not written. Nothing is left, and the loop ends.
+
+The loop executes 10 instructions per pass: 30 for the ten elements, against 90 for the scalar loop. With VLEN = 512 the same binary would process sixteen elements per pass. An implementation that grants 3 in pass 2 finishes with passes of 4, 3 and 3 and the same result.
+
+## GPUs: thousands of threads in groups of 32
+
+A **graphics processing unit** pushes data-level parallelism furthest. It is built from many SIMD processors, which NVIDIA calls **streaming multiprocessors** (SMs), with a memory system designed for bandwidth rather than latency. An NVIDIA A100 has 108 SMs with 64 single-precision lanes each, 6,912 in all; at its boost clock of 1.41 GHz, with a fused multiply-add counted as two operations, that is $6{,}912 \cdot 2 \cdot 1.41 \times 10^9 = 19.5$ TFLOP/s, its rated single-precision peak. Its tensor cores, units that multiply small matrices in one operation, reach 312 TFLOP/s in 16-bit arithmetic ([NVIDIA, 2020](#references), Table 4).
+
+**SIMT.** A GPU is programmed in a scalar style. The programmer writes a function, a **kernel**, for one thread, and launches it on a grid of thousands of threads, grouped into blocks; each thread computes its own index. In CUDA, saxpy is (an excerpt, not run here; it needs an NVIDIA GPU):
+
+```c
+__global__ void saxpy(int n, float a, const float *x, float *y) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;   // this thread's element
+    if (i < n) y[i] = a * x[i] + y[i];
+}
+// launched as saxpy<<<(n + 255) / 256, 256>>>(n, a, x, y): blocks of 256 threads
+```
+
+The hardware runs 32 consecutive threads of a block together as a **warp**: one instruction is fetched and issued for all 32, and each lane applies it to its own thread's registers. NVIDIA calls this single instruction, multiple threads (**SIMT**; [Lindholm et al., 2008](#references)). It is SIMD with a per-lane mask that the hardware manages: when threads of one warp take different sides of a branch, the warp executes both sides one after the other, with the lanes of the other side switched off. This **divergence** costs time; an `if`/`else` that splits every warp in two halves the throughput of that part of the code.
+
+**Worked example.** For $n = 10^6$ and blocks of 256 threads, the launch creates $\lceil 10^6/256 \rceil = 3{,}907$ blocks, $3{,}907 \cdot 256 = 1{,}000{,}192$ threads and $3{,}907 \cdot 8 = 31{,}256$ warps. The test `i < n` switches off the last 192 threads; they all fall in the last block, in its last six warps, so only those warps have masked lanes and no warp diverges in a way that costs a second pass over useful work.
+
+**Hiding latency with threads.** A load from GPU memory takes hundreds of cycles, and a GPU has no out-of-order execution to work around it. Instead, each A100 SM keeps up to 64 warps (2,048 threads) resident, with their registers in a 256 KB register file per SM, and every cycle its schedulers issue from warps that are ready while the others wait. This is the fine-grained multithreading of the [previous note](/notes/acos/thread-level-parallelism#hardware-multithreading), on a large scale. It works only if there are many more threads than lanes; the register file sets the limit: $65{,}536$ 32-bit registers shared by 2,048 threads is 32 registers per thread at full occupancy.
+
+**The memory hierarchy.** Each A100 SM has its registers and 192 KB of fast on-chip memory, split between an L1 cache and up to 164 KB of **shared memory**, which the program manages explicitly to share data between the threads of a block. All SMs share a 40 MB L2 cache and 40 GB of high-bandwidth memory (HBM2) at 1,555 GB/s ([NVIDIA, 2020](#references), Table 4). When the 32 threads of a warp load 32 consecutive 4-byte words, the hardware **coalesces** the accesses into a few transactions for 128 contiguous bytes; when they load scattered words, each needs its own, and the effective bandwidth falls by up to 32 times ([NVIDIA, CUDA C++ Programming Guide](#references), on device memory accesses). The [efficient-transformers note](/notes/nlp/efficient-transformers#where-the-time-goes-memory-traffic-not-arithmetic) shows what this hierarchy means for attention: FlashAttention computes it in tiles that stay in shared memory and never writes the large score matrix to HBM.
+
+## The roofline model: arithmetic or memory?
+
+The measured saxpy stopped gaining from wider registers once its data came from main memory. The **roofline model** ([Williams, Waterman and Patterson, 2009](#references)) predicts that limit from two numbers of the machine and one of the computation.
+
+A computation does $F$ floating-point operations and moves $D$ bytes between the processor and memory. On a machine with peak arithmetic rate $P$ and memory bandwidth $B$, the arithmetic alone takes at least $F/P$ seconds and the memory traffic at least $D/B$. Even if the two overlap perfectly, the running time $t$ is at least the larger of them, so
+
+$$
+\begin{aligned}
+t &\ge \max\!\Big(\frac{F}{P}, \frac{D}{B}\Big) && \text{both must happen} \\
+\frac{F}{t} &\le \min\!\Big(P, \frac{F}{D}\,B\Big) && \text{divide } F \text{ by both sides} \\
+&= \min(P,\; I \cdot B) && I = F/D .
+\end{aligned}
+$$
+
+$$
+\boxed{\;\text{attainable FLOP/s} = \min(P,\; I \cdot B)\;}
+$$
+
+On a log-log plot of attainable performance against $I$, the bound is a slanted line $I \cdot B$ (the memory roof) that meets a flat line $P$ (the compute roof) at the **ridge point** $I^* = P/B$. A computation with $I < I^*$ is **memory-bound**: a faster arithmetic unit would not help it, and only moving fewer bytes would. One with $I > I^*$ is **compute-bound**.
+
+**Worked example.** For the A100 with $B = 1.555$ TB/s, the ridge point is $19.5/1.555 = 12.5$ FLOP/byte for single-precision arithmetic and $312/1.555 = 200.6$ for the 16-bit tensor cores.
+
+- **Vector addition**, $z_i = x_i + y_i$: one operation per 12 bytes (two loads and a store of 4-byte floats), $I = 0.083$. It attains at most $0.083 \cdot 1.555 = 0.13$ TFLOP/s, 0.7 % of the single-precision peak.
+- **Saxpy**: two operations per 12 bytes, $I = 0.167$, at most 0.26 TFLOP/s. A saxpy on $2^{24}$ elements takes at least 129 µs to move its 201 MB, while its arithmetic alone would take 1.7 µs.
+- **Matrix multiplication** of two $n \times n$ matrices: $2n^3$ operations. If each of the three matrices crosses the memory boundary once, it moves $3 \cdot 4 n^2$ bytes in single precision, and $I = 2n^3/(12 n^2) = n/6$. For $n = 64$ that is 10.7, just below the ridge (at most 16.6 TFLOP/s); for $n = 4{,}096$ it is 683, far above it: compute-bound at 19.5 TFLOP/s, or at 312 TFLOP/s on the tensor cores, whose 16-bit data doubles $I$ to 1,365.
+
+<Roofline />
+
+The matrix product reaches its high intensity only if the implementation actually reuses each loaded number about $n$ times, which needs tiles that stay in fast memory: in the shared memory of a GPU or the caches of a CPU, by the blocking of the [next note](/notes/acos/performance-optimization#blocking). A naive implementation that reloads its operands for every multiply-add has an intensity below 1 and sits on the memory roof. This is why the dense layers of a neural network, matrix products as the [neural-networks note](/notes/ml/neural-networks#the-multilayer-perceptron) writes them, run near the peak of a GPU, while element-wise operations such as activations, normalizations and the softmax of attention are memory-bound and take a share of the running time far above their share of the arithmetic.
+
+<aside class="callout"><strong>Check yourself.</strong> (1) An RVV machine has VLEN = 256. What is VLMAX for SEW = 32 and LMUL = 1, and how many passes does the strip-mined saxpy make for $n = 20$ if the hardware always grants the maximum? (2) A kernel reads two arrays of doubles and writes one, doing 3 operations per element. Is it compute- or memory-bound on the A100 in double precision (peak 9.7 TFLOP/s), and what can it attain? (3) Why does a GPU need many more threads than it has lanes?<details><summary>Answers</summary>(1) $\mathrm{VLMAX} = 256/32 = 8$; passes of 8, 8 and 4, three in all. (2) $I = 3/24 = 0.125$ FLOP/byte, against a ridge point of $9.7/1.555 = 6.2$: memory-bound, at most $0.125 \cdot 1.555 = 0.19$ TFLOP/s. (3) A memory access takes hundreds of cycles, and the GPU hides it by switching to other warps instead of executing out of order; the warps waiting for memory must be covered by enough warps that are ready.</details></aside>
+
+## What changed
+
+| | Scalar core | SIMD extension | Vector (RVV) | GPU |
+| --- | --- | --- | --- | --- |
+| Elements per instruction | 1 | fixed by the ISA (4 floats at 128 bits) | $\mathit{vl} \le \mathrm{VLMAX}$, set at run time | 32 per warp instruction |
+| Leftover elements | none | a scalar tail loop | handled by $\mathit{vl}$ | masked threads |
+| Who finds the parallelism | the out-of-order hardware | compiler or programmer | compiler or programmer | programmer, one thread per element |
+| Hides memory latency by | out-of-order execution, caches | the same | long vectors, pipelining | switching among many warps |
+| Peak in single precision | a few FLOP per cycle | ×4–16 | ×lanes | 19.5 TFLOP/s (A100), 312 with tensor cores |
+
+## Limitations
+
+- **Only regular loops benefit.** Data-dependent branches, pointer chasing and loop-carried dependences leave lanes idle or prevent vectorization altogether.
+- **Memory bandwidth is the usual limit.** Low-intensity code such as vector addition and saxpy sits on the memory roof, and wider units do not help it.
+- **Fixed-width SIMD ages with its ISA.** Code compiled for one width does not use a wider one; vector-length-agnostic designs such as RVV avoid this.
+- **GPUs pay for distance.** Data must be copied to the GPU's memory, and divergent or uncoalesced code loses most of the peak.
+- **The roofline is a bound, not a prediction.** It ignores latency, caches between the processor and memory, and the instruction overhead that kept the scalar saxpy below its memory roof.
+
+## What you should remember
+
+- Data-level parallelism applies one instruction to many elements, saving the fetch, decode and scheduling of the scalar loop.
+- SIMD registers hold a fixed number of elements (four floats in 128 bits); vector architectures such as RVV let `vsetvli` grant $\mathit{vl} \le \mathrm{VLMAX} = \mathrm{LMUL} \cdot \mathrm{VLEN}/\mathrm{SEW}$ elements per pass, and strip mining loops until nothing is left.
+- A compiler vectorizes a loop without loop-carried dependences or aliasing. Measured on the M1: saxpy at 31 GFLOP/s from the cache against 6 without SIMD, but only 8.2 against 3.4 from memory.
+- GPUs run thousands of threads in warps of 32 (SIMT), hide memory latency by switching warps, and need coalesced accesses and little divergence.
+- Roofline: attainable FLOP/s $= \min(P, I \cdot B)$, with the ridge at $I^* = P/B$ (12.5 FLOP/byte for the A100 in single precision). Vector operations are memory-bound; a large blocked matrix product is compute-bound.
+
+## Code
+
+The scalar loop of the baseline as a RARS program, on integers: $y \leftarrow 2x + y$ for ten elements.
+
+```asm
+# y[i] = a * x[i] + y[i] on integers, one element per iteration (scalar code)
+        .data
+x:      .word 1, 2, 3, 4, 5, 6, 7, 8, 9, 10
+y:      .word 10, 10, 10, 10, 10, 10, 10, 10, 10, 10
+n:      .word 10
+        .text
+main:
+        lw   a0, n              # a0 = n, elements left
+        li   a1, 2              # a = 2
+        la   a2, x
+        la   a3, y
+loop:   lw   t0, 0(a2)          # t0 = x[i]
+        lw   t1, 0(a3)          # t1 = y[i]
+        mul  t0, t0, a1         # t0 = a * x[i]
+        add  t1, t1, t0         # t1 = a * x[i] + y[i]
+        sw   t1, 0(a3)          # y[i] = t1
+        addi a2, a2, 4
+        addi a3, a3, 4
+        addi a0, a0, -1
+        bnez a0, loop
+        la   s0, y              # print y
+        lw   s1, n
+print:  lw   a0, 0(s0)
+        li   a7, 1
+        ecall
+        li   a0, ' '
+        li   a7, 11
+        ecall
+        addi s0, s0, 4
+        addi s1, s1, -1
+        bnez s1, print
+        li   a7, 10
+        ecall
+# prints: 12 14 16 18 20 22 24 26 28 30
+```
+
+Saxpy in C, timed for an array that fits in the first-level cache and one that does not. Compile it three ways: `clang -std=c17 -Wall -Wextra -O0 saxpy.c`, then with `-O3 -fno-vectorize -fno-slp-vectorize`, then with `-O3`; adding `-Rpass=loop-vectorize` to the last prints the vectorization report. The rates depend on the machine and vary between runs; the output shown is one run on an Apple M1 (macOS 26.5, Apple clang 21), one thread, with other programs running.
+
+```c
+// saxpy, y = a*x + y, timed for a small array (fits in the L1 cache) and a large one (does not fit in any cache).
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+
+static void saxpy(long n, float a, const float *restrict x, float *restrict y) {
+    for (long i = 0; i < n; i++)
+        y[i] = a * x[i] + y[i];
+}
+
+static double now(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec + t.tv_nsec / 1e9;
+}
+
+int main(void) {
+    long sizes[] = {4096, 1L << 24};                // 2 x 16 KB, and 2 x 64 MB
+    for (int s = 0; s < 2; s++) {
+        long n = sizes[s], reps = (1L << 28) / n;   // 2^28 element updates in total
+        float *x = malloc(n * sizeof *x), *y = malloc(n * sizeof *y);
+        for (long i = 0; i < n; i++) { x[i] = 1.0f; y[i] = 0.0f; }
+        double t0 = now();
+        for (long r = 0; r < reps; r++) saxpy(n, 0.5f, x, y);
+        double t = now() - t0;
+        // 2 flops and 12 bytes (load x, load y, store y) per element
+        printf("n = %8ld: y[0] = %.0f, %.2f GFLOP/s, %.1f GB/s\n",
+               n, y[0], 2.0 * n * reps / t / 1e9, 12.0 * n * reps / t / 1e9);
+        free(x); free(y);
+    }
+    return 0;
+}
+// -O0:
+// n =     4096: y[0] = 32768, 1.45 GFLOP/s, 8.7 GB/s
+// n = 16777216: y[0] = 8, 1.39 GFLOP/s, 8.4 GB/s
+// -O3 -fno-vectorize -fno-slp-vectorize:
+// n =     4096: y[0] = 32768, 6.02 GFLOP/s, 36.1 GB/s
+// n = 16777216: y[0] = 8, 3.41 GFLOP/s, 20.5 GB/s
+// -O3 (remark: vectorized loop (vectorization width: 4, interleaved count: 4)):
+// n =     4096: y[0] = 32768, 31.12 GFLOP/s, 186.7 GB/s
+// n = 16777216: y[0] = 8, 8.21 GFLOP/s, 49.2 GB/s
+```
+
+The roofline of the A100 and the kernels of the worked example:
+
+```python
+# The roofline of an NVIDIA A100 (40 GB): attainable FLOP/s = min(peak, intensity * bandwidth)
+B = 1.555e12                                  # HBM bandwidth, bytes/s
+roofs = {'FP32': 19.5e12, 'FP16 tensor': 312e12}
+for name, P in roofs.items():
+    print(f'{name}: ridge point {P / B:.1f} FLOP/byte')
+# FP32: ridge point 12.5 FLOP/byte
+# FP16 tensor: ridge point 200.6 FLOP/byte
+
+def matmul(n, size):                          # C = A B for n x n matrices: 2n^3 flops, each matrix moved once
+    return 2 * n**3, 3 * n * n * size
+kernels = {                                   # (flops, bytes) per call, 32-bit floats unless stated
+    'vector add, z = x + y':  (1, 12),        # per element: load x, load y, store z
+    'saxpy, y = a x + y':     (2, 12),
+    'matmul n = 64, fp32':    matmul(64, 4),
+    'matmul n = 4096, fp32':  matmul(4096, 4),
+    'matmul n = 4096, fp16':  matmul(4096, 2),
+}
+for name, (flops, nbytes) in kernels.items():
+    I = flops / nbytes
+    P = roofs['FP16 tensor'] if 'fp16' in name else roofs['FP32']
+    att = min(P, I * B)
+    print(f'{name:24s} I = {I:8.3f} FLOP/byte  attainable {att / 1e12:7.3f} TFLOP/s  '
+          f'{"memory" if I * B < P else "compute"}-bound')
+# vector add, z = x + y    I =    0.083 FLOP/byte  attainable   0.130 TFLOP/s  memory-bound
+# saxpy, y = a x + y       I =    0.167 FLOP/byte  attainable   0.259 TFLOP/s  memory-bound
+# matmul n = 64, fp32      I =   10.667 FLOP/byte  attainable  16.587 TFLOP/s  memory-bound
+# matmul n = 4096, fp32    I =  682.667 FLOP/byte  attainable  19.500 TFLOP/s  compute-bound
+# matmul n = 4096, fp16    I = 1365.333 FLOP/byte  attainable 312.000 TFLOP/s  compute-bound
+
+# saxpy at memory speed: the time is set by the bytes, not the flops
+n = 1 << 24
+print(f'saxpy n = 2^24: {12 * n / B * 1e6:.0f} us for {12 * n / 1e6:.0f} MB; its flops alone would take {2 * n / 19.5e12 * 1e6:.1f} us')
+# saxpy n = 2^24: 129 us for 201 MB; its flops alone would take 1.7 us
+```
+
+## Next
+
+Instruction-, thread- and data-level parallelism are now all on the table, and the roofline says how close a computation can come to the machine's peak. Getting there is a matter of the program: measuring where the time goes, letting the compiler do its work, and arranging the data so that the caches deliver it. The [next note](/notes/acos/performance-optimization) does this for a matrix product, step by step, from loop order to blocking.
+
+## References
+
+- A. Tatarnikov. *Computer Architecture and Operating Systems* (HSE), [lecture 16: data-level parallelism: vector, SIMD, GPU](https://andrewt0301.github.io/hse-acos-course/part1ca/16_DLP/lecture.html).
+- D. A. Patterson, J. L. Hennessy. *Computer Organization and Design, RISC-V Edition*, 2nd ed. Morgan Kaufmann, 2020. §6.3 (SISD, MIMD, SIMD, SPMD and vector), §6.6 (introduction to graphics processing units), §6.11 (the roofline performance model).
+- J. L. Hennessy, D. A. Patterson. *Computer Architecture: A Quantitative Approach*, 6th ed. Morgan Kaufmann, 2019. Chapter 4 (data-level parallelism in vector, SIMD and GPU architectures; the roofline model).
+- RISC-V International. [The RISC-V Instruction Set Manual, Volume I: Unprivileged ISA](https://github.com/riscv/riscv-isa-manual), "V" Standard Extension for Vector Operations, version 1.0 (ratified 2021): vector registers and VLEN, `vtype` and VLMAX, the constraints on setting `vl`, Zvl128b.
+- S. Williams, A. Waterman, D. Patterson. [Roofline: an insightful visual performance model for multicore architectures](https://doi.org/10.1145/1498765.1498785). *Communications of the ACM*, 52(4), 2009.
+- E. Lindholm, J. Nickolls, S. Oberman, J. Montrym. [NVIDIA Tesla: a unified graphics and computing architecture](https://doi.org/10.1109/MM.2008.31). *IEEE Micro*, 28(2), 2008 (SIMT and warps).
+- J. Nickolls, I. Buck, M. Garland, K. Skadron. [Scalable parallel programming with CUDA](https://doi.org/10.1145/1365490.1365500). *ACM Queue*, 6(2), 2008.
+- NVIDIA. [NVIDIA A100 Tensor Core GPU Architecture](https://images.nvidia.com/aem-dam/en-zz/Solutions/data-center/nvidia-ampere-architecture-whitepaper.pdf), whitepaper, 2020. Table 4 (SMs, FP32 cores, boost clock, peak rates, memory bandwidth, L2 and shared memory sizes, register file), and the table of compute capabilities (warps and threads per SM).
+- NVIDIA. [CUDA C++ Programming Guide](https://docs.nvidia.com/cuda/cuda-c-programming-guide/), sections on the SIMT architecture and on device memory accesses (warps of 32 threads, coalescing).

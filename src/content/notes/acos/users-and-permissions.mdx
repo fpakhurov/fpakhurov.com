@@ -1,0 +1,294 @@
+---
+title: Users, groups and permissions
+description: "How the kernel decides who may read, write or run a file: user and group IDs, the nine permission bits for owner, group and others, octal modes and the umask, setuid, setgid and the sticky bit, real and effective user IDs, ACLs and capabilities."
+course: acos
+section: Files, Users and Isolation
+order: 26
+status: published
+tags: [users, groups, uid, gid, permissions, chmod, umask, setuid, sticky-bit, least-privilege, acl, capabilities]
+prerequisites: [Files and input/output, Processes and threads, System calls]
+---
+
+import PermissionCheck from '../../../components/figures/users-and-permissions/PermissionCheck.astro';
+
+In the [previous note](/notes/acos/files-and-io) every `open` succeeded, because every program opened files it had created itself. On a machine used by several people, or by several services that should not trust each other, the kernel must decide on every `open`, every `exec` and at every directory on a path whether the request is allowed. Security has two halves. *Authentication* establishes who is asking, for example with a password at login. *Access control* decides what that identity may do. This note is about the second half as Unix does it: the identities a process carries, the permission bits that the [inode](/notes/acos/files-and-io#where-the-bytes-live-inodes-and-directories) stores next to the file's size, the special bits that let a program act with someone else's rights, and the finer tools that came later.
+
+**Notation.** UID is a user ID and GID a group ID, both small integers. A process has a real, an effective and a saved UID, written ruid, euid and suid, and the same three GIDs. Permission modes are octal numbers written, as in C, with a leading zero: `0640` is $6 \cdot 8^2 + 4 \cdot 8 = 416$ in decimal.
+
+## Who is asking? Users, groups and credentials
+
+To the kernel a user is a number, the **UID**. Names exist for people and are kept in ordinary files. Each line of `/etc/passwd` has seven fields separated by colons: name, a placeholder for the password, UID, primary GID, a comment, the home directory and the login shell. On a Debian 13 system, for example:
+
+```
+root:x:0:0:root:/root:/bin/bash
+postgres:x:999:999::/var/lib/postgresql:/bin/bash
+```
+
+The password hashes are in `/etc/shadow`, which ordinary users cannot read. A **group** is a number too, the **GID**, with names and members listed in `/etc/group`. A user has one primary group, from `/etc/passwd`, and any number of *supplementary* groups, from the member lists in `/etc/group`. The command `id` prints them: `uid=999(postgres) gid=999(postgres) groups=999(postgres),101(ssl-cert)`. UID 0 is special. Its usual name is `root`, and the kernel lets a process with UID 0 bypass the permission checks of this note.
+
+Permissions are checked against a process, not against a person. Every process carries **credentials**: a real UID and GID (who started it), an effective UID and GID (whose rights it uses), a saved UID and GID (explained below), and the list of supplementary groups. `fork` copies them and `exec` keeps them, so every program a user starts from the shell runs with the user's IDs. They are set once at login: the login program runs as root, checks the password, sets the user's groups, GID and UID, and then executes the user's shell.
+
+Every inode stores two of these numbers: the owner's UID and the file's GID. A new file gets the effective UID of the process that created it as its owner; its group is the creator's effective GID on Linux, and the group of the containing directory on BSD and macOS.
+
+## Baseline: one owner, all or nothing
+
+The simplest scheme is that a file belongs to its owner, only the owner may touch it, and root may touch everything. It protects private files, and it is roughly what a home directory with mode `0700` gives. It fails in three common situations:
+
+- A team works on a shared project. Everyone in the team should be able to read and change the files, and nobody else.
+- Some files must be usable by everyone and changeable by no one: every user runs `/bin/ls` and reads `/etc/passwd`, and none of them may modify either.
+- A user must be able to change their own password, which is stored in `/etc/shadow`, a file the user may neither read nor write.
+
+The first two need different rights for different classes of users and different rights for different operations. The third needs a controlled exception: a program that acts with more rights than the person running it, but only to do one thing.
+
+## Nine bits: read, write and execute for owner, group and others
+
+Unix divides everyone into three classes relative to a file: its **owner** (u, for user), members of its **group** (g), and **others** (o). For each class the inode stores three bits:
+
+| Bit | On a regular file | On a directory |
+| --- | --- | --- |
+| r, read | read the contents | list the names in it |
+| w, write | change the contents | create, delete and rename entries (needs x too) |
+| x, execute | run it as a program | *search*: use it in a path, reach the files inside by name |
+
+Each process falls into exactly one class. The kernel takes the first rule that applies ([`path_resolution(7)`](#references)):
+
+1. If the effective UID is 0, the check passes. (On Linux this is the capability `CAP_DAC_OVERRIDE` that root holds; it grants execute permission only if at least one of the file's three x bits is set.)
+2. Otherwise, if the effective UID equals the file's owner, the owner bits decide.
+3. Otherwise, if the effective GID or one of the supplementary GIDs equals the file's group, the group bits decide.
+4. Otherwise the others bits decide.
+
+<aside class="callout"><strong>Key idea.</strong> The kernel picks one class and then looks only at that class's three bits. A permission is never collected from several classes: an owner whose bits say <code>---</code> is refused even if the others bits say <code>rw-</code>.</aside>
+
+<PermissionCheck />
+
+1. The mode word of `report.txt` is `0640`: four octal digits, one for each group of three bits.
+2. A process with effective UID 0 is not checked.
+3. If the effective UID is the owner's, only the owner bits count: `ann` may read and write.
+4. Otherwise, if the process is in the file's group, only the group bits count: `bob`, a member of `staff`, may read but not write.
+5. Otherwise the others bits count: `carol` may do nothing.
+
+**Worked example.** `report.txt` belongs to `ann` and the group `staff`, with mode `rw-r-----`. `ann` opens it for writing: she is the owner, the owner bits are `rw-`, the open succeeds. `bob`, who is in `staff`, opens it for reading: the group bits `r--` allow it; for writing they do not, and `open` fails with `EACCES`, "Permission denied". `carol`, in neither, gets the others bits `---` and cannot even read it. Now reverse the bits: mode `----rw-rw-`. Every user except the owner may read and write, and the owner may not open the file at all; the program in the Code section shows exactly that. The owner can, however, always change the mode back, because `chmod` is allowed to the owner whatever the bits say.
+
+Directories add a second layer. To open `/home/ann/report.txt`, a process needs x on `/`, `/home` and `/home/ann`, and then the right bit on `report.txt` itself. Deleting or renaming a file is an operation on its directory: it needs w and x on the directory and no permission at all on the file. A directory with mode `rwx--x--x` (`0711`) lets others reach a file inside whose name they already know, but not list the directory: `ls /home/ann` fails while `cat /home/ann/notes.txt` works if `notes.txt` itself is readable.
+
+The check happens when the file is opened, not on every read. A process that opened a file keeps its descriptor even if the owner removes every permission bit a moment later; only new `open` calls are refused.
+
+## Octal modes and the umask
+
+Three bits make one octal digit, with r worth 4, w worth 2 and x worth 1. A mode is therefore four octal digits: the special bits of the next section, then owner, group and others. The shell command `chmod 750 file` and the system call `chmod(path, 0750)` both set the mode `rwxr-x---`; `chmod u+x`, `g-w`, `o=r` and `a+r` change single bits by class.
+
+**Worked example.** `rwxr-x---` is $4+2+1 = 7$ for the owner, $4+0+1 = 5$ for the group and $0$ for others: `0750`. In the other direction, `0644` is `rw-` ($6 = 4+2$), `r--` and `r--`: the usual mode of a document. `0755` is the usual mode of a program or a directory, and `0600` of a private file such as an SSH key.
+
+A process also has a **umask**, a set of bits to remove from the mode of every file or directory it creates. `open(path, O_CREAT | O_WRONLY, 0666)` asks for `rw-rw-rw-`, and the file gets
+
+$$
+\text{mode} = \text{requested} \mathbin{\&} \lnot\,\text{umask}.
+$$
+
+**Worked example.** With umask `022`:
+
+$$
+\begin{aligned}
+0666 &= 110\ 110\ 110 \\
+\lnot\, 0022 &= 111\ 101\ 101 \\
+0666 \mathbin{\&} \lnot\, 0022 &= 110\ 100\ 100 = 0644 .
+\end{aligned}
+$$
+
+`mkdir` asks for `0777` and gets `0755`. With umask `077` the same calls give `0600` and `0700`: nothing for group and others. The operation removes bits; it does not subtract. With umask `033`, a file asked for with `0666` gets $0666 \mathbin{\&} \lnot\, 0033 = 0644$, not $0666 - 0033 = 0633$. The umask is inherited through `fork` and `exec`, and the shell's `umask` command sets it. `022` is a common default; distributions that give every user a private group of their own often use `002`, so that group members can write each other's files in shared directories.
+
+## setuid, setgid and the sticky bit
+
+The first of the four octal digits holds three more bits: setuid (4), setgid (2) and sticky (1). `ls` shows them in the x positions: `s` in place of the owner's or group's x for setuid and setgid (a capital `S` if the x bit under it is off), and `t` in place of the others' x for the sticky bit (`T` without x).
+
+**setuid** on an executable makes the process that runs it take the file's owner as its effective UID. This is the controlled exception the baseline needed. On Debian 13:
+
+```
+-rwsr-xr-x 1 root root   142424 Apr 19  2025 /usr/bin/passwd
+-rw-r----- 1 root shadow    497 Oct  6 01:35 /etc/shadow
+```
+
+`passwd` has mode `4755` and belongs to root. Any user may run it, and while it runs its effective UID is 0, so it may open `/etc/shadow` for writing. Its real UID is still the user's, which tells `passwd` whose password to change; the program itself enforces that an ordinary user changes only their own.
+
+**setgid** on an executable does the same for the group. `chage`, which reads password-ageing data, is `-rwxr-sr-x root shadow` (`2755`): it runs with the group `shadow`, which lets it read `/etc/shadow` through the group bits `r--`, and it never becomes root. On a directory, setgid has another meaning on Linux: files created inside get the directory's group instead of the creator's, and new subdirectories inherit the bit, which keeps a shared project directory in one group.
+
+**The sticky bit** on a directory restricts deletion. In a directory everyone may write, such as `/tmp` with mode `drwxrwxrwt` (`1777`), anyone could otherwise delete or rename anyone else's files, because those are operations on the directory. With the sticky bit, a file there can be deleted or renamed only by its owner, the directory's owner or root.
+
+**Worked example.** In a Linux container, a directory `/shared` has mode `1777`. `ann` creates `/shared/a.txt` with mode `0666`. `bob` may append to the file, since the others bits allow writing, but `rm /shared/a.txt` as `bob` fails with "Operation not permitted". After `chmod 0777 /shared`, without the sticky bit, the same `rm` succeeds.
+
+A setuid program runs with someone else's rights on input chosen by the caller, so the kernel limits the damage it can do. Linux ignores setuid and setgid on interpreted scripts (a file starting with `#!`); an unprivileged write to a file clears both bits; and a file system mounted with the `nosuid` option ignores them altogether.
+
+## Real and effective user IDs
+
+The three UIDs exist so that a setuid program can switch between its two identities. When `exec` runs a setuid file, the effective UID becomes the file's owner and is copied into the saved UID; the real UID does not change. Afterwards:
+
+- `seteuid(id)` changes only the effective UID. An unprivileged process may set it to its real or its saved UID, and to nothing else.
+- `setuid(id)` called with effective UID 0 sets all three, permanently. Called without privilege, it changes only the effective UID, like `seteuid`.
+
+**Worked example.** `ann` (UID 1000) runs a setuid-root program. It starts with real, effective and saved UIDs $(1000, 0, 0)$. It does its privileged step, then calls `seteuid(1000)` and works with $(1000, 1000, 0)$: files are now checked as `ann`'s. Because the saved UID is still 0, `seteuid(0)` can restore $(1000, 0, 0)$ for a second privileged step. When it no longer needs root, it calls `setuid(1000)` while its effective UID is 0, which gives $(1000, 1000, 1000)$; from then on `seteuid(0)` fails with `EPERM`, and a bug in the rest of the program cannot regain root.
+
+This is the **principle of least privilege**, stated in this form by [Saltzer and Schroeder (1975)](#references): every program should run with the smallest set of rights that its job needs, for no longer than it needs them. `chage` follows it by being setgid `shadow` instead of setuid root. A web server that must listen on port 80, which ordinary users may not bind, starts as root, opens the port, and then switches its worker processes to an unprivileged user. `sudo` runs single commands as root after checking a configuration file and logs each one, instead of handing out a root shell.
+
+One call in this area is a trap. `access(path, mode)` checks permissions with the *real* UID, so that a setuid program can ask whether its caller could open a file. Between that check and the following `open`, another process can replace the file, for instance with a symbolic link to `/etc/shadow`. This is a *time-of-check to time-of-use* race. The safe version lowers the effective UID to the real one and simply calls `open`, letting the kernel check and open in one step.
+
+## Beyond nine bits: ACLs and capabilities
+
+*Optional depth: the two extensions that modern systems add to the classic model. The rest of the note does not depend on it.*
+
+**Access control lists** attach entries for named users and groups to a file. To let `carol` read `report.txt` without adding her to `staff`, on Linux (Linux only; checked in a Linux 5.10 container):
+
+```
+$ setfacl -m u:carol:r report.txt
+$ getfacl report.txt
+# file: report.txt
+# owner: ann
+# group: staff
+user::rw-
+user:carol:r--
+group::r--
+mask::r--
+other::---
+```
+
+`carol` can now read the file while `bob` from the earlier example, who is in neither `staff` nor the list, still cannot. The `mask` entry is the upper limit for the named entries and the group entry; `chmod` and `stat` show it in the group position of the mode, and GNU `ls -l` marks such a file with a `+` after the mode. macOS has richer, Windows-like ACLs, set with `chmod +a "bob allow read" report.txt`.
+
+**Capabilities** split the power of root on Linux into 41 separate privileges ([`capabilities(7)`](#references)), among them `CAP_CHOWN` (change any file's owner), `CAP_DAC_OVERRIDE` (bypass permission checks), `CAP_NET_BIND_SERVICE` (bind ports below 1024) and the very broad `CAP_SYS_ADMIN`. A process holds a set of them, and an executable can carry a set as a file attribute instead of being setuid root: `setcap cap_net_bind_service=+ep ./server` lets an ordinary user run a server on port 80 that cannot read other users' files or change the system. Container runtimes start processes as root with most capabilities dropped, as the next note shows.
+
+## What changed
+
+| | Owner only (baseline) | rwx for owner, group, others | setuid and setgid | ACLs and capabilities |
+| --- | --- | --- | --- | --- |
+| Who may share a file | nobody | one group, or everyone | the program's owner or group, through the program | any list of users and groups |
+| Rights per operation | all or nothing | read, write, execute separately | whatever the program allows | same, per entry |
+| A user changing a protected file | impossible | impossible | through a trusted program | through a program with one capability |
+| Root | all-powerful | all-powerful | all-powerful | power split into 41 capabilities |
+| Stored in | owner UID | 9 mode bits and the group | 3 special mode bits | extended attributes of the inode |
+
+## Limitations
+
+- **The control is discretionary.** The owner of a file decides its mode and can give it away. A program that runs as a user, including a malicious one, can do everything that user can, such as read all of the user's files. Mandatory access control, such as SELinux or AppArmor, and sandboxes add rules that owners cannot override.
+- **Root is still one key to everything.** Capabilities split it, but `CAP_SYS_ADMIN` alone covers so much that it is close to full root.
+- **Groups are coarse.** One group per file; a change of membership takes effect only for processes started after the next login.
+- **setuid programs are a classic attack surface.** They run with the caller's environment variables, open descriptors and arguments, and every bug in them is a bug with their owner's rights.
+- **Checks happen at `open`.** Removing a permission does not revoke descriptors that are already open.
+- **Everyone still shares one system.** Users with different UIDs see the same file tree, the same processes and the same network, and a kernel bug breaks every boundary at once.
+
+## What you should remember
+
+- The kernel checks numbers, not names: a process's effective UID, effective GID and supplementary GIDs against the file's owner and group.
+- Exactly one class applies, chosen in the order root, owner, group, others; only that class's three bits matter.
+- On a directory, r lists, w changes entries, x lets a path pass through. Deleting a file needs w and x on its directory, not rights on the file.
+- A mode is four octal digits with r = 4, w = 2, x = 1: `0640` is `rw-r-----`. New files get the requested mode with the umask bits cleared: $0666 \mathbin{\&} \lnot\,0022 = 0644$.
+- setuid and setgid executables run with the file's owner or group as the effective ID; the sticky bit on a directory protects other users' files from deletion.
+- Real UID: who ran the program. Effective UID: whose rights it uses. Saved UID: what it may switch back to. Drop privileges as early and as permanently as possible.
+- ACLs add named users and groups; Linux capabilities split root into 41 privileges.
+
+## Code
+
+The mode bits of a temporary file and directory, set with `chmod` and `umask` and printed in octal and in the format of `ls`. It also shows that the owner is refused when the owner bits say no, and that a permission check happens at `open` only (macOS and Linux; compile with `clang -std=c17 -Wall -Wextra -O0` and run as an ordinary user):
+
+```c
+// Mode bits of a temporary file and directory: what mkstemp, chmod and umask set, printed in octal and as ls shows them.
+// Run it as an ordinary user: root skips the permission checks.
+#include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+static void show(const char *what, const char *path) {
+    struct stat st;
+    stat(path, &st);
+    mode_t m = st.st_mode;
+    char s[11] = "-rwxrwxrwx";
+    if (S_ISDIR(m)) s[0] = 'd';
+    for (int i = 0; i < 9; i++)                    // s[1] is bit 8 (owner r), ..., s[9] is bit 0 (others x)
+        if (!(m & (1 << (8 - i)))) s[i + 1] = '-';
+    if (m & S_ISUID) s[3] = (m & S_IXUSR) ? 's' : 'S';
+    if (m & S_ISGID) s[6] = (m & S_IXGRP) ? 's' : 'S';
+    if (m & S_ISVTX) s[9] = (m & S_IXOTH) ? 't' : 'T';
+    printf("%-22s %04o  %s\n", what, (unsigned)(m & 07777), s);
+}
+
+int main(void) {
+    char path[] = "/tmp/perm-demo-XXXXXX";
+    int fd = mkstemp(path);                        // mkstemp creates the file with mode 0600
+    write(fd, "secret\n", 7);
+    close(fd);
+    show("mkstemp", path);
+    chmod(path, 0640);                             // rw- r-- ---
+    show("chmod 0640", path);
+    chmod(path, S_IRWXU | S_IRGRP | S_IXGRP);      // the same idea with named constants: 0750
+    show("chmod u=rwx,g=rx", path);
+    chmod(path, 04755);                            // setuid + rwx r-x r-x
+    show("chmod 4755", path);
+
+    chmod(path, 0066);                             // --- rw- rw-: everyone but the owner may read
+    show("chmod 0066", path);
+    fd = open(path, O_RDONLY);                     // we are the owner, so only the owner bits count
+    printf("owner opens for reading: %s\n", fd < 0 ? strerror(errno) : "ok");
+    if (fd >= 0) close(fd);
+
+    chmod(path, 0600);
+    fd = open(path, O_RDONLY);                     // the check happens here, at open
+    chmod(path, 0000);                             // taking every bit away afterwards...
+    char buf[16];
+    ssize_t n = read(fd, buf, sizeof buf);
+    printf("after chmod 0000: old fd reads %zd bytes, a new open: %s\n",
+           n, open(path, O_RDONLY) < 0 ? strerror(errno) : "ok");
+    close(fd);                                     // ...does not revoke the open descriptor
+    unlink(path);
+
+    char dir[] = "/tmp/perm-dir-XXXXXX";
+    mkdtemp(dir);                                  // mkdtemp creates the directory with mode 0700
+    show("mkdtemp", dir);
+    chmod(dir, 01777);                             // what /tmp has: everyone may create, sticky bit set
+    show("chmod 1777 (dir)", dir);
+    rmdir(dir);
+
+    mode_t old = umask(022);                       // the umask clears bits from every new file's mode
+    fd = open(path, O_CREAT | O_WRONLY, 0666);     // asks for rw-rw-rw-, gets 0666 & ~022
+    close(fd);
+    show("open 0666, umask 022", path);
+    unlink(path);
+    umask(077);
+    fd = open(path, O_CREAT | O_WRONLY, 0666);     // gets 0666 & ~077
+    close(fd);
+    show("open 0666, umask 077", path);
+    unlink(path);
+    umask(old);
+
+    // The kernel compares numbers: here the real and the effective UID are the same.
+    printf("real UID == effective UID: %s\n", getuid() == geteuid() ? "yes" : "no");
+    return 0;
+}
+// mkstemp                0600  -rw-------
+// chmod 0640             0640  -rw-r-----
+// chmod u=rwx,g=rx       0750  -rwxr-x---
+// chmod 4755             4755  -rwsr-xr-x
+// chmod 0066             0066  ----rw-rw-
+// owner opens for reading: Permission denied
+// after chmod 0000: old fd reads 7 bytes, a new open: Permission denied
+// mkdtemp                0700  drwx------
+// chmod 1777 (dir)       1777  drwxrwxrwt
+// open 0666, umask 022   0644  -rw-r--r--
+// open 0666, umask 077   0600  -rw-------
+// real UID == effective UID: yes
+```
+
+<aside class="callout"><strong>Check yourself.</strong> (1) What mode does a file get from <code>open(path, O_CREAT | O_WRONLY, 0640)</code> under umask <code>027</code>? Write it in octal and as <code>ls</code> shows it. (2) <code>bob</code> owns a file with mode <code>0604</code>; <code>bob</code> is also in the file's group. Can he read it? Can <code>carol</code>, who is not in the group? (3) A directory has mode <code>0733</code> and no sticky bit. What can other users do in it?<details><summary>Answers</summary>(1) $0640 \mathbin{\&} \lnot\,0027 = 0640$: the umask removes group w and others' rwx, none of which was requested. The file is <code>rw-r-----</code>. (2) <code>bob</code> is the owner, so the owner bits <code>rw-</code> apply and he can read; his group membership is never consulted. <code>carol</code> gets the others bits <code>r--</code> and can read too. (3) <code>-wx</code> for group and others: they cannot list the directory, but they can create files in it, open files whose names they know (subject to each file's own bits), and delete or rename any entry, including the owner's files, because there is no sticky bit.</details></aside>
+
+## Next
+
+Permissions separate users who share one machine. They share everything else: one kernel, one file tree, one list of processes, one network stack, and a process running as root, or a kernel bug, crosses every boundary of this note at once. The [next note](/notes/acos/virtual-machines-and-containers) builds stronger walls in two ways: a virtual machine gives a program a whole machine of its own, kernel included, and a container gives it its own view of a shared kernel, with its own files, process IDs and network, and limits on what it may consume.
+
+## References
+
+- A. Tatarnikov. *Computer Architecture and Operating Systems* (HSE), [lecture 10: users, groups and permissions](https://andrewt0301.github.io/hse-acos-course/part2os/10_Permissions/lecture.html).
+- M. Kerrisk. [*The Linux Programming Interface*](https://man7.org/tlpi/). No Starch Press, 2010. Chapter 8 (users and groups), Chapter 9 (process credentials), §15.4 (file permissions), Chapter 17 (access control lists), Chapter 38 (writing secure privileged programs), Chapter 39 (capabilities).
+- J. H. Saltzer, M. D. Schroeder. [The protection of information in computer systems](https://doi.org/10.1109/PROC.1975.9939). *Proceedings of the IEEE*, 63(9), 1975. Section I.A.3 (design principles, including least privilege).
+- R. H. Arpaci-Dusseau, A. C. Arpaci-Dusseau (security chapters by P. Reiher). *Operating Systems: Three Easy Pieces*. [Chapter 55: access control](https://pages.cs.wisc.edu/~remzi/OSTEP/security-access.pdf).
+- A. S. Tanenbaum, H. Bos. *Modern Operating Systems*, 4th ed. Pearson, 2015. Chapter 9 (security: protection domains, access control lists, capabilities).
+- Linux manual pages: [path_resolution(7)](https://man7.org/linux/man-pages/man7/path_resolution.7.html) (the order of the permission check and the execute rule for root), [credentials(7)](https://man7.org/linux/man-pages/man7/credentials.7.html), [setuid(2)](https://man7.org/linux/man-pages/man2/setuid.2.html), [chmod(2)](https://man7.org/linux/man-pages/man2/chmod.2.html), [umask(2)](https://man7.org/linux/man-pages/man2/umask.2.html), [acl(5)](https://man7.org/linux/man-pages/man5/acl.5.html), [capabilities(7)](https://man7.org/linux/man-pages/man7/capabilities.7.html), [execve(2)](https://man7.org/linux/man-pages/man2/execve.2.html) (set-user-ID bits ignored on scripts).

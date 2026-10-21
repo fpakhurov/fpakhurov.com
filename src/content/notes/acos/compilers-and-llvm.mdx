@@ -1,0 +1,419 @@
+---
+title: Compilers and LLVM
+description: "How a compiler turns C into machine code, followed through LLVM: the front end and Clang, the intermediate representation in SSA form, optimization passes such as mem2reg, instruction selection and register allocation, and why one shared IR serves many languages and processors."
+course: acos
+section: Languages and Compilers
+order: 31
+status: published
+tags: [compilers, llvm, clang, intermediate-representation, ssa, phi-nodes, mem2reg, optimization, register-allocation, instruction-selection, risc-v]
+prerequisites: [RISC-V instructions and their encoding, "Procedures, the stack and calling conventions", Linking and loading, High-level languages and the operating system]
+---
+
+import CompilerPipeline from '../../../components/figures/compilers-and-llvm/CompilerPipeline.astro';
+import SsaLoop from '../../../components/figures/compilers-and-llvm/SsaLoop.astro';
+
+The [previous note](/notes/acos/language-runtimes) ended with a C loop that the compiler deleted: at `-O2`, a countdown of 20 million iterations took no time, because the compiler worked out its result in advance. This last note opens the compiler. It follows one small C function through LLVM, the compiler infrastructure behind Clang, Rust, Swift and many other languages: from text to tokens and a syntax tree, into an intermediate representation in static single assignment form, through optimization passes that rewrite it, and out as RISC-V instructions of the kind the [assembly section](/notes/acos/processor-and-isa) of the course wrote by hand. It ends with why LLVM is built the way it is, and with the course in one paragraph.
+
+**Notation.** IR is the compiler's **intermediate representation**, the program as the compiler holds it between source and machine code. SSA is **static single assignment** form. A **pass** is one step of the compiler that reads IR and writes IR. LLVM IR is shown as LLVM prints it: `%name` is a value, `i32` a 32-bit integer, `ptr` a pointer, and a label followed by a colon starts a basic block.
+
+The running example is the sum $1 + 2 + \dots + n$:
+
+```c
+int sum_to(int n) {
+    int s = 0;
+    for (int i = 1; i <= n; i++)
+        s += i;
+    return s;
+}
+```
+
+## Baseline: one compiler for each language and processor
+
+The simplest compiler translates one language straight into the assembly of one processor: it reads the C function above and prints RISC-V instructions, the way the assembly notes translated C by hand. Such a compiler is a single program with no visible stages, and for one pair it works. It breaks in two ways.
+
+1. **The pairs multiply.** With $M$ languages and $N$ processors there are $M \times N$ compilers to write, and each repeats the same work: the parser of C is written once per processor, the RISC-V instruction tables once per language. Three languages and three processors already need nine compilers; ten of each need a hundred.
+2. **Optimization has no home.** Improvements such as keeping variables in registers, computing constants in advance or moving work out of loops are the same for every language and almost the same for every processor. In a compiler built per pair they are written again in each one, or not at all.
+
+## The pipeline
+
+<aside class="callout"><strong>Key idea.</strong> Put one representation in the middle. A **front end** per language translates source code into a common IR; an **optimizer** rewrites IR into better IR, as a sequence of independent passes that know nothing about the source language or the target; a **back end** per processor translates IR into machine code. $M$ languages and $N$ processors then need $M + N$ parts instead of $M \times N$ compilers, and every optimization is written once and serves them all.</aside>
+
+<CompilerPipeline />
+
+1. **Front ends.** Clang for C, C++ and Objective-C, rustc for Rust, swiftc for Swift: each parses its language, checks it, and emits LLVM IR.
+2. **One IR.** LLVM IR is a typed, low-level language of instructions on values, in SSA form. It exists as data structures in memory, as readable text (`.ll` files) and as compact binary *bitcode* (`.bc`).
+3. **The optimizer.** A pipeline of passes, each a function from IR to IR. The `-O2` pipeline runs dozens of them, some several times.
+4. **Back ends.** One per processor family: x86-64, AArch64, RISC-V, GPU targets and others. Each selects machine instructions, assigns registers, orders the instructions, and writes assembly or an object file.
+5. **The count.** 3 languages and 3 targets need $3 + 3 = 6$ parts instead of $3 \times 3 = 9$ compilers; 10 and 10 need 20 instead of 100.
+
+The `clang` command is a **driver** that runs these stages and then the assembler and linker of the [linking note](/notes/acos/linking-and-loading). It prints its plan with `-ccc-print-phases` (LLVM 17, output trimmed to the stages):
+
+```text
+$ clang -ccc-print-phases -c sum.c
+            +- 0: input, "sum.c", c
+         +- 1: preprocessor, {0}, cpp-output
+      +- 2: compiler, {1}, ir
+   +- 3: backend, {2}, assembler
++- 4: assembler, {3}, object
+```
+
+## The front end: from text to IR
+
+The front end works in four steps, all inside Clang.
+
+1. **Preprocessing** pastes in `#include` files and expands macros, as in the [C note](/notes/acos/c-for-systems-programming).
+2. **Lexical analysis** cuts the text into **tokens**. The statement `s += i;` becomes four: `identifier 's'`, `plusequal '+='`, `identifier 'i'`, `semi ';'` (the output of `clang -fsyntax-only -Xclang -dump-tokens`).
+3. **Parsing** builds an **abstract syntax tree** (AST) from the tokens by the grammar of C: a function `sum_to` whose body holds a declaration, a `for` statement whose body is a compound assignment, and a `return`.
+4. **Semantic analysis** checks the tree against the rules the grammar cannot express: every name is declared, `s += i` adds two `int`s, the returned value has the declared type. Errors and warnings come from here, with the line and column of the offending token.
+
+**Code generation** then walks the AST and emits IR. At `-O0` Clang takes the simplest correct route: every local variable gets a stack slot (`alloca`), every use loads it and every assignment stores it. To see that IR, emit it without optimization and without the `optnone` attribute that would stop later passes from touching it (all IR in this note is from LLVM 17 for the target `riscv32`, with value names kept):
+
+```llvm
+define dso_local i32 @sum_to(i32 noundef %n) #0 {
+entry:
+  %n.addr = alloca i32, align 4
+  %s = alloca i32, align 4
+  %i = alloca i32, align 4
+  store i32 %n, ptr %n.addr, align 4
+  store i32 0, ptr %s, align 4
+  store i32 1, ptr %i, align 4
+  br label %for.cond
+
+for.cond:                                         ; preds = %for.inc, %entry
+  %0 = load i32, ptr %i, align 4
+  %1 = load i32, ptr %n.addr, align 4
+  %cmp = icmp sle i32 %0, %1
+  br i1 %cmp, label %for.body, label %for.end
+
+for.body:                                         ; preds = %for.cond
+  %2 = load i32, ptr %i, align 4
+  %3 = load i32, ptr %s, align 4
+  %add = add nsw i32 %3, %2
+  store i32 %add, ptr %s, align 4
+  br label %for.inc
+
+for.inc:                                          ; preds = %for.body
+  %4 = load i32, ptr %i, align 4
+  %inc = add nsw i32 %4, 1
+  store i32 %inc, ptr %i, align 4
+  br label %for.cond, !llvm.loop !4
+
+for.end:                                          ; preds = %for.cond
+  %5 = load i32, ptr %s, align 4
+  ret i32 %5
+}
+```
+
+The function is split into **basic blocks**: straight-line sequences of instructions that are entered only at the top and left only through the last instruction, a branch (`br`) or a return (`ret`). The `for` loop became four blocks, a header that tests (`for.cond`), a body, an increment and an exit, the same shape as the loops of the [control-flow note](/notes/acos/control-flow-and-memory). `icmp sle` is a signed less-or-equal comparison; `nsw` ("no signed wrap") records that C makes signed overflow undefined, so the optimizer may assume it never happens. Clang is also the base of other tools that need a correct C parser: the Clang Static Analyzer, which explores paths through a function in search of bugs such as null dereferences, and `clang-tidy`, which checks style and common mistakes.
+
+## LLVM IR and SSA
+
+In the IR above, `%s` names a memory slot that is stored to twice, and finding which store a load sees means following the control flow. **Static single assignment** form removes that question: every value is assigned exactly once, in one place in the program text, so every use names exactly one definition ([Cytron et al., 1991](#references)). A variable that changes becomes several values. Where control flow joins and a variable could hold one of several values, SSA places a **φ node** (written `phi`) at the top of the block, which picks the value according to the block that control came from.
+
+The pass **mem2reg** converts the stack slots of the `-O0` IR into SSA values. It applies to a slot whose address never escapes, which holds for all three here, and it places φ nodes where the definitions from different paths meet. After `opt -passes=mem2reg`:
+
+```llvm
+define dso_local i32 @sum_to(i32 noundef %n) #0 {
+entry:
+  br label %for.cond
+
+for.cond:                                         ; preds = %for.inc, %entry
+  %s.0 = phi i32 [ 0, %entry ], [ %add, %for.inc ]
+  %i.0 = phi i32 [ 1, %entry ], [ %inc, %for.inc ]
+  %cmp = icmp sle i32 %i.0, %n
+  br i1 %cmp, label %for.body, label %for.end
+
+for.body:                                         ; preds = %for.cond
+  %add = add nsw i32 %s.0, %i.0
+  br label %for.inc
+
+for.inc:                                          ; preds = %for.body
+  %inc = add nsw i32 %i.0, 1
+  br label %for.cond, !llvm.loop !4
+
+for.end:                                          ; preds = %for.cond
+  ret i32 %s.0
+}
+```
+
+Every `alloca`, `load` and `store` is gone: besides its four branches and the return, the function now has 5 instructions instead of 17. The `!llvm.loop` tag attaches metadata about the loop and does not affect its meaning.
+
+<SsaLoop />
+
+1. `entry` jumps to the loop header.
+2. In `for.cond`, the φ node `%s.0` is 0 when control comes from `entry` and `%add` when it comes back from `for.inc`; `%i.0` likewise is 1 or `%inc`. Then the comparison and the branch.
+3. `for.body` computes the new sum and gives it a new name, `%add`.
+4. `for.inc` computes the new counter, `%inc`, and returns along the back edge.
+5. `for.end` returns `%s.0`, the value the header chose last.
+
+**Worked example.** For $n = 3$, control enters `for.cond` four times. The pairs $(\%i.0, \%s.0)$ are $(1, 0)$ from `entry`, then $(2, 1)$, $(3, 3)$ and $(4, 6)$ from `for.inc`. The comparisons $1 \le 3$, $2 \le 3$, $3 \le 3$ hold and $4 \le 3$ fails, so the function returns 6.
+
+SSA makes many questions cheap. Each value has one definition, so the optimizer can follow a value to its uses and back without analysing the control flow; a value with no uses is dead and can be deleted; a value computed from constants is a constant. Most of LLVM's optimizations are written on SSA.
+
+## The optimizer: passes
+
+A pass reads IR and either computes facts about it (an **analysis**: dominators, loops, aliasing) or rewrites it (a **transformation**: mem2reg, constant folding, inlining, loop unrolling). The levels `-O1`, `-O2`, `-O3` and `-Os` are fixed sequences of passes. Running the `-O2` pipeline on the `-O0` IR with `opt -passes='default<O2>' -print-changed=quiet` lists the passes that changed this function, in order: SimplifyCFG, SROA, GlobalOpt, InstCombine, Reassociate, LCSSA, LoopRotate, SimplifyCFG, InstCombine, LoopSimplify, LCSSA, IndVarSimplify, GVN, CorrelatedValuePropagation and PostOrderFunctionAttrs. Inside the `-O2` pipeline **SROA** (scalar replacement of aggregates) does mem2reg's job, and more: it also splits structures into separate scalars.
+
+The decisive pass is **IndVarSimplify**. It uses **scalar evolution**, an analysis that describes how a value changes from one iteration of a loop to the next. Here `%i.0` starts at 1 and grows by 1, and `%s.0` starts at 0 and grows by `%i.0`, a sum of an arithmetic sequence, whose value after the loop has a closed form. The pass computes the final value of `s` without the loop; the loop is then left with no effect, and **LoopDeletion** removes it. The result, after the remaining passes:
+
+```llvm
+define dso_local i32 @sum_to(i32 noundef %n) local_unnamed_addr #0 {
+entry:
+  %cmp.not4 = icmp slt i32 %n, 1
+  br i1 %cmp.not4, label %for.end, label %for.body.preheader
+
+for.body.preheader:                               ; preds = %entry
+  %0 = shl nuw i32 %n, 1
+  %1 = add nsw i32 %n, -1
+  %2 = zext i32 %1 to i33
+  %3 = add nsw i32 %n, -2
+  %4 = zext i32 %3 to i33
+  %5 = mul i33 %2, %4
+  %6 = lshr i33 %5, 1
+  %7 = trunc i33 %6 to i32
+  %8 = add i32 %0, %7
+  %9 = add i32 %8, -1
+  br label %for.end
+
+for.end:                                          ; preds = %for.body.preheader, %entry
+  %s.0.lcssa = phi i32 [ 0, %entry ], [ %9, %for.body.preheader ]
+  ret i32 %s.0.lcssa
+}
+```
+
+For $n \ge 1$ the function now returns $2n + (n-1)(n-2)/2 - 1$ (`shl` by 1 doubles, `lshr` by 1 halves). That is the familiar formula:
+
+$$
+\begin{aligned}
+2n + \frac{(n-1)(n-2)}{2} - 1 &= \frac{4n - 2 + n^2 - 3n + 2}{2} && \text{common denominator, expand } (n-1)(n-2) \\
+&= \frac{n(n+1)}{2} && \text{collect terms.}
+\end{aligned}
+$$
+
+**Worked example.** For $n = 3$: $2 \cdot 3 + (2 \cdot 1)/2 - 1 = 6 + 1 - 1 = 6$, the value of the trace above. Why this form, with a 33-bit type (`i33`)? Scalar evolution computes the closed form so that it agrees with the loop's 32-bit arithmetic for every $n$, including values where the sum wraps around. A product halved after being cut to 32 bits would lose its top bit, so $(n-1)(n-2)$ is formed modulo $2^{33}$, halved, and only then cut back to 32 bits. For $n \le 65{,}535$, where the sum $n(n+1)/2$ fits in a signed 32-bit `int`, the product happens to fit in 32 bits, but the pass does not rely on that. At $n = 70{,}000$ the product $69{,}999 \times 69{,}998 = 4{,}899{,}790{,}002$ exceeds $2^{32}$, and only the 33-bit version matches the wrapped sum of the loop. The Code section checks both claims.
+
+## The back end: instructions and registers
+
+The back end turns IR into instructions for one processor in three main steps ([Aho et al.](#references), ch. 8).
+
+1. **Instruction selection** maps IR operations onto the target's instructions, matching patterns: an `add` of a register and a constant becomes `addi`, an `icmp` feeding a `br` becomes one conditional branch such as `bge`. LLVM does this mostly on a graph per basic block (SelectionDAG), with a newer framework, GlobalISel, used by some targets.
+2. **Register allocation** maps the unlimited SSA values onto the 31 usable registers of RISC-V. Two values that are alive at the same time need different registers; if more values are alive at once than there are registers, some are **spilled** to stack slots and reloaded. The classic formulation colours a graph whose vertices are values and whose edges join values alive at the same time ([Chaitin, 1982](#references)); LLVM's default allocator at `-O1` and above, the greedy allocator, splits the live ranges of values and assigns them in order of priority. The φ nodes disappear here: a φ means "the same register on every incoming edge", plus a move where that is not possible.
+3. **Instruction scheduling** orders the instructions to avoid the pipeline stalls of the [pipelining note](/notes/acos/pipelining), for example by moving a load away from the instruction that uses its result. The assembler then encodes each instruction as in the [encoding note](/notes/acos/risc-v-instructions).
+
+**Worked example.** The same function at three stages, compiled for RV32IM (LLVM 17; assembler directives left out). Straight from the `-O0` IR, every variable lives in its stack slot, and each use is a `lw` and each assignment an `sw`; the block of the loop body alone is (comments added)
+
+```text
+.LBB0_2:
+	lw	a1, -20(s0)          # i
+	lw	a0, -16(s0)          # s
+	add	a0, a0, a1
+	sw	a0, -16(s0)          # s = s + i
+	j	.LBB0_3
+```
+
+From the SSA form, with no IR optimization (`llc -O2` on the mem2reg output, comments left out), the register allocator puts `%s.0` in `a1` and `%i.0` in `a2`, and the loop is three instructions with no memory access:
+
+```text
+	li	a1, 0
+	li	a2, 1
+	blt	a0, a2, .LBB0_2
+.LBB0_1:
+	add	a1, a1, a2
+	addi	a2, a2, 1
+	bge	a0, a2, .LBB0_1
+.LBB0_2:
+	mv	a0, a1
+	ret
+```
+
+The back end also turned the loop around: the test moved to the bottom, so each iteration runs one branch instead of two. With the full `-O2` pipeline there is no loop, and the 33-bit product is built from the low half (`mul`) and the high half (`mulhu`) of a 64-bit product:
+
+```text
+	blez	a0, .LBB0_2
+	slli	a1, a0, 1            # 2n
+	addi	a2, a0, -1           # n - 1
+	addi	a0, a0, -2           # n - 2
+	mul	a3, a2, a0           # low 32 bits of (n-1)(n-2)
+	mulhu	a0, a2, a0           # high 32 bits
+	slli	a0, a0, 31
+	srli	a3, a3, 1
+	or	a0, a0, a3           # bits 1 to 32 of the product: (n-1)(n-2)/2
+	add	a0, a0, a1
+	addi	a0, a0, -1
+	ret
+.LBB0_2:
+	li	a0, 0
+	ret
+```
+
+In all three versions the argument arrives in `a0` and the result leaves in `a0`, as the [calling convention](/notes/acos/procedures-and-the-stack) requires; that convention is the contract that lets code from different compilers call each other.
+
+## Why the modular design matters
+
+[Lattner and Adve (2004)](#references) designed LLVM around one idea: a single low-level, typed, language-independent representation in SSA form, kept for the whole life of the program, so that it can be analysed and optimized at compile time, at link time across all files, between runs using profiles, and while the program runs. Each of these has become ordinary practice:
+
+- **Link-time optimization.** With `-flto`, object files hold LLVM bitcode instead of machine code, and the linker runs the optimizer over the whole program at once, so that a function in one file can be inlined into another.
+- **New languages get a complete compiler.** A language implementer writes a front end that emits LLVM IR and inherits the optimizer and every back end. Rust, Swift, Julia and Zig were built this way.
+- **New processors get every language.** A back end for RISC-V makes C, C++, Rust and the rest available on RISC-V at once, with the same optimizer behind them.
+- **The same IR feeds other machines.** Back ends for NVIDIA and AMD GPUs compile kernels written in CUDA, OpenCL or Triton, a language for writing the fused GPU kernels behind methods such as the tiled attention of the [efficient-transformers note](/notes/nlp/efficient-transformers); Triton lowers its programs through MLIR to LLVM IR and from there to GPU code ([Tillet et al., 2019](#references)).
+- **JIT compilers reuse it.** The JIT compilers of the previous note can build on LLVM's libraries: Julia compiles each function with LLVM the first time it is called with given argument types.
+
+The design has a cost. The IR is not fully independent of the target: a front end must already know the sizes of types and the calling convention of the target, so the IR Clang emits for RISC-V cannot be compiled for x86-64. And a large shared optimizer is slow to run and to change, which is why fast JITs often write their own simpler back ends.
+
+<aside class="callout"><strong>Check yourself.</strong> (1) Put `int f(int a, int b) { int x = a; if (b) x = 2 * a; return x + 1; }` into SSA form: how many values named after `x`, and where is the φ node? (2) Why does mem2reg not apply to a local variable whose address is passed to another function? (3) With 4 languages and 5 processors, how many components does an LLVM-style design need, and how many compilers would a design without a shared IR need?<details><summary>Answers</summary>(1) Two definitions, `x1 = a` before the `if` and `x2 = 2 * a` in its body, joined at the block after the `if` by `x3 = φ(x1 from the block of the test, x2 from the body)`; the return uses `x3 + 1`. (2) The other function may read or write the variable through the pointer, at moments the compiler cannot see, so the variable must stay in memory; mem2reg handles only slots whose address does not escape. (3) $4 + 5 = 9$ against $4 \times 5 = 20$.</details></aside>
+
+## What changed
+
+| | One compiler per language and processor (the baseline) | LLVM |
+| --- | --- | --- |
+| Components for $M$ languages and $N$ processors | $M \times N$ compilers | $M$ front ends + 1 optimizer + $N$ back ends |
+| Where optimizations live | in each compiler, if anywhere | once, as passes on the shared IR |
+| Program representation | text in, assembly out | AST, then LLVM IR in SSA form, then machine instructions |
+| `sum_to` at `-O0` and `-O2` | a loop that loads and stores at each step | a loop in registers, or no loop at all |
+| Analysis across files | none | link-time optimization over bitcode |
+
+## Limitations
+
+- The note shows LLVM. GCC follows the same plan with its own IRs (GIMPLE, in SSA form, and RTL), and the ideas are the same.
+- The IR carries the target's type sizes and calling convention, so it is portable between compilers, not between processors.
+- Optimizations rely on the rules of the language. The `nsw` flag above is safe only because signed overflow is undefined in C; a C program that overflows anyway can be "miscompiled" in ways that surprise its author.
+- The pass pipeline is a heuristic: a pass that helps one program can slow down another, and the `-O2` pipeline changes between LLVM versions, so the IR printed here will differ in detail with another version.
+- Parsing theory, the AST of C++, alias analysis, loop vectorization and the rest of the optimizer are beyond this note.
+
+## What you should remember
+
+- A compiler is a pipeline: front end (preprocessing, tokens, AST, semantic checks, IR generation), optimizer (passes from IR to IR), back end (instruction selection, register allocation, scheduling, emission). One shared IR turns $M \times N$ compilers into $M + N$ parts.
+- LLVM IR is a typed, low-level language in basic blocks. Clang at `-O0` keeps every variable in a stack slot (`alloca`, `load`, `store`).
+- In SSA form every value is defined once; φ nodes merge values at the points where control flow joins. mem2reg builds SSA from stack slots.
+- Optimization is a sequence of passes. On `sum_to`, IndVarSimplify with scalar evolution replaced the loop by the closed form $n(n+1)/2$, computed in 33 bits to match the loop's 32-bit result.
+- Register allocation maps unlimited values onto the processor's registers and spills the rest; the calling convention fixes where arguments and results go.
+
+## The course in one paragraph
+
+The course followed one program from the bits of its data to a process talking over the network, and back to the compiler that produced it. Numbers are [bits](/notes/acos/data-representation): integers in two's complement and in an order of bytes, real numbers as [floating point](/notes/acos/floating-point) with its rounding. A [processor](/notes/acos/processor-and-isa) executes an instruction set, the contract between hardware and software, whose RISC-V [encodings](/notes/acos/risc-v-instructions), [branches and memory accesses](/notes/acos/control-flow-and-memory) and [procedures and stack](/notes/acos/procedures-and-the-stack) we wrote and ran by hand. Memory is slower than the processor, so [caches](/notes/acos/caches) keep the data in use close to it, and [virtual memory](/notes/acos/virtual-memory) gives every program a private address space of its own. Inside the processor, the [pipeline](/notes/acos/pipelining) overlaps instructions, [exceptions and interrupts](/notes/acos/exceptions-and-interrupts) break the sequence to hand control to the kernel, and [I/O devices](/notes/acos/input-and-output) move data in and out. Performance comes from parallelism at every scale, [instruction-level](/notes/acos/instruction-level-parallelism), [thread-level](/notes/acos/thread-level-parallelism) and [data-level](/notes/acos/data-level-parallelism), from [code that respects the memory hierarchy](/notes/acos/performance-optimization), and in the end from [hardware specialised for one domain](/notes/acos/domain-specific-architectures). [The operating system](/notes/acos/operating-systems) turns this machine into a safe, shared one: programs written in [C](/notes/acos/c-for-systems-programming) ask it for services through [system calls](/notes/acos/system-calls), are [linked and loaded](/notes/acos/linking-and-loading) into processes, and [allocate memory](/notes/acos/memory-allocation) from it. [Processes and threads](/notes/acos/processes-and-threads) run at the same time, [synchronize](/notes/acos/synchronization) to stay correct, and [communicate](/notes/acos/inter-process-communication) through pipes and shared memory; [files](/notes/acos/files-and-io) give them persistent data, [users and permissions](/notes/acos/users-and-permissions) decide who may touch it, and [virtual machines and containers](/notes/acos/virtual-machines-and-containers) isolate whole systems. [Networks](/notes/acos/networking) carry bytes between machines, through layers that each solve one problem, and [sockets](/notes/acos/sockets) give a program both ends of a connection. Last, [language runtimes](/notes/acos/language-runtimes) build objects, garbage collection and threads on top of the same system calls, and compilers like LLVM turn source code into the instructions the course started from. The `printf("hello, world\n")` of the [first note](/notes/acos/computer-systems) touches every one of these layers: a compiler chose its instructions, a processor executed them through its caches and its pipeline, and a system call carried thirteen bytes from a process through the kernel to the screen.
+
+## Code
+
+The commands that produce every listing of the note. They need `clang`, `opt` and `llc` from one LLVM installation; the outputs shown were made with LLVM 17.0.4 (Homebrew on macOS; on Debian or Ubuntu the tools are called `clang-17`, `opt-17` and `llc-17`). Other versions print the same structure with small differences.
+
+```sh
+# sum.c holds the function sum_to from the top of the note.
+T="--target=riscv32-unknown-elf -march=rv32im"
+
+clang -ccc-print-phases -c sum.c                      # the stages of the driver (the first listing)
+clang -fsyntax-only -Xclang -dump-tokens sum.c        # the tokens, including the four of `s += i;`
+
+# -O0 IR with the stack slots, keeping value names and allowing later passes to run on it
+clang $T -S -emit-llvm -O0 -Xclang -disable-O0-optnone -fno-discard-value-names -fomit-frame-pointer sum.c -o sum.ll
+opt -S -passes=mem2reg sum.ll -o sum.m2r.ll           # the SSA form with phi nodes
+opt -S -passes='default<O2>' -print-changed=quiet sum.ll -o sum.o2.ll   # the closed form, and the passes that changed it
+
+clang $T -S -O0 sum.c -o -                            # RISC-V code with every variable on the stack
+llc -O2 sum.m2r.ll -o -                               # RISC-V code from the SSA form: the loop in a1 and a2
+clang $T -S -O2 sum.c -o -                            # RISC-V code from the full -O2 pipeline: no loop
+```
+
+The loop and the closed form, as LLVM compiled them, in a RARS program that calls both; check it with `python3 -I rv32.py sum.s` or run it in RARS:
+
+```asm
+# sum_to(n) = 1 + 2 + ... + n, as LLVM compiled it for RV32IM: a loop (mem2reg, no IR optimization)
+# and a closed form (-O2). main calls both for n = 100 and n = 70000 and prints the four results.
+# For n = 70000 the sum wraps around in 32 bits (in C that overflow is undefined; here both agree).
+        .data
+space:  .asciz " "
+newline: .asciz "\n"
+        .text
+main:
+        li      s0, 100
+        jal     try
+        li      s0, 70000
+        jal     try
+        li      a7, 10                  # exit
+        ecall
+
+try:                                    # print sum_loop(s0), sum_closed(s0) and a newline
+        addi    sp, sp, -16
+        sw      ra, 12(sp)
+        mv      a0, s0
+        jal     sum_loop
+        li      a7, 1                   # print the integer in a0
+        ecall
+        la      a0, space
+        li      a7, 4
+        ecall
+        mv      a0, s0
+        jal     sum_closed
+        li      a7, 1
+        ecall
+        la      a0, newline
+        li      a7, 4
+        ecall
+        lw      ra, 12(sp)
+        addi    sp, sp, 16
+        ret
+
+sum_loop:                               # llc -O2 on the mem2reg IR: s in a1, i in a2
+        li      a1, 0
+        li      a2, 1
+        blt     a0, a2, loop_end
+loop:
+        add     a1, a1, a2
+        addi    a2, a2, 1
+        bge     a0, a2, loop
+loop_end:
+        mv      a0, a1
+        ret
+
+sum_closed:                             # clang -O2: 2n + (n-1)(n-2)/2 - 1, with a 64-bit product
+        blez    a0, closed_zero
+        slli    a1, a0, 1
+        addi    a2, a0, -1
+        addi    a0, a0, -2
+        mul     a3, a2, a0              # low 32 bits of (n-1)(n-2)
+        mulhu   a0, a2, a0              # high 32 bits
+        slli    a0, a0, 31
+        srli    a3, a3, 1
+        or      a0, a0, a3              # bits 1..32 of the product: (n-1)(n-2)/2
+        add     a0, a0, a1
+        addi    a0, a0, -1
+        ret
+closed_zero:
+        li      a0, 0
+        ret
+# 5050 5050
+# -1844932296 -1844932296
+```
+
+The closed form of the `-O2` IR checked against the loop in Python, with the 33-bit product and 32-bit wrap-around of the IR:
+
+```python
+def loop(n):                          # the C loop, in 32-bit arithmetic
+    s = 0
+    for i in range(1, n + 1):
+        s = (s + i) % 2**32
+    return s
+
+def closed(n, bits=33):               # what the -O2 IR computes: the product modulo 2**bits
+    if n < 1:
+        return 0
+    p = ((n - 1) * (n - 2)) % 2**bits # zext to i33, then mul i33
+    return (2 * n + p // 2 - 1) % 2**32   # lshr, trunc to i32, the two adds
+
+ns = list(range(3000)) + [65535, 70000, 100000]
+print(all(loop(n) == closed(n) for n in ns))              # True
+print(closed(3), closed(100), closed(65535))              # 6 5050 2147450880
+print((65535 - 1) * (65535 - 2) < 2**32)                  # True: up to n = 65535 the product fits in 32 bits
+print(loop(70000), closed(70000), closed(70000, bits=32)) # 2450035000 2450035000 302551352: 32 bits are not enough
+```
+
+## References
+
+- C. Lattner, V. Adve. [LLVM: A Compilation Framework for Lifelong Program Analysis & Transformation](https://doi.org/10.1109/CGO.2004.1281665). CGO, 2004. §2 (the LLVM IR), §3 (the compiler architecture).
+- R. Cytron, J. Ferrante, B. K. Rosen, M. N. Wegman, F. K. Zadeck. [Efficiently Computing Static Single Assignment Form and the Control Dependence Graph](https://doi.org/10.1145/115372.115320). ACM TOPLAS, 13(4), 1991.
+- G. J. Chaitin. [Register Allocation & Spilling via Graph Coloring](https://doi.org/10.1145/800230.806984). SIGPLAN Symposium on Compiler Construction, 1982.
+- P. Tillet, H. T. Kung, D. Cox. [Triton: An Intermediate Language and Compiler for Tiled Neural Network Computations](https://doi.org/10.1145/3315508.3329973). MAPL, 2019.
+- LLVM Project. [LLVM Language Reference Manual](https://llvm.org/docs/LangRef.html) (`alloca`, `phi`, `icmp`, `nsw`) and [LLVM's Analysis and Transform Passes](https://llvm.org/docs/Passes.html) (`mem2reg`, `indvars`, `loop-deletion`).
+- A. V. Aho, M. S. Lam, R. Sethi, J. D. Ullman. *Compilers: Principles, Techniques, and Tools*, 2nd ed. Addison-Wesley, 2006. Ch. 1 (the structure of a compiler), ch. 3–4 (lexical and syntax analysis), §6.2 (three-address code), ch. 8 (code generation, §8.8 register allocation), ch. 9 (machine-independent optimizations).
+- D. A. Patterson, J. L. Hennessy. *Computer Organization and Design, RISC-V Edition*, 2nd ed. Morgan Kaufmann, 2020. §2.12 (translating and starting a program).
+- R. E. Bryant, D. R. O'Hallaron. *Computer Systems: A Programmer's Perspective*, 3rd ed. Pearson, 2016. §5.1 (capabilities and limitations of optimizing compilers).
+- A. Tatarnikov. [Computer Architecture and Operating Systems, Lecture 15: Compiler Infrastructure Clang/LLVM](https://andrewt0301.github.io/hse-acos-course/part2os/15_Clang/lecture.html). HSE University.

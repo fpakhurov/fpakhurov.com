@@ -1,0 +1,374 @@
+---
+title: Synchronization
+description: "Why threads that share memory lose updates, and the tools that prevent it: critical sections, atomic read-modify-write instructions in RISC-V and C11, mutexes, condition variables for producer and consumer, semaphores, deadlock and lock ordering, and a brief word on memory ordering."
+course: acos
+section: Processes and Concurrency
+order: 23
+status: published
+tags: [race-condition, critical-section, atomics, lr-sc, amo, mutex, condition-variable, semaphore, producer-consumer, deadlock, memory-ordering]
+prerequisites: [Processes and threads, Multicore processors and thread-level parallelism]
+---
+
+import LostUpdate from '../../../components/figures/synchronization/LostUpdate.astro';
+import LockOrder from '../../../components/figures/synchronization/LockOrder.astro';
+
+The [previous note](/notes/acos/processes-and-threads) gave a program several threads over one address space, and its example was correct only because the threads ran one after the other. Threads exist to run at the same time, on different cores or interleaved on one, and then the scheduler, the caches and the compiler decide the order of their memory accesses. This note shows how an update as simple as `counter++` goes wrong when two threads do it at once, explains the failure at the level of the instructions, and builds the tools that prevent it: atomic instructions, locks, condition variables and semaphores. It ends with deadlock, the failure that locks bring with them, and with a short look at memory ordering.
+
+## Baseline: a shared counter with no protection
+
+Two threads each run `counter++` one million times on a shared `long counter = 0`. The program should print 2,000,000. Compiled with `clang -O0` on an Apple M1 (macOS 26), six runs printed between 1,002,319 and 1,008,633, a different number every time (the Code section). About half of the increments disappeared.
+
+The reason is that `counter++` is not one operation. On RISC-V it compiles to three instructions, and the same holds on every load–store architecture:
+
+```asm
+        lw   t0, 0(a0)        # load: t0 = counter
+        addi t0, t0, 1        # add:  t0 = t0 + 1
+        sw   t0, 0(a0)        # store: counter = t0
+```
+
+Each thread has its own registers but shares the memory word. If both threads load before either stores, both compute the same new value and the second store overwrites the first:
+
+<LostUpdate />
+
+1. Thread A loads 5 into its register `t0`.
+2. Thread B loads 5 into its register `t1`: A has not stored yet.
+3. A adds 1: `t0 = 6`.
+4. B adds 1: `t1 = 6`.
+5. A stores 6.
+6. B stores 6. Two increments raised the counter by one: A's update is lost.
+
+This is a **race condition**: the result depends on the timing of the threads. Of the 20 possible interleavings of one increment by each thread (choose which 3 of the 6 steps belong to A), only the 2 that run one thread's three steps entirely before the other's give 7; the other 18 lose an update (the Code section enumerates them). On two cores the threads really run in parallel, each iteration takes a few nanoseconds, and the windows overlap constantly; that is why so many of the two million increments were lost.
+
+A correct-looking result proves nothing. Compiled with `-O2`, the same racy program printed 2,000,000 in three runs out of three: the optimizer turned each thread's loop into a single addition of 1,000,000, so the two threads now rarely overlap, but nothing prevents them from doing so. In C11, two threads accessing the same non-atomic variable, at least one of them writing, without synchronization is a **data race**, and the behaviour of the program is undefined ([ISO/IEC 9899:2018](#references), §5.1.2.4).
+
+## Critical sections
+
+A **critical section** is a piece of code that accesses shared data and must not run in two threads at once; here, the three instructions of `counter++`. A solution to the critical-section problem must guarantee **mutual exclusion** (at most one thread inside at a time), **progress** (if the section is free and some threads want to enter, one of them gets in) and **bounded waiting** (a thread that asked to enter is not overtaken forever) ([Arpaci-Dusseau, 2018](#references), chapter 28).
+
+On a machine with one core, the kernel can make a section atomic by disabling interrupts: without the timer interrupt there is no preemption, so nothing else runs until interrupts are enabled again. That is a privileged operation, useless to user programs, and on a multicore machine it stops nothing: the other cores keep running. Solutions with ordinary loads and stores alone exist (Peterson's algorithm for two threads, Lamport's bakery algorithm for many), but they need several memory accesses per entry and, on processors with relaxed memory ordering, fences as well. Every practical lock is built on one hardware feature instead: an instruction that reads and writes a memory word as one indivisible step.
+
+## Atomic instructions
+
+<aside class="callout"><strong>Key idea.</strong> A sequence of instructions is atomic only if something makes it so. Either the hardware performs the whole read-modify-write as one indivisible instruction, so no other core can access the word in between, or a lock, itself built on such an instruction, lets one thread at a time run the whole sequence.</aside>
+
+The RISC-V A extension provides two kinds of atomic instructions ([RISC-V Unprivileged ISA](#references), "Zaamo" and "Zalrsc").
+
+**Atomic memory operations** (AMOs) load a word, combine it with a register, and store the result back, indivisibly: `amoadd.w rd, rs2, (rs1)` puts the old value of the word at address `rs1` into `rd` and stores the old value plus `rs2`. There are AMOs for swap, add, and, or, xor, minimum and maximum. One instruction makes the counter correct:
+
+```asm
+# excerpt (A extension; not run here: the course's interpreter has no atomics; runs on a RISC-V machine)
+        li      t0, 1
+        amoadd.w zero, t0, (a0)       # counter += 1 as one indivisible step; old value discarded
+```
+
+**Load-reserved / store-conditional** (LR/SC) splits the operation in two. `lr.w rd, (rs1)` loads a word and registers a *reservation* on it. `sc.w rd, rs2, (rs1)` stores `rs2` only if the reservation is still valid, that is, if no other core has written the word since the `lr.w`, and writes 0 to `rd` on success and a nonzero value on failure. A failed attempt simply retries:
+
+```asm
+# excerpt (A extension; not run here)
+again:  lr.w    t0, (a0)              # load counter and reserve it
+        addi    t0, t0, 1
+        sc.w    t1, t0, (a0)          # store only if nobody wrote counter since lr.w
+        bnez    t1, again             # t1 != 0: the store failed, try again
+```
+
+LR/SC can build any read-modify-write, compare-and-swap among them. The specification guarantees that such a loop eventually succeeds if it is *constrained*: at most 16 instructions, with only simple integer instructions between the `lr` and the `sc` and no other loads or stores.
+
+A **spinlock** follows directly. The lock is a word, 0 when free and 1 when held. To acquire it, swap in a 1: if the old value was 0, the lock was free and is now ours; if it was 1, someone holds it, and we try again.
+
+```asm
+# excerpt (A extension; not run here). a0 = address of the lock word
+acquire: li     t0, 1
+retry:   amoswap.w.aq t1, t0, (a0)    # t1 = old value, the word becomes 1
+         bnez   t1, retry             # it was already 1: held by someone else
+         ret
+release: amoswap.w.rl zero, zero, (a0)  # store 0: the lock is free
+         ret
+```
+
+The suffixes `.aq` (acquire) and `.rl` (release) are about ordering, the last section of this note: no memory access of the critical section may be performed before the acquiring swap or after the releasing one.
+
+**C11 atomics** give portable access to these instructions through `<stdatomic.h>` ([ISO/IEC 9899:2018](#references), §7.17). A variable declared `atomic_long counter` is updated with `atomic_fetch_add(&counter, 1)`; `atomic_compare_exchange_strong(&x, &expected, desired)` stores `desired` only if `x` still equals `expected`. With the default, sequentially consistent ordering, the RISC-V specification maps an atomic read-modify-write such as `atomic_fetch_add` to an AMO with both bits set, `amoadd.w.aqrl` ([RISC-V Unprivileged ISA](#references), "Code porting and mapping guidelines"). In the Code section the atomic counter reaches exactly 2,000,000 on every run.
+
+## Mutexes
+
+A spinlock wastes a core while it waits: a thread that finds the lock taken keeps swapping until the holder releases it, which can take a whole time slice if the holder was preempted. A **mutex** (mutual-exclusion lock) waits differently: a thread that cannot get the lock asks the kernel to put it to sleep, and the thread that releases the lock wakes it. Linux implements this with a **futex**: the lock word lives in user memory, an uncontended lock or unlock is a single atomic instruction with no system call, and the kernel is involved only when a thread must sleep or be woken ([Drepper, 2011](#references)).
+
+The POSIX interface is `pthread_mutex_lock(&m)` and `pthread_mutex_unlock(&m)`, with `PTHREAD_MUTEX_INITIALIZER` for a statically allocated mutex ([Kerrisk, 2010](#references), chapter 30). The counter becomes
+
+```c
+pthread_mutex_lock(&m);
+counter++;                            /* the critical section: at most one thread here */
+pthread_mutex_unlock(&m);
+```
+
+and both threads together reach 2,000,000 on every run. Correctness has a price: on the M1 used here, the two million increments took about 2.2 ms without protection, 30 to 39 ms with the mutex and 34 to 51 ms with the atomic add (six runs, `-O0`, timed by the program in the Code section). The atomic version is not faster here, because every increment moves the cache line holding the counter from one core to the other, the coherence traffic of the [multicore note](/notes/acos/thread-level-parallelism#false-sharing); a mutex holder often does several increments before the line moves. The times vary with the machine and the contention, and a lock held only for a few instructions should protect more work to be worth taking.
+
+The rules for using a mutex: every access to the shared data, reads included, happens with the mutex held; the critical section is short; and the code never returns, breaks out of a loop or calls something that might block forever while holding it.
+
+## Condition variables: waiting for a state
+
+A mutex makes threads take turns. Often a thread must also wait until the shared state allows it to continue: a consumer until a queue is not empty, a producer until it is not full. Checking in a loop with the mutex released in between (*busy waiting*) wastes a core. A **condition variable** lets a thread sleep until another thread signals that the state may have changed.
+
+`pthread_cond_wait(&cv, &m)` must be called with the mutex `m` held. It releases the mutex and puts the thread to sleep, as one atomic step, so a signal cannot slip in between; on waking up it takes the mutex again before returning. `pthread_cond_signal(&cv)` wakes one waiting thread, `pthread_cond_broadcast(&cv)` all of them.
+
+The classic use is the **bounded buffer** of the producer–consumer problem: a ring of `CAP` slots, a producer that puts items in and a consumer that takes them out, one mutex and two condition variables, `not_full` and `not_empty`:
+
+```c
+void put(int v) {
+    pthread_mutex_lock(&m);
+    while (count == CAP)                      /* full: sleep until a consumer makes room */
+        pthread_cond_wait(&not_full, &m);
+    buf[tail] = v; tail = (tail + 1) % CAP; count++;
+    pthread_cond_signal(&not_empty);          /* a consumer may be waiting for this item */
+    pthread_mutex_unlock(&m);
+}
+```
+
+`get` is the mirror image. The condition is checked in a `while` loop, never an `if`. A woken thread is not guaranteed to find the condition true: another consumer may have taken the item between the signal and the moment this thread reacquired the mutex, and POSIX allows *spurious wakeups* with no signal at all. Rechecking after every wakeup is always correct. In the Code section a producer passes the squares 1, 4, …, 100 through a four-slot buffer and the consumer receives all ten in order, with the buffer never holding more than four.
+
+## Semaphores
+
+Dijkstra's **semaphore** is an integer with two atomic operations ([Dijkstra, 1965](#references)): *P*, or `sem_wait`, waits until the value is positive and then decrements it; *V*, or `sem_post`, increments it and wakes a waiter if there is one. A semaphore initialized to 1 is a lock: `sem_wait` enters, `sem_post` leaves. A semaphore initialized to $n$ admits up to $n$ threads at once, for example to limit the number of open connections. A semaphore initialized to 0 is a signal: one thread waits on it until another posts.
+
+The bounded buffer needs two counting semaphores and a lock: `empty` starts at `CAP` and counts free slots, `full` starts at 0 and counts items. The producer does `sem_wait(&empty)`, inserts under the lock, then `sem_post(&full)`; the consumer does the reverse. The counts replace the `while` loops of the condition-variable version, because a semaphore remembers how many posts have happened, while a signal on a condition variable with no waiter is lost.
+
+POSIX provides unnamed semaphores (`sem_init`), which live in memory shared by the threads, and named ones (`sem_open`), which processes can open by name. macOS implements only the named kind: `sem_init` there returns $-1$ with `errno` set to "Function not implemented". The [next note](/notes/acos/inter-process-communication) uses named semaphores between processes.
+
+| Tool | What it guarantees | Waiting | Typical use |
+| --- | --- | --- | --- |
+| Atomic instruction | one read-modify-write of one word is indivisible | none | counters, flags, building locks |
+| Spinlock | mutual exclusion | busy: keeps the core | very short sections, inside kernels |
+| Mutex | mutual exclusion, with an owner | sleeps in the kernel when contended | protecting shared data structures |
+| Condition variable | sleep until signalled, with the mutex released | sleeps | waiting for a state: queue not empty |
+| Semaphore | a counter of available units | sleeps when the count is 0 | limiting concurrency, signalling between processes |
+
+## Deadlock
+
+Locks introduce a failure of their own. Thread 1 transfers money from account X to account Y: it locks X, then Y. Thread 2 transfers from Y to X: it locks Y, then X. If each takes its first lock before the other takes its second, thread 1 holds X and waits for Y, thread 2 holds Y and waits for X, and neither will ever continue. This is a **deadlock**.
+
+A deadlock can happen only if four conditions hold at once ([Coffman, Elphick and Shoshani, 1971](#references)):
+
+1. **Mutual exclusion**: a resource can be held by one thread at a time.
+2. **Hold and wait**: a thread holds one resource while waiting for another.
+3. **No preemption**: a resource cannot be taken away from the thread that holds it.
+4. **Circular wait**: there is a cycle of threads, each waiting for a resource that the next one holds.
+
+Removing any one condition prevents deadlock. The usual one to remove is the circular wait, by **lock ordering**: fix a global order of the locks (for accounts, by account number; in general, by the lock's address) and always acquire them in that order. Both transfers then lock the lower-numbered account first; whichever thread gets it also gets the second lock, and the other waits at the first.
+
+<LockOrder />
+
+The figure draws each situation as a graph: an arrow from a lock to the thread that holds it, and a dashed arrow from a thread to the lock it waits for. Deadlock is a cycle in this graph. With a global order every thread acquires locks in increasing order, so every arrow along a path leads to a higher lock, and a path can never return to where it started.
+
+The other conditions can be attacked too: acquire all locks at once or none (`pthread_mutex_trylock` and release everything on failure), which removes hold and wait at the risk of *livelock*, threads that keep retrying in step; or detect cycles at run time and break them, as database systems do by aborting one transaction.
+
+## Memory ordering, briefly
+
+*Optional depth: why locks also order memory. The rest of the note does not depend on it.*
+
+A lock does more than exclude. Processors and compilers reorder memory accesses to different addresses when a single thread cannot tell the difference, and the [multicore note](/notes/acos/thread-level-parallelism#memory-consistency-in-what-order-do-writes-become-visible) shows that the RISC-V memory model, like ARM's, lets other cores see one core's stores in a different order. The pattern that breaks is message passing:
+
+```c
+/* thread 1 */                    /* thread 2 */
+data = 42;                        while (!ready) { }
+ready = 1;                        printf("%d\n", data);   /* may print 0 */
+```
+
+Nothing stops the store to `ready` from becoming visible before the store to `data`, or the load of `data` from being performed before the load of `ready`; the compiler may even hoist the load of `ready` out of the loop. The fix is to make `ready` atomic and say what order is needed: `atomic_store_explicit(&ready, 1, memory_order_release)` keeps every earlier access before the store, and `atomic_load_explicit(&ready, memory_order_acquire)` keeps every later access after the load. On RISC-V the specification maps the release store to `fence rw,w` followed by `sw` and the acquire load to `lw` followed by `fence r,rw` ([RISC-V Unprivileged ISA](#references), "Code porting and mapping guidelines"). A mutex does exactly this: `lock` has acquire semantics and `unlock` release semantics, which is what the `.aq` and `.rl` bits of the spinlock above provide. A program whose shared data is always accessed under locks or through atomics has no data races; if its atomics also keep the default, sequentially consistent ordering, C11 guarantees that it behaves as if the threads' accesses were interleaved in one global order, the sequential consistency of [Lamport (1979)](#references).
+
+<aside class="callout"><strong>Check yourself.</strong> (1) Two threads each run <code>x = x + 2</code> once, with <code>x = 0</code> at the start and no lock. Which final values are possible? (2) Why must <code>pthread_cond_wait</code> release the mutex and fall asleep in one atomic step? (3) Threads use locks A, B and C. Thread 1 takes A then B; thread 2 takes B then C; thread 3 takes C then A. Can they deadlock, and which single change prevents it?<details><summary>Answers</summary>(1) 4 if one thread's load comes after the other's store; 2 if both load 0 before either stores. (2) If it released the mutex first and then went to sleep, a producer could insert an item and signal in between; the signal would find no waiter and be lost, and the consumer would sleep with an item in the buffer. (3) Yes: 1 holds A and waits for B, 2 holds B and waits for C, 3 holds C and waits for A is a cycle. Making thread 3 take A before C (the global order A, B, C) removes it.</details></aside>
+
+## What changed
+
+| | Unprotected shared counter | With synchronization |
+| --- | --- | --- |
+| `counter++` | load, add, store; another thread can interleave | one AMO, an LR/SC loop, or the three instructions under a mutex |
+| Result of 2 × 1,000,000 increments | about 1.0 million, different every run (here) | exactly 2,000,000 |
+| Time (M1, `-O0`, six runs) | about 2.2 ms | 30–39 ms (mutex), 34–51 ms (atomic) |
+| Waiting for a state | busy loop on a flag | condition variable or semaphore |
+| New failure modes | lost updates, undefined behaviour | deadlock, livelock, contention |
+
+## Limitations
+
+- **Locks do not compose.** Two correct functions that each take a lock can deadlock when one calls the other; the lock order is a property of the whole program.
+- **Contention serializes.** Under a single lock, threads run one at a time; a popular lock limits the speed-up by Amdahl's law.
+- **Priority inversion.** A low-priority thread holding a lock that a high-priority thread needs can be kept off the processor by medium-priority threads; real-time systems need priority inheritance.
+- **Races hide.** A race can stay invisible in testing, as at `-O2` above. Tools such as ThreadSanitizer (`clang -fsanitize=thread`) detect data races at run time on the paths that tests execute.
+
+## What you should remember
+
+- `counter++` is three instructions: load, add, store. Two threads that interleave them lose updates; 18 of the 20 interleavings of two increments do.
+- A critical section needs mutual exclusion, progress and bounded waiting. Disabling interrupts works only in the kernel of a single-core machine.
+- RISC-V atomics: AMOs (`amoadd.w`, `amoswap.w`) do a read-modify-write in one instruction; LR/SC (`lr.w`, `sc.w`) retries until no other core wrote in between. C11 `atomic_fetch_add` maps to `amoadd.w.aqrl`.
+- A spinlock busy-waits; a mutex sleeps in the kernel when contended and costs one atomic instruction when not.
+- A condition variable waits for a state with the mutex released; always recheck the condition in a `while` loop.
+- A semaphore counts: initialized to 1 it is a lock, to $n$ it admits $n$, to 0 it signals.
+- Deadlock needs mutual exclusion, hold and wait, no preemption and circular wait; acquiring locks in one global order removes the cycle.
+- Locks and atomics with acquire and release semantics also order memory; a race-free program that uses only locks and atomics with the default ordering behaves as if sequentially consistent.
+
+## Code
+
+The counter, without protection, with a mutex and with a C11 atomic. Compile and run with `clang -std=c17 -Wall -Wextra -O0 race.c -o race && ./race`. The racy count varies from run to run and from machine to machine; the other two are always 2,000,000:
+
+```c
+#include <pthread.h>
+#include <stdatomic.h>
+#include <stdio.h>
+#include <time.h>
+
+#define N 1000000                                    /* increments per thread */
+static long counter;
+static atomic_long acounter;
+static pthread_mutex_t m = PTHREAD_MUTEX_INITIALIZER;
+
+static void *racy(void *arg)   { (void)arg; for (int i = 0; i < N; i++) counter++; return NULL; }
+static void *locked(void *arg) {
+    (void)arg;
+    for (int i = 0; i < N; i++) {
+        pthread_mutex_lock(&m);
+        counter++;                                   /* the critical section */
+        pthread_mutex_unlock(&m);
+    }
+    return NULL;
+}
+static void *atomic(void *arg) { (void)arg; for (int i = 0; i < N; i++) atomic_fetch_add(&acounter, 1); return NULL; }
+
+static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
+
+static void run(const char *name, void *(*f)(void *)) {
+    pthread_t a, b;
+    counter = 0;
+    double t0 = now();
+    pthread_create(&a, NULL, f, NULL);
+    pthread_create(&b, NULL, f, NULL);
+    pthread_join(a, NULL);
+    pthread_join(b, NULL);
+    printf("%-7s %ld  (%.1f ms)\n", name, f == atomic ? (long)atomic_load(&acounter) : counter, (now() - t0) * 1e3);
+}
+
+int main(void) {
+    printf("expect  %d\n", 2 * N);
+    run("racy", racy);
+    run("mutex", locked);
+    run("atomic", atomic);
+    return 0;
+}
+/* One run on an Apple M1, macOS 26, clang -O0. In six runs the racy count was 1,002,319 to 1,008,633,
+   and the times were 2.2-2.3 ms, 29.6-39.0 ms and 34.4-51.1 ms:
+expect  2000000
+racy    1008633  (2.2 ms)
+mutex   2000000  (30.5 ms)
+atomic  2000000  (34.5 ms)
+*/
+```
+
+The lost update of the figure, in RARS syntax: one program plays both threads, A with register `t0` and B with `t1`, in the interleaving of the figure (checked with the course's RV32IM interpreter):
+
+```asm
+# Two "threads" increment one counter; their load/add/store steps interleave by hand.
+        .data
+counter: .word 5
+nl:     .asciz "\n"
+        .text
+main:
+        la   a1, counter
+        lw   t0, 0(a1)        # A: load  -> t0 = 5
+        lw   t1, 0(a1)        # B: load  -> t1 = 5 (A has not stored yet)
+        addi t0, t0, 1        # A: add   -> t0 = 6
+        addi t1, t1, 1        # B: add   -> t1 = 6
+        sw   t0, 0(a1)        # A: store -> counter = 6
+        sw   t1, 0(a1)        # B: store -> counter = 6: A's update is lost
+        lw   a0, 0(a1)
+        li   a7, 1            # print integer: prints 6
+        ecall
+        la   a0, nl
+        li   a7, 4            # print string
+        ecall
+        li   a7, 10           # exit
+        ecall
+```
+
+Every interleaving of one increment per thread, in Python:
+
+```python
+from itertools import combinations
+
+results = {}
+for slots in combinations(range(6), 3):         # which 3 of the 6 steps belong to thread A
+    mem, reg, step = 5, {'A': 0, 'B': 0}, {'A': 0, 'B': 0}
+    for k in range(6):
+        t = 'A' if k in slots else 'B'
+        op = step[t]; step[t] += 1
+        if op == 0: reg[t] = mem                 # load
+        elif op == 1: reg[t] += 1                # add
+        else: mem = reg[t]                       # store
+    results[mem] = results.get(mem, 0) + 1
+print(results)                                   # {7: 2, 6: 18}: 18 of 20 interleavings lose an update
+```
+
+The bounded buffer with a mutex and two condition variables. A producer thread sends the squares of 1 to 10 and then $-1$ as an end marker:
+
+```c
+#include <pthread.h>
+#include <stdio.h>
+
+#define CAP 4                                        /* a bounded buffer of 4 slots */
+static int buf[CAP], head, tail, count, max_seen;
+static pthread_mutex_t m = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t not_full = PTHREAD_COND_INITIALIZER, not_empty = PTHREAD_COND_INITIALIZER;
+
+static void put(int v) {
+    pthread_mutex_lock(&m);
+    while (count == CAP) pthread_cond_wait(&not_full, &m);    /* while, not if: recheck after waking */
+    buf[tail] = v; tail = (tail + 1) % CAP; count++;
+    if (count > max_seen) max_seen = count;
+    pthread_cond_signal(&not_empty);
+    pthread_mutex_unlock(&m);
+}
+
+static int get(void) {
+    pthread_mutex_lock(&m);
+    while (count == 0) pthread_cond_wait(&not_empty, &m);
+    int v = buf[head]; head = (head + 1) % CAP; count--;
+    pthread_cond_signal(&not_full);
+    pthread_mutex_unlock(&m);
+    return v;
+}
+
+static void *producer(void *arg) {
+    (void)arg;
+    for (int i = 1; i <= 10; i++) put(i * i);
+    put(-1);                                         /* end marker: no more items */
+    return NULL;
+}
+
+int main(void) {
+    pthread_t p;
+    pthread_create(&p, NULL, producer, NULL);
+    long sum = 0;
+    for (int v; (v = get()) != -1; ) { printf("%d ", v); sum += v; }
+    pthread_join(p, NULL);
+    printf("\nsum=%ld, buffer within %d slots: %s\n", sum, CAP, max_seen <= CAP ? "yes" : "no");
+    return 0;
+}
+/* Output:
+1 4 9 16 25 36 49 64 81 100
+sum=385, buffer within 4 slots: yes
+*/
+```
+
+## Next
+
+Threads share memory by default and need synchronization to use it safely. Processes share nothing by default: each has its own address space, so a race on a variable is impossible, and so is any communication through one. The [next note](/notes/acos/inter-process-communication) is about the channels the kernel provides between processes: pipes, signals, shared memory with a semaphore, and message queues.
+
+## References
+
+- R. H. Arpaci-Dusseau, A. C. Arpaci-Dusseau. [*Operating Systems: Three Easy Pieces*](https://pages.cs.wisc.edu/~remzi/OSTEP/). Arpaci-Dusseau Books, 2018. Chapters 26 (concurrency and race conditions), 28 (locks: spinlocks, test-and-set, compare-and-swap, LL/SC), 30 (condition variables, producer–consumer), 31 (semaphores), 32 (common concurrency bugs, deadlock).
+- R. E. Bryant, D. R. O'Hallaron. [*Computer Systems: A Programmer's Perspective*](https://csapp.cs.cmu.edu/), 3rd ed. Pearson, 2016. §12.5 (synchronizing threads with semaphores), §12.7 (other concurrency issues: races, deadlocks).
+- M. Kerrisk. [*The Linux Programming Interface*](https://man7.org/tlpi/). No Starch Press, 2010. Chapter 30 (thread synchronization: mutexes and condition variables), chapter 53 (POSIX semaphores).
+- [*The RISC-V Instruction Set Manual, Volume I: Unprivileged ISA*](https://github.com/riscv/riscv-isa-manual). The "A" extension: "Zalrsc" (load-reserved/store-conditional, constrained LR/SC loops) and "Zaamo" (atomic memory operations, *aq* and *rl* bits); the RVWMO explanatory appendix, "Code porting and mapping guidelines" (mappings from C/C++ atomics).
+- ISO/IEC 9899:2018, *Programming languages — C* (C17); [final draft N2176](https://www.open-std.org/jtc1/sc22/wg14/www/docs/n2176.pdf). §5.1.2.4 (multi-threaded executions and data races), §7.17 (atomics).
+- E. W. Dijkstra. [Cooperating sequential processes](https://www.cs.utexas.edu/~EWD/transcriptions/EWD01xx/EWD123.html). EWD123, Technological University Eindhoven, 1965.
+- E. G. Coffman, M. J. Elphick, A. Shoshani. [System deadlocks](https://doi.org/10.1145/356586.356588). *ACM Computing Surveys*, 3(2), 1971.
+- L. Lamport. [How to make a multiprocessor computer that correctly executes multiprocess programs](https://doi.org/10.1109/TC.1979.1675439). *IEEE Transactions on Computers*, C-28(9), 1979.
+- U. Drepper. [Futexes are tricky](https://www.akkadia.org/drepper/futex.pdf). Red Hat, 2011.
+- A. Tatarnikov. *Computer Architecture and Operating Systems* (HSE), [lecture 8: threads and synchronization](https://andrewt0301.github.io/hse-acos-course/part2os/08_IPC/lecture.html).

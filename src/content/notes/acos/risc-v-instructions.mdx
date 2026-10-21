@@ -1,0 +1,379 @@
+---
+title: RISC-V instructions and their encoding
+description: "The computational instructions of RV32I and its multiply extension, and how every instruction becomes one 32-bit word: the six formats, encoding by hand, why store and branch immediates are split and scrambled, and how lui and addi build any 32-bit constant."
+course: acos
+section: RISC-V Assembly
+order: 4
+status: published
+tags: [risc-v, instruction-encoding, instruction-formats, immediates, sign-extension, shifts, lui, machine-code]
+prerequisites: [The processor and the instruction set, "Bits, integers and byte order"]
+---
+
+import InstructionFormats from '../../../components/figures/risc-v-instructions/InstructionFormats.astro';
+import BranchEncoding from '../../../components/figures/risc-v-instructions/BranchEncoding.astro';
+
+The [previous note](/notes/acos/processor-and-isa) ran its first programs and treated each instruction as a mnemonic with operands. The processor sees none of that: it sees 32-bit words, such as `0x006283b3` for `add t2, t0, t1` and the pair `0x0fc10517`, `0xffc50513` that the assembler made out of `la a0, greeting`. This note covers both sides of that translation. It lists the instructions that compute (arithmetic, logic, shifts, comparisons, multiplication and division), then opens the words: six formats, three instructions encoded by hand, the reason store and branch constants are cut into pieces and shuffled, and the two-instruction recipe for any 32-bit constant.
+
+**Notation.** `rd` is the destination register, `rs1` and `rs2` the source registers, `imm` the constant (**immediate**) stored inside the instruction. $x[r]$ is the value in register $r$. For a word $w$, $w[a{:}b]$ is the field of bits $a$ down to $b$, with bit 0 the least significant. $\operatorname{sext}(v)$ extends a narrow two's-complement number to 32 bits by copying its sign bit. Arithmetic is on 32-bit words, that is modulo $2^{32}$. $\ll$ is a left shift; $\gg_u$ and $\gg_s$ are the logical (zeros enter) and arithmetic (copies of the sign bit enter) right shifts.
+
+## Baseline: lay out each instruction as it is written
+
+The most direct encoding writes the operands in the order the assembly line lists them, after an opcode: `addi rd, rs1, imm` as opcode, `rd`, `rs1`, `imm`; `sw rs2, imm(rs1)` as opcode, `rs2`, `imm`, `rs1`; `add rd, rs1, rs2` as opcode, `rd`, `rs1`, `rs2`. Each instruction gets the layout that suits it. It works, and it breaks in two places.
+
+- **Not everything fits.** With 128 opcodes (7 bits) and 32 registers (5 bits per register), an instruction with two registers has $32 - 7 - 10 = 15$ bits left for its constant. A 32-bit constant or address can never fit in a 32-bit instruction alongside an opcode.
+- **The decoder must decode before it can read.** If `rs1` sits in bits 11–7 in one instruction and in bits 19–15 in another, the processor cannot start reading the register file until it has worked out which instruction it has. Reading the registers is on the critical path of every instruction, so this delay slows down every instruction, not only the unusual ones.
+
+RISC-V answers both: a small number of formats with the register fields at fixed places, immediates of 12 or 20 bits with a separate way to build wider constants, and the immediate packed around the register fields wherever space is left.
+
+## Arithmetic, logic and shifts
+
+The computational instructions of RV32I come in two shapes. **Register–register** instructions take two source registers: `add rd, rs1, rs2` computes $x[rd] = x[rs1] + x[rs2]$. **Register–immediate** instructions take one register and a 12-bit constant, sign-extended to 32 bits before use: `addi rd, rs1, imm` computes $x[rd] = x[rs1] + \operatorname{sext}(imm)$, so the constant ranges from −2048 to 2047.
+
+| Operation | Register–register | Register–immediate | Result |
+| --- | --- | --- | --- |
+| add, subtract | `add`, `sub` | `addi` | sum or difference modulo $2^{32}$ |
+| bitwise logic | `and`, `or`, `xor` | `andi`, `ori`, `xori` | bit by bit |
+| shift left | `sll` | `slli` | $x[rs1] \ll s$ |
+| shift right, logical | `srl` | `srli` | $x[rs1] \gg_u s$ |
+| shift right, arithmetic | `sra` | `srai` | $x[rs1] \gg_s s$ |
+| set if less than, signed | `slt` | `slti` | 1 if $x[rs1] < $ the operand as signed numbers, else 0 |
+| set if less than, unsigned | `sltu` | `sltiu` | the same comparison on unsigned numbers |
+| upper immediate | | `lui`, `auipc` | $imm \ll 12$, or $pc + (imm \ll 12)$ |
+
+The shift amount $s$ is the low 5 bits of `rs2` or of the immediate: shifting a 32-bit word by 32 or more makes no sense, and `sll t0, t0, t1` with `t1` = 33 shifts by 1. There is no `subi`, because `addi` with a negative constant does the same.
+
+The **M extension** adds multiplication and division:
+
+| Instruction | Result |
+| --- | --- |
+| `mul rd, rs1, rs2` | the low 32 bits of the 64-bit product |
+| `mulh`, `mulhu`, `mulhsu` | the high 32 bits of the product, for signed × signed, unsigned × unsigned and signed × unsigned |
+| `div`, `divu` | the quotient, rounded towards zero |
+| `rem`, `remu` | the remainder, with the sign of the dividend |
+
+Three things are missing that other processors have. There are **no condition flags**: no instruction records a carry, an overflow or a zero result on the side, so every result goes into a register. **Overflow is silent**: `add` returns the sum modulo $2^{32}$. And there are **no traps on arithmetic**: the [previous note](/notes/acos/processor-and-isa#the-instruction-set-as-a-contract) showed what division by zero returns. When a program needs to know about a carry or an overflow, it computes it with a comparison. An unsigned sum has carried out exactly when it is smaller than an operand, so after `add t3, t1, t2`, the instruction `sltu t4, t3, t1` sets `t4` to the carry ([RISC-V Unprivileged ISA](#references), the integer computational instructions, which also give the three-instruction check for signed overflow).
+
+Several common operations are special cases, and the assembler offers them as pseudo-instructions: `not rd, rs` is `xori rd, rs, -1`; `neg rd, rs` is `sub rd, zero, rs`; `seqz rd, rs` (set if zero) is `sltiu rd, rs, 1`, because only 0 is below 1 as an unsigned number; `snez rd, rs` is `sltu rd, zero, rs`.
+
+**Worked example.** Let `t0` = −20, the word `0xffffffec`.
+
+| Instruction | Result in hex | As a signed number | Why |
+| --- | --- | --- | --- |
+| `srai a0, t0, 2` | `0xfffffffb` | −5 | copies of the sign bit 1 enter from the left: division by 4 |
+| `srli a0, t0, 2` | `0x3ffffffb` | 1,073,741,819 | zeros enter: the same bits read as the unsigned 4,294,967,276, divided by 4 |
+| `slli a0, t0, 2` | `0xffffffb0` | −80 | multiplication by 4 |
+| `slti a0, t0, 1` | `0x00000001` | 1 | $-20 < 1$ as signed numbers |
+| `sltiu a0, t0, 1` | `0x00000000` | 0 | 4,294,967,276 is not below 1 as an unsigned number |
+
+Two more cases with wider numbers: `0xfffffff0` + `0x20` gives `0x10`, which is below `0xfffffff0`, so `sltu` reports a carry of 1; and $2^{16} \cdot 2^{16} = 2^{32}$ does not fit, so `mul` returns 0 while `mulhu` returns 1, the upper half of the 64-bit product. The Code section runs all of these.
+
+## Six formats
+
+<aside class="callout"><strong>Key idea.</strong> Every RV32I instruction is one 32-bit word in one of six formats. The opcode, `rd`, `rs1`, `rs2`, funct3 and funct7 sit in the same bits in every format that has them, so the processor can start reading registers before it knows the instruction. The immediate takes whatever bits are left, cut into pieces if necessary, with its sign always in bit 31.</aside>
+
+<InstructionFormats />
+
+The fields have fixed meanings:
+
+- **opcode**, bits 6–0, names the class of instruction: `0110011` for register–register arithmetic (OP), `0010011` for register–immediate arithmetic (OP-IMM), `0000011` for loads, `0100011` for stores, `1100011` for branches, `0110111` for `lui`, `0010111` for `auipc`, `1101111` for `jal`, `1100111` for `jalr`, `1110011` for `ecall` and other system instructions. The two lowest bits are `11` for every 32-bit instruction; the compressed 16-bit instructions of the C extension use the other three values, so a processor can tell an instruction's length from its first two bits.
+- **funct3**, bits 14–12, and **funct7**, bits 31–25, choose the operation within the class. `add` and `sub` share opcode and funct3 `000` and differ in funct7: `0000000` for `add`, `0100000` for `sub`. The M extension uses funct7 `0000001`.
+- **rd**, bits 11–7; **rs1**, bits 19–15; **rs2**, bits 24–20: register numbers, 0 to 31.
+
+The six formats and their users:
+
+| Format | Fields | Used by |
+| --- | --- | --- |
+| R | funct7, rs2, rs1, funct3, rd, opcode | register–register arithmetic, `mul`, `div` |
+| I | imm[11:0], rs1, funct3, rd, opcode | register–immediate arithmetic, loads, `jalr`, `ecall` |
+| S | imm[11:5], rs2, rs1, funct3, imm[4:0], opcode | stores |
+| B | imm[12], imm[10:5], rs2, rs1, funct3, imm[4:1], imm[11], opcode | conditional branches |
+| U | imm[31:12], rd, opcode | `lui`, `auipc` |
+| J | imm[20], imm[10:1], imm[11], imm[19:12], rd, opcode | `jal` |
+
+Shifts by a constant use the I format with a twist: only the low 5 bits of the immediate are the shift amount, and bit 30 tells `srai` (1) from `srli` (0), the same bit that tells `sub` from `add`.
+
+## Encoding by hand
+
+**Worked example 1: `sub a0, a1, a2`**, an R-type instruction. `a0`, `a1` and `a2` are `x10`, `x11` and `x12`.
+
+| Field | funct7 | rs2 = a2 | rs1 = a1 | funct3 | rd = a0 | opcode |
+| --- | --- | --- | --- | --- | --- | --- |
+| Bits | 31–25 | 24–20 | 19–15 | 14–12 | 11–7 | 6–0 |
+| Value | `0100000` | 12 = `01100` | 11 = `01011` | `000` | 10 = `01010` | `0110011` |
+
+Written out, the word is `0100000 01100 01011 000 01010 0110011`. Regrouped into fours from the left, `0100 0000 1100 0101 1000 0101 0011 0011`, it is `0x40c58533`.
+
+**Worked example 2: `addi sp, sp, -16`**, an I-type instruction with a negative constant. −16 in 12-bit two's complement is $2^{12} - 16 = 4080$ = `1111 1111 0000`; `sp` is `x2`.
+
+| Field | imm[11:0] | rs1 = sp | funct3 | rd = sp | opcode |
+| --- | --- | --- | --- | --- | --- |
+| Value | `111111110000` | `00010` | `000` | `00010` | `0010011` |
+
+The word is `1111 1111 0000 0001 0000 0001 0001 0011` = `0xff010113`. When the processor executes it, it sign-extends the 12 bits: bit 11 is 1, so 20 ones are prepended and the constant becomes `0xfffffff0`, −16 again.
+
+**Worked example 3: `bne t0, t1, -12`**, a B-type branch. At the end of a four-instruction loop, it jumps back 12 bytes to the first instruction of the loop when `t0` ≠ `t1`. The offset is relative to the address of the branch itself.
+
+<BranchEncoding />
+
+1. The offset −12 as a 13-bit two's-complement number is `1 1111 1111 0100` (bits 12 to 0). Branch targets are always at even addresses, so bit 0 is 0 and is not stored. That doubles the range: 12 stored bits reach ±4 KiB.
+2. The remaining bits go to four places: bit 12 (the sign) to bit 31, bits 10–5 (`111111`) to bits 30–25, bits 4–1 (`1010`) to bits 11–8, and bit 11 (`1`) to bit 7.
+3. The other fields are as in any format: `rs2` = `t1` = `x6` = `00110`, `rs1` = `t0` = `x5` = `00101`, funct3 = `001` for `bne`, opcode `1100011`.
+4. The word `1111111 00110 00101 001 1010 1 1100011` regrouped by four is `1111 1110 0110 0010 1001 1010 1110 0011` = `0xfe629ae3`.
+5. Little-endian memory holds it as the bytes `e3 9a 62 fe`, the order in which a disassembler that prints bytes shows them.
+
+Decoding runs the same steps backwards: read the opcode, which fixes the format, then pick up the fields. The Code section encodes these three and three more with a few lines of Python; the results agree with the words that the LLVM assembler (`llvm-mc -triple=riscv32 -show-encoding`) produces for the same lines.
+
+<aside class="callout"><strong>Check yourself.</strong> Decode (1) `0x00a00893` and (2) `0x00112623`. (3) Which branch offsets can a B-type instruction encode?<details><summary>Answers</summary>(1) Opcode `0010011` (OP-IMM) with funct3 `000`: `addi`. rd = bits 11–7 = `10001` = 17 = `a7`, rs1 = 0 = `zero`, imm = bits 31–20 = 10. It is `addi a7, zero, 10`, which is `li a7, 10`. (2) Opcode `0100011`: a store; funct3 `010`: `sw`. rs1 = bits 19–15 = 2 = `sp`, rs2 = bits 24–20 = 1 = `ra`, imm = bits 31–25 followed by bits 11–7 = `0000000` `01100` = 12. It is `sw ra, 12(sp)`. (3) Even offsets from −4096 to 4094 bytes.</details></aside>
+
+## Why the S and B immediates are split and scrambled
+
+**S: split.** A store has two source registers, the base address in `rs1` and the value in `rs2`, and no destination. Its 12-bit constant cannot sit in bits 31–20 as in the I format, because `rs2` must stay in bits 24–20. So the constant goes around it: bits 11–5 of the constant in bits 31–25, and bits 4–0 in bits 11–7, the place that `rd` occupies in other formats and that a store does not need. The register fields stay where the register file expects them.
+
+**B: scrambled.** A branch also has two source registers, so its constant must use the same bits as a store's. But a branch offset is even, so its bit 0 need not be stored, and the 12 available bits can hold bits 12–1. The conventional choice would put bits 12–1 where S puts bits 11–0, shifting the whole constant by one place. RISC-V instead keeps bits 10–5 and 4–1 exactly where S has them, puts the sign (bit 12) in bit 31 like every other sign, and moves the leftover bit 11 into the slot that holds bit 0 in S, instruction bit 7. The J format treats U the same way: bits 19–12 stay where U has them, bits 10–1 sit where I has them, bit 11 takes bit 20, and the sign is in bit 31 ([RISC-V Unprivileged ISA](#references), the immediate encoding variants).
+
+**Why it helps.** Before an instruction can execute, the hardware must assemble its 32-bit immediate, and in front of each immediate bit sits a multiplexer that chooses which instruction bit feeds it, depending on the format. With the RISC-V layout, bits 10–5 of the immediate come from instruction bits 30–25 in every format that has them, bits 4–1 from one of two places, and the sign always from bit 31, so sign extension can begin before the format is known. Counting, for every immediate bit, the distinct instruction bits that can feed it across I, S, B, U and J gives 58 multiplexer inputs, at most 3 per bit; if B and J were plain shifted copies of S and U, the count would be 86, with up to 4 per bit (the Code section counts them). The specification estimates that the layout roughly halves the multiplexer cost and the fanout of the instruction signals. The price is paid by people and tools that encode instructions: the assembler, a just-in-time compiler, and this note.
+
+## Loading a 32-bit constant: lui and addi
+
+No single instruction can hold a 32-bit constant, so constants outside −2048..2047 take two. `lui rd, hi` (load upper immediate, U format) sets `rd` to $hi \ll 12$: the 20-bit constant in the upper bits and zeros in the lower 12. `addi rd, rd, lo` then adds a 12-bit constant. The question is how to split a constant $c$ into $hi$ and $lo$.
+
+The obvious split takes the upper 20 bits for $hi$ and the lower 12 bits for $lo$. It fails whenever bit 11 of $c$ is 1, because `addi` sign-extends its constant: the lower 12 bits `0xeef` are read as $3823 - 4096 = -273$, and the sum comes out 4096 too small. The fix is to take the signed reading of the low bits as given and let $hi$ absorb the difference:
+
+$$
+\boxed{\;lo = \operatorname{sext}(c[11{:}0]) \in [-2048,\, 2047], \qquad hi = \frac{c - lo}{2^{12}} \bmod 2^{20}\;}
+$$
+
+$$
+\begin{aligned}
+c[11{:}0] < 2048 &\;\Rightarrow\; lo = c[11{:}0],\; c - lo = c[31{:}12] \cdot 2^{12} &&\Rightarrow\; hi = c[31{:}12] \\
+c[11{:}0] \ge 2048 &\;\Rightarrow\; lo = c[11{:}0] - 2^{12},\; c - lo = (c[31{:}12] + 1) \cdot 2^{12} &&\Rightarrow\; hi = c[31{:}12] + 1 \\
+\text{both cases} &\;\Rightarrow\; hi = \left\lfloor (c + 2^{11}) / 2^{12} \right\rfloor \bmod 2^{20} . &&
+\end{aligned}
+$$
+
+The last line holds because adding $2^{11}$ = `0x800` carries into bit 12 exactly when bit 11 of $c$ is 1. In both cases `lui` followed by `addi` gives $hi \cdot 2^{12} + lo = c$ modulo $2^{32}$.
+
+**Worked example.** For $c$ = `0x12345678` the low 12 bits are `0x678` = 1656, below 2048: `lui a0, 0x12345` then `addi a0, a0, 1656`, the naive split. For $c$ = `0xdeadbeef` the low 12 bits are `0xeef` = 3823, so $lo = 3823 - 4096 = -273$ and $hi$ = `0xdeadb` + 1 = `0xdeadc`:
+
+| Instruction | `a0` after it |
+| --- | --- |
+| `lui a0, 0xdeadc` | `0xdeadc000` |
+| `addi a0, a0, -273` | `0xdeadc000` − `0x111` = `0xdeadbeef` |
+
+With the naive `lui a0, 0xdeadb`, the same `addi` gives `0xdeadaeef`. An assembler rejects `addi a0, a0, 0xeef` outright, because 3823 does not fit in 12 signed bits.
+
+The pseudo-instruction `li rd, c` does this split for us: one `addi` when $c$ fits in 12 bits, `lui` and `addi` otherwise. `la rd, label` does the same with `auipc`, which adds $hi \ll 12$ to the address of the `auipc` itself, so the split applies to the distance from the instruction to the label. That is the hello-world `la` of the previous note: the distance `0x0fc0fffc` has `0xffc` in its low 12 bits, which is −4 as a signed number, so the upper part becomes `0x0fc0f` + 1 = `0x0fc10`.
+
+## What changed
+
+| | Baseline: one layout per instruction | RISC-V formats |
+| --- | --- | --- |
+| Register fields | wherever the operand order puts them | fixed: rd 11–7, rs1 19–15, rs2 24–20 |
+| Reading registers | waits for the decoder | starts in parallel with decoding |
+| Sign of the immediate | wherever the constant ends | always bit 31 |
+| Constants | up to the bits left over, different per instruction | 12 bits (I, S, B) or 20 bits (U, J); wider ones with `lui` + `addi` |
+| Cost | simple to encode, slow to decode | quick to decode, fiddly to encode by hand |
+
+## Limitations
+
+- **Constants cost instructions.** Any constant outside −2048..2047 and any address takes two instructions, and a 64-bit constant in RV64 takes more.
+- **Short reach.** A conditional branch reaches ±4 KiB and `jal` ±1 MiB. Farther targets need `auipc` and `jalr`; the assembler and linker arrange it, at the cost of an extra instruction.
+- **No flags.** Multi-word arithmetic and overflow checks cost explicit comparisons and branches that flag-based instruction sets get for free.
+- **Fixed 32-bit words waste space** on common short instructions; the C extension adds 16-bit forms, at the price of instructions that are no longer all aligned to 4 bytes.
+- **Scrambled immediates are hard to read.** Decoding a B- or J-type word by eye, or generating code at run time, means shuffling bits.
+
+## What you should remember
+
+- RV32I computes with `add`, `sub`, `and`, `or`, `xor`, shifts (`sll`, `srl`, `sra`), and comparisons (`slt`, `sltu`), each with an immediate form taking a sign-extended 12-bit constant; M adds `mul`, `mulh*`, `div*`, `rem*`. No flags, no overflow traps.
+- Six formats, R, I, S, B, U, J, all 32 bits. Opcode in bits 6–0, rd 11–7, funct3 14–12, rs1 19–15, rs2 24–20, funct7 31–25; the sign of any immediate in bit 31.
+- To encode: choose the format, write each field in binary, concatenate, regroup by four bits. `sub a0, a1, a2` = `0x40c58533`, `addi sp, sp, -16` = `0xff010113`, `bne t0, t1, -12` = `0xfe629ae3`.
+- S splits its immediate around rs2; B drops bit 0 of the (even) offset and moves bit 11 into instruction bit 7, so that every immediate bit has few possible sources.
+- A 32-bit constant is `lui hi` + `addi lo` with $lo = \operatorname{sext}(c[11{:}0])$ and $hi = (c + \texttt{0x800}) \gg 12$; `0xdeadbeef` is `lui 0xdeadc`, `addi -273`.
+
+## Code
+
+The worked examples of the arithmetic section. Each value is printed by a short subroutine `show`; `jal ra, show` jumps to it and its `ret` comes back, the mechanism of the [procedures note](/notes/acos/procedures-and-the-stack).
+
+```riscv
+        .text
+        .globl main
+main:
+        li   t0, -20
+        srai a0, t0, 2              # arithmetic shift: copies of the sign bit come in from the left
+        jal  ra, show               # -5 0xfffffffb
+        srli a0, t0, 2              # logical shift: zeros come in from the left
+        jal  ra, show               # 1073741819 0x3ffffffb
+        slli a0, t0, 2              # shift left by 2 multiplies by 4
+        jal  ra, show               # -80 0xffffffb0
+        slti a0, t0, 1              # signed: -20 < 1
+        jal  ra, show               # 1 0x00000001
+        sltiu a0, t0, 1             # unsigned: 4294967276 < 1 is false
+        jal  ra, show               # 0 0x00000000
+        li   t1, 0xfffffff0         # unsigned 4294967280
+        li   t2, 0x20               # 32
+        add  t3, t1, t2             # the sum wraps around to 0x10
+        sltu a0, t3, t1             # carry out = 1 exactly when the sum is below an operand
+        jal  ra, show               # 1 0x00000001
+        li   t1, 0x10000            # 2^16
+        mul  a0, t1, t1             # 2^32 does not fit: the low 32 bits are 0
+        jal  ra, show               # 0 0x00000000
+        mulhu a0, t1, t1            # the high 32 bits of the 64-bit product are 1
+        jal  ra, show               # 1 0x00000001
+        li   a7, 10
+        ecall
+
+show:                               # print a0 in decimal and in hex on one line
+        mv   t6, a0
+        li   a7, 1
+        ecall
+        li   a0, ' '
+        li   a7, 11
+        ecall
+        mv   a0, t6
+        li   a7, 34
+        ecall
+        li   a0, 10
+        li   a7, 11
+        ecall
+        ret
+# Output:
+# -5 0xfffffffb
+# 1073741819 0x3ffffffb
+# -80 0xffffffb0
+# 1 0x00000001
+# 0 0x00000000
+# 1 0x00000001
+# 0 0x00000000
+# 1 0x00000001
+```
+
+Building `0xdeadbeef`, with and without the adjustment:
+
+```riscv
+        .text
+        .globl main
+main:
+        lui  a0, 0xdeadc            # a0 = 0xdeadc000
+        addi a0, a0, -273           # a0 = 0xdeadc000 - 273
+        li   a7, 34                 # PrintIntHex
+        ecall                       # prints 0xdeadbeef
+        li   a0, ' '
+        li   a7, 11                 # PrintChar
+        ecall
+        lui  a0, 0xdeadb            # the naive upper part, without the adjustment
+        addi a0, a0, -273           # 0xeef read as a signed 12-bit number is -273
+        li   a7, 34
+        ecall                       # prints 0xdeadaeef: 4096 too small
+        li   a0, ' '
+        li   a7, 11
+        ecall
+        li   a0, 0xdeadbeef         # the pseudo-instruction does the split itself
+        li   a7, 34
+        ecall                       # prints 0xdeadbeef
+        li   a7, 10
+        ecall
+# Output: 0xdeadbeef 0xdeadaeef 0xdeadbeef
+```
+
+An encoder for the six formats, the decoding of the fixed fields, the constant split, and the count of immediate sources:
+
+```python
+ABI = ['zero', 'ra', 'sp', 'gp', 'tp', 't0', 't1', 't2', 's0', 's1', 'a0', 'a1', 'a2', 'a3', 'a4', 'a5', 'a6', 'a7',
+       's2', 's3', 's4', 's5', 's6', 's7', 's8', 's9', 's10', 's11', 't3', 't4', 't5', 't6']
+x = {name: i for i, name in enumerate(ABI)}             # ABI name -> register number
+
+def bits(v, hi, lo):                                     # bits hi..lo of v (two's complement for negative v)
+    return (v >> lo) & ((1 << (hi - lo + 1)) - 1)
+
+def r_type(f7, rs2, rs1, f3, rd, op):
+    return f7 << 25 | x[rs2] << 20 | x[rs1] << 15 | f3 << 12 | x[rd] << 7 | op
+
+def i_type(imm, rs1, f3, rd, op):
+    assert -2048 <= imm <= 2047
+    return bits(imm, 11, 0) << 20 | x[rs1] << 15 | f3 << 12 | x[rd] << 7 | op
+
+def s_type(imm, rs2, rs1, f3, op):
+    assert -2048 <= imm <= 2047
+    return bits(imm, 11, 5) << 25 | x[rs2] << 20 | x[rs1] << 15 | f3 << 12 | bits(imm, 4, 0) << 7 | op
+
+def b_type(off, rs2, rs1, f3, op=0b1100011):
+    assert -4096 <= off <= 4094 and off % 2 == 0
+    return (bits(off, 12, 12) << 31 | bits(off, 10, 5) << 25 | x[rs2] << 20 | x[rs1] << 15
+            | f3 << 12 | bits(off, 4, 1) << 8 | bits(off, 11, 11) << 7 | op)
+
+def u_type(imm20, rd, op):
+    return bits(imm20, 19, 0) << 12 | x[rd] << 7 | op
+
+def j_type(off, rd, op=0b1101111):
+    assert -(1 << 20) <= off < (1 << 20) and off % 2 == 0
+    return (bits(off, 20, 20) << 31 | bits(off, 10, 1) << 21 | bits(off, 11, 11) << 20
+            | bits(off, 19, 12) << 12 | x[rd] << 7 | op)
+
+for text, word in [
+        ('sub  a0, a1, a2',  r_type(0b0100000, 'a2', 'a1', 0b000, 'a0', 0b0110011)),
+        ('addi sp, sp, -16', i_type(-16, 'sp', 0b000, 'sp', 0b0010011)),
+        ('sw   ra, 12(sp)',  s_type(12, 'ra', 'sp', 0b010, 0b0100011)),
+        ('bne  t0, t1, -12', b_type(-12, 't1', 't0', 0b001)),
+        ('lui  t0, 0x12345', u_type(0x12345, 't0', 0b0110111)),
+        ('jal  ra, 2048',    j_type(2048, 'ra'))]:
+    print(f'{text:<17} 0x{word:08x}')
+# sub  a0, a1, a2   0x40c58533
+# addi sp, sp, -16  0xff010113
+# sw   ra, 12(sp)   0x00112623
+# bne  t0, t1, -12  0xfe629ae3
+# lui  t0, 0x12345  0x123452b7
+# jal  ra, 2048     0x001000ef
+
+def decode_fields(w):                                    # the fields that sit in the same place in every format
+    return dict(opcode=bits(w, 6, 0), rd=ABI[bits(w, 11, 7)], funct3=bits(w, 14, 12),
+                rs1=ABI[bits(w, 19, 15)], rs2=ABI[bits(w, 24, 20)], funct7=bits(w, 31, 25))
+print(decode_fields(0x00a00893))   # opcode 0x13 (OP-IMM), rd a7, rs1 zero; imm = bits 31..20 = 10: li a7, 10
+# {'opcode': 19, 'rd': 'a7', 'funct3': 0, 'rs1': 'zero', 'rs2': 'a0', 'funct7': 0}
+
+def split(c):
+    """lui/addi immediates for a 32-bit constant c: c = hi * 4096 + lo with lo in -2048..2047."""
+    lo = ((c & 0xfff) ^ 0x800) - 0x800                   # the low 12 bits, read as a signed number
+    hi = ((c - lo) >> 12) & 0xfffff                      # the same as (c + 0x800) >> 12, modulo 2^20
+    return hi, lo
+
+for c in (0x12345678, 0xdeadbeef, 0x00000800, 0x7ffff800):
+    hi, lo = split(c)
+    naive = ((c >> 12 << 12) + lo) % 2**32               # lui with the upper 20 bits unchanged
+    print(f'0x{c:08x}: lui 0x{hi:05x}, addi {lo:5}  -> 0x{((hi << 12) + lo) % 2**32:08x}   naive 0x{naive:08x}')
+# 0x12345678: lui 0x12345, addi  1656  -> 0x12345678   naive 0x12345678
+# 0xdeadbeef: lui 0xdeadc, addi  -273  -> 0xdeadbeef   naive 0xdeadaeef
+# 0x00000800: lui 0x00001, addi -2048  -> 0x00000800   naive 0xfffff800
+# 0x7ffff800: lui 0x80000, addi -2048  -> 0x7ffff800   naive 0x7fffe800
+
+# Which instruction bit feeds bit k of the immediate, per format (None: constant 0). Counting the distinct
+# sources per immediate bit measures the multiplexers in front of the immediate.
+def source(fmt, k):
+    table = {
+        'I': k + 20 if k <= 10 else 31,
+        'S': (k + 7 if k <= 4 else k + 20) if k <= 10 else 31,
+        'B': None if k == 0 else k + 7 if k <= 4 else k + 20 if k <= 10 else 7 if k == 11 else 31,
+        'U': None if k < 12 else k,
+        'J': None if k == 0 else k + 20 if k <= 10 else 20 if k == 11 else k if k <= 19 else 31,
+        'B as S shifted': None if k == 0 else k + 6 if k <= 5 else k + 19 if k <= 11 else 31,
+        'J as U shifted': None if k == 0 else min(k + 11, 31),
+    }
+    return table[fmt]
+for formats in (['I', 'S', 'B', 'U', 'J'], ['I', 'S', 'B as S shifted', 'U', 'J as U shifted']):
+    per_bit = [len({source(f, k) for f in formats} - {None}) for k in range(32)]
+    print(sum(per_bit), max(per_bit))
+# 58 3    the RISC-V layout
+# 86 4    if B and J were S and U shifted by one bit
+```
+
+## Next
+
+Every program so far runs straight from its first instruction to its last, and keeps all its data in registers. The [next note](/notes/acos/control-flow-and-memory) adds the two things that real programs need: branches and jumps, which turn `if`, `while` and `for` into assembly, and loads and stores, which reach the data in memory, from single bytes to arrays and strings.
+
+## References
+
+- A. Tatarnikov. *Computer Architecture and Operating Systems* (HSE), [lecture 4: RISC-V instructions](https://andrewt0301.github.io/hse-acos-course/part1ca/04_Instructions/lecture.html).
+- RISC-V International. [*The RISC-V Instruction Set Manual, Volume I: Unprivileged ISA*](https://github.com/riscv/riscv-isa-manual/releases/latest). The RV32I chapter: base instruction formats, immediate encoding variants, integer computational instructions (including the overflow checks); the M extension; the instruction-set listings.
+- D. A. Patterson, J. L. Hennessy. *Computer Organization and Design, RISC-V Edition*, 2nd ed. Morgan Kaufmann, 2020. Sections 2.5 (representing instructions), 2.6 (logical operations) and 2.10 (addressing for wide immediates and addresses).
+- S. L. Harris, D. M. Harris. *Digital Design and Computer Architecture, RISC-V Edition*. Morgan Kaufmann, 2021. Section 6.4 (machine language).
+- A. Waterman. [Design of the RISC-V Instruction Set Architecture](https://www2.eecs.berkeley.edu/Pubs/TechRpts/2016/EECS-2016-1.html). PhD thesis, UC Berkeley, 2016. The chapter on the base ISA and its encoding choices.
+- [The LLVM `llvm-mc` tool](https://llvm.org/docs/CommandGuide/llvm-mc.html), used to check the encodings.

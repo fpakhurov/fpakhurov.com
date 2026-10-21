@@ -1,0 +1,382 @@
+---
+title: Dynamic memory allocation and strings
+description: "How a C program gets memory whose size and lifetime are known only at run time: the contract of malloc and free, an allocator that keeps its free blocks inside the heap, fragmentation, where the heap comes from, the classic memory bugs, and C strings."
+course: acos
+section: The Operating System
+order: 21
+status: published
+tags: [malloc, free, heap, stack, allocator, free-list, fragmentation, boundary-tags, sbrk, mmap, addresssanitizer, c-strings]
+prerequisites: [C for systems programming, System calls, Virtual memory]
+---
+
+import HeapBlocks from '../../../components/figures/memory-allocation/HeapBlocks.astro';
+
+The [previous note](/notes/acos/linking-and-loading) followed a program until its first instruction ran: the loader mapped the code and the initialized data, reserved the zeroed data, set up a stack and jumped to the entry point. Everything in that image has a size fixed when the program was linked, plus a stack that grows and shrinks with the calls. Most programs need more: a line of input of unknown length, a list that grows while the program runs, a buffer that must outlive the function that filled it. This note is about the memory that serves those needs. It starts from the contract of `malloc` and `free`, builds an allocator that keeps all its bookkeeping inside the memory it manages, shows how that memory is obtained from the kernel, and ends with the bugs that the contract makes possible and with C strings, the data structure where most of those bugs happen.
+
+**Notation.** A *block* is a contiguous piece of the heap managed by the allocator; its *payload* is the part the program may use. After the $k$-th request, $P_k$ is the total payload of the blocks currently allocated and $H_k$ the size of the heap. The **peak utilization** after $k$ requests is
+
+$$
+U_k = \frac{\max_{i \le k} P_i}{H_k},
+$$
+
+the fraction of the heap that the program's data needed at its peak ([Bryant and O'Hallaron, 2016](#references), §9.9.3). An allocator that wastes nothing has $U_k = 1$.
+
+## The stack and the heap
+
+A C program stores data in three kinds of places. **Static** storage (globals and `static` variables) lives in the data and zeroed-data segments for the whole run. **Automatic** storage (local variables) lives in the current function's frame on the stack: the [calling convention](/notes/acos/procedures-and-the-stack) allocates the frame by moving the stack pointer down on entry and frees it by moving it back on return. **Allocated** storage lives in the heap, a region of the address space managed by a library allocator, and exists from the call that allocates it until the call that frees it.
+
+| | Stack | Heap |
+| --- | --- | --- |
+| Allocated by | moving the stack pointer on function entry | a call to `malloc` |
+| Freed by | returning from the function | a call to `free` |
+| Lifetime | the function call | chosen by the program |
+| Size | fixed when the function is compiled, unless it uses `alloca` or a variable-length array | any, known at run time |
+| Cost | one instruction | a search in the allocator's data structures |
+| Limit | the stack size: 8,176 KiB for the main thread and 512 KiB for other threads on the machine used below (macOS 26, Apple M1) | the address space and the memory the kernel grants |
+
+The stack is fast because it is strictly last-in, first-out: freeing a frame never leaves a hole. That is also its limitation. A function cannot return a pointer to its own local array, because the frame that holds the array is reused by the next call:
+
+```c
+char *greeting(void) {
+    char buf[16] = "hello";
+    return buf;           /* bug: buf dies when greeting returns */
+}
+```
+
+Clang warns about this one (`address of stack memory associated with local variable 'buf' returned`), but in general the compiler cannot see it. Data that must outlive the call that creates it, or whose size is not known until run time, goes on the heap.
+
+## The contract of malloc and free
+
+The C standard library declares four functions in `<stdlib.h>` ([ISO/IEC 9899:2018](#references), §7.22.3):
+
+- `void *malloc(size_t n)` returns a pointer to at least `n` bytes, suitably aligned for any object type, or `NULL` if it cannot. The bytes are **not** initialized. On 64-bit Linux and macOS the result is a multiple of 16.
+- `void *calloc(size_t count, size_t size)` allocates `count * size` bytes set to zero, and returns `NULL` if the product overflows.
+- `void *realloc(void *p, size_t n)` resizes the block at `p`, keeping its contents up to the smaller of the two sizes. It may move the block: the old pointer is then invalid, and the new one must be used.
+- `void free(void *p)` returns the block to the allocator. `p` must be a value returned by one of the three functions above and not yet freed; `free(NULL)` does nothing.
+
+The obligations are split. The allocator must answer each request immediately, in the order it arrives, with memory that does not overlap any block still in use, and it can never move a block it has handed out, because the program holds raw addresses into it. The program must free each block exactly once, never touch a block after freeing it, and never write outside the `n` bytes it asked for. Nothing checks the program's side of the contract. Breaking it is **undefined behaviour**: the program may crash, print wrong results, or appear to work until the allocator's own data is overwritten.
+
+An allocator may hand out more than was asked. On the machine used in this note, `malloc(1)` through `malloc(16)` all return 16-byte blocks; `malloc_size`, the macOS query for a block's usable size, reports 16 for each (the Code section prints these).
+
+## Baseline: a bump allocator
+
+The simplest allocator keeps one pointer to the first unused byte of a large region. `malloc(n)` rounds `n` up to the alignment, returns the pointer and advances it by that amount; `free` does nothing. Allocation is a single addition, and no bookkeeping is needed at all.
+
+It breaks as soon as the program frees memory and expects to get it back. A loop that allocates a 1 KiB buffer, uses it and frees it, a million times, needs 1 GiB from a bump allocator, while an allocator that reuses freed blocks needs one block of about 1 KiB. A bump allocator is still the right tool when every object dies at the same moment: compilers and request handlers allocate from such an *arena* and release the whole region at once. A general-purpose allocator has to reuse freed blocks individually, which raises four questions: how `free` learns the size of the block it is given, where the free blocks are recorded, which free block serves a request, and what happens to the space left over.
+
+## An allocator that keeps its bookkeeping in the heap
+
+<aside class="callout"><strong>Key idea.</strong> Store the allocator's data structure inside the heap it manages. Each block begins with a header word that holds its size and an allocated bit, so the blocks form a list that can be walked from the first to the last without any memory outside the heap. A copy of the header at the end of the block, the boundary tag, lets <code>free</code> find the previous block as well and merge neighbouring free blocks in constant time.</aside>
+
+### Headers: how free knows the size
+
+`free(p)` receives only an address. The allocator therefore stores the block's size just before the payload, in a **header**. Because every block size is a multiple of 8, the three lowest bits of the size are always zero, and the lowest one can record whether the block is allocated: a header value of 25 means a 24-byte block in use, 24 a 24-byte free block ([Bryant and O'Hallaron, 2016](#references), §9.9.6). In the allocator of this note the header is 4 bytes and the block size counts the header too.
+
+### The implicit free list and the placement policy
+
+Since each header gives the distance to the next header, the blocks form a list without any pointers: start at the first header, add its size to reach the next one, stop at a header of size 0 that marks the end. The list is called **implicit** because it links all blocks, free or not, and the free ones are found by skipping the others. To serve a request the allocator computes the block size it needs (payload plus tags, rounded up to 8) and walks the list for a free block at least that large. Which one it picks is the **placement policy**:
+
+- **First fit** takes the first free block that is large enough. It is simple, but small leftover pieces accumulate near the start of the heap, and every search has to walk past them.
+- **Next fit** starts each search where the previous one stopped. Searches are shorter, and fragmentation is often worse.
+- **Best fit** examines every free block and takes the smallest one that is large enough. It wastes the least space per request and costs a full walk of the list each time.
+
+For example, with free blocks of 48, 16 and 32 bytes in address order and a request that needs a 16-byte block, first fit splits the 48-byte block into 16 and 32 and leaves free blocks of 32, 16 and 32 bytes; best fit takes the 16-byte block exactly and leaves the 48 and 32 untouched, so a later request for a 40-byte block can still be served. Measurements on eight real C and C++ programs found near-zero fragmentation for several conventional policies, best fit and first fit in address order among them, once headers and alignment were accounted for ([Johnstone and Wilson, 1998](#references)): a good policy is easy to find, and an efficient implementation of it is the hard part.
+
+### Splitting and coalescing
+
+When the chosen block is larger than the request, the allocator **splits** it: the front part becomes the allocated block and the rest becomes a new free block with its own header. If the rest is smaller than the minimum block (here 16 bytes: two tags and the smallest payload that keeps the alignment), it is left inside the allocated block as padding.
+
+When a block is freed, its neighbours may be free too. Leaving them as separate blocks creates *false fragmentation*: two adjacent free blocks of 16 bytes cannot serve a 24-byte request, although together they could. So `free` **coalesces** a freed block with a free neighbour. Merging with the next block is easy: its header is at the address of the current header plus the current size. Merging with the previous block needs its size, and nothing in the list points backwards.
+
+### Boundary tags
+
+Knuth's answer is to repeat the header at the end of every block, as a **footer** or boundary tag ([Knuth, 1997](#references), §2.5). The word just before a block's header is then the previous block's footer, and it gives the previous block's size and status. Freeing a block looks at two words, the previous footer and the next header, and falls into one of four cases: both neighbours allocated (just clear the bit), the next one free (merge with it), the previous one free (merge into it), or both free (merge all three). Each case rewrites one header and one footer, so `free` takes constant time.
+
+The price is one more word per block. Allocated blocks do not need a footer if the header of the next block keeps a bit saying whether the previous block is free, which is how production allocators recover that word.
+
+### The worked example
+
+The Code section implements exactly this allocator over a static array of 128 bytes: a 4-byte padding word, so that every payload lands on a multiple of 8; blocks with 4-byte headers and footers; and a 4-byte end marker. That leaves one free block of 120 bytes. The request sequence and what the allocator prints after each step:
+
+<HeapBlocks />
+
+1. **Start**: one free block of 120 bytes, payload at offset 8.
+2. **`a = malloc(10)`** needs $10 + 8 = 18$ bytes, rounded up to a 24-byte block. First fit splits the free block into 24 allocated and 96 free.
+3. **`b = malloc(20)`** needs 28, so a 32-byte block, split from the 96.
+4. **`c = malloc(8)`** needs 16: a 16-byte block, leaving 48 bytes free at the end.
+5. **`free(b)`**: both neighbours are allocated, so only the bit is cleared. The heap now has 80 free bytes, but in two pieces of 32 and 48. A `malloc(60)` needs a 72-byte block and fails, although more than 72 bytes are free: this is **external fragmentation**.
+6. **`d = malloc(4)`** needs the minimum block of 16. First fit reaches the 32-byte hole first and splits it into 16 allocated and 16 free.
+7. **`free(c)`**: the footer before `c` belongs to the 16-byte free block and the header after `c` to the 48-byte free block, so all three merge into one free block of $16 + 16 + 48 = 80$ bytes.
+8. **`e = malloc(60)`** now finds a block of 80. Splitting would leave 8 bytes, less than the minimum block, so `e` gets all 80.
+
+At the end the program holds $10 + 4 + 60 = 74$ bytes of payload in 120 bytes of blocks. The other 46 bytes are **internal fragmentation**: 24 bytes of tags (8 per block) and 22 bytes of padding (6 in `a`, 4 in `d`, 12 in `e`). The peak payload was 74 bytes, reached at the last step, so the peak utilization is $U = 74/128 \approx 0.58$ of the whole array.
+
+### Explicit and segregated free lists
+
+The implicit list searches through allocated blocks too, so `malloc` takes time linear in the number of all blocks. Two refinements fix that.
+
+An **explicit free list** links only the free blocks, through a predecessor and a successor pointer stored in their payloads, which free blocks do not otherwise use. A search then visits free blocks only. The pointers set a minimum block size: with 4-byte tags and 8-byte pointers, a free block needs at least $4 + 8 + 8 + 4 = 24$ bytes.
+
+**Segregated free lists** keep one list per size class (for example 16, 32, 48 and 64 bytes, then powers of two). A request goes straight to the list of its class, which approximates best fit without searching the whole heap. Production allocators such as glibc's, jemalloc and mimalloc are built on size classes, plus per-thread caches so that threads do not contend for one lock. The operating-system kernel uses the same idea in the **slab allocator**, which keeps caches of identical kernel objects, such as process descriptors, ready to hand out ([Bonwick, 1994](#references)).
+
+The same trade-off appears far from C. A server that generates text with a language model must store the attention keys and values of every request, and a request's memory grows token by token to a length nobody knows in advance; reserving the maximum per request wastes most of it to fragmentation. vLLM allocates that memory in fixed-size blocks, as an operating system allocates pages ([Kwon et al., 2023](#references)); the [quantization note](/notes/nlp/quantization#memory-latency-and-throughput-of-generation) computes how much memory the cache takes.
+
+### Fragmentation
+
+The two kinds of waste behave differently. **Internal fragmentation** is the space inside allocated blocks that holds no payload: tags, alignment padding, leftovers too small to split. It depends only on the requests made so far, so it is easy to measure. **External fragmentation** is free memory split into pieces too small for the next request. It depends on future requests, which the allocator cannot know, and since allocated blocks cannot be moved, no allocator for C can avoid it in general: for any placement policy there are request sequences that fragment the heap badly ([Wilson et al., 1995](#references)). Garbage-collected languages can *compact* the heap by moving objects and updating every reference to them; the [language-runtimes note](/notes/acos/language-runtimes) returns to that.
+
+## Where the heap comes from: brk, sbrk and mmap
+
+The allocator manages memory, but it must first obtain it from the kernel. Unix gives a process two ways ([Kerrisk, 2010](#references), §7.1 and §49.7).
+
+The **program break** is the end of the heap segment, which starts just above the zeroed data. The system call `brk(addr)` moves it to `addr`, and the library function `sbrk(incr)` moves it by `incr` bytes and returns the old end. A simple allocator grows the heap with `sbrk` whenever no free block fits, and the new memory becomes one more free block at the end of its list. The heap can shrink only from the top, so a single live block near the end pins everything below it.
+
+**`mmap`** with `MAP_ANONYMOUS` asks for a fresh region of pages anywhere in the address space, and `munmap` gives it back. glibc's `malloc` serves requests of at least 128 KiB this way by default, so that a large block can be returned to the kernel on `free` without waiting for the blocks below it; the threshold rises dynamically when large blocks are freed ([mallopt(3)](#references)). The macOS manual calls `brk` and `sbrk` "historical curiosities", and Apple's allocator does not use the break: it obtains its memory as virtual-memory regions, as `mmap` does.
+
+Both calls work in whole pages: 16 KiB on the Apple M1 used below, 4 KiB on most x86-64 Linux machines. Neither gives physical memory. They reserve virtual pages; the first access to a page causes a [page fault](/notes/acos/virtual-memory), and only then does the kernel find a physical frame, fill it with zeros and map it. This is why `calloc` of a large block from fresh `mmap` memory is cheap: the zeros are already guaranteed, and pages that are never touched are never backed.
+
+## Bugs the contract allows
+
+The program's side of the contract is unchecked, and four mistakes account for most memory bugs:
+
+- **Use after free**: reading or writing a block after `free`. The allocator may already have given the memory to someone else, or stored its free-list pointers there.
+- **Double free**: freeing the same block twice. The block can end up in the free list twice, and two later `malloc` calls can return the same address.
+- **Buffer overflow**: writing past the end of a block or a stack array. On the heap it overwrites the next block's header; on the stack it can overwrite the saved return address, the classic route for an attacker to take control of a program.
+- **Leak**: losing the last pointer to a block that was never freed. Nothing breaks, but a long-running program grows without bound.
+
+**AddressSanitizer** finds the first three when they happen ([Serebryany et al., 2012](#references)). The compiler adds a check before every load and store; a *shadow memory* keeps one byte of state for every 8 bytes of the program's memory, saying how many of them may be accessed. The sanitizer's allocator surrounds each block with poisoned *redzones* and keeps freed blocks in a quarantine instead of reusing them at once, so an access just past a block or into a recently freed one hits poisoned shadow. The typical slowdown is about 2× ([Clang AddressSanitizer documentation](#references)), cheap enough for testing. Compiled with `clang -g -fsanitize=address` (Apple clang 21, macOS 26), the program in the Code section that frees a block and then reads its first byte stops with this report (an excerpt: the process number and the stack frames inside the sanitizer's own `free` and `malloc` are left out):
+
+```text
+ERROR: AddressSanitizer: heap-use-after-free on address 0x6020000000b0
+READ of size 1 at 0x6020000000b0 thread T0
+    #0 0x000102098910 in main bugs.c:9
+0x6020000000b0 is located 0 bytes inside of 8-byte region [0x6020000000b0,0x6020000000b8)
+freed by thread T0 here:
+    #1 0x0001020988c8 in main bugs.c:9
+previously allocated by thread T0 here:
+    #1 0x00010209889c in main bugs.c:7
+```
+
+The report names the bad access, the line that made it, and the lines that freed and allocated the block. The double free reports `attempting double-free`, and writing `p[8]` into an 8-byte block reports `heap-buffer-overflow ... WRITE of size 1 ... located 0 bytes after 8-byte region`. Addresses differ from run to run; the kinds, sizes and line numbers do not.
+
+Leaks are found at exit by LeakSanitizer, which on Linux is part of AddressSanitizer and prints `Direct leak of 8 byte(s) in 1 object(s) allocated from:` followed by the allocation's stack ([Clang LeakSanitizer documentation](#references)). Apple's clang on the machine used here answers `detect_leaks is not supported on this platform`; macOS ships a separate tool instead, and `leaks --atExit -- ./a.out` reports `1 leak for 16 total leaked bytes` for the same program, 16 because that is the size of the block behind `malloc(8)`.
+
+## C strings
+
+C has no string type. A string is an array of `char` that ends at the first byte equal to zero, the **NUL terminator**, and every string function relies on finding it. The literal `"hi!"` occupies four bytes, `'h' 'i' '!' '\0'`: `sizeof` reports 4 and `strlen` 3. `strlen` has to walk the bytes until it meets the zero, so it takes time proportional to the length, and it runs off the end of the array if the zero is missing.
+
+The standard copying functions ([ISO/IEC 9899:2018](#references), §7.24.2) each have a trap:
+
+- `strcpy(dst, src)` copies until the terminator and never asks how large `dst` is. Copying a 15-character argument into `char name[8]` overflows the array; AddressSanitizer reports `stack-buffer-overflow ... WRITE of size 16` and names the variable: `[32, 40) 'name' <== Memory access at offset 40 overflows this variable`. Sixteen bytes, because the terminator is copied too.
+- `strncpy(dst, src, n)` writes exactly `n` bytes: it pads with zeros if `src` is shorter, and **does not terminate** `dst` if `src` is `n` bytes or longer. Copying `"systems"` into `char d[6]` with `n = 6` leaves six letters and no zero; the program must set `d[5] = '\0'` itself, which keeps `"syste"`.
+- `strcat(dst, src)` appends at the end of `dst`, so it must find that end first, and it has the same unchecked bound as `strcpy`.
+
+`snprintf(buf, size, format, ...)` is the safe general tool ([ISO/IEC 9899:2018](#references), §7.21.6.5): it writes at most `size` bytes **including** the terminator, always terminates when `size > 0`, and returns the length the full output would have had. `snprintf(buf, 8, "pid=%d", 123456)` stores `"pid=123"` and returns 10, so the comparison `returned >= size` detects the truncation, and `returned + 1` is the size to allocate for a second try. The BSD functions `strlcpy` and `strlcat` take the full buffer size and always terminate; they are on macOS and in glibc since version 2.38 ([glibc 2.38 release notes](#references)).
+
+The general rule follows from the representation: every function that writes a string needs the size of the destination, and every string must be terminated before it is passed to a function that reads one.
+
+<aside class="callout"><strong>Check yourself.</strong> (1) With the allocator of this note, what block size does <code>malloc(17)</code> get, and how many bytes of it are padding? (2) The heap holds, in order, a free 24-byte block, the block being freed (16 bytes) and an allocated block. What does <code>free</code> write, and where? (3) <code>char s[4]; strncpy(s, "abcd", 4); printf("%zu", strlen(s));</code> What is printed?<details><summary>Answers</summary>(1) $17 + 8 = 25$, rounded up to 32; padding $32 - 8 - 17 = 7$ bytes. (2) The previous footer says free, the next header says allocated: case 3. The merged block starts at the previous block's header, with size $24 + 16 = 40$ and the allocated bit clear; <code>free</code> writes that value into the previous block's header and into the footer of the block being freed, which is the merged block's footer. (3) Nothing defined: <code>strncpy</code> wrote four letters and no terminator, so <code>strlen</code> reads past the end of <code>s</code>. It may print 4, a larger number, or crash.</details></aside>
+
+## What changed
+
+| | Bump allocator | Implicit list with boundary tags | Segregated lists (production allocators) |
+| --- | --- | --- | --- |
+| `malloc` | one addition | walk all blocks: linear in their number | pick the size class: about constant |
+| `free` | nothing | constant: two tags, four cases | constant, plus returning memory to the kernel |
+| Reuses freed memory | no | yes, with splitting and coalescing | yes |
+| Overhead per block | none | 8 bytes of tags here | a header or none (sizes known per page) |
+| Fragmentation | everything freed is lost | internal (tags, padding) and external | internal (rounding to the class), less external |
+
+## Limitations
+
+- **Blocks cannot move.** The program holds raw pointers, so the allocator can never compact the heap; some request sequences fragment any placement policy.
+- **The contract is unchecked.** Use after free, double free and overflows corrupt memory silently; sanitizers find them only on the paths that tests execute.
+- **Threads.** A single free list protected by one lock serializes every allocation in a multithreaded program; real allocators add per-thread caches and arenas, which the toy allocator here does not have.
+- **Strings carry no length.** Every operation pays a search for the terminator, and every write depends on a size passed separately.
+
+## What you should remember
+
+- Stack memory lives for one function call and is freed by returning; heap memory lives from `malloc` to `free`, and its size can be chosen at run time.
+- `malloc` returns uninitialized, suitably aligned memory or `NULL`; `free` takes exactly one pointer from `malloc`, once. Everything else is undefined behaviour.
+- An allocator stores a header with size and allocated bit in front of every block; the headers form an implicit list. First fit, next fit and best fit choose a free block; splitting returns the rest, coalescing merges free neighbours.
+- A footer copy of the header, the boundary tag, lets `free` coalesce with the previous block in constant time.
+- Internal fragmentation is waste inside blocks; external fragmentation is free memory in pieces too small to use. In the worked example 80 free bytes could not serve a 72-byte block.
+- The heap grows with `brk`/`sbrk` or with `mmap`, in whole pages, and physical memory is assigned only on first touch.
+- AddressSanitizer reports use after free, double free and overflows at the faulting line; LeakSanitizer (Linux) or `leaks` (macOS) find leaks at exit.
+- A C string ends at its NUL byte. `strcpy` and `strcat` ignore the destination size, `strncpy` may not terminate, and `snprintf` truncates safely and returns the length it needed.
+
+## Code
+
+The allocator of the worked example. It prints the block list after every request, each block as status, size and payload offset; compile and run with `clang -std=c17 -Wall -Wextra -O0 alloc.c -o alloc && ./alloc`:
+
+```c
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+
+/* A first-fit allocator with boundary tags over a 128-byte static heap.
+   Every block has a 4-byte header and a 4-byte footer holding (size | allocated bit);
+   sizes include both tags and are multiples of 8, so every payload is 8-byte aligned. */
+#define HEAP 128
+static _Alignas(8) uint8_t heap[HEAP];
+
+static uint32_t get(size_t off)             { uint32_t v; memcpy(&v, heap + off, 4); return v; }
+static void     put(size_t off, uint32_t v) { memcpy(heap + off, &v, 4); }
+static uint32_t size_at(size_t hdr)  { return get(hdr) & ~7u; }
+static int      alloc_at(size_t hdr) { return get(hdr) & 1; }
+static void     tag(size_t hdr, uint32_t size, int a) { put(hdr, size | a); put(hdr + size - 4, size | a); }
+
+static void heap_init(void) {
+    put(0, 0);                        /* padding word: the first payload lands at offset 8 */
+    tag(4, HEAP - 8, 0);              /* one free block of 120 bytes */
+    put(HEAP - 4, 0 | 1);             /* end marker: a size-0 "allocated" header ends the list */
+}
+
+static void *my_malloc(size_t n) {
+    uint32_t need = (uint32_t)((n + 8 + 7) & ~(size_t)7);       /* payload + tags, rounded up to 8 */
+    if (need < 16) need = 16;
+    for (size_t h = 4; size_at(h) > 0; h += size_at(h)) {       /* first fit: walk the implicit list */
+        uint32_t sz = size_at(h);
+        if (alloc_at(h) || sz < need) continue;
+        if (sz - need >= 16) { tag(h, need, 1); tag(h + need, sz - need, 0); }   /* split */
+        else tag(h, sz, 1);                                      /* remainder too small: take it all */
+        return heap + h + 4;
+    }
+    return NULL;
+}
+
+static void my_free(void *p) {
+    size_t h = (size_t)((uint8_t *)p - heap) - 4;
+    uint32_t sz = size_at(h);
+    size_t next = h + sz;
+    if (!alloc_at(next)) sz += size_at(next);                    /* coalesce with the next block */
+    if (h > 4 && !(get(h - 4) & 1)) {                            /* the previous block's footer says it is free */
+        h -= get(h - 4) & ~7u;
+        sz += size_at(h);
+    }
+    tag(h, sz, 0);
+}
+
+static void show(const char *what) {
+    printf("%-14s", what);
+    for (size_t h = 4; size_at(h) > 0; h += size_at(h))
+        printf(" [%s %u @%zu]", alloc_at(h) ? "A" : "f", size_at(h), h + 4);
+    printf("\n");
+}
+
+int main(void) {
+    heap_init();                     show("init");
+    char *a = my_malloc(10);         show("a=malloc(10)");
+    char *b = my_malloc(20);         show("b=malloc(20)");
+    char *c = my_malloc(8);          show("c=malloc(8)");
+    my_free(b);                      show("free(b)");
+    printf("malloc(60) -> %s\n", my_malloc(60) ? "ok" : "NULL: 80 bytes free, no block of 72");
+    char *d = my_malloc(4);          show("d=malloc(4)");
+    my_free(c);                      show("free(c)");
+    char *e = my_malloc(60);         show("e=malloc(60)");
+    printf("payload offsets a=%td d=%td e=%td\n", a - (char *)heap, d - (char *)heap, e - (char *)heap);
+    return 0;
+}
+/* Output:
+init           [f 120 @8]
+a=malloc(10)   [A 24 @8] [f 96 @32]
+b=malloc(20)   [A 24 @8] [A 32 @32] [f 64 @64]
+c=malloc(8)    [A 24 @8] [A 32 @32] [A 16 @64] [f 48 @80]
+free(b)        [A 24 @8] [f 32 @32] [A 16 @64] [f 48 @80]
+malloc(60) -> NULL: 80 bytes free, no block of 72
+d=malloc(4)    [A 24 @8] [A 16 @32] [f 16 @48] [A 16 @64] [f 48 @80]
+free(c)        [A 24 @8] [A 16 @32] [f 80 @48]
+e=malloc(60)   [A 24 @8] [A 16 @32] [A 80 @48]
+payload offsets a=8 d=32 e=48
+*/
+```
+
+The four bugs, one per command-line argument. Build with AddressSanitizer, `clang -std=c17 -Wall -Wextra -O0 -g -fsanitize=address bugs.c -o bugs`, and run `./bugs 1`, `./bugs 2`, `./bugs 3`; the first line of each report is in the comments. Argument 4 leaks the block, which AddressSanitizer reports at exit on Linux; on macOS run a build without the sanitizer under `leaks --atExit -- ./bugs 4`:
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+int main(int argc, char **argv) {
+    int which = argc > 1 ? atoi(argv[1]) : 0;
+    char *p = malloc(8);
+    strcpy(p, "hello");
+    if (which == 1) { free(p); printf("%c\n", p[0]); }          /* use after free */
+    if (which == 2) { free(p); free(p); }                        /* double free */
+    if (which == 3) { p[8] = '!'; free(p); }                     /* one byte past the block: overflow */
+    if (which == 4) { p = NULL; }                                /* the only pointer is lost: leak */
+    if (which == 0) free(p);
+    return 0;
+}
+/* ./bugs 1  ERROR: AddressSanitizer: heap-use-after-free ... READ of size 1 ... in main bugs.c:9
+   ./bugs 2  ERROR: AddressSanitizer: attempting double-free ... in main bugs.c:10
+   ./bugs 3  ERROR: AddressSanitizer: heap-buffer-overflow ... WRITE of size 1 ... in main bugs.c:11
+   leaks --atExit -- ./bugs 4   (macOS, built without -fsanitize)   1 leak for 16 total leaked bytes. */
+```
+
+The string functions and the sizes of small `malloc` blocks. The last loop uses `malloc_size` from `<malloc/malloc.h>`, which exists only on macOS (glibc's equivalent is `malloc_usable_size` in `<malloc.h>`, and its sizes differ):
+
+```c
+#include <malloc/malloc.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+int main(void) {
+    char s[] = "hi!";                                  /* 4 bytes: 'h' 'i' '!' '\0' */
+    printf("sizeof=%zu strlen=%zu last=%d\n", sizeof s, strlen(s), s[3]);
+
+    char d[6];
+    strncpy(d, "systems", sizeof d);                   /* copies 6 bytes, no terminator */
+    printf("strncpy terminated? %s\n", memchr(d, '\0', sizeof d) ? "yes" : "no");
+    d[sizeof d - 1] = '\0';                            /* terminate by hand */
+    printf("after fix: \"%s\"\n", d);
+
+    char buf[8];
+    int need = snprintf(buf, sizeof buf, "pid=%d", 123456);
+    printf("snprintf wrote \"%s\", wanted %d chars, truncated: %s\n", buf, need, need >= (int)sizeof buf ? "yes" : "no");
+
+    char path[32];
+    snprintf(path, sizeof path, "%s/%s", "/tmp", "notes.txt");   /* the safe way to join strings */
+    printf("%s (%zu chars)\n", path, strlen(path));
+
+    for (size_t n = 1; n <= 64; n *= 4) {              /* macOS only: the usable size of a block */
+        void *p = malloc(n);
+        printf("malloc(%zu): block of %zu\n", n, malloc_size(p));
+        free(p);
+    }
+    return 0;
+}
+/* Output (the last three lines on macOS 26, Apple M1):
+sizeof=4 strlen=3 last=0
+strncpy terminated? no
+after fix: "syste"
+snprintf wrote "pid=123", wanted 10 chars, truncated: yes
+/tmp/notes.txt (14 chars)
+malloc(1): block of 16
+malloc(4): block of 16
+malloc(16): block of 16
+malloc(64): block of 64
+*/
+```
+
+## Next
+
+Every block in this note belonged to one program running alone. The [next note](/notes/acos/processes-and-threads) puts several programs on the machine at once. The operating system wraps each running program in a process with its own address space, so one process's heap is invisible to the others; it creates processes with `fork` and `exec`, adds threads that share one heap, and decides which of them runs on the processor next.
+
+## References
+
+- R. E. Bryant, D. R. O'Hallaron. [*Computer Systems: A Programmer's Perspective*](https://csapp.cs.cmu.edu/), 3rd ed. Pearson, 2016. §9.9 (dynamic memory allocation: requirements and goals §9.9.3, fragmentation §9.9.4, implicit free lists §9.9.6, placement, splitting and coalescing §9.9.7–9.9.10, boundary tags §9.9.11, explicit and segregated lists §9.9.13–9.9.14), §9.11 (common memory-related bugs).
+- R. H. Arpaci-Dusseau, A. C. Arpaci-Dusseau. [*Operating Systems: Three Easy Pieces*](https://pages.cs.wisc.edu/~remzi/OSTEP/). Arpaci-Dusseau Books, 2018. Chapter 14 (interlude: memory API), Chapter 17 (free-space management).
+- M. Kerrisk. [*The Linux Programming Interface*](https://man7.org/tlpi/). No Starch Press, 2010. Chapter 7 (memory allocation: §7.1 the program break and `malloc`), §49.7 (anonymous mappings).
+- D. E. Knuth. *The Art of Computer Programming*, Vol. 1: Fundamental Algorithms, 3rd ed. Addison-Wesley, 1997. §2.5 (dynamic storage allocation; boundary tags).
+- P. R. Wilson, M. S. Johnstone, M. Neely, D. Boles. [Dynamic storage allocation: a survey and critical review](https://doi.org/10.1007/3-540-60368-9_19). *International Workshop on Memory Management*, LNCS 986, 1995.
+- M. S. Johnstone, P. R. Wilson. [The memory fragmentation problem: solved?](https://doi.org/10.1145/286860.286864) *International Symposium on Memory Management (ISMM)*, 1998.
+- J. Bonwick. [The slab allocator: an object-caching kernel memory allocator](https://www.usenix.org/legacy/publications/library/proceedings/bos94/bonwick.html). *USENIX Summer Technical Conference*, 1994.
+- K. Serebryany, D. Bruening, A. Potapenko, D. Vyukov. [AddressSanitizer: a fast address sanity checker](https://www.usenix.org/conference/atc12/technical-sessions/presentation/serebryany). *USENIX Annual Technical Conference*, 2012.
+- [Clang AddressSanitizer documentation](https://clang.llvm.org/docs/AddressSanitizer.html) and [Clang LeakSanitizer documentation](https://clang.llvm.org/docs/LeakSanitizer.html).
+- W. Kwon et al. [Efficient memory management for large language model serving with PagedAttention](https://arxiv.org/abs/2309.06180). *SOSP*, 2023.
+- ISO/IEC 9899:2018, *Programming languages — C* (C17); [final draft N2176](https://www.open-std.org/jtc1/sc22/wg14/www/docs/n2176.pdf). §7.21.6.5 (`snprintf`), §7.22.3 (memory management functions), §7.24 (string handling).
+- [mallopt(3)](https://man7.org/linux/man-pages/man3/mallopt.3.html), Linux manual page: `M_MMAP_THRESHOLD`. [glibc 2.38 release notes](https://sourceware.org/git/?p=glibc.git;a=blob_plain;f=NEWS;hb=refs/heads/release/2.38/master): `strlcpy` and `strlcat`.
+- A. Tatarnikov. *Computer Architecture and Operating Systems* (HSE), [lecture 5: dynamic memory allocation, and the workshop on C strings](https://andrewt0301.github.io/hse-acos-course/part2os/05_Strings/lecture.html).

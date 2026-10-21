@@ -1,0 +1,366 @@
+---
+title: System calls
+description: "How a program asks the kernel for a service: the C library wrapper, the system-call number and arguments in registers, the trap and the table lookup in the kernel, errors through errno, what a call costs, watching calls with strace, and write against printf."
+course: acos
+section: The Operating System
+order: 19
+status: published
+tags: [system-calls, ecall, syscall, errno, abi, strace, write, printf, buffering, vdso]
+prerequisites: [What an operating system does, Exceptions and interrupts, C for systems programming]
+---
+
+import SyscallPath from '../../../components/figures/system-calls/SyscallPath.astro';
+import SyscallCost from '../../../components/figures/system-calls/SyscallCost.astro';
+
+The [operating-systems note](/notes/acos/operating-systems) put the kernel in a privileged mode that user programs cannot enter, and the [previous note](/notes/acos/c-for-systems-programming) wrote those programs in C. Between the two stands a narrow door. A program that wants to print, read a file, start a process or get memory must ask the kernel, and the only way to ask is a **system call**: a trap that carries a request number and its arguments into the kernel and brings a result back. The [exceptions note](/notes/acos/exceptions-and-interrupts#how-ecall-becomes-a-system-call) followed the trap through the hardware. This note follows the request: from a C function call through the C library to the instruction `ecall`, through the kernel's table of services and back; how errors are reported; what the round trip costs; how to watch the calls a program makes; and how `printf` differs from the `write` it is built on.
+
+**Notation.** On RISC-V, `a0`–`a7` are the argument registers of the [calling convention](/notes/acos/procedures-and-the-stack). A function's manual section is written after its name: `write(2)` is the system call in section 2 of the manual, `printf(3)` the library function in section 3. *errno* is the C library's variable for the last error number.
+
+## Baseline: calling the kernel like a function
+
+Why not call the kernel's `sys_write` directly, with `jal`, like any other function? Three reasons.
+
+1. **The code is out of reach.** The kernel's pages are mapped in every process, but with the U bit clear. Jumping to `sys_write` in U-mode fetches an instruction from such a page and raises an instruction page fault (cause 12); the kernel answers with `SIGSEGV`.
+2. **The mode would not change.** Even if the code could be fetched, it would run in U-mode, where every privileged instruction it uses would fault.
+3. **Any entry point would do.** A `jal` can target any address, including the middle of a function, past the code that checks the arguments.
+
+A request into the kernel therefore needs an instruction that changes the mode and jumps to an address the program does not choose: a trap. RISC-V's is `ecall`, x86-64's `syscall`, Arm's `svc`. What the trap cannot carry by itself is *which* service the program wants and with which arguments; that is an agreement between the kernel and the C library, the **system-call ABI**.
+
+## The path of one system call
+
+The hello-world program of the [first note](/notes/acos/computer-systems) ends in `write(1, buf, 13)`: write 13 bytes from `buf` to file descriptor 1, the standard output. On Linux for RISC-V the call goes as follows.
+
+<SyscallPath />
+
+1. **The call.** `main` calls `write` like any C function. By the calling convention its three arguments are already in `a0`, `a1` and `a2`. `write` is a short function in the C library, a **wrapper**.
+2. **The trap.** The wrapper puts the system-call number of `write`, 64, in `a7` and executes `ecall`. The processor records the address of the `ecall` in `sepc` and the cause 8 (environment call from U-mode) in `scause`, switches to S-mode and jumps to the address in `stvec`.
+3. **The entry.** The kernel's entry code saves all 31 user registers on the process's kernel stack and adds 4 to the saved `sepc`, so that the return lands after the `ecall`, not on it.
+4. **The dispatch.** The number in `a7` indexes the kernel's **system-call table**. If it is out of range, the result is `-ENOSYS`; entry 64 is `sys_write` ([Linux, `arch/riscv/kernel/traps.c`](#references)).
+5. **The service.** `sys_write(1, buf, 13)` checks that descriptor 1 is open for writing and that the 13 bytes at `buf` lie in the process's user memory, copies them into the kernel, and hands them to the terminal driver. It returns 13. The exit path stores 13 in the saved `a0`, restores the registers and executes `sret`, which returns to U-mode at `sepc`.
+6. **The result.** Back in the wrapper, `a0` holds 13, a non-negative number, so `write` returns it to `main`.
+
+**Worked example: the same call without the library.** The wrapper does nothing a program could not do itself. On Linux for RISC-V the following program prints the greeting and exits with two raw `ecall`s and no C library at all. It is Linux-only (the numbers and `ecall` mean nothing to macOS). Built with LLVM's `clang` by the command in its second line and run under `qemu-riscv64`, the user-mode RISC-V emulator, in a Debian 13 container, it prints `hello, world` and exits with status 0; and its `_start` disassembles to the instructions of steps 1 and 2: `auipc` and `addi` put the address of `msg` in `a1`, then `li a2, 13`, `li a7, 64`, `li a0, 1` and `ecall`; two more instructions turn the result into the exit code, and `li a7, 93` precedes a second `ecall`.
+
+```c
+// raw.c: Linux on RISC-V only, no C library; run under qemu-riscv64 in a Debian 13 container: prints hello, world, exit status 0.
+// clang --target=riscv64-linux-gnu -O1 -ffreestanding -nostdlib -static -fuse-ld=lld raw.c -o raw
+static long syscall3(long number, long arg0, long arg1, long arg2) {
+    register long a0 __asm__("a0") = arg0;
+    register long a1 __asm__("a1") = arg1;
+    register long a2 __asm__("a2") = arg2;
+    register long a7 __asm__("a7") = number;
+    __asm__ volatile("ecall" : "+r"(a0) : "r"(a1), "r"(a2), "r"(a7) : "memory");
+    return a0;                                    /* the result, or -errno */
+}
+
+void _start(void) {
+    static const char msg[] = "hello, world\n";
+    long n = syscall3(64, 1, (long)msg, 13);      /* write(1, msg, 13) */
+    syscall3(93, n == 13 ? 0 : 1, 0, 0);          /* exit(0) if all 13 bytes were written */
+}
+```
+
+<aside class="callout"><strong>Key idea.</strong> A system call is a function call split in two by a trap. The program's half (the wrapper) puts a number and up to six arguments in registers and executes one trapping instruction; the kernel's half saves the registers, looks the number up in a table, checks every argument, does the work and returns one value in a register. Everything the program can ask of the kernel is a row of that table.</aside>
+
+## Arguments, numbers and errors
+
+**Registers.** Each architecture fixes where the number, the arguments and the result go ([Linux man-pages, syscall(2)](#references)):
+
+| Architecture | Instruction | Number in | Arguments 1–6 in | Result in |
+| --- | --- | --- | --- | --- |
+| RISC-V | `ecall` | `a7` | `a0`–`a5` | `a0` |
+| arm64 | `svc #0` | `x8` | `x0`–`x5` | `x0` |
+| x86-64 | `syscall` | `rax` | `rdi`, `rsi`, `rdx`, `r10`, `r8`, `r9` | `rax` |
+
+On RISC-V and arm64 the arguments of a system call sit exactly where a C function's arguments sit, so the wrapper only has to set the number. On x86-64 the fourth argument moves from `rcx`, where a function call puts it, to `r10`, because the `syscall` instruction itself overwrites `rcx` with the return address (and `r11` with the flags). No system call takes more than six arguments; those that need more pass a pointer to a structure.
+
+**Numbers.** The number of a call is part of the ABI of one kernel on one architecture. `write` is 64 on RISC-V and arm64, which share Linux's generic table, 1 on x86-64, and 4 on macOS, whose kernel numbers its calls in the BSD tradition ([Linux `asm-generic/unistd.h`](#references); [XNU `syscalls.master`](#references)). A program compiled for one of these systems cannot make its calls on another even when the instruction set is the same; this is one reason executables are specific to an operating system and not only to a processor. The C library hides the numbers: programs call `write`, and the library for each target knows the number.
+
+**Errors.** The kernel never sets `errno`. On failure it returns the negated error number in the result register: −9 (`-EBADF`) for a descriptor that is not open, −14 (`-EFAULT`) for a buffer outside the process's memory. Valid results are never in the range −4095 to −1, so the wrapper can tell them apart: for a value in that range it stores the absolute value in `errno` and returns −1 ([Linux man-pages, intro(2)](#references)). Three rules follow for the caller:
+
+- check the return value first; `errno` means something only after a call has returned −1;
+- read `errno` immediately, because the next library call may change it;
+- each thread has its own `errno` ([C17](#references), §7.5), so threads do not see each other's errors.
+
+**Worked example.** `write(42, "x", 1)` on a process with no descriptor 42: the kernel returns −9, the wrapper sets `errno = 9` and returns −1, and `strerror(9)` is "Bad file descriptor". `write(1, (char *)1, 5)` names a buffer at address 1, which is not mapped: the kernel's check fails before it copies anything, it returns −14, and the program sees −1 with `errno = 14`, "Bad address". The kernel does not crash and does not send a signal: an invalid pointer passed to a system call is reported, not trapped. Both cases are in the Code section, with the same numbers on macOS and on Linux.
+
+<aside class="callout"><strong>Check yourself.</strong> (1) A RISC-V program executes <code>ecall</code> with <code>a7 = 999</code>. What does it get back? (2) Why can the kernel not simply trust the pointer <code>buf</code> it receives from <code>write</code>?<details><summary>Answers</summary>(1) Linux has no call 999, so the dispatch finds no table entry and the call returns <code>-ENOSYS</code> in <code>a0</code>; through the C library's generic <code>syscall()</code> function the program sees −1 with <code>errno</code> set to <code>ENOSYS</code>, "Function not implemented". (2) The kernel runs with access to all memory. If it copied from any address it is given, a program could pass the address of kernel data and have it written to a file; so every pointer is checked to lie in the user part of the address space before it is used, and copying goes through functions that turn a fault into <code>-EFAULT</code>.</details></aside>
+
+## What a system call costs
+
+A function call is a jump and a return. A system call adds the trap, saving and restoring the registers, the argument checks and the dispatch, and on processors vulnerable to Meltdown also a switch of page tables on every entry and exit, which the [operating-systems note](/notes/acos/operating-systems) mentioned among its limitations. Its indirect cost is harder to see: the kernel's code and data displace the program's lines in the caches and its entries in the TLB, so the program runs slower for a while after each call.
+
+Measured on an Apple M1 with macOS 26.5 and `clang -O2` (the first program in the Code section, one run; the numbers vary between runs and machines):
+
+| Operation | Time |
+| --- | --- |
+| an empty function call (not inlined) | 3.4 ns |
+| `getppid()`, the cheapest system call: it returns one number | 149 ns |
+| `write` of 1 byte to `/dev/null`, which discards it | 516 ns |
+| `pwrite` of 1 byte into a file in the page cache | 736 ns |
+
+The cheapest system call costs about 40 function calls, and one that does real work hundreds. The fixed part does not depend on the size of the request, so a program that moves many bytes per call pays it rarely.
+
+<SyscallCost />
+
+**Worked example.** Writing 1 MiB, 1,048,576 bytes, into a file one byte per call makes 1,048,576 calls at about 736 ns: about 0.77 s. Writing it in 4 KiB pieces makes 256 calls at 824 ns: about 0.21 ms, some 3,700 times faster, for the same bytes. Per byte, the cost falls from 736 ns to 0.20 ns. Beyond about 16 KiB, larger calls help little: the fixed cost of the call is spread so thin that the copy of the bytes, about 0.026 ns per byte, dominates. The [files note](/notes/acos/files-and-io#buffering-fewer-and-larger-calls) builds the same argument for reading and shows the buffering that the C library does for us.
+
+Some services are too frequent to pay even that. Linux maps a small shared library, the **vDSO**, into every process, with functions such as `clock_gettime` and `gettimeofday` that read data the kernel keeps updated in a page the process can read; they return the time without entering the kernel at all ([Linux man-pages, vdso(7)](#references)).
+
+## Watching system calls: strace
+
+`strace` runs a program and prints each system call it makes, with its arguments and its result; `strace -c` prints a summary table instead, `-e trace=write,read` limits the output to some calls, and `-o file` sends it to a file instead of the terminal ([strace(1)](#references)). It uses the kernel's debugging interface, `ptrace`, so it needs no change to the program. Even a hello-world program makes many calls before `main` runs: `execve` to start it, then the dynamic linker's `openat`, `mmap` and `mprotect` to load the C library, which the [next note](/notes/acos/linking-and-loading) explains.
+
+The program `order.c` in the Code section calls `printf("A\n")`, then `write(1, "B\n", 2)`, then `printf("C\n")`. Traced on Linux, keeping only `write`:
+
+```text
+# Linux only: run in a Debian 13 container (glibc 2.41, strace, arm64).
+$ strace -e trace=write -o trace.txt ./order          # standard output is a terminal
+$ cat trace.txt
+write(1, "A\n", 2)                      = 2
+write(1, "B\n", 2)                      = 2
+write(1, "C\n", 2)                      = 2
++++ exited with 0 +++
+$ strace -e trace=write -o trace.txt ./order > out.txt   # standard output is a file
+$ cat trace.txt
+write(1, "B\n", 2)                      = 2
+write(1, "A\nC\n", 4)                   = 4
++++ exited with 0 +++
+```
+
+With a terminal, each `printf` ends in its own `write`. With a file, the two `printf`s make one `write` between them, at exit, and it comes *after* the direct `write` of B: the file contains B, A, C. The next section explains why.
+
+macOS has no `strace`. Its equivalent, `dtruss`, is built on DTrace, needs root and, with System Integrity Protection on, cannot trace most programs; the timing and ordering experiments of the Code section run there instead.
+
+## write(2) directly versus printf
+
+`write` is the system call: it takes bytes that are ready and makes one trap per call. `printf` is a library function that does two jobs in user space before any system call. It **formats**: `printf("%d", 13)` turns the integer into the characters `1` and `3`. And it **buffers**: the characters go into a buffer in the process's own memory, attached to the `FILE` called `stdout`, and `write` is called only when the buffer is flushed. When that happens depends on what standard output is connected to ([C17](#references), §7.21.3):
+
+- a terminal: **line-buffered**, flushed at every newline, so the user sees each line at once;
+- a file or a pipe: **fully buffered**, flushed when the buffer fills (typically 4 KiB) or at `exit`, which makes the fewest calls;
+- `stderr`: **unbuffered**, so error messages appear even if the program crashes right after.
+
+`fflush(stdout)` forces a flush. Mixing `printf` and `write` on the same descriptor mixes a buffered and an unbuffered path, which is why the traced program printed B first when its output went to a file: A and C were still waiting in the buffer when B went straight to the kernel.
+
+| | `write(fd, buf, n)` | `printf(fmt, ...)` |
+| --- | --- | --- |
+| Manual section | 2: system call | 3: library function |
+| Formatting | none: bytes in, bytes out | converts numbers and strings into text |
+| System calls | exactly one per call | one per flush: per line, per buffer, or at exit |
+| Errors | returns −1 and sets `errno` | returns a negative number; the error may surface only at the flush |
+| Portability | POSIX | ISO C: every hosted C implementation |
+
+## A table of common system calls
+
+Linux has about 470 system-call numbers; a few dozen do most of the work. The numbers are from Linux's generic table, used by RISC-V and arm64, and from the x86-64 table ([Linux source](#references)):
+
+| Group | Call | What it does | RISC-V, arm64 | x86-64 |
+| --- | --- | --- | --- | --- |
+| files | `openat` | open a file, return a descriptor | 56 | 257 |
+| | `read`, `write` | move bytes between a descriptor and memory | 63, 64 | 0, 1 |
+| | `close` | release a descriptor | 57 | 3 |
+| | `lseek` | move the file offset | 62 | 8 |
+| | `fstat` | file size, type and permissions | 80 | 5 |
+| memory | `brk` | move the end of the heap | 214 | 12 |
+| | `mmap`, `munmap` | map and unmap pages | 222, 215 | 9, 11 |
+| | `mprotect` | change the permissions of pages | 226 | 10 |
+| processes | `clone` | create a process or a thread | 220 | 56 |
+| | `execve` | run a new program in this process | 221 | 59 |
+| | `exit_group` | end the process | 94 | 231 |
+| | `wait4` | wait for a child to finish | 260 | 61 |
+| | `getpid` | the process's own ID | 172 | 39 |
+| | `kill` | send a signal | 129 | 62 |
+| communication | `pipe2` | create a pipe | 59 | 293 |
+| | `socket` | create a network endpoint | 198 | 41 |
+
+The generic table has no `open` and no `fork`: the library's `open` calls `openat`, and its `fork` calls `clone`. x86-64 still has both, for compatibility. The [processes note](/notes/acos/processes-and-threads), the [files note](/notes/acos/files-and-io) and the [sockets note](/notes/acos/sockets) use these calls one group at a time.
+
+## What changed
+
+| | Function call | System call |
+| --- | --- | --- |
+| Instruction | `jal` to any address | `ecall`; the kernel chose the target in `stvec` |
+| Mode | stays in U-mode | U → S, and `sret` back |
+| Which code runs | the address in the instruction | the number in `a7`, looked up in the kernel's table |
+| Arguments | trusted | checked: every descriptor and every pointer |
+| Errors | whatever the function decides | `-errno` from the kernel, −1 and `errno` from the wrapper |
+| Cost on an M1 | about 3 ns | about 150 ns for the cheapest, hundreds for real work |
+
+## Limitations
+
+- **Every call is a round trip.** Programs that make many small calls spend their time entering and leaving the kernel; batching (buffers, `readv`/`writev`, asynchronous interfaces such as Linux's `io_uring`) exists to amortize it.
+- **The interface is per kernel and per architecture.** Numbers, structures and some semantics differ between Linux, macOS and Windows; portable programs go through the C library and POSIX, which hide some of the differences, not all.
+- **Calls can block.** A `read` from a pipe or a socket waits until data arrives; the process sleeps, and a program that must stay responsive needs threads or non-blocking descriptors.
+- **Checks are only as good as their timing.** If the kernel checks a value in user memory and reads it again later, another thread can change it in between (a *time-of-check to time-of-use* bug); kernels copy arguments into kernel memory once and use only the copy.
+- **Tracing has a cost and needs permission.** `strace` stops the program at every call, so it slows it down considerably; on macOS the equivalent needs root and is limited by System Integrity Protection.
+
+## What you should remember
+
+- A system call is a trap with a number and arguments in registers: on Linux for RISC-V, number in `a7`, arguments in `a0`–`a5`, `ecall`, result in `a0`. `write` is 64 (RISC-V, arm64), 1 (x86-64), 4 (macOS).
+- The C library's wrapper sets the number and executes the trap; the kernel saves the registers, moves `sepc` past the `ecall`, indexes its system-call table, checks the arguments, does the work and returns with `sret`.
+- The kernel returns `-errno` on failure; the wrapper turns a result in −4095…−1 into −1 and sets `errno`. Check the return value first, then `errno`.
+- On an M1: a function call about 3 ns, `getppid` about 150 ns, a 1-byte write 0.5–0.7 µs. Move many bytes per call: 1 MiB in 4 KiB writes is about 3,700 times faster than byte by byte.
+- `strace` shows every system call; `printf` buffers in user space (line-buffered on a terminal, fully buffered otherwise), `write` goes straight to the kernel.
+
+## Code
+
+The cost of a function call, of the cheapest system call and of writes of growing size; the numbers in the comments are one run on an Apple M1 (macOS 26.5, Apple clang 21) and vary by tens of percent between runs:
+
+```c
+// cost.c: clang -std=c17 -Wall -Wextra -O2 cost.c -o cost && ./cost
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+#include <unistd.h>
+
+static double now(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec + t.tv_nsec * 1e-9;
+}
+static int cmp(const void *a, const void *b) {
+    double x = *(const double *)a, y = *(const double *)b;
+    return (x > y) - (x < y);
+}
+__attribute__((noinline)) static int empty(int x) { __asm__ volatile(""); return x + 1; }
+
+int main(void) {
+    enum { N = 1000000 };
+    volatile long sink = 0;
+    int null = open("/dev/null", O_WRONLY);
+    static char buf[1 << 16];
+
+    double t0 = now();
+    for (int i = 0; i < N; i++) sink += empty(i);           /* an ordinary function call */
+    double t1 = now();
+    for (int i = 0; i < N; i++) sink += getppid();          /* the cheapest system call */
+    double t2 = now();
+    for (int i = 0; i < N; i++) sink += write(null, buf, 1); /* write 1 byte, discarded */
+    double t3 = now();
+    printf("call %.1f ns, getppid %.0f ns, write to /dev/null %.0f ns\n",
+           (t1 - t0) / N * 1e9, (t2 - t1) / N * 1e9, (t3 - t2) / N * 1e9);
+
+    /* rewrite the same 1 MiB of a file in chunks of B bytes; median of 9 repetitions */
+    const long total = 1 << 20;
+    int fd = open("cost.tmp", O_RDWR | O_CREAT | O_TRUNC, 0600);
+    for (long off = 0; off < total; off += sizeof buf) pwrite(fd, buf, sizeof buf, off);
+    for (long b = 1; b <= 65536; b *= 4) {
+        double t[9];
+        for (int r = 0; r < 9; r++) {
+            double s = now();
+            for (long off = 0; off < total; off += b) pwrite(fd, buf, b, off);
+            t[r] = now() - s;
+        }
+        qsort(t, 9, sizeof t[0], cmp);
+        printf("B = %5ld: %6.0f ns per call, %8.3f ns per byte\n", b, t[4] / (total / b) * 1e9, t[4] / total * 1e9);
+    }
+    close(fd);
+    unlink("cost.tmp");
+    return 0;
+}
+// call 3.4 ns, getppid 149 ns, write to /dev/null 516 ns
+// B =     1:    736 ns per call,  735.963 ns per byte
+// B =     4:    736 ns per call,  184.042 ns per byte
+// B =    16:    745 ns per call,   46.540 ns per byte
+// B =    64:    745 ns per call,   11.648 ns per byte
+// B =   256:    747 ns per call,    2.916 ns per byte
+// B =  1024:    757 ns per call,    0.739 ns per byte
+// B =  4096:    824 ns per call,    0.201 ns per byte
+// B = 16384:   1078 ns per call,    0.066 ns per byte
+// B = 65536:   2437 ns per call,    0.037 ns per byte
+```
+
+`write`, `read` and `getpid`, and the two errors of the worked example:
+
+```c
+// calls.c: clang -std=c17 -Wall -Wextra -O0 calls.c -o calls && echo "abc" | ./calls
+#include <errno.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+
+int main(void) {
+    /* write(2): file descriptor 1 is standard output; the result is the number of bytes written */
+    const char msg[] = "hello, world\n";
+    ssize_t n = write(1, msg, strlen(msg));
+
+    /* read(2): up to 64 bytes from standard input; 0 would mean end of input */
+    char line[64];
+    ssize_t got = read(0, line, sizeof line);
+
+    /* getpid(2): no arguments, cannot fail */
+    pid_t pid = getpid();
+
+    /* errors: the wrapper returns -1 and leaves the error number in errno */
+    ssize_t bad_fd = write(42, "x", 1);              /* descriptor 42 is not open */
+    int e1 = errno;
+    ssize_t bad_buf = write(1, (const char *)1, 5);  /* address 1 is not mapped */
+    int e2 = errno;
+
+    printf("write -> %zd, read -> %zd, getpid > 1: %d\n", n, got, pid > 1);
+    printf("write(42, ...) -> %zd, errno %d (%s)\n", bad_fd, e1, strerror(e1));
+    printf("write(1, (char *)1, 5) -> %zd, errno %d (%s)\n", bad_buf, e2, strerror(e2));
+    return 0;
+}
+// hello, world
+// write -> 13, read -> 4, getpid > 1: 1                     ("abc" and the newline: 4 bytes)
+// write(42, ...) -> -1, errno 9 (Bad file descriptor)
+// write(1, (char *)1, 5) -> -1, errno 14 (Bad address)
+```
+
+Buffered and unbuffered output on one descriptor:
+
+```c
+// order.c: clang -std=c17 -Wall -Wextra -O0 order.c -o order && ./order && ./order | cat
+#include <stdio.h>
+#include <unistd.h>
+
+int main(void) {
+    printf("A\n");          /* into the stdio buffer */
+    write(1, "B\n", 2);     /* straight to the kernel */
+    printf("C\n");          /* into the stdio buffer */
+    return 0;               /* exit flushes the buffer */
+}
+// ./order on a terminal prints A, B, C on three lines (line-buffered: each printf flushes at its newline)
+// ./order | cat prints B, A, C (fully buffered: A and C leave the buffer together at exit)
+```
+
+In RARS, `ecall` reaches the simulator, which plays the kernel: the number in `a7` selects a service just as on Linux, but from RARS's own table. Checked with the course's RV32 interpreter:
+
+```asm
+# ecall in RARS: the simulator plays the kernel. a7 selects the service, a0 carries the argument.
+    .data
+msg:    .asciz "hello, world\n"
+    .text
+main:
+    la   a0, msg
+    li   a7, 4          # PrintString: print the zero-terminated string at a0
+    ecall
+    li   a0, 13
+    li   a7, 1          # PrintInt: print a0 in decimal
+    ecall
+    li   a0, '\n'
+    li   a7, 11         # PrintChar
+    ecall
+    li   a0, 0
+    li   a7, 93         # Exit2: end the program with exit code a0 (93 is also exit on Linux)
+    ecall
+# hello, world
+# 13
+```
+
+## Next
+
+The program's `write` is a function in the C library, and the call to it in `main.o` is still unresolved when the compiler finishes: the object file records only that a function named `write` must be found somewhere. The [next note](/notes/acos/linking-and-loading) follows that name: how the linker joins object files and libraries and patches the addresses into the code, how a shared C library is found and bound at run time through the PLT and the GOT, and how the kernel and the dynamic linker load the result into a fresh process.
+
+## References
+
+- A. Tatarnikov. *Computer Architecture and Operating Systems* (HSE), [lecture 3: system calls](https://andrewt0301.github.io/hse-acos-course/part2os/03_SystemCalls/lecture.html).
+- M. Kerrisk. *The Linux Programming Interface*. No Starch Press, 2010. Chapter 3 (system calls, library functions, handling errors), §13.2 (buffering in the stdio library).
+- R. H. Arpaci-Dusseau, A. C. Arpaci-Dusseau. [*Operating Systems: Three Easy Pieces*](https://pages.cs.wisc.edu/~remzi/OSTEP/), version 1.10, 2023. Chapter 6 (limited direct execution: the system-call mechanism and its cost).
+- R. E. Bryant, D. R. O'Hallaron. *Computer Systems: A Programmer's Perspective*, 3rd ed. Pearson, 2016. §8.1.2 (traps and system calls), §8.1.3 (system calls on Linux x86-64), §10.10 (standard I/O).
+- Linux man-pages: [syscall(2)](https://man7.org/linux/man-pages/man2/syscall.2.html) (registers per architecture), [intro(2)](https://man7.org/linux/man-pages/man2/intro.2.html) (negated error numbers and the wrapper), [syscalls(2)](https://man7.org/linux/man-pages/man2/syscalls.2.html), [vdso(7)](https://man7.org/linux/man-pages/man7/vdso.7.html), [errno(3)](https://man7.org/linux/man-pages/man3/errno.3.html), [strace(1)](https://man7.org/linux/man-pages/man1/strace.1.html).
+- Linux source: [`include/uapi/asm-generic/unistd.h`](https://github.com/torvalds/linux/blob/master/include/uapi/asm-generic/unistd.h) (the generic table), [`arch/x86/entry/syscalls/syscall_64.tbl`](https://github.com/torvalds/linux/blob/master/arch/x86/entry/syscalls/syscall_64.tbl), [`arch/riscv/kernel/traps.c`](https://github.com/torvalds/linux/blob/master/arch/riscv/kernel/traps.c) (`do_trap_ecall_u`: `epc += 4`, `-ENOSYS`, the table call).
+- Apple, XNU: [`bsd/kern/syscalls.master`](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/syscalls.master) (macOS system-call numbers).
+- ISO/IEC 9899:2018 (C17), [N2176](https://www.open-std.org/jtc1/sc22/wg14/www/docs/n2176.pdf). §7.5 (`errno`, thread storage duration), §7.21.3 (buffering of the standard streams).

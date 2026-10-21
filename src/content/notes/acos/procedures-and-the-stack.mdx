@@ -1,0 +1,441 @@
+---
+title: Procedures, the stack and calling conventions
+description: "How one piece of code is called from many places and returns to the right one: jal and jalr, the RISC-V calling convention with its caller- and callee-saved registers, stack frames, recursion, leaf procedures, and what breaks when a frame is wrong."
+course: acos
+section: RISC-V Assembly
+order: 6
+status: published
+tags: [risc-v, procedures, calling-convention, stack, stack-frame, recursion, abi, jal, jalr]
+prerequisites: ["Branches, loops and memory access"]
+---
+
+import FactorialFrames from '../../../components/figures/procedures-and-the-stack/FactorialFrames.astro';
+import FibCost from '../../../components/figures/procedures-and-the-stack/FibCost.astro';
+
+The [previous note](/notes/acos/control-flow-and-memory) gave assembly programs loops, decisions and memory, and its examples already used a small routine, `show`, reached with `jal ra, show` and left with `ret`. It worked because `show` called nothing else and touched only three registers that its callers did not need. This note turns that luck into rules. A **procedure** (a function, in C) is code that exists once and runs on behalf of many callers: it must find its arguments, return to whichever caller invoked it, deliver a result, and leave the caller's values intact. RISC-V provides two instructions for the jumps, a **calling convention** that divides the registers between caller and callee, and a **stack** in memory where each active call keeps what does not fit in registers. With them, procedures can call procedures, including themselves.
+
+**Notation.** `ra` is the return address register `x1`, `sp` the stack pointer `x2`. The **caller** is the code that makes a call, the **callee** the procedure called. A **frame** is the block of stack memory that one active call owns; its size is a multiple of 16 bytes.
+
+## Baseline: jump to shared code and jump back
+
+Without a call instruction, code can still be shared: put it at a label, jump there with `j`, and end it with `j` back to the place after the jump. With one caller this works. With two it does not, because the shared code must end with one fixed `j`, and it can only go back to one of them.
+
+The fix suggests itself: the caller stores the address it wants to come back to in a register, and the shared code jumps to whatever address that register holds. That is exactly what RISC-V provides. But the fix immediately creates the next problem. If the shared code itself calls another procedure the same way, the second call overwrites the register holding the first return address, and the first caller is never found again. And every register the shared code uses for its own work may hold something the caller still needs. Procedures need a place to keep return addresses and values *per active call*, and a rule about who saves what.
+
+## jal and jalr: calling and returning
+
+Two instructions make calls and returns:
+
+| Instruction | Effect |
+| --- | --- |
+| `jal rd, label` | $x[rd] = pc + 4$; $pc = $ label (offset of ±1 MiB, J format) |
+| `jalr rd, rs1, imm` | $t = (x[rs1] + \operatorname{sext}(imm))$ with bit 0 cleared; $x[rd] = pc + 4$; $pc = t$ (I format) |
+
+Both **link**: they write the address of the instruction after themselves into `rd`, which the convention makes `ra`. `jalr` jumps to an address held in a register, so it can return to any caller, and it can also call a procedure whose address is computed at run time. The assembler's pseudo-instructions name the common uses:
+
+| Pseudo-instruction | Expansion | Use |
+| --- | --- | --- |
+| `jal label` | `jal ra, label` | call a procedure within ±1 MiB |
+| `call label` | `auipc ra, hi` + `jalr ra, ra, lo` | call a procedure anywhere |
+| `ret` | `jalr zero, ra, 0` | return: jump to `ra`, link nothing |
+| `jr rs` | `jalr zero, rs, 0` | jump to the address in a register |
+
+**Worked example.** In the factorial program of the Code section, `main` starts at `0x00400000` and its `jal ra, fact` sits at `0x00400004`; `fact` begins at `0x00400050`. Executing the `jal` sets `ra` = `0x00400008` and `pc` = `0x00400050`. When `fact` ends with `ret`, the processor jumps to `ra` and `main` continues at `0x00400008`. Inside `fact`, the recursive `jal ra, fact` sits at `0x0040006c`, so every recursive call returns to `0x00400070`, the instruction after it.
+
+## The calling convention
+
+<aside class="callout"><strong>Key idea.</strong> A procedure is safe to call from anywhere if both sides follow one contract. Arguments go in `a0`–`a7` and the result comes back in `a0` (and `a1`). The callee may change `t0`–`t6`, `a0`–`a7` and `ra` freely, so the caller saves any of them it still needs; the callee must leave `s0`–`s11` and `sp` as it found them, so it saves any of them it changes and restores them before returning. Everything that must survive a call and does not fit in registers goes into the callee's frame on the stack.</aside>
+
+The convention is part of the ABI, not of the ISA ([RISC-V psABI](#references), the integer calling convention):
+
+| Registers | Role | Who preserves them across a call |
+| --- | --- | --- |
+| `a0`–`a7` | the first eight integer arguments; `a0`–`a1` also the return value | the caller, if it needs them |
+| `t0`–`t6` | temporaries | the caller, if it needs them |
+| `ra` | return address | the caller (every call overwrites it) |
+| `s0`–`s11` | saved registers; `s0` may serve as frame pointer `fp` | the callee, if it uses them |
+| `sp` | stack pointer | the callee: it must be the same on return |
+| `zero`, `gp`, `tp` | constant, global and thread pointers | never changed by procedures |
+
+Arguments beyond the eighth are passed on the stack, at `0(sp)`, `4(sp)` and so on at the moment of the call.
+
+Why split the registers instead of making one side save everything? If callers saved every register they use, a call to a tiny procedure would cost many stores and loads that the procedure never needed. If callees saved every register they use, a caller with nothing to keep would pay for saves all the same. With the split, values that must live across calls go into `s` registers, paid for once by each callee that uses them, and short-lived values go into `t` and `a` registers, which cost nothing unless a call falls in the middle of their life.
+
+**Worked example.** The procedure `sum_f` of the Code section computes $f(1) + \dots + f(5)$ for a procedure $f$ whose address it receives in `a0`. Its loop counter `i`, the running sum, the bound 5 and the address of $f$ must all survive five calls of $f$. It keeps them in `s0`–`s3`, which `f` must preserve, and therefore saves the caller's values of `s0`–`s3` itself, together with its own `ra`, which every `jalr` to `f` overwrites: five words, in a frame of 32 bytes. The alternative, keeping `i` in `t0`, would force `sum_f` to store and reload `t0` around every one of the five calls.
+
+## The stack and stack frames
+
+The **stack** is a region of memory that grows towards lower addresses. `sp` points at its lowest used byte; in RARS it starts at `0x7fffeffc`. A procedure that needs memory for one call takes it by lowering `sp` and gives it back by raising `sp` by the same amount before it returns. Because every call gives back exactly what it took, the memory of the calls currently active is always a contiguous run, the most recent call lowest: last in, first out, the order in which calls finish.
+
+A procedure that needs a frame follows a fixed pattern:
+
+```riscv
+proc:   addi sp, sp, -16            # prologue: allocate a 16-byte frame
+        sw   ra, 12(sp)             # save the return address (if proc calls anything)
+        sw   s0, 8(sp)              # save each s register proc will use
+        ...                         # body: may call other procedures
+        lw   s0, 8(sp)              # epilogue: restore in reverse
+        lw   ra, 12(sp)
+        addi sp, sp, 16             # free the frame
+        ret
+```
+
+The psABI requires `sp` to be a multiple of 16 at every call, so frames come in multiples of 16 bytes even when fewer are used; a frame also holds local variables and arrays that do not fit in registers, and outgoing arguments beyond the eighth. Data below `sp` belongs to nobody and may be overwritten at any moment. (RARS starts `sp` at `0x7fffeffc`, which is not a multiple of 16; our frames keep their sizes multiples of 16 as the convention prescribes, so `sp` stays congruent to 12 modulo 16 throughout.)
+
+## Recursion: factorial
+
+A recursive procedure is an ordinary procedure that happens to call itself, and the stack makes it work without any special mechanism: each active call has its own frame, so each has its own saved `ra` and its own saved values.
+
+```riscv
+fact:   addi sp, sp, -16            # prologue: a 16-byte frame
+        sw   ra, 12(sp)             # save the return address: fact calls fact
+        sw   s0, 8(sp)              # save the caller's s0: we are about to use it
+        mv   s0, a0                 # s0 = n, kept across the recursive call
+        li   t0, 1
+        ble  a0, t0, base           # n <= 1: the base case
+        addi a0, a0, -1
+        jal  ra, fact               # a0 = fact(n - 1)
+        mul  a0, s0, a0             # a0 = n * fact(n - 1)
+        j    out
+base:   li   a0, 1
+out:    lw   s0, 8(sp)              # epilogue: restore in reverse
+        lw   ra, 12(sp)
+        addi sp, sp, 16             # free the frame
+        ret
+```
+
+`n` is needed after the recursive call, to multiply by its result, so it lives in `s0`, and `fact` saves its caller's `s0` before overwriting it. `ra` is saved because the recursive `jal` overwrites it.
+
+<FactorialFrames />
+
+**Worked example.** `main` calls `fact(3)` with `sp` = `0x7fffeffc`:
+
+1. `jal ra, fact` in `main` sets `ra` = `0x00400008`.
+2. `fact(3)` lowers `sp` to `0x7fffefec` and saves `ra` = `0x00400008` at `0x7fffeff8` and `main`'s `s0` (0) at `0x7fffeff4`; it sets `s0` = 3.
+3. It calls `fact(2)`, which lowers `sp` to `0x7fffefdc` and saves `ra` = `0x00400070` (the `mul` in `fact`) and `s0` = 3; it sets `s0` = 2.
+4. `fact(2)` calls `fact(1)`: `sp` = `0x7fffefcc`, saved `ra` = `0x00400070` and `s0` = 2. Since $n \le 1$, it returns 1, after restoring `s0` = 2 and `ra` = `0x00400070` from its frame.
+5. Back in `fact(2)` at `0x00400070`: `mul` gives $2 \cdot 1 = 2$; the epilogue restores `s0` = 3 and `ra` = `0x00400070` and frees the frame.
+6. Back in `fact(3)`: $3 \cdot 2 = 6$; the epilogue restores `s0` = 0 and `ra` = `0x00400008`, `sp` returns to `0x7fffeffc`, and `ret` lands in `main` with `a0` = 6.
+
+`fact(n)` makes $n$ calls and needs $16n$ bytes of stack at its deepest point. The results overflow long before the stack does: $12! = 479{,}001{,}600$ fits in 32 bits, while $13! = 6{,}227{,}020{,}800$ does not, and `mul` silently returns it modulo $2^{32}$, 1,932,053,504.
+
+**The cost of recursion.** The recursive Fibonacci function, $\mathrm{fib}(n) = \mathrm{fib}(n-1) + \mathrm{fib}(n-2)$, makes two calls per call, and the number of calls grows like the Fibonacci numbers themselves: $\mathrm{fib}(n)$ makes $2F_{n+1} - 1$ calls, where $F_k$ is the $k$-th Fibonacci number. For $n = 20$ that is $2 \cdot 10{,}946 - 1 = 21{,}891$ calls to compute 6,765. The version in the Code section spends 8 instructions on a call that hits the base case and 23 on a call that recurses, which adds up to $31 F_{n+1} - 23$ instructions, 339,303 for $n = 20$; a loop that carries two consecutive Fibonacci numbers needs $5n + 5$, that is 105.
+
+<FibCost />
+
+Recursion is the natural expression of many algorithms, and the stack makes it correct; whether it is cheap depends on how many calls the recursion makes.
+
+## Leaf and non-leaf procedures
+
+A **leaf** procedure calls nothing. Its `ra` survives untouched, and if it uses only `t` and `a` registers it saves nothing at all and needs no frame: `show` of the previous notes, the iterative Fibonacci loop and `square_leaf` below are leaves. A **non-leaf** procedure must save `ra` before its first call and keep every value it needs after a call either in an `s` register (and save the caller's value of that register) or in its frame.
+
+**Worked example.** Two correct ways to compute $i^2$ for the `sum_f` loop:
+
+```riscv
+square_leaf:                        # leaf: only a temporary, no frame
+        mul  t0, a0, a0
+        mv   a0, t0
+        ret
+
+square_frame:                       # uses s0, so it must save and restore it
+        addi sp, sp, -16
+        sw   s0, 12(sp)
+        mul  s0, a0, a0
+        mv   a0, s0
+        lw   s0, 12(sp)
+        addi sp, sp, 16
+        ret
+```
+
+Both return the same value; the leaf version executes 3 instructions per call and the other 7, and touches no memory. Compilers make the same choice: a leaf function that fits in temporaries gets no prologue at all, and the recursive `fib` above tests its base case *before* building a frame, so the half of its calls that end at once cost 8 instructions instead of 23.
+
+<aside class="callout"><strong>Check yourself.</strong> (1) A procedure calls two others and needs one value after both calls. Which registers must it save in its frame? (2) `jalr` clears bit 0 of its target address. Why is that harmless, and what is it good for? (3) `fact(1000)` in RARS: what limits it first, the stack or the arithmetic?<details><summary>Answers</summary>(1) `ra`, because its own calls overwrite it, and one `s` register to hold the value (saving the caller's value of that `s` register), or else the value itself in a frame slot: two words, so a 16-byte frame. (2) Instruction addresses are always even, so bit 0 of a target carries no information. Clearing it simplifies the hardware slightly and lets software keep a tag in the low bit of a function pointer and still jump through it ([RISC-V Unprivileged ISA](#references), the rationale for `jalr`). (3) The arithmetic: the result is wrong (modulo $2^{32}$) from 13 on, while 1000 frames take only 16,000 bytes of a stack that has room for far more.</details></aside>
+
+## A stack-frame bug and what it breaks
+
+The convention is a contract that nothing enforces: the assembler accepts a procedure that breaks it, and the program fails somewhere else, later.
+
+**A callee that clobbers an `s` register.** `square_bad` computes $i^2$ in `s0` without saving it:
+
+```riscv
+square_bad:                         # BUG: writes s0 without saving it
+        mul  s0, a0, a0
+        mv   a0, s0
+        ret
+```
+
+`sum_f` keeps its loop counter $i$ in `s0`, trusting the convention. After `square_bad(1)`, `s0` = 1 and the sum is 1; `i++` makes 2. After `square_bad(2)`, `s0` = 4: the counter has jumped, and `i++` makes 5. After `square_bad(5)`, `s0` = 25, the sum is $1 + 4 + 25 = 30$, and `i++` makes 26, which ends the loop. The program prints 30 instead of 55 and stops normally. The bug is in `square_bad`; the wrong number appears in `sum_f`. The Code section runs this and both correct versions.
+
+**A non-leaf procedure that does not save `ra`.**
+
+```riscv
+f:      addi sp, sp, -16            # BUG: the frame does not save ra
+        sw   s0, 12(sp)
+        mv   s0, a0
+        jal  ra, g                  # overwrites ra with the address of the add below
+        add  a0, a0, s0
+        lw   s0, 12(sp)
+        addi sp, sp, 16
+        ret                         # jumps to the add, not back to the caller
+```
+
+`jal ra, g` replaces the caller's return address with the address of the `add`. When `f` reaches `ret`, it jumps to that `add`, runs the epilogue again, frees another 16 bytes it never allocated, and returns to the `add` again: the caller is never reached. Each round raises `sp` by 16 and reloads `s0` from memory above the frame, so after a few hundred rounds `sp` has climbed out of the stack entirely. How the program finally ends depends on the environment, an endless loop or a fault when a load reaches memory the program may not touch; in either case the output the caller was going to print never appears. In a run where `f` starts at `0x00400018`, the trace after the return from `g` repeats four addresses forever: the `add` at `0x00400028`, the `lw` at `0x0040002c`, the `addi` at `0x00400030`, the `ret` at `0x00400034`, and back to `0x00400028`.
+
+Both bugs have the same shape: a value that one side of a call relied on was destroyed by the other side, and the symptom shows up far from the cause. The usual defences are mechanical: write the prologue and epilogue together, save every `s` register and `ra` that the body writes, and match every `addi sp, sp, -N` with an `addi sp, sp, N`.
+
+## What changed
+
+| | Baseline: `j` to shared code and back | Procedures with a convention and a stack |
+| --- | --- | --- |
+| Return address | one fixed label | `ra`, written by `jal`/`jalr` at every call |
+| Nested calls | impossible: the return address is overwritten | `ra` saved in the caller's own frame |
+| Recursion | impossible | each active call has its own frame |
+| Arguments and results | ad hoc | `a0`–`a7` in, `a0`–`a1` out |
+| Registers across a call | anything may change | `s0`–`s11`, `sp` preserved; `t`, `a`, `ra` not |
+| Cost of a call | one jump each way | a jump each way plus the saves and restores the procedure needs; none for a leaf |
+
+## Limitations
+
+- **Nothing enforces the convention.** A procedure that breaks it assembles and runs, and the failure appears elsewhere, as the two bugs show. Compilers follow it reliably; hand-written assembly must be checked by hand or by tests.
+- **Calls cost instructions and memory traffic.** Saves and restores are loads and stores; deep recursion turns them into many memory accesses, which the [caches note](/notes/acos/caches) prices. Compilers remove calls by inlining small procedures.
+- **The stack is finite.** Deep recursion exhausts it: on Linux a thread's stack is typically 8 MiB by default (the `ulimit -s` setting), so a recursion with 64-byte frames overflows after about 130,000 levels. What happens then is the subject of the [virtual memory note](/notes/acos/virtual-memory).
+- **A frame is reachable by address.** A procedure that writes past the end of a local array overwrites the saved `ra` above it, and the `ret` jumps wherever the written data points. This is the stack buffer overflow, the basis of a long line of security attacks.
+- **Recursion can multiply work.** The naive Fibonacci makes an exponential number of calls; the stack makes recursion correct, not efficient.
+
+## What you should remember
+
+- `jal rd, label` and `jalr rd, rs1, imm` jump and write the return address $pc + 4$ into `rd`; `call`, `jal label` and `ret` are their usual forms with `rd` = `ra` or `zero`.
+- Arguments go in `a0`–`a7`, results come back in `a0`–`a1`. The caller saves the `t`, `a` and `ra` registers it still needs; the callee saves the `s` registers it changes and returns `sp` unchanged.
+- The stack grows down from `sp`; a procedure's frame is taken by `addi sp, sp, -N` and given back by `addi sp, sp, N`, with $N$ a multiple of 16. It holds the saved `ra`, saved `s` registers, locals and extra arguments.
+- Recursion needs nothing beyond this: each call has its own frame. `fact(3)` builds three 16-byte frames, down to `sp` = `0x7fffefcc` in RARS.
+- A leaf procedure that uses only temporaries needs no frame. A non-leaf procedure must save `ra`.
+- Breaking the convention fails far from the cause: a clobbered `s0` turned a sum of 55 into 30; a forgotten `ra` makes a procedure return into itself.
+
+## Code
+
+The recursive factorial, including the first result that overflows:
+
+```riscv
+        .text
+        .globl main
+main:
+        li   a0, 3
+        jal  ra, fact               # a0 = fact(3)
+        li   a7, 1
+        ecall                       # prints 6
+        li   a0, ' '
+        li   a7, 11
+        ecall
+        li   a0, 12
+        jal  ra, fact
+        li   a7, 1
+        ecall                       # prints 479001600
+        li   a0, ' '
+        li   a7, 11
+        ecall
+        li   a0, 13
+        jal  ra, fact               # 13! = 6227020800 does not fit in 32 bits
+        li   a7, 1
+        ecall                       # prints 1932053504, the product modulo 2^32
+        li   a7, 10
+        ecall
+
+fact:   addi sp, sp, -16            # prologue: a 16-byte frame
+        sw   ra, 12(sp)             # save the return address: fact calls fact
+        sw   s0, 8(sp)              # save the caller's s0: we are about to use it
+        mv   s0, a0                 # s0 = n, kept across the recursive call
+        li   t0, 1
+        ble  a0, t0, base           # n <= 1: the base case
+        addi a0, a0, -1
+        jal  ra, fact               # a0 = fact(n - 1)
+        mul  a0, s0, a0             # a0 = n * fact(n - 1)
+        j    out
+base:   li   a0, 1
+out:    lw   s0, 8(sp)              # epilogue: restore in reverse
+        lw   ra, 12(sp)
+        addi sp, sp, 16             # free the frame
+        ret
+# Output: 6 479001600 1932053504
+```
+
+The recursive Fibonacci function with a counter of its calls (339,316 instructions executed in all, 13 of them in `main`):
+
+```riscv
+        .data
+calls:  .word 0                     # incremented by every call of fib
+
+        .text
+        .globl main
+main:
+        li   a0, 20
+        jal  ra, fib                # a0 = fib(20)
+        li   a7, 1
+        ecall                       # prints 6765
+        li   a0, ' '
+        li   a7, 11
+        ecall
+        lw   a0, calls
+        li   a7, 1
+        ecall                       # prints 21891, the number of calls
+        li   a7, 10
+        ecall
+
+fib:    la   t0, calls              # calls++ (t0, t1 are temporaries: no need to save them)
+        lw   t1, 0(t0)
+        addi t1, t1, 1
+        sw   t1, 0(t0)
+        li   t0, 2
+        blt  a0, t0, done           # n < 2: return n, before any frame is built
+        addi sp, sp, -16            # the recursive path needs a frame
+        sw   ra, 12(sp)
+        sw   s0, 8(sp)
+        sw   s1, 4(sp)
+        mv   s0, a0                 # s0 = n
+        addi a0, a0, -1
+        jal  ra, fib
+        mv   s1, a0                 # s1 = fib(n - 1), must survive the next call
+        addi a0, s0, -2
+        jal  ra, fib                # a0 = fib(n - 2)
+        add  a0, s1, a0
+        lw   s1, 4(sp)
+        lw   s0, 8(sp)
+        lw   ra, 12(sp)
+        addi sp, sp, 16
+done:   ret
+# Output: 6765 21891
+```
+
+The iterative version, a leaf (111 instructions executed in all, 105 of them in `fib_iter`):
+
+```riscv
+        .text
+        .globl main
+main:
+        li   a0, 20
+        jal  ra, fib_iter
+        li   a7, 1
+        ecall                       # prints 6765
+        li   a7, 10
+        ecall
+
+fib_iter:                           # leaf: a0 = fib(a0) with temporaries only, no frame
+        li   t0, 0                  # t0 = fib(i)
+        li   t1, 1                  # t1 = fib(i + 1)
+        beqz a0, fdone
+floop:  add  t2, t0, t1
+        mv   t0, t1
+        mv   t1, t2
+        addi a0, a0, -1
+        bnez a0, floop
+fdone:  mv   a0, t0
+        ret
+# Output: 6765
+```
+
+A convention bug and two correct callees, called through `jalr` with the procedure's address in a register:
+
+```riscv
+        .text
+        .globl main
+main:
+        la   a0, square_bad
+        jal  ra, sum_f
+        jal  ra, print              # 30: the loop counter was destroyed
+        la   a0, square_leaf
+        jal  ra, sum_f
+        jal  ra, print              # 55
+        la   a0, square_frame
+        jal  ra, sum_f
+        jal  ra, print              # 55
+        li   a7, 10
+        ecall
+
+sum_f:                              # a0 = f(1) + ... + f(5), where f is the procedure whose address is in a0
+        addi sp, sp, -32            # frame: ra and the four s registers this procedure uses
+        sw   ra, 28(sp)
+        sw   s0, 24(sp)
+        sw   s1, 20(sp)
+        sw   s2, 16(sp)
+        sw   s3, 12(sp)
+        mv   s3, a0                 # s3 = f, kept across the calls
+        li   s0, 1                  # s0 = i: a callee-saved register, so it must survive every call of f
+        li   s1, 0                  # s1 = sum
+        li   s2, 5
+loop:   mv   a0, s0
+        jalr ra, s3, 0              # call f(i): jump to the address in s3, link in ra
+        add  s1, s1, a0
+        addi s0, s0, 1
+        ble  s0, s2, loop
+        mv   a0, s1
+        lw   s3, 12(sp)
+        lw   s2, 16(sp)
+        lw   s1, 20(sp)
+        lw   s0, 24(sp)
+        lw   ra, 28(sp)
+        addi sp, sp, 32
+        ret
+
+square_bad:                         # BUG: writes s0 without saving it
+        mul  s0, a0, a0
+        mv   a0, s0
+        ret
+
+square_leaf:                        # correct leaf: only a temporary, no frame
+        mul  t0, a0, a0
+        mv   a0, t0
+        ret
+
+square_frame:                       # also correct: uses s0, so saves and restores it
+        addi sp, sp, -16
+        sw   s0, 12(sp)
+        mul  s0, a0, a0
+        mv   a0, s0
+        lw   s0, 12(sp)
+        addi sp, sp, 16
+        ret
+
+print:                              # print a0 and a newline
+        li   a7, 1
+        ecall
+        li   a0, 10
+        li   a7, 11
+        ecall
+        ret
+# Output:
+# 30
+# 55
+# 55
+```
+
+The call and instruction counts of the recursive Fibonacci function, from its two paths:
+
+```python
+F = [0, 1]
+for k in range(2, 32):
+    F.append(F[-1] + F[-2])
+
+def calls(n):        # fib(n) with n >= 2 calls fib(n-1) and fib(n-2); fib(0) and fib(1) call nothing
+    return 1 if n < 2 else 1 + calls(n - 1) + calls(n - 2)
+
+print([calls(n) for n in range(8)], [2 * F[n + 1] - 1 for n in range(8)])
+# [1, 1, 3, 5, 9, 15, 25, 41] [1, 1, 3, 5, 9, 15, 25, 41]
+
+n = 20
+base, recursive = F[n + 1], F[n + 1] - 1      # calls that stop at once, calls that recurse
+print(F[n], base + recursive, 8 * base + 23 * recursive, 5 * n + 5)
+# 6765 21891 339303 105
+```
+
+## Next
+
+With procedures, the RISC-V picture of a program is complete: values in use sit in 32 registers, and everything else, arrays, strings and the frames of active calls, lives in memory and is reached with loads and stores. These notes have treated every load as equally cheap. The [next note](/notes/acos/caches) shows why it is not: main memory takes far longer than an instruction to answer, and the small, fast caches that hide this delay decide how fast real programs run.
+
+## References
+
+- A. Tatarnikov. *Computer Architecture and Operating Systems* (HSE), [lecture 6: subroutines, call stack, calling conventions](https://andrewt0301.github.io/hse-acos-course/part1ca/06_CallStack/lecture.html).
+- RISC-V International. [*RISC-V ELF psABI specification*](https://github.com/riscv-non-isa/riscv-elf-psabi-doc), the calling convention chapter: register convention, integer calling convention, stack alignment, frame pointer convention.
+- RISC-V International. [*The RISC-V Instruction Set Manual, Volume I: Unprivileged ISA*](https://github.com/riscv/riscv-isa-manual/releases/latest). The RV32I chapter: unconditional jumps (`jal`, `jalr`, the link register convention).
+- D. A. Patterson, J. L. Hennessy. *Computer Organization and Design, RISC-V Edition*, 2nd ed. Morgan Kaufmann, 2020. Section 2.8 (supporting procedures in computer hardware).
+- S. L. Harris, D. M. Harris. *Digital Design and Computer Architecture, RISC-V Edition*. Morgan Kaufmann, 2021. Section 6.3 (programming: function calls and the stack).
+- R. E. Bryant, D. R. O'Hallaron. *Computer Systems: A Programmer's Perspective*, 3rd ed. Pearson, 2016. Section 3.7 (procedures: the run-time stack, register usage conventions, recursive procedures) and section 3.10.3 (out-of-bounds memory references and buffer overflow), for the same mechanisms on x86-64.
+- [RARS: RISC-V Assembler and Runtime Simulator](https://github.com/TheThirdOne/rars), its default memory configuration (initial `sp`).

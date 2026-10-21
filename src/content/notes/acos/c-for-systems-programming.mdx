@@ -1,0 +1,410 @@
+---
+title: C for systems programming
+description: "C as the language of kernels and system libraries: types and their sizes, pointers and pointer arithmetic, how structures are laid out with padding, where each part of a program lives in memory, undefined behaviour, and how gcc and clang turn files into an executable."
+course: acos
+section: The Operating System
+order: 18
+status: published
+tags: [c, pointers, pointer-arithmetic, struct-padding, alignment, memory-layout, undefined-behaviour, gcc, clang, header-files]
+prerequisites: [What an operating system does, "Bits, integers and byte order", "Procedures, the stack and calling conventions"]
+---
+
+import StructLayout from '../../../components/figures/c-for-systems-programming/StructLayout.astro';
+import ProgramLayout from '../../../components/figures/c-for-systems-programming/ProgramLayout.astro';
+import CompilePipeline from '../../../components/figures/c-for-systems-programming/CompilePipeline.astro';
+
+The [previous note](/notes/acos/operating-systems) described the kernel and the boundary between it and user programs. Both sides of that boundary are written in C. The Linux kernel is C with some assembly, the C library that wraps the system calls is C, and the manual pages define the interface itself as C functions: `ssize_t write(int fd, const void *buf, size_t count)`. C earned that place because it is the language closest to the machine model of the first half of the course: an address is a number, memory is an array of bytes, a structure is a fixed arrangement of bytes, and a function is a label that code jumps to. This note covers the parts of C a systems programmer must know exactly: the sizes of its types, pointers and the arithmetic on them, the layout of structures and of a whole program in memory, the undefined behaviour that comes with the closeness to the machine, and the stages that turn source files into an executable.
+
+**Notation.** `sizeof(T)` is the size of type `T` in bytes and `_Alignof(T)` its alignment: the number its address must be a multiple of. `offsetof(S, m)` is the distance in bytes from the start of structure `S` to its member `m`. Hexadecimal numbers are written `0x…`, as in the [integers note](/notes/acos/data-representation).
+
+## Why C for systems
+
+C was created by Dennis Ritchie at Bell Labs in 1972–1973 to write the utilities of Unix, and in 1973 the Unix kernel itself was rewritten in it ([Ritchie, 1993](#references)). Five properties keep it there.
+
+- **Types are sizes.** An `int` is a machine word of known width, not an abstract integer; arithmetic compiles to single instructions.
+- **Pointers are addresses.** A program can compute an address, store it, and read or write whatever is there, which is what a kernel does with page tables and device registers.
+- **Layout is predictable.** The bytes of a structure lie in a documented order, so C can describe a hardware register block, a network header or the arguments of a system call.
+- **No hidden runtime.** No garbage collector, no bounds checks, no exceptions. A C function can run before memory management exists, which is why the kernel's first code after boot can be C.
+- **Freestanding mode.** The standard defines a subset that needs no library at all, the subset the kernel uses.
+
+The same properties make C dangerous: nothing checks an index or a pointer, and errors corrupt memory silently. Since version 6.1 (2022) the Linux kernel can also contain code written in Rust, so far mostly drivers: Rust gives the same control over layout and memory, with checks at compile time.
+
+## Baseline: the same function in assembly
+
+A function that sums an array, in C:
+
+```c
+int sum(const int *a, int n) {
+    int s = 0;
+    for (int i = 0; i < n; i++)
+        s += a[i];
+    return s;
+}
+```
+
+and the RISC-V code LLVM's `clang --target=riscv32-unknown-elf -march=rv32im -O1 -S` produces for it (directives removed):
+
+```asm
+sum:
+    li   a2, 0              # s = 0
+    blez a1, .LBB0_2        # if n <= 0, skip the loop
+.LBB0_1:
+    lw   a3, 0(a0)          # *a
+    add  a2, a3, a2         # s += *a
+    addi a1, a1, -1         # n--
+    addi a0, a0, 4          # a++: the next int is 4 bytes further
+    bnez a1, .LBB0_1
+.LBB0_2:
+    mv   a0, a2             # return s
+    ret
+```
+
+The [procedures note](/notes/acos/procedures-and-the-stack) wrote such code by hand. Every register, every offset and every size was the programmer's to track: that `a0` holds the address, that an `int` takes 4 bytes so the next one is at `a0 + 4`, which registers a caller expects to survive. It works, but a program written this way runs on one instruction set, and every change means redoing the bookkeeping by hand. C keeps the machine model and hands the bookkeeping to the compiler: the C function above compiles for RISC-V, x86-64 and arm64 unchanged. The compiler also did something we did not ask for: it turned the index `i` into a pointer that advances by 4, and counts `n` down instead of `i` up. That freedom to transform is the reason for undefined behaviour, later in this note.
+
+<aside class="callout"><strong>Key idea.</strong> C keeps the machine model of assembly and hands the bookkeeping to the compiler: a type is a size and an alignment, a pointer is an address that moves in steps of its element's size, a structure is a fixed arrangement of bytes, and every object lives in a region of memory chosen by how it was declared. The compiler checks types and nothing else, and it optimizes on the assumption that the program follows the rules; a program that breaks them has undefined behaviour, and no result is guaranteed.</aside>
+
+## Types and their sizes
+
+C fixes only minimum ranges: `char` has at least 8 bits, `short` and `int` at least 16, `long` at least 32, `long long` at least 64, and `sizeof(char)` is 1 by definition ([C17](#references), §5.2.4.2.1). Each platform picks the rest in its *data model*:
+
+| Type | ILP32 (RV32) | LP64 (Linux and macOS, 64-bit) | LLP64 (Windows, 64-bit) |
+| --- | --- | --- | --- |
+| `short` | 2 | 2 | 2 |
+| `int` | 4 | 4 | 4 |
+| `long` | 4 | 8 | 4 |
+| `long long` | 8 | 8 | 8 |
+| pointer, `size_t` | 4 | 8 | 8 |
+
+(the sizes Clang reports for the targets `riscv32-unknown-elf`, `riscv64-linux-gnu`, `x86_64-linux-gnu`, `arm64-apple-darwin` and `x86_64-pc-windows-msvc`.) Code that stores a pointer in an `int` works on RV32 and breaks on every 64-bit system. When the width matters, as in a file format or a register, use the exact-width types of `<stdint.h>`: `int32_t`, `uint8_t`, `uint64_t`, and `uintptr_t` for an integer that can hold a pointer. `size_t` is the unsigned type of sizes and indices, the type `sizeof` returns.
+
+Some properties are left to the implementation. Whether plain `char` is signed is one: it is signed on x86-64 and on Apple's arm64, unsigned on RISC-V and on Linux for arm64. So `char c = (char)200;` holds −56 on a Mac and 200 on a RISC-V machine. Conversions between signed and unsigned types follow the rules of the [integers note](/notes/acos/data-representation): in `-1 < 1u` the `-1` is converted to `unsigned int`, becomes `0xFFFFFFFF` = 4,294,967,295, and the comparison is false. Converting 300 to `uint8_t` keeps the low 8 bits: 300 − 256 = 44.
+
+## Pointers and arrays
+
+A pointer is an address together with the type of what it points to. `&x` is the address of `x`; `*p` is the object at address `p`, which can be read or assigned. C passes arguments by value, so a function that must change its caller's variable receives the variable's address: `scanf("%d", &n)` writes into `n` through the pointer.
+
+An array is a block of consecutive elements. In almost every expression the name of an array is converted to a pointer to its first element, and indexing is defined through pointer arithmetic ([C17](#references), §6.5.2.1, §6.5.6):
+
+$$
+\texttt{a[i]} \equiv \texttt{*(a + i)}, \qquad \text{address}(\texttt{p + i}) = \text{address}(\texttt{p}) + i \cdot \texttt{sizeof(*p)} .
+$$
+
+Adding $i$ to a pointer moves it by $i$ *elements*, not $i$ bytes. Subtracting two pointers into the same array gives the number of elements between them, of type `ptrdiff_t`.
+
+**Worked example.** `int a[4] = {10, 20, 30, 40};` starts at address `0x1000`. Then `a + 2` is `0x1000 + 2 · 4 = 0x1008`, and `*(a + 2)` and `a[2]` both read the 4 bytes at `0x1008`: 30. Viewed as bytes, `(char *)(a + 2) - (char *)a` is 8; viewed as `int`s, `&a[3] - a` is 3. Because `a[i]` is `*(a + i)` and addition commutes, `2[a]` is also 30, a curiosity that shows the definition is literal. In RISC-V, `a[i]` is the three instructions the [memory-access note](/notes/acos/control-flow-and-memory) used: `slli t0, i, 2` (multiply by 4), `add t0, a, t0`, `lw t1, 0(t0)`.
+
+Nothing checks that `a + i` stays inside the array. Reading `a[4]` reads whatever lies after it; the section on undefined behaviour shows what can happen. Strings are arrays of `char` ending with a zero byte, and the [allocation note](/notes/acos/memory-allocation) treats them together with the bugs they attract.
+
+## Structures and their layout
+
+A `struct` groups members of different types into one object. The compiler places them in the declared order, but not necessarily next to each other, because of **alignment**: most processors load an `int` fastest, or at all, from an address that is a multiple of 4, and an 8-byte `double` from a multiple of 8. RISC-V allows a misaligned load to be handled by a trap and emulated in software, which is correct but slow; some processors simply fault. The rule the compiler follows, for every common ABI ([Bryant and O'Hallaron, 2016](#references), §3.9.3):
+
+1. each member starts at the next offset that is a multiple of its own alignment;
+2. the structure's alignment is the largest alignment of its members;
+3. its size is rounded up to a multiple of that alignment, so that in an array of such structures every element is aligned too.
+
+The bytes skipped by rules 1 and 3 are **padding**.
+
+<StructLayout />
+
+**Worked example.** `struct rec { char tag; int count; char flag; double value; short id; };` on LP64:
+
+- `tag` at 0 (1 byte). `count` needs a multiple of 4: offset 4, after 3 bytes of padding.
+- `flag` at 8. `value` needs a multiple of 8: offset 16, after 7 bytes of padding.
+- `id` at 24, ending at 26. The largest alignment is 8, so the size rounds up from 26 to 32.
+
+The structure holds 1 + 4 + 1 + 8 + 2 = 16 bytes of data in 32 bytes. Sorting the members by decreasing alignment, `value, count, id, tag, flag`, gives offsets 0, 8, 12, 14, 15 and size 16: no padding at all. `offsetof` confirms every number (the Code section). Halving a structure halves the memory and the cache lines an array of a million of them occupies, which matters on the [cache](/notes/acos/caches) level. Compilers also accept `__attribute__((packed))`, which removes padding at the cost of misaligned accesses; it is used for wire formats such as network headers, and nowhere else.
+
+A **union** is the opposite of a structure: all members start at offset 0 and share the same bytes, so writing one member and reading another shows how a value is stored, for example the bytes of a `uint32_t` in [little-endian](/notes/acos/data-representation) order.
+
+## The memory layout of a program
+
+When a C program runs, each object it declares lives in one of a few regions of the process's [virtual address space](/notes/acos/virtual-memory), set by how it was declared:
+
+- **`.text`**: the machine code of the functions. Read-only and executable.
+- **`.rodata`**: constants, such as the characters of string literals. Read-only.
+- **`.data`**: global and `static` variables with a non-zero initial value. The values are stored in the executable file.
+- **`.bss`**: global and `static` variables that start at zero. The file records only their total size; the loader provides zeroed memory. A `static int values[1000];` costs 4000 bytes of memory and nothing in the file.
+- **heap**: memory from `malloc`, which grows upward from just above `.bss`, managed by the C library ([Dynamic memory allocation and strings](/notes/acos/memory-allocation)).
+- **stack**: local variables, arguments that do not fit in registers, and saved registers, one frame per active call, growing downward from near the top of the user half ([procedures note](/notes/acos/procedures-and-the-stack)).
+- **shared libraries** and other mappings, between the heap and the stack.
+
+The names `.text`, `.data` and `.bss` are the section names of ELF object files, which the [linking note](/notes/acos/linking-and-loading) opens up.
+
+<ProgramLayout />
+
+**Worked example.** In the program of the figure, `initialized` (value 42) is in `.data`; `zeroed` in `.bss`; `greeting` is a pointer in `.data` whose value is the address of the six bytes `h e l l o \0` in `.rodata`; `local` is in `main`'s stack frame; and `dynamic` is a pointer on the stack that holds the address of a 4-byte block on the heap. On Linux x86-64 with address randomization off, as under a debugger, the kernel loads such a program at `0x555555554000`, two thirds of the way up the $2^{47}$-byte user half, and starts the stack just below `0x7ffffffff000`; the kernel's half starts at `0xffff800000000000`. With randomization on, the usual setting, those bases move on every run. The order of the regions does not: the Code section compares the addresses of one object from each region and finds `text < rodata < data < bss < heap < stack` on macOS as on Linux. C itself promises nothing about this order; it is a convention of the operating system and the linker.
+
+A pointer to a local variable is valid only while its function runs. Returning `&local` from a function returns the address of a stack frame that the next call will reuse; `-Wall` warns about it.
+
+## Undefined behaviour
+
+The C standard defines **undefined behaviour** as behaviour "for which this International Standard imposes no requirements" ([C17](#references), §3.4.3). It differs from two weaker categories: *implementation-defined* behaviour (the signedness of `char`, the size of `long`) must be documented by each compiler, and *unspecified* behaviour (the order in which function arguments are evaluated) must be one of a few choices. Undefined behaviour has no constraint at all. The common cases in systems code:
+
+- signed integer overflow, such as `INT_MAX + 1`;
+- reading or writing outside an array, including one past the end;
+- dereferencing a null or dangling pointer (after `free`, or to a finished stack frame);
+- reading an uninitialized local variable;
+- shifting by a negative amount or by at least the width of the type: `1 << 32` for a 32-bit `int`;
+- accessing an object through a pointer of an unrelated type (the *strict aliasing* rule);
+- two threads accessing the same variable without synchronization when at least one writes (a data race, since C11).
+
+The point is not that such code crashes. It is that the compiler may **assume it never happens** and optimize on that assumption ([Lattner, 2011](#references)). The assumption is what lets a compiler keep a 32-bit loop counter in a 64-bit register or vectorize a loop without proving that the counter never wraps around.
+
+**Worked example.** The function `int next_is_bigger(int x) { return x + 1 > x; }` is called with `x = INT_MAX` = 2,147,483,647. Compiled with `-O0`, the addition wraps to −2,147,483,648 as two's-complement hardware does, the comparison is false, and the function returns 0. Compiled with `-O2`, Clang reasons that `x + 1 > x` holds for every `x` whose `x + 1` does not overflow, and overflow cannot happen in a correct program, so it compiles the function to `mov w0, #1; ret`: it returns 1 without looking at `x`. Both results are allowed. Same source, two answers, and neither compiler is wrong.
+
+Real code has been bitten by exactly this reasoning. In 2009 a Linux driver dereferenced a pointer and then checked it for null; since the dereference would have been undefined for a null pointer, GCC deleted the check, and the bug became an exploitable vulnerability. The kernel has since been built with `-fno-delete-null-pointer-checks`, `-fno-strict-aliasing` and `-fno-strict-overflow` (the kernel's top-level `Makefile`), flags that turn three kinds of undefined behaviour into defined ones ([Wang et al., 2012](#references)).
+
+Three defences, in order of cost:
+
+- **Warnings.** `-Wall -Wextra` catch many mistakes at compile time, such as an uninitialized variable or a signed–unsigned comparison.
+- **Sanitizers.** `-fsanitize=undefined` adds a check before each operation that could be undefined and prints the source line when one fails; `-fsanitize=address` surrounds every object with poisoned memory and catches out-of-bounds and use-after-free accesses. They slow the program down (AddressSanitizer by 73 % on average in the paper's benchmarks, [Serebryany et al., 2012](#references)) and are meant for testing.
+- **Flags that define behaviour.** `-fwrapv` makes signed overflow wrap, at some cost to optimization.
+
+## From source file to executable: gcc and clang
+
+`gcc` and `clang` are *drivers*: one command that runs four stages in turn and deletes the intermediate files unless asked to keep them.
+
+<CompilePipeline />
+
+1. **Preprocessor.** Handles the lines starting with `#`: `#include` pastes in the text of another file, `#define` defines a macro that is replaced textually wherever it appears, and `#if`/`#ifdef` keep or drop lines. `-E` stops here and prints the result.
+2. **Compiler.** Parses the preprocessed C, checks types, optimizes, and emits assembly for the target. `-S` stops here.
+3. **Assembler.** Encodes the instructions as machine code in an **object file** (`.o`), which also contains a symbol table and *relocation entries*: notes saying where an address must be filled in later. `-c` stops here.
+4. **Linker.** Combines object files and libraries into an executable and fills in those addresses. The [linking note](/notes/acos/linking-and-loading) is about this stage.
+
+**Worked example.** The 6-line hello-world program of the [first note](/notes/acos/computer-systems), built with Apple clang 21 on macOS (arm64) at `-O0`: `clang -E` produces 572 lines, almost all of them declarations from `stdio.h`, among them the one that matters, `int printf(const char * restrict, ...)`; `clang -S` produces 30 lines of arm64 assembly with one `bl _printf`; `clang -c` produces a 744-byte object file whose symbol table lists `_main` as defined and `_printf` as undefined; the linker produces a 33,432-byte executable. The same steps on Linux give different sizes, but the same four files. GCC runs the stages as separate programs (`cc1`, `as`, `ld`); Clang runs the first three inside one process. Either way the stages are the same.
+
+The flags used throughout the course: `-std=c17` selects the language version; `-Wall -Wextra` turn on the important warnings (`-Wall` is not "all": `-Wextra` adds more, such as `-Wsign-compare`); `-O0` compiles literally, which is easiest to debug, and `-O2` optimizes; `-g` keeps debugging information for `gdb` and `lldb`; `-o name` names the output.
+
+## Header files
+
+The compiler translates one `.c` file at a time, a *translation unit*, and knows nothing of the others. To call a function defined elsewhere it needs the function's **declaration**: its name, parameter types and return type. A **header file** (`.h`) collects the declarations a module offers: function prototypes, `struct` definitions, constants and macros, and `extern` declarations of global variables. The module's `.c` file holds the **definitions**, the function bodies and the variables themselves, and every file that uses the module includes the header.
+
+```c
+/* stats.h */
+#ifndef STATS_H                /* include guard: the second #include of this file is empty */
+#define STATS_H
+
+#include <stddef.h>            /* for size_t */
+
+struct stats { long count; int min, max; double mean; };
+
+int compute_stats(const int *values, size_t n, struct stats *out);
+
+#endif
+```
+
+Three rules follow from how the stages work. A definition goes in exactly one `.c` file: a function body or an initialized global in a header becomes a duplicate definition in every file that includes it, and the linker rejects it. The include guard (or `#pragma once`) makes a header safe to include twice in the same translation unit, which happens when headers include each other. And `static` on a global function or variable makes it local to its file: it never appears to the linker, so two files can each have a `static` helper of the same name. `#include <...>` searches the system directories, `#include "..."` first the directory of the file that contains the `#include`.
+
+## A small program, walked through
+
+The program reads integers from standard input and prints their count, minimum, maximum and mean. It has three files: `stats.h` above, `stats.c` with the computation, and `main.c` with the input and output (the Code section has all three).
+
+1. **Preprocessing.** In both `.c` files `#include "stats.h"` pastes in the declaration of `struct stats` and of `compute_stats`, so both files agree on the layout of the structure and the signature of the function. `main.c` also includes `stdio.h` for `scanf` and `printf`, and `#define MAX_VALUES 1000` replaces the name by `1000` wherever it occurs.
+2. **Where the data lives.** `static int values[MAX_VALUES]` is a zero-initialized file-local array: 4000 bytes in `.bss`. `struct stats s` is a local variable in `main`'s frame. The string literals of the `printf` format are in `.rodata`.
+3. **Pointers as arguments.** `main` passes `values` (converted to `&values[0]`), the count `n`, and `&s`. `compute_stats` writes its results through `out->min`, which is `(*out).min`: a store at offset `offsetof(struct stats, min)` = 8 from the address in `out`. The loop walks a pointer from `values` to `values + n`, the same transformation the compiler made in the baseline.
+4. **Layout.** `struct stats` holds a `long` (8 bytes), two `int`s (4 + 4) and a `double` (8): offsets 0, 8, 12 and 16, size 24, with no padding, because every member already falls on a multiple of its alignment.
+5. **Building.** `clang -std=c17 -Wall -Wextra main.c stats.c -o stats` compiles the two files separately and links them. In `main.o`, `compute_stats` is an undefined symbol; the linker finds its definition in `stats.o`.
+6. **Running.** `printf '3 -1 4 1 5\n' | ./stats` prints `count 5, min -1, max 5, mean 2.40`: the mean of 3, −1, 4, 1 and 5 is 12 / 5 = 2.4. With empty input, `compute_stats` returns −1 and the program exits with status 1.
+
+## What changed
+
+| | Assembly | C |
+| --- | --- | --- |
+| Registers and stack offsets | chosen by hand | chosen by the compiler |
+| Sizes and element strides | remembered by hand (`addi a0, a0, 4`) | from the types (`p + 1`, `sizeof`) |
+| Data layout | wherever the programmer puts it | fixed by the ABI rules: members in order, padded for alignment |
+| Portability | one instruction set | any target with a C compiler; sizes vary by data model |
+| Checks | none | types at compile time; no bounds or pointer checks at run time |
+| Errors | do what the instructions say | undefined behaviour: the optimizer may assume they never happen |
+
+## Limitations
+
+- **No memory safety.** Out-of-bounds accesses, use-after-free and null dereferences are not detected; in C and C++ code they cause a large share of security vulnerabilities.
+- **Sizes vary.** `long` is 4 or 8 bytes, `char` is signed or not; portable code needs `<stdint.h>` and care with conversions.
+- **Undefined behaviour is subtle.** Code can work at `-O0` and fail at `-O2`, or work with one compiler version and fail with the next.
+- **The preprocessor is textual.** Macros ignore scope and types: `#define SQUARE(x) x * x` makes `SQUARE(1 + 2)` equal 1 + 2 · 1 + 2 = 5.
+- **Headers are a convention.** Nothing forces a header and its `.c` file to agree, beyond including one in the other; a mismatch between a declaration and a definition in separate files is not diagnosed by the compiler.
+
+## What you should remember
+
+- C types have platform-dependent sizes: LP64 on 64-bit Linux and macOS (`int` 4, `long` and pointers 8), ILP32 on RV32. Use `<stdint.h>` when the width matters.
+- A pointer is a typed address; `a[i]` is `*(a + i)`, and `p + i` adds `i · sizeof(*p)` bytes.
+- Structure members are placed in order, each at a multiple of its alignment; the size is a multiple of the largest alignment. `struct rec` takes 32 bytes, its sorted version 16. Check with `offsetof` and `sizeof`.
+- Code in `.text`, constants in `.rodata`, initialized globals in `.data`, zeroed globals in `.bss`, `malloc` blocks on the heap, locals on the stack.
+- Undefined behaviour (signed overflow, out-of-bounds access, null and dangling pointers, uninitialized reads) lets the compiler assume it never happens: `x + 1 > x` becomes 1 at `-O2`. Compile with `-Wall -Wextra` and test with `-fsanitize=address,undefined`.
+- The driver runs preprocessor (`-E`), compiler (`-S`), assembler (`-c`) and linker. Headers carry declarations; each definition lives in one `.c` file.
+
+## Code
+
+All programs were compiled with Apple clang 21 on macOS 26.5 (Apple M1) with `clang -std=c17 -Wall -Wextra -O0 file.c -o prog`, unless a comment says otherwise.
+
+Types, conversions, pointer arithmetic, structure layout and the order of the regions:
+
+```c
+// types.c
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+struct rec { char tag; int count; char flag; double value; short id; };
+struct rec_sorted { double value; int count; short id; char tag; char flag; };
+
+int initialized = 42;                    /* .data */
+int zeroed;                              /* .bss */
+const char *greeting = "hello";          /* the pointer in .data, the characters in .rodata */
+
+int main(void) {
+    /* 1. sizes depend on the data model: LP64 here */
+    printf("char %zu short %zu int %zu long %zu long long %zu pointer %zu\n",
+           sizeof(char), sizeof(short), sizeof(int), sizeof(long), sizeof(long long), sizeof(void *));
+
+    /* 2. implementation-defined and surprising conversions */
+    char c = (char)200;
+    printf("(char)200 = %d, -1 < 1u is %d, (uint8_t)300 = %d\n", c, -1 < 1u, (uint8_t)300);
+
+    /* 3. pointer arithmetic is scaled by the size of the element */
+    int a[4] = {10, 20, 30, 40};
+    int *p = a;
+    printf("*(p + 2) = %d, a[2] = %d, 2[a] = %d\n", *(p + 2), a[2], 2[a]);
+    printf("bytes from a to p + 2: %td, elements from a to &a[3]: %td\n",
+           (char *)(p + 2) - (char *)a, &a[3] - a);
+
+    /* 4. struct layout: each member at a multiple of its alignment */
+    printf("rec: tag %zu count %zu flag %zu value %zu id %zu, size %zu\n",
+           offsetof(struct rec, tag), offsetof(struct rec, count), offsetof(struct rec, flag),
+           offsetof(struct rec, value), offsetof(struct rec, id), sizeof(struct rec));
+    printf("rec_sorted: value %zu count %zu id %zu tag %zu flag %zu, size %zu\n",
+           offsetof(struct rec_sorted, value), offsetof(struct rec_sorted, count), offsetof(struct rec_sorted, id),
+           offsetof(struct rec_sorted, tag), offsetof(struct rec_sorted, flag), sizeof(struct rec_sorted));
+
+    /* 5. where things live: compare addresses of the regions */
+    int local = 1;
+    int *dynamic = malloc(sizeof *dynamic);
+    uintptr_t text = (uintptr_t)main, rodata = (uintptr_t)greeting, data = (uintptr_t)&initialized,
+              bss = (uintptr_t)&zeroed, heap = (uintptr_t)dynamic, stack = (uintptr_t)&local;
+    printf("text < rodata < data < bss < heap < stack: %d\n",
+           text < rodata && rodata < data && data < bss && bss < heap && heap < stack);
+    free(dynamic);
+    return 0;
+}
+// char 1 short 2 int 4 long 8 long long 8 pointer 8
+// (char)200 = -56, -1 < 1u is 0, (uint8_t)300 = 44          (200 where char is unsigned, as on RISC-V)
+// *(p + 2) = 30, a[2] = 30, 2[a] = 30
+// bytes from a to p + 2: 8, elements from a to &a[3]: 3
+// rec: tag 0 count 4 flag 8 value 16 id 24, size 32
+// rec_sorted: value 0 count 8 id 12 tag 14 flag 15, size 16
+// text < rodata < data < bss < heap < stack: 1
+```
+
+Undefined behaviour at two optimization levels and under the two sanitizers:
+
+```c
+// ub.c
+#include <limits.h>
+#include <stdio.h>
+
+int next_is_bigger(int x) { return x + 1 > x; }   /* undefined when x == INT_MAX */
+
+int sum4(const int *a) {
+    int s = 0;
+    for (int i = 0; i <= 4; i++)                  /* off by one: reads a[4] */
+        s += a[i];
+    return s;
+}
+
+int main(void) {
+    int a[4] = {1, 2, 3, 4};
+    printf("next_is_bigger(INT_MAX) = %d\n", next_is_bigger(INT_MAX));
+    printf("sum4 = %d\n", sum4(a));
+    return 0;
+}
+// -O0:  next_is_bigger(INT_MAX) = 0     sum4 = -137658102   (garbage: 10 plus whatever follows a[3]; changes between builds)
+// -O2:  next_is_bigger(INT_MAX) = 1     sum4 = 1            (different garbage)
+// -O0 -fsanitize=undefined:
+//   ub.c:5:38: runtime error: signed integer overflow: 2147483647 + 1 cannot be represented in type 'int'
+// -O0 -fsanitize=address:
+//   ERROR: AddressSanitizer: stack-buffer-overflow on address ...
+//   READ of size 4 ... in sum4
+```
+
+What the warning flags add. Without flags this file compiles silently:
+
+```c
+// warn.c: clang -std=c17 -Wall -Wextra -O0 -c warn.c
+#include <stddef.h>
+
+long total(const int *values, size_t n) {
+    long sum;                          /* never initialized */
+    for (int i = 0; i < n; i++)        /* int compared with size_t */
+        sum += values[i];
+    return sum;
+}
+// -Wall adds:   warn.c:7:9: warning: variable 'sum' is uninitialized when used here [-Wuninitialized]
+// -Wextra adds: warn.c:6:23: warning: comparison of integers of different signs: 'int' and 'size_t' (aka 'unsigned long') [-Wsign-compare]
+```
+
+The walked-through program, in three files (with `stats.h` as in the section on header files):
+
+```c
+// stats.c
+#include "stats.h"
+
+int compute_stats(const int *values, size_t n, struct stats *out) {
+    if (n == 0)
+        return -1;
+    long long total = 0;
+    out->min = out->max = values[0];
+    for (const int *p = values; p < values + n; p++) {   /* walk with a pointer */
+        if (*p < out->min) out->min = *p;
+        if (*p > out->max) out->max = *p;
+        total += *p;
+    }
+    out->count = (long)n;
+    out->mean = (double)total / n;
+    return 0;
+}
+```
+
+```c
+// main.c: clang -std=c17 -Wall -Wextra -O0 main.c stats.c -o stats && printf '3 -1 4 1 5\n' | ./stats
+#include <stdio.h>
+#include "stats.h"
+
+#define MAX_VALUES 1000
+
+static int values[MAX_VALUES];            /* zero-initialized storage: .bss */
+
+int main(void) {
+    size_t n = 0;
+    while (n < MAX_VALUES && scanf("%d", &values[n]) == 1)
+        n++;
+    struct stats s;                       /* automatic storage: the stack */
+    if (compute_stats(values, n, &s) != 0) {
+        fprintf(stderr, "no input\n");
+        return 1;
+    }
+    printf("count %ld, min %d, max %d, mean %.2f, sizeof(struct stats) %zu\n",
+           s.count, s.min, s.max, s.mean, sizeof s);
+    return 0;
+}
+// count 5, min -1, max 5, mean 2.40, sizeof(struct stats) 24
+// with empty input: "no input" on stderr, exit status 1
+```
+
+## Next
+
+The programs of this note print with `printf` and read with `scanf`, library functions that end in a request to the kernel. The [next note](/notes/acos/system-calls) follows such a request: how the C library's `write` puts its arguments in registers and executes `ecall`, how the kernel finds the right function and checks the arguments, how errors come back through `errno`, what a system call costs, and how to watch a program's system calls with `strace`.
+
+## References
+
+- A. Tatarnikov. *Computer Architecture and Operating Systems* (HSE), [lecture 2: the C programming language](https://andrewt0301.github.io/hse-acos-course/part2os/02_C/lecture.html).
+- B. W. Kernighan, D. M. Ritchie. *The C Programming Language*, 2nd ed. Prentice Hall, 1988. Chapter 5 (pointers and arrays), chapter 6 (structures), §4.11 (the C preprocessor).
+- ISO/IEC 9899:2018, *Programming languages — C* (C17); the final committee draft [N2176](https://www.open-std.org/jtc1/sc22/wg14/www/docs/n2176.pdf). §3.4.1–3.4.4 (implementation-defined, unspecified and undefined behaviour), §5.2.4.2.1 (sizes of integer types), §6.5.2.1 (array subscripting), §6.5.6 (additive operators on pointers), §6.7.2.1 (structure members and padding), §7.19 (`offsetof`).
+- R. E. Bryant, D. R. O'Hallaron. *Computer Systems: A Programmer's Perspective*, 3rd ed. Pearson, 2016. §1.2 (the compilation system), §2.2 (integer representations), §3.8 (array allocation and access), §3.9.3 (data alignment), §7.9 (the memory image of a program).
+- D. M. Ritchie. [The development of the C language](https://doi.org/10.1145/154766.155580). *HOPL-II*, 1993.
+- C. Lattner. [What every C programmer should know about undefined behavior](https://blog.llvm.org/2011/05/what-every-c-programmer-should-know.html). LLVM Project Blog, 2011.
+- X. Wang, H. Chen, A. Cheung, Z. Jia, N. Zeldovich, M. F. Kaashoek. [Undefined behavior: what happened to my code?](https://doi.org/10.1145/2349896.2349905) *APSys*, 2012 (the Linux null-check example and the kernel's flags).
+- K. Serebryany, D. Bruening, A. Potapenko, D. Vyukov. [AddressSanitizer: a fast address sanity checker](https://www.usenix.org/conference/atc12/technical-sessions/presentation/serebryany). *USENIX ATC*, 2012 (average slowdown 73 %).
+- [Clang compiler user's manual](https://clang.llvm.org/docs/UsersManual.html) and [GCC warning options](https://gcc.gnu.org/onlinedocs/gcc/Warning-Options.html).
