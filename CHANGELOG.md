@@ -4,6 +4,8 @@ Notable changes to the site, newest first. Each entry gives the date, what chang
 
 ## 2026-10-22
 
+- **Cross-course audit.** All nine courses were read against each other after four new courses arrived in two days. Notes now link to where a topic is developed in full: Mathematics for linear algebra, matrix calculus, convexity and duality; Bayesian Methods for VI, Gibbs and evidence; AI Agents for RL, RLHF/GRPO and evaluation; ACOS for floating point. Stale statements and course-page texts were updated, two external prerequisite links now point to site notes, a gradient-descent bound now matches its proof, and a misattributed RLHF result is corrected. In the Russian notes, "policy" is «стратегия» and "alignment" is «выравнивание» throughout, now in the glossary.
+
 - **A new course: Mathematics for Machine Learning.** It has 15 notes in four sections, in English and Russian. It is a starting course next to Probability, and Machine Learning now builds on both.
   - **Linear algebra:** vectors, spaces and linear maps; matrices and linear systems with LU; inner products, norms and orthogonality with QR; determinants and eigenvalues; symmetric matrices and quadratic forms; the singular value decomposition.
   - **Calculus:** derivatives and Taylor series, gradients, Jacobians and Hessians, matrix calculus by the differential method, multiple integrals and change of variables.

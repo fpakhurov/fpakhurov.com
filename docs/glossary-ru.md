@@ -426,6 +426,8 @@ Terms settled in the Probability Theory course; the course's Russian notes use t
 | prompt, prompt tuning | промпт, настройка промпта (prompt tuning) † |
 | instruction tuning, alignment | обучение на инструкциях (instruction tuning), выравнивание (alignment) † |
 | reward model, RLHF, DPO | модель вознаграждения, RLHF, DPO |
+| policy (reinforcement learning) | стратегия (policy); not «политика» |
+| lethal trifecta / deadly triad | опасное трио / смертельная триада |
 | quantization, calibration | квантизация, калибровка |
 | knowledge distillation | дистилляция знаний |
 | named entity recognition (NER) | распознавание именованных сущностей (NER) |
