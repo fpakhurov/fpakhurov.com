@@ -13,6 +13,7 @@ Notable changes to the site, newest first. Each entry gives the date, what chang
   Scope follows Deisenroth, Faisal and Ong's *Mathematics for Machine Learning*. It is cited alongside Strang, Axler, Boyd–Vandenberghe, Nocedal–Wright and Trefethen–Bau, not copied. Derivations go step by step, and every Code section checks the note's results numerically in NumPy.
   - **Figures:** 29, computed at build time.
   - **Prerequisites:** "Linear algebra", "Calculus" and "Determinants" now link to these notes instead of the external book.
+  - **Course graph:** cards in the same column no longer overlap. A card now moves below the one above it, and on phones a row holds either one centre card or side cards only. This also fixes the NLP, AI Agents and Computer Architecture cards, which overlapped since the last release.
   - **Build:** the build gets a 4 GB Node heap. With every course the bundling step had outgrown the 2 GB default on an 8 GB machine.
 
   Why: the ML, Deep Learning and Bayes notes assumed linear algebra, calculus and optimization that were only linked to a book.
