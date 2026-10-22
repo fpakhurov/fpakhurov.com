@@ -53,7 +53,7 @@ export const courses: Record<CourseKey, Course> = {
     requires: [],
     shortTitle: 'Probability',
     description: 'Reasoning exactly about outcomes we cannot predict: from counting to the limit theorems, and how they become the losses, estimates and guarantees of machine learning.',
-    entry: 'Before you start: school algebra, sums and limits. Derivatives and integrals are used from Continuous distributions on; matrix products, inverses and eigenvectors from The multivariate Gaussian on. No probability is assumed. Proof-heavy detours inside notes, such as the Vitali set or the characteristic-function proof of the central limit theorem, are marked as optional depth and can be skipped on a first reading.',
+    entry: 'Before you start: school algebra, sums and limits. Derivatives and integrals are used from Continuous distributions on; matrix products, inverses and eigenvectors from The multivariate Gaussian on; the Mathematics for Machine Learning course, which can be taken alongside this one, develops both. No probability is assumed. Proof-heavy detours inside notes, such as the Vitali set or the characteristic-function proof of the central limit theorem, are marked as optional depth and can be skipped on a first reading.',
     guide: [{ label: 'The course map', note: 'probability/what-probability-is', anchor: 'what-the-course-builds' }],
     progression: [
       { label: 'Events', section: 'Foundations' },
@@ -67,7 +67,7 @@ export const courses: Record<CourseKey, Course> = {
       title: 'Теория вероятностей',
       shortTitle: 'Теорвер',
       description: 'Точные рассуждения об исходах, которые нельзя предсказать: от подсчёта вариантов до предельных теорем и того, как они становятся функциями потерь, оценками и гарантиями машинного обучения.',
-      entry: 'Что нужно знать: школьная алгебра, суммы и пределы. Производные и интегралы нужны начиная с непрерывных распределений; произведения и обращение матриц, собственные векторы — начиная с многомерного нормального распределения. Знакомство с теорией вероятностей не предполагается. Отступления с тяжёлыми доказательствами внутри заметок, например множество Витали или доказательство центральной предельной теоремы через характеристические функции, помечены как дополнительный материал, и при первом чтении их можно пропустить.',
+      entry: 'Что нужно знать: школьная алгебра, суммы и пределы. Производные и интегралы нужны начиная с непрерывных распределений; произведения и обращение матриц, собственные векторы — начиная с многомерного нормального распределения; курс математики, который можно проходить параллельно, разбирает и то и другое. Знакомство с теорией вероятностей не предполагается. Отступления с тяжёлыми доказательствами внутри заметок, например множество Витали или доказательство центральной предельной теоремы через характеристические функции, помечены как дополнительный материал, и при первом чтении их можно пропустить.',
       progression: ['События', 'Случайные величины', 'Зависимость', 'Пределы', 'Статистика', 'Сэмплирование'],
       labels: {
         'The course map': 'Карта курса',
@@ -131,7 +131,7 @@ export const courses: Record<CourseKey, Course> = {
     requires: ['probability', 'math'],
     shortTitle: 'ML',
     description: 'How a program learns a rule from examples and how to tell whether it will work on new data: from a line through points to gradient boosting and neural networks. Each note either fixes a limitation of the previous method or changes the task, and says which.',
-    entry: 'Before you start: the Probability Theory course, or at least expectation, conditional probability and maximum likelihood; vectors, matrix products and derivatives; reading short NumPy code. Every note ends with a Code section that runs as written. Learning Without Labels and Beyond Classification branch off the supervised route: they change the task rather than replace a classifier.',
+    entry: 'Before you start: the Probability Theory course, or at least expectation, conditional probability and maximum likelihood; the Mathematics for Machine Learning course, or at least vectors, matrix products and derivatives; reading short NumPy code. Every note ends with a Code section that runs as written. Learning Without Labels and Beyond Classification branch off the supervised route: they change the task rather than replace a classifier.',
     guide: [{ label: 'The course map', note: 'ml/what-machine-learning-is', anchor: 'the-course-map' }, { label: 'The course in one paragraph', note: 'ml/recommender-systems', anchor: 'the-course-in-one-paragraph' }],
     progression: [
       { label: 'Learning problem', section: 'The Learning Problem' },
@@ -146,7 +146,7 @@ export const courses: Record<CourseKey, Course> = {
       title: 'Машинное обучение',
       shortTitle: 'ML',
       description: 'Как программа выучивает правило по примерам и как понять, что оно сработает на новых данных: от прямой через точки до градиентного бустинга и нейросетей. Каждая заметка либо исправляет ограничение предыдущего метода, либо меняет задачу, и говорит, что именно.',
-      entry: 'Что нужно знать: курс теории вероятностей или хотя бы математическое ожидание, условную вероятность и метод максимального правдоподобия; векторы, произведения матриц и производные; умение читать короткий код на NumPy. Каждая заметка заканчивается разделом «Код», который запускается как написан. Разделы «Обучение без разметки» и «За пределами классификации» ответвляются от обучения с учителем: они меняют задачу, а не заменяют классификатор.',
+      entry: 'Что нужно знать: курс теории вероятностей или хотя бы математическое ожидание, условную вероятность и метод максимального правдоподобия; курс математики для машинного обучения или хотя бы векторы, произведения матриц и производные; умение читать короткий код на NumPy. Каждая заметка заканчивается разделом «Код», который запускается как написан. Разделы «Обучение без разметки» и «За пределами классификации» ответвляются от обучения с учителем: они меняют задачу, а не заменяют классификатор.',
       progression: ['Постановка', 'Линейные модели', 'Классификация', 'Деревья и ансамбли', 'Нейросети', 'Без разметки', 'Ранжирование'],
       labels: {
         'The course map': 'Карта курса',
@@ -326,7 +326,7 @@ export const courses: Record<CourseKey, Course> = {
     requires: ['ml'],
     shortTitle: 'DL',
     description: 'How to train deep networks that work: automatic differentiation, losses, normalization and optimizers, convolutional networks for vision, self-supervised features and Vision Transformers, robustness and compression. The course the Generative Models and NLP courses build on.',
-    entry: 'Before you start: Machine Learning up to neural networks and backpropagation, and basic Python. Every note ends with a Code section in PyTorch that runs on a laptop CPU in seconds, on synthetic data or small bundled datasets. Sequences, attention and Transformers for text are developed in the NLP course, and GANs, VAEs and diffusion in the Generative Models course; this course links to them instead of repeating them.',
+    entry: 'Before you start: Machine Learning up to neural networks and backpropagation, and basic Python. Every note ends with a Code section in PyTorch that runs on a laptop CPU in seconds, on synthetic data or small bundled datasets. Sequences, attention and Transformers for text are developed in the NLP course, and GANs, VAEs and diffusion in the Generative Models course, and uncertainty over the weights in the Bayesian Methods course; this course links to them instead of repeating them.',
     guide: [{ label: 'The plan of the course', note: 'deep-learning/deep-learning', anchor: 'the-plan-of-the-course' }, { label: 'The course in one paragraph', note: 'deep-learning/training-in-practice', anchor: 'the-course-in-one-paragraph' }],
     progression: [
       { label: 'Training', section: 'Training Neural Networks' },
@@ -338,7 +338,7 @@ export const courses: Record<CourseKey, Course> = {
       title: 'Глубинное обучение',
       shortTitle: 'ГО',
       description: 'Как обучать глубокие сети, которые работают: автоматическое дифференцирование, функции потерь, нормализация и оптимизаторы, свёрточные сети для зрения, обучение с самоконтролем признаков и Vision Transformer, устойчивость и сжатие. Курс, на котором строятся курсы по генеративным моделям и NLP.',
-      entry: 'Что нужно знать: машинное обучение до нейросетей и обратного распространения и основы Python. Каждая заметка заканчивается разделом «Код» на PyTorch, который за секунды запускается на процессоре ноутбука, на синтетических данных или небольших встроенных наборах. Последовательности, внимание и трансформеры для текста разобраны в курсе NLP, а GAN, VAE и диффузия — в курсе по генеративным моделям; этот курс ссылается на них, а не повторяет.',
+      entry: 'Что нужно знать: машинное обучение до нейросетей и обратного распространения и основы Python. Каждая заметка заканчивается разделом «Код» на PyTorch, который за секунды запускается на процессоре ноутбука, на синтетических данных или небольших встроенных наборах. Последовательности, внимание и трансформеры для текста разобраны в курсе NLP, а GAN, VAE и диффузия — в курсе по генеративным моделям, а неопределённость весов — в курсе байесовских методов; этот курс ссылается на них, а не повторяет.',
       progression: ['Обучение', 'Свёртки', 'Представления', 'Устойчивость'],
       labels: {
         'Training Neural Networks': 'Обучение нейронных сетей',
@@ -401,7 +401,7 @@ export const courses: Record<CourseKey, Course> = {
     requires: ['ml'],
     shortTitle: 'Bayes',
     description: 'Building probabilistic models from standard blocks and computing their posteriors: conjugate priors, Bayesian model selection, linear models with automatic relevance determination, EM, variational inference and Gibbs sampling, Gaussian and Dirichlet processes, and variational inference at scale.',
-    entry: 'Before you start: Probability Theory, especially Bayesian inference, the multivariate Gaussian and Markov chain Monte Carlo, and Machine Learning, especially linear models, the EM algorithm and kernels; matrix calculus is introduced where it is needed. Every note ends with a Code section in NumPy and SciPy. The course is the lead-in to the variational and sampling methods of the Generative Models course.',
+    entry: 'Before you start: Probability Theory, especially Bayesian inference, the multivariate Gaussian and Markov chain Monte Carlo, and Machine Learning, especially linear models, the EM algorithm and kernels; and from Mathematics for Machine Learning, symmetric matrices and matrix calculus. Every note ends with a Code section in NumPy and SciPy. The course is the lead-in to the variational and sampling methods of the Generative Models course.',
     guide: [{ label: 'The plan of the course', note: 'bayesian-methods/bayesian-approach', anchor: 'the-plan-of-the-course' }, { label: 'The course in one paragraph', note: 'bayesian-methods/bayesian-deep-learning', anchor: 'the-course-in-one-paragraph' }],
     extensions: ['bayesian-methods/bayesian-deep-learning'],
     progression: [
@@ -415,7 +415,7 @@ export const courses: Record<CourseKey, Course> = {
       title: 'Байесовские методы машинного обучения',
       shortTitle: 'Байес',
       description: 'Построение вероятностных моделей из стандартных блоков и вычисление их апостериорных распределений: сопряжённые распределения, байесовский выбор модели, линейные модели с автоматическим определением релевантности, EM, вариационный вывод и сэмплирование по Гиббсу, гауссовские процессы и процессы Дирихле, вариационный вывод на больших данных.',
-      entry: 'Что нужно знать: теорию вероятностей, особенно байесовский вывод, многомерное нормальное распределение и марковские методы Монте-Карло, и машинное обучение, особенно линейные модели, EM-алгоритм и ядра; матричное дифференцирование вводится там, где оно нужно. Каждая заметка заканчивается разделом «Код» на NumPy и SciPy. Курс подводит к вариационным методам и сэмплированию из курса по генеративным моделям.',
+      entry: 'Что нужно знать: теорию вероятностей, особенно байесовский вывод, многомерное нормальное распределение и марковские методы Монте-Карло, и машинное обучение, особенно линейные модели, EM-алгоритм и ядра; а также симметричные матрицы и матричное дифференцирование из курса математики. Каждая заметка заканчивается разделом «Код» на NumPy и SciPy. Курс подводит к вариационным методам и сэмплированию из курса по генеративным моделям.',
       progression: ['Моделирование', 'Линейные модели', 'Приближённый вывод', 'Непараметрика', 'Масштабируемый вывод'],
       labels: {
         'Bayesian Modelling': 'Байесовское моделирование',
@@ -485,7 +485,7 @@ export const courses: Record<CourseKey, Course> = {
     requires: ['deep-learning', 'bayesian-methods'],
     shortTitle: 'Generative Models',
     description: 'How to learn a distribution from data, draw new samples from it and decide whether the model captured the data. Six families of models, each a different trade-off between exact likelihood, fast sampling and a useful latent representation.',
-    entry: 'Before you start: Probability Theory (distributions, expectation, maximum likelihood), Deep Learning (training networks, convolutions, U-Net) and Bayesian Methods (variational inference, sampling), both of which build on Machine Learning; some PyTorch helps with the Notebook sections. Flows, energy-based models, diffusion and autoregressive models are parallel routes, not a ladder. Notes marked Extension are architecture and application branches; the main route reads without them.',
+    entry: 'Before you start: Probability Theory (distributions, expectation, maximum likelihood), Deep Learning (training networks, convolutions, U-Net) and Bayesian Methods (variational inference, sampling), both of which build on Machine Learning; the linear algebra and change of variables of Mathematics for Machine Learning; some PyTorch helps with the Notebook sections. Flows, energy-based models, diffusion and autoregressive models are parallel routes, not a ladder. Notes marked Extension are architecture and application branches; the main route reads without them.',
     guide: [{ label: 'The plan of the course', note: 'generative-models/generative-modeling', anchor: 'the-plan-of-the-course' }, { label: 'The course in one paragraph', note: 'generative-models/audio-generation', anchor: 'the-course-in-one-paragraph' }],
     extensions: ['generative-models/gan-scaling', 'generative-models/stylegan', 'generative-models/alpha-gan', 'generative-models/cyclegan', 'generative-models/stargan', 'generative-models/image-translation', 'generative-models/flow-architectures', 'generative-models/mcmc-samplers#nuts', 'generative-models/drag-editing', 'generative-models/audio-generation'],
     progression: [
@@ -506,7 +506,7 @@ export const courses: Record<CourseKey, Course> = {
       title: 'Генеративные модели',
       shortTitle: 'Генеративные модели',
       description: 'Как выучить распределение по данным, сэмплировать из него новые объекты и решить, уловила ли модель данные. Шесть семейств моделей, и каждое по-своему выбирает между точным правдоподобием, быстрым сэмплированием и полезным латентным представлением.',
-      entry: 'Что нужно знать: теорию вероятностей (распределения, математическое ожидание, метод максимального правдоподобия) глубинное обучение (обучение сетей, свёртки, U-Net) и байесовские методы (вариационный вывод, сэмплирование); оба курса опираются на машинное обучение; для разделов «Ноутбук» пригодится немного PyTorch. Потоки, энергетические модели, диффузия и авторегрессионные модели — параллельные пути, а не лестница. Заметки с пометкой «Ответвление» — архитектурные и прикладные ветви; основной маршрут читается без них.',
+      entry: 'Что нужно знать: теорию вероятностей (распределения, математическое ожидание, метод максимального правдоподобия), глубинное обучение (обучение сетей, свёртки, U-Net) и байесовские методы (вариационный вывод, сэмплирование), оба курса опираются на машинное обучение; линейную алгебру и замену переменных из курса математики; для разделов «Ноутбук» пригодится немного PyTorch. Потоки, энергетические модели, диффузия и авторегрессионные модели — параллельные пути, а не лестница. Заметки с пометкой «Ответвление» — архитектурные и прикладные ветви; основной маршрут читается без них.',
       progression: ['Вероятность', 'Дивергенции', 'Автоэнкодеры', 'VAE', 'GAN', 'Оценка', 'Потоки', 'EBM', 'Диффузия', 'Авторегрессия', 'Звук'],
       labels: {
         'The plan of the course': 'План курса',
@@ -1342,7 +1342,7 @@ export const courses: Record<CourseKey, Course> = {
         'Measure an agent with the right benchmark and statistic, defend it against prompt injection with isolation and least privilege, and recognize reward hacking and the oversight it calls for.': 'Измерять агента подходящим бенчмарком и статистикой, защищать его от инъекций в промпт изоляцией и минимальными правами и распознавать взлом награды и надзор, которого он требует.',
         'Evaluating agents': 'Оценка агентов',
         'Agent security and prompt injection': 'Безопасность агентов и инъекции в промпт',
-        'Alignment and oversight of agents': 'Согласование агентов и надзор за ними',
+        'Alignment and oversight of agents': 'Выравнивание агентов и надзор за ними',
         'Open problems': 'Открытые проблемы',
         'The plan of the course': 'План курса',
         'The course in one paragraph': 'Курс в одном абзаце',

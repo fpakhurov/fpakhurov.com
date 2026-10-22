@@ -10,7 +10,6 @@
 
 export type PrerequisiteTarget = { note: string; anchor?: string } | { href: string };
 
-const D2L_LINEAR = 'https://d2l.ai/chapter_linear-classification/index.html';
 
 const background: Record<string, PrerequisiteTarget> = {
   // Probability: the notes of the probability course.
@@ -108,8 +107,8 @@ const background: Record<string, PrerequisiteTarget> = {
   'Свёртки': { note: 'deep-learning/convolution' },
   'Wasserstein GANs': { note: 'generative-models/wgan' },
   'GAN Вассерштейна': { note: 'generative-models/wgan' },
-  'Linear models': { href: D2L_LINEAR },
-  'Линейные модели': { href: D2L_LINEAR },
+  'Linear models': { note: 'ml/linear-classifiers' },
+  'Линейные модели': { note: 'ml/linear-classifiers' },
   'Logistic regression': { note: 'ml/logistic-regression' },
   'Kernels': { note: 'ml/kernels' },
   'Ядра': { note: 'ml/kernels' },
