@@ -92,6 +92,14 @@ const background: Record<string, PrerequisiteTarget> = {
   'Linear models': { href: D2L_LINEAR },
   'Линейные модели': { href: D2L_LINEAR },
   'Logistic regression': { note: 'ml/logistic-regression' },
+  'Kernels': { note: 'ml/kernels' },
+  'Ядра': { note: 'ml/kernels' },
+  'Support vector machines': { note: 'ml/support-vector-machines' },
+  'Метод опорных векторов': { note: 'ml/support-vector-machines' },
+  'Mixtures and the EM algorithm': { note: 'ml/em-algorithm' },
+  'Смеси распределений и EM-алгоритм': { note: 'ml/em-algorithm' },
+  'Dimensionality reduction': { note: 'ml/dimensionality-reduction' },
+  'Понижение размерности': { note: 'ml/dimensionality-reduction' },
   'Логистическая регрессия': { note: 'ml/logistic-regression' },
 };
 
