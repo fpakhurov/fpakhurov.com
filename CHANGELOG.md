@@ -4,6 +4,18 @@ Notable changes to the site, newest first. Each entry gives the date, what chang
 
 ## 2026-10-22
 
+- **A new course: Mathematics for Machine Learning.** It has 15 notes in four sections, in English and Russian. It is a starting course next to Probability, and Machine Learning now builds on both.
+  - **Linear algebra:** vectors, spaces and linear maps; matrices and linear systems with LU; inner products, norms and orthogonality with QR; determinants and eigenvalues; symmetric matrices and quadratic forms; the singular value decomposition.
+  - **Calculus:** derivatives and Taylor series, gradients, Jacobians and Hessians, matrix calculus by the differential method, multiple integrals and change of variables.
+  - **Optimization:** convex sets and functions, unconstrained optimization (gradient descent rates, Newton, BFGS), Lagrange multipliers and KKT conditions, duality.
+  - **Numerical computation:** conditioning and numerical stability.
+
+  Scope follows Deisenroth, Faisal and Ong's *Mathematics for Machine Learning*. It is cited alongside Strang, Axler, Boyd–Vandenberghe, Nocedal–Wright and Trefethen–Bau, not copied. Derivations go step by step, and every Code section checks the note's results numerically in NumPy.
+  - **Figures:** 29, computed at build time.
+  - **Prerequisites:** "Linear algebra", "Calculus" and "Determinants" now link to these notes instead of the external book.
+  - **Build:** the build gets a 4 GB Node heap. With every course the bundling step had outgrown the 2 GB default on an 8 GB machine.
+
+  Why: the ML, Deep Learning and Bayes notes assumed linear algebra, calculus and optimization that were only linked to a book.
 - **A new course: AI Agents.** It has 27 notes in seven sections, in English and Russian, and runs from the classical agent to current language-model agents. It comes after the NLP course.
   - **Agents and environments:** what an agent is, search and planning (A*, STRIPS/PDDL), Markov decision processes, games and Monte Carlo tree search.
   - **Reinforcement learning:** Q-learning and TD, deep Q-networks, policy gradients and actor-critic up to PPO, model-based RL.
