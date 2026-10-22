@@ -4,6 +4,8 @@ Notable changes to the site, newest first. Each entry gives the date, what chang
 
 ## 2026-10-22
 
+- **Header mark matches the favicon.** The FP badge in the header now draws the favicon's letter outlines in its exact colours (#365DC2 on #ECEEF5, #A5BAFF on #212124 in dark), instead of system-font text in the navigation blue.
+
 - **Site icons.** A new FP favicon drawn from the site's own type and accent colour, in light and dark versions that follow the browser theme: an adaptive SVG, PNG and ICO fallbacks, an Apple touch icon, a web manifest with 192 and 512 px icons, and theme-colour tags. The social card at `/og.png` is replaced by the matching one, at 80 KB instead of 1 MB.
 
 - **Cross-course audit.** All nine courses were read against each other after four new courses arrived in two days. Notes now link to where a topic is developed in full: Mathematics for linear algebra, matrix calculus, convexity and duality; Bayesian Methods for VI, Gibbs and evidence; AI Agents for RL, RLHF/GRPO and evaluation; ACOS for floating point. Stale statements and course-page texts were updated, two external prerequisite links now point to site notes, a gradient-descent bound now matches its proof, and a misattributed RLHF result is corrected. In the Russian notes, "policy" is «стратегия» and "alignment" is «выравнивание» throughout, now in the glossary.
