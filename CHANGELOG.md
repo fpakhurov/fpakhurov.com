@@ -2,6 +2,16 @@
 
 Notable changes to the site, newest first. Each entry gives the date, what changed and why.
 
+## 2026-10-23
+
+- **NLP figures: five labels fixed.** In the ROUGE overlap figure, the score header ran past the right edge. On phones:
+  - the byte row in "From bytes to cleaned units" ran past the edge;
+  - the rotated tokens in the BPE compression chart overlapped each other and the row above;
+  - the "one row per token" label in the embedding lookup ran past the edge;
+  - the Russian «B = 0 в начале» note beside LoRA's B ran past the edge.
+
+  The byte-row figure now checks at build time that every row fits.
+
 ## 2026-10-22
 
 - **A new course: Programming in Python.** It has 22 notes in six sections, in English and Russian, and goes from the first line of code to how CPython runs it. It is a starting course, and Machine Learning now builds on it with Probability and Mathematics.
