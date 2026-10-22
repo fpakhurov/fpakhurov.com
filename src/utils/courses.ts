@@ -131,7 +131,7 @@ export const courses: Record<CourseKey, Course> = {
     requires: ['probability', 'math', 'python'],
     shortTitle: 'ML',
     description: 'How a program learns a rule from examples and how to tell whether it will work on new data: from a line through points to gradient boosting and neural networks. Each note either fixes a limitation of the previous method or changes the task, and says which.',
-    entry: 'Before you start: the Probability Theory course, or at least expectation, conditional probability and maximum likelihood; the Mathematics for Machine Learning course, or at least vectors, matrix products and derivatives; reading short NumPy code. Every note ends with a Code section that runs as written. Learning Without Labels and Beyond Classification branch off the supervised route: they change the task rather than replace a classifier.',
+    entry: 'Before you start: the Probability Theory course, or at least expectation, conditional probability and maximum likelihood; the Mathematics for Machine Learning course, or at least vectors, matrix products and derivatives; the Programming in Python course, or at least reading short NumPy code. Every note ends with a Code section that runs as written. Learning Without Labels and Beyond Classification branch off the supervised route: they change the task rather than replace a classifier.',
     guide: [{ label: 'The course map', note: 'ml/what-machine-learning-is', anchor: 'the-course-map' }, { label: 'The course in one paragraph', note: 'ml/recommender-systems', anchor: 'the-course-in-one-paragraph' }],
     progression: [
       { label: 'Learning problem', section: 'The Learning Problem' },
@@ -146,7 +146,7 @@ export const courses: Record<CourseKey, Course> = {
       title: 'Машинное обучение',
       shortTitle: 'ML',
       description: 'Как программа выучивает правило по примерам и как понять, что оно сработает на новых данных: от прямой через точки до градиентного бустинга и нейросетей. Каждая заметка либо исправляет ограничение предыдущего метода, либо меняет задачу, и говорит, что именно.',
-      entry: 'Что нужно знать: курс теории вероятностей или хотя бы математическое ожидание, условную вероятность и метод максимального правдоподобия; курс математики для машинного обучения или хотя бы векторы, произведения матриц и производные; умение читать короткий код на NumPy. Каждая заметка заканчивается разделом «Код», который запускается как написан. Разделы «Обучение без разметки» и «За пределами классификации» ответвляются от обучения с учителем: они меняют задачу, а не заменяют классификатор.',
+      entry: 'Что нужно знать: курс теории вероятностей или хотя бы математическое ожидание, условную вероятность и метод максимального правдоподобия; курс математики для машинного обучения или хотя бы векторы, произведения матриц и производные; курс программирования на Python или хотя бы умение читать короткий код на NumPy. Каждая заметка заканчивается разделом «Код», который запускается как написан. Разделы «Обучение без разметки» и «За пределами классификации» ответвляются от обучения с учителем: они меняют задачу, а не заменяют классификатор.',
       progression: ['Постановка', 'Линейные модели', 'Классификация', 'Деревья и ансамбли', 'Нейросети', 'Без разметки', 'Ранжирование'],
       labels: {
         'The course map': 'Карта курса',
@@ -326,7 +326,7 @@ export const courses: Record<CourseKey, Course> = {
     requires: ['ml'],
     shortTitle: 'DL',
     description: 'How to train deep networks that work: automatic differentiation, losses, normalization and optimizers, convolutional networks for vision, self-supervised features and Vision Transformers, robustness and compression. The course the Generative Models and NLP courses build on.',
-    entry: 'Before you start: Machine Learning up to neural networks and backpropagation, and basic Python. Every note ends with a Code section in PyTorch that runs on a laptop CPU in seconds, on synthetic data or small bundled datasets. Sequences, attention and Transformers for text are developed in the NLP course, and GANs, VAEs and diffusion in the Generative Models course, and uncertainty over the weights in the Bayesian Methods course; this course links to them instead of repeating them.',
+    entry: 'Before you start: Machine Learning up to neural networks and backpropagation, and Python (the Programming in Python course). Every note ends with a Code section in PyTorch that runs on a laptop CPU in seconds, on synthetic data or small bundled datasets. Sequences, attention and Transformers for text are developed in the NLP course, and GANs, VAEs and diffusion in the Generative Models course, and uncertainty over the weights in the Bayesian Methods course; this course links to them instead of repeating them.',
     guide: [{ label: 'The plan of the course', note: 'deep-learning/deep-learning', anchor: 'the-plan-of-the-course' }, { label: 'The course in one paragraph', note: 'deep-learning/training-in-practice', anchor: 'the-course-in-one-paragraph' }],
     progression: [
       { label: 'Training', section: 'Training Neural Networks' },
@@ -338,7 +338,7 @@ export const courses: Record<CourseKey, Course> = {
       title: 'Глубинное обучение',
       shortTitle: 'ГО',
       description: 'Как обучать глубокие сети, которые работают: автоматическое дифференцирование, функции потерь, нормализация и оптимизаторы, свёрточные сети для зрения, обучение с самоконтролем признаков и Vision Transformer, устойчивость и сжатие. Курс, на котором строятся курсы по генеративным моделям и NLP.',
-      entry: 'Что нужно знать: машинное обучение до нейросетей и обратного распространения и основы Python. Каждая заметка заканчивается разделом «Код» на PyTorch, который за секунды запускается на процессоре ноутбука, на синтетических данных или небольших встроенных наборах. Последовательности, внимание и трансформеры для текста разобраны в курсе NLP, а GAN, VAE и диффузия — в курсе по генеративным моделям, а неопределённость весов — в курсе байесовских методов; этот курс ссылается на них, а не повторяет.',
+      entry: 'Что нужно знать: машинное обучение до нейросетей и обратного распространения и Python (курс программирования на Python). Каждая заметка заканчивается разделом «Код» на PyTorch, который за секунды запускается на процессоре ноутбука, на синтетических данных или небольших встроенных наборах. Последовательности, внимание и трансформеры для текста разобраны в курсе NLP, а GAN, VAE и диффузия — в курсе по генеративным моделям, а неопределённость весов — в курсе байесовских методов; этот курс ссылается на них, а не повторяет.',
       progression: ['Обучение', 'Свёртки', 'Представления', 'Устойчивость'],
       labels: {
         'Training Neural Networks': 'Обучение нейронных сетей',

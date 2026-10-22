@@ -4,6 +4,19 @@ Notable changes to the site, newest first. Each entry gives the date, what chang
 
 ## 2026-10-22
 
+- **A new course: Programming in Python.** It has 22 notes in six sections, in English and Russian, and goes from the first line of code to how CPython runs it. It is a starting course, and Machine Learning now builds on it with Probability and Mathematics.
+  - **Getting started:** running Python, values and names, control flow, functions, strings and Unicode.
+  - **Data structures:** lists and tuples, dictionaries and sets, iteration and generators, files and exceptions.
+  - **Abstraction:** classes and the MRO, the data model, closures and decorators, modules, packages and environments, type hints.
+  - **Reliable code:** testing with pytest, debugging and profiling.
+  - **Under the hood:** how CPython runs code (bytecode, the specializing interpreter, reference counting and the GC, the JIT), writing fast Python, concurrency with threads, processes and asyncio, with and without the GIL.
+  - **Scientific Python:** NumPy arrays, pandas data frames, Matplotlib.
+
+  Every example and Code section was run on Python 3.14.7 and shows its real output; 3.15, released in October 2026, is noted where it differs. Timings are measured on one machine and say so, including the same thread benchmark on the default and the free-threaded build. The "Python basics" prerequisite across the site now links here instead of the official tutorial.
+  - **Figures:** 42, computed at build time.
+
+  Why: every course assumed basic Python and pointed to an external tutorial.
+
 - **Header mark matches the favicon.** The FP badge in the header now draws the favicon's letter outlines in its exact colours (#365DC2 on #ECEEF5, #A5BAFF on #212124 in dark), instead of system-font text in the navigation blue.
 
 - **Site icons.** A new FP favicon drawn from the site's own type and accent colour, in light and dark versions that follow the browser theme: an adaptive SVG, PNG and ICO fallbacks, an Apple touch icon, a web manifest with 192 and 512 px icons, and theme-colour tags. The social card at `/og.png` is replaced by the matching one, at 80 KB instead of 1 MB.
