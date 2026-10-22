@@ -4,6 +4,22 @@ Notable changes to the site, newest first. Each entry gives the date, what chang
 
 ## 2026-10-22
 
+- **A new course: Bayesian Methods in Machine Learning.** It has 15 notes in five sections, in English and Russian, and sits between Machine Learning and Generative Models.
+  - **Bayesian modelling:** the Bayesian approach, conjugate priors and the exponential family, Bayesian model selection.
+  - **Bayesian linear models:** Bayesian linear regression, the relevance vector machine, the Laplace approximation and Bayesian classification.
+  - **Latent variables and approximate inference:** EM and Bayesian PCA, variational inference, Gibbs sampling.
+  - **Nonparametric models:** Gaussian processes, Dirichlet processes, latent Dirichlet allocation.
+  - **Scalable inference:** stochastic variational inference, black-box variational inference and the VAE, Bayesian deep learning.
+
+  The scope follows the course of D. P. Vetrov and D. A. Kropotov (2015). It is cited, not copied, alongside Bishop, Murphy, MacKay, Barber, Rasmussen–Williams and the primary papers.
+  - **Code:** every Code section is NumPy or SciPy that runs on a laptop in under a minute, and its printed numbers match the text. Experiments report what they found, including a collapsed Gibbs sampler that gets stuck, variational LDA missing topics from some starts, and Bayesian networks that stay overconfident far from the data.
+  - **Figures:** 34, computed at build time.
+  - **Course graph:** Generative Models now builds on both Deep Learning and Bayesian Methods.
+
+  Why: the Generative Models course leans on evidence, variational inference and sampling. The HSE curriculum teaches them in a Bayesian methods course before generative models.
+
+- **Generative Models: the training background note is slimmed.** Batch normalization, the signal-scale argument, convolution shapes and the training routine now live in the Deep Learning course. The note keeps what Generative Models needs on its own (instance normalization, the one-unit gradient derivation, a convolution layer's fan-in), and the ML and Deep Learning notes link the Deep Learning course for the rest.
+
 - **A new course: Deep Learning.** It has 14 notes in four sections, in English and Russian, and sits between Machine Learning and the Generative Models and NLP courses.
   - **Training neural networks:**
     - what deep learning is;

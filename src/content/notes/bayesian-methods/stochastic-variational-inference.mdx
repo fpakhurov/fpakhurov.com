@@ -1,0 +1,290 @@
+---
+title: Stochastic variational inference
+description: "Why coordinate-ascent variational inference stalls on large data, how splitting the variables into global and local ones turns its global update into a natural-gradient step, and how mini-batches with decreasing Robbins–Monro steps make each step cost a batch instead of a pass."
+course: bayesian-methods
+section: Scalable Inference
+order: 12
+status: published
+tags: [stochastic-variational-inference, natural-gradient, exponential-family, mean-field, mini-batches, robbins-monro, bayesian-mixture, online-lda]
+prerequisites: [Variational inference, Latent Dirichlet allocation, Conjugate priors and the exponential family, Stochastic gradient descent]
+---
+
+import SviLoop from '../../../components/figures/stochastic-variational-inference/SviLoop.astro';
+import ElboGap from '../../../components/figures/stochastic-variational-inference/ElboGap.astro';
+
+The [previous note](/notes/bayesian-methods/latent-dirichlet-allocation) fitted topics with coordinate-ascent variational inference: every sweep updates the topic proportions of every document and then the topics. On a corpus of a few thousand documents that is fine. On millions it is not, because the topics, the quantity we came for, change only once per sweep, and each sweep reads the whole corpus. The same holds for every model of the [variational inference note](/notes/bayesian-methods/variational-inference) that has one set of shared parameters and one set of latent variables per data point. **Stochastic variational inference** (SVI) of [Hoffman et al. (2013)](#references) keeps the model, the variational family and the objective, and changes only how the objective is climbed: it notices that the update of the shared parameters is a natural-gradient step, estimates that step from a random mini-batch, and takes a fraction of it. This note derives the step, runs it on a Bayesian mixture, and measures how many passes over the data it saves.
+
+**Notation.** The data are $x_1, \dots, x_N$. Each point has its own **local** latent variable $z_i$ (a cluster assignment, a document's topic proportions); the **global** latent variable $\beta$ (the cluster means, the topics) is shared by all points. The model is $p(\beta) \prod_{i=1}^N p(x_i, z_i \mid \beta)$, and the mean-field family is $q(\beta \mid \lambda) \prod_i q(z_i \mid \phi_i)$ with global variational parameter $\lambda$ and local parameters $\phi_i$. An exponential-family density with natural parameter $\eta$, sufficient statistic $u(\beta)$ and log-normalizer $A(\eta)$ is $h(\beta) \exp\big(\eta^\top u(\beta) - A(\eta)\big)$; its moments are $\nabla A(\eta) = E[u(\beta)]$ and $\nabla^2 A(\eta) = \operatorname{Cov}[u(\beta)]$ ([derivatives of the log-partition function](/notes/bayesian-methods/conjugate-priors#derivatives-of-the-log-partition-function)). $S$ is a mini-batch of $B$ indices drawn uniformly, $t = 1, 2, \dots$ counts steps, and $\rho_t$ is the step size.
+
+## Baseline: coordinate ascent on a large data set
+
+Take the Bayesian mixture of [Blei, Kucukelbir and McAuliffe (2017)](#references), section 3: $K$ means $\mu_k \sim \mathcal N(0, \sigma_0^2 I)$ in $\mathbb R^D$, an assignment $c_i$ uniform over $\{1, \dots, K\}$, and $x_i \sim \mathcal N(\mu_{c_i}, I)$. The variational family is $q(\mu_k) = \mathcal N(m_k, P_k^{-1} I)$, with mean $m_k$ and precision $P_k$, and $q(c_i = k) = \phi_{ik}$. Coordinate ascent alternates two updates, both derived in the [variational inference note](/notes/bayesian-methods/variational-inference):
+
+$$
+\begin{aligned}
+\text{local:}\quad \phi_{ik} &\propto \exp\Big(x_i^\top m_k - \tfrac12\big(\lVert m_k \rVert^2 + D/P_k\big)\Big), \qquad i = 1, \dots, N, \\
+\text{global:}\quad P_k &= \frac{1}{\sigma_0^2} + \sum_{i=1}^N \phi_{ik}, \qquad P_k m_k = \sum_{i=1}^N \phi_{ik}\, x_i .
+\end{aligned}
+$$
+
+The exponent of the local update is $E_q[\log \mathcal N(x_i \mid \mu_k, I)]$ up to terms that do not depend on $k$, with $E_q\lVert \mu_k\rVert^2 = \lVert m_k\rVert^2 + D/P_k$. The global update is the conjugate Gaussian posterior of $\mu_k$ in which the point $x_i$ counts with weight $\phi_{ik}$.
+
+The cost is in the order of the loop. The global update sums over all $N$ points, so it cannot run before every $\phi_i$ has been recomputed, and every $\phi_i$ was computed from the previous, often poor, means. With $N = 200{,}000$ points, $K = 8$ clusters in the plane and a start at $K$ randomly chosen data points, the ELBO after the first full pass is still $0.95$ nats per point below the optimum; it takes 5 passes to get within $0.01$ (the [experiment](#an-experiment-svi-against-batch-coordinate-ascent) below). Each of those passes touches every point to change eight means a little. In LDA the local step of one document is itself an inner loop of coordinate ascent, so on a corpus of millions of documents a single update of the topics waits for millions of such loops.
+
+## Global and local variables
+
+The structure that SVI uses is the split into the two kinds of variables. Under the mean-field family the ELBO separates into a global part and a sum of local parts:
+
+$$
+\mathcal L(\lambda, \phi) = E_q[\log p(\beta)] - E_q[\log q(\beta \mid \lambda)] + \sum_{i=1}^N \Big( E_q[\log p(x_i, z_i \mid \beta)] - E_q[\log q(z_i \mid \phi_i)] \Big) .
+$$
+
+The $i$-th local term involves only $x_i$, $\phi_i$ and $\lambda$. So for a fixed $\lambda$ each $\phi_i$ can be optimized on its own, and the result $\phi_i(\lambda)$ depends on nothing else. Plugging in these optima leaves a function of the global parameter alone, $\mathcal L(\lambda) = \max_\phi \mathcal L(\lambda, \phi)$, which is the objective that SVI climbs. In LDA, the global variables are the topics and the local ones are the topic proportions and word assignments of a document; in the mixture, the means and the assignments.
+
+The second ingredient is conjugacy. In the models of this course the **complete conditional** of $\beta$, its distribution given everything else, is in an exponential family whose natural parameter is the prior's plus a sum over data points:
+
+$$
+p(\beta \mid x, z) = h(\beta) \exp\big(\eta_g(x, z)^\top u(\beta) - A_g(\eta_g(x, z))\big), \qquad \eta_g(x, z) = \alpha + \sum_{i=1}^N s(x_i, z_i) ,
+$$
+
+with $\alpha$ the natural parameter of the prior and $s(x_i, z_i)$ the statistics that one point contributes. For the mixture, in the coordinates $(P_k m_k, P_k)$, $\alpha = (0, 1/\sigma_0^2)$ and point $i$ contributes $(x_i, 1)$ to component $c_i$. The global family $q(\beta \mid \lambda)$ is chosen in the same exponential family, with natural parameter $\lambda$; the global coordinate update is then $\lambda = E_\phi[\eta_g(x, z)]$, which is what the mixture update above computes.
+
+<aside class="callout"><strong>Key idea.</strong> The global update of coordinate ascent is a prior plus a sum over the data, and a sum over the data can be estimated from a random sample scaled up by $N/B$. Stochastic variational inference replaces the exact update by this unbiased estimate and moves only part of the way towards it. Each such move is a noisy step along the natural gradient of the ELBO, so with decreasing step sizes the procedure is stochastic optimization with the usual convergence guarantees, and each step costs a mini-batch instead of a pass.</aside>
+
+## The natural gradient of the ELBO
+
+Fix the local parameters and look at $\mathcal L$ as a function of $\lambda$. Only the terms that contain $\beta$ matter. Write $\log p(x, z, \beta) = \log p(\beta \mid x, z) + \log p(x, z)$; the second term does not involve $\beta$, so its expectation does not depend on $\lambda$. With $\bar\eta = E_\phi[\eta_g(x, z)]$ the expected natural parameter of the complete conditional:
+
+$$
+\begin{aligned}
+\mathcal L(\lambda) &= E_q[\log p(\beta \mid x, z)] - E_q[\log q(\beta \mid \lambda)] + \text{const} \\
+&= \bar\eta^\top \nabla A_g(\lambda) - \big(\lambda^\top \nabla A_g(\lambda) - A_g(\lambda)\big) + \text{const}, \\
+\nabla_\lambda \mathcal L &= \nabla^2 A_g(\lambda)\, \bar\eta + \nabla A_g(\lambda) - \nabla A_g(\lambda) - \nabla^2 A_g(\lambda)\, \lambda = \nabla^2 A_g(\lambda)\,(\bar\eta - \lambda) .
+\end{aligned}
+$$
+
+The second line substitutes both exponential-family densities: their base measures $h(\beta)$ cancel, $E_q[u(\beta)] = \nabla A_g(\lambda)$ because $q$ has natural parameter $\lambda$, and $E_q[A_g(\eta_g(x, z))]$ depends on $\phi$ but not on $\lambda$, so it joins the constant. Mean field makes $q(\beta)$ and $q(z)$ independent, which lets the expectation over $z$ act on $\eta_g$ alone. The third line is the product rule. This is equation 14 of [Hoffman et al. (2013)](#references).
+
+The ordinary gradient carries the factor $\nabla^2 A_g(\lambda)$, the covariance of $u(\beta)$ under $q$. That covariance is also the **Fisher information** of $q(\beta \mid \lambda)$ ([Fisher information](/notes/probability/maximum-likelihood#fisher-information)): $G(\lambda) = E_q\big[\nabla_\lambda \log q \, \nabla_\lambda \log q^\top\big] = E_q\big[(u - \nabla A_g)(u - \nabla A_g)^\top\big] = \nabla^2 A_g(\lambda)$. The **natural gradient** ([Amari, 1998](#references)) premultiplies the gradient by $G(\lambda)^{-1}$, and the factor disappears:
+
+$$
+\boxed{\;\hat\nabla_\lambda \mathcal L = G(\lambda)^{-1}\, \nabla_\lambda \mathcal L = E_\phi[\eta_g(x, z)] - \lambda\;}
+$$
+
+(Hoffman et al., equation 22). A natural-gradient step of length $\rho$ is $\lambda \leftarrow \lambda + \rho\,(\bar\eta - \lambda) = (1 - \rho)\lambda + \rho\,\bar\eta$. With $\rho = 1$ it lands on $\bar\eta$, the coordinate-ascent update. **Coordinate ascent on the global parameter is natural-gradient ascent with step 1** ([Sato, 2001](#references)). The natural gradient is also cheaper than the ordinary one: no matrix has to be formed or inverted.
+
+**Worked example.** One mean $\mu$ with prior $\mathcal N(0, 100)$, ten points with average 2 and noise variance 1. Use the natural parameters $\lambda = (m/s^2, -1/(2s^2))$ of $q(\mu) = \mathcal N(m, s^2)$, with $u(\mu) = (\mu, \mu^2)$. The complete conditional is the exact posterior, $\bar\eta = (20, -10.01/2)$: precision $10.01$, mean $20/10.01 = 1.998$. Start at $m = 0$, $s = 1$, so $\lambda = (0, -0.5)$. The natural gradient is $\bar\eta - \lambda = (20, -4.505)$, and a step of 1 reaches the posterior. The Fisher matrix at the start is the covariance of $(\mu, \mu^2)$ under $\mathcal N(0, 1)$, $\operatorname{diag}(1, 2)$, so the ordinary gradient is $(20, -9.01)$. It points elsewhere: a step of 1 gives precision $19.02$ and mean $1.05$, and since $(20, -9.01)$ is not a multiple of $(20, -4.505)$, no step size along it reaches the posterior.
+
+### Why measure steps by the Fisher information
+
+*Optional depth: the geometry behind the natural gradient. The rest of the note uses only its formula.*
+
+The ordinary gradient is the steepest direction when the size of a step is measured by the Euclidean length $\lVert d\lambda\rVert$. That length depends on the parameterization: the same two distributions are close in one parameterization and far in another. A step can instead be measured by how much it changes the distribution. For a small $d\lambda$, a second-order expansion of the [KL divergence](/notes/generative-models/entropy-and-divergences#kullbackleibler-divergence) gives $\mathrm{KL}\big(q_\lambda \,\Vert\, q_{\lambda + d\lambda}\big) \approx \tfrac12\, d\lambda^\top G(\lambda)\, d\lambda$: the first-order term vanishes because $E_q[\nabla \log q] = 0$, and the second-order term is the Fisher information. Maximizing the linear change $\nabla\mathcal L^\top d\lambda$ subject to $\tfrac12 d\lambda^\top G\, d\lambda = \epsilon$ gives, by a Lagrange multiplier, $d\lambda \propto G^{-1} \nabla \mathcal L$: the natural gradient is the steepest ascent per unit of KL, and it does not change when $\lambda$ is reparameterized ([Hoffman et al., 2013](#references), section 2.3). In the worked example, the posterior precision is ten times the starting one; the KL geometry knows that a change in the second natural parameter matters more where the variance is small, and the Euclidean one does not.
+
+## Mini-batches: a noisy natural gradient
+
+The natural gradient still needs $\bar\eta = \alpha + \sum_{i=1}^N E_{\phi_i}[s(x_i, z_i)]$, a sum over all points. Draw one index $I$ uniformly from $\{1, \dots, N\}$ and replace the sum by $N$ copies of its $I$-th term. Since $E_I\big[N\, E_{\phi_I}[s(x_I, z_I)]\big] = \sum_i E_{\phi_i}[s(x_i, z_i)]$, the result is an unbiased estimate of $\bar\eta$, and it is exactly the coordinate-ascent update for a data set that consists of $N$ replicates of $x_I$ (Hoffman et al., section 2.4). Averaging $B$ such draws gives the **intermediate global parameter** of a mini-batch $S$ and the SVI update:
+
+$$
+\boxed{\;\hat\lambda_S = \alpha + \frac{N}{B} \sum_{i \in S} E_{\phi_i(\lambda)}\big[s(x_i, z_i)\big], \qquad \lambda^{(t)} = \big(1 - \rho_t\big)\,\lambda^{(t-1)} + \rho_t\, \hat\lambda_S\;}
+$$
+
+Here $\phi_i(\lambda)$ is the local optimum for the current $\lambda$, computed only for the points of the batch, and $\hat\lambda_S - \lambda^{(t-1)}$ is an unbiased estimate of the natural gradient. One step costs $B$ local updates instead of $N$.
+
+<SviLoop />
+
+1. Sample $B$ of the $N$ points uniformly.
+2. Local step: compute $\phi_i$ from the current $\lambda$ for the points of the batch. For the mixture this is the softmax of the local update above; for LDA it is an inner loop of coordinate ascent on one document.
+3. Intermediate global parameter: the prior plus the batch statistics multiplied by $N/B$, the global update as if the batch had been seen $N/B$ times.
+4. Natural-gradient step: blend the current natural parameter with the intermediate one, with weight $\rho_t$.
+5. Repeat with the new $\lambda$ and the next, smaller $\rho_t$.
+
+**Worked example.** $N = 200{,}000$, $B = 100$, prior precision $1/\sigma_0^2 = 0.01$, one component $k$ and the first coordinate of its mean. The current $q(\mu_k)$ has precision $P = 24{,}000$ and mean $m = 3.00$, so $Pm = 72{,}000$. In the batch the responsibilities of component $k$ sum to $12.5$ and $\sum_{i \in S} \phi_{ik} x_i = 40$. Scaled by $N/B = 2000$: $\hat P = 0.01 + 2000 \cdot 12.5 = 25{,}000.01$ and $\widehat{Pm} = 80{,}000$, an intermediate mean of $3.20$. At step $t = 10$ with $\rho_t = 11^{-0.7} = 0.187$, the new precision is $0.813 \cdot 24{,}000 + 0.187 \cdot 25{,}000 = 24{,}187$ and the new $Pm$ is $73{,}493$, a mean of $3.039$. The blend acts on natural parameters, so the mean does not move exactly a fraction $\rho$ of the way from $3.00$ to $3.20$ (that would be $3.037$). The Code section checks that $\hat\lambda_S$ is unbiased: averaged over 2000 batches at a fixed $q$, its precisions agree with the full-data ones to within $0.6\%$.
+
+**A running average.** With $\rho_1 = 1$ and $\rho_t = 1/t$, induction on $\lambda^{(t)} = (1 - 1/t)\lambda^{(t-1)} + \hat\lambda_t/t$ gives $\lambda^{(t)} = \frac1t \sum_{s=1}^t \hat\lambda_s$: the global parameter is the plain average of all the intermediate estimates. Other schedules weight recent estimates more. That is wanted, because the early $\hat\lambda_s$ were computed from local steps under a poor $\lambda$; Hoffman et al. call $\kappa$ below the **forgetting rate**.
+
+## Step sizes: the Robbins–Monro conditions
+
+A step that stays constant leaves SVI in a cloud around the optimum whose size is proportional to the step, as for any stochastic gradient method ([a constant step stalls in a noise ball](/notes/ml/stochastic-and-adaptive-optimizers#a-constant-step-stalls-in-a-noise-ball)). The classical conditions of [Robbins and Monro (1951)](#references),
+
+$$
+\sum_{t=1}^\infty \rho_t = \infty, \qquad \sum_{t=1}^\infty \rho_t^2 < \infty,
+$$
+
+ask for steps that can travel any distance but whose accumulated noise stays finite. Under them, and with the usual smoothness assumptions, SVI converges to a local optimum of $\mathcal L(\lambda)$ (Hoffman et al., section 2.4). The schedule used in practice is
+
+$$
+\rho_t = (t + \tau)^{-\kappa}, \qquad \kappa \in (0.5, 1], \quad \tau \ge 0 .
+$$
+
+The first sum diverges because $\kappa \le 1$; the second converges because $2\kappa > 1$. The delay $\tau$ damps the first steps. Hoffman et al. fixed $\tau = 1$, reported that the results were not sensitive to it, and explored $\kappa$ from $0.5$ to $1$ and batches from 10 to 1000 documents.
+
+**Worked example.** With $\tau = 1$ and $\kappa = 0.7$, $\rho_{10} = 0.187$, $\rho_{1000} = 0.0079$ and $\rho_{4000} = 0.0030$. Since $\lambda$ is an exponentially weighted average whose most recent terms have weight about $\rho_t$, it remembers roughly the last $1/\rho_t$ batches: about 330 batches, or 33,000 of the 200,000 points, after two passes. That memory sets the noise floor seen in the experiment. The batch size trades in the same currency: the variance of $\hat\lambda_S$ falls like $1/B$, and the cost of a step grows like $B$.
+
+## An experiment: SVI against batch coordinate ascent
+
+The setup, one for both methods: the Bayesian mixture above with $K = 8$ components in $D = 2$ dimensions, true means drawn from $\mathcal N(0, 5^2 I)$, $N = 200{,}000$ points, prior $\sigma_0 = 10$; both methods start from the same $K$ randomly chosen data points as means with precision 1. Batch coordinate ascent runs 30 passes. SVI uses $B = 100$, $\tau = 1$, $\kappa = 0.7$, for two passes (4000 steps). After every pass, and for SVI every 0.01 pass, we compute the ELBO per point on all the data with every $\phi_i$ at its optimum. The **gap** is the batch value after 30 passes, $-4.7142$, minus the current value. A pass means $N$ points processed by the local step, which is the dominant cost of both methods.
+
+| tolerance on the gap | batch, passes | SVI, passes |
+| --- | --- | --- |
+| $0.1$ | 4 | 0.01 |
+| $0.01$ | 5 | 0.02 |
+| $0.001$ | 6 | 0.08 |
+| smallest gap reached | $2.1 \cdot 10^{-6}$ after 12 passes | $5.4 \cdot 10^{-5}$ in 2 passes |
+
+<ElboGap />
+
+SVI reaches a gap of $0.01$ after 0.02 passes, 4000 points, and $0.001$ after 0.08 passes: 250 and 75 times fewer than the batch method. On the laptop where the Code section ran, that was about 1.4 and 6 milliseconds of computation against about 100 and 120; the seconds depend on the machine, the counts of points do not. Both runs end at the same optimum, $-4.7142$ and $-4.7143$ per point. The last row is the other side of the trade. Below $10^{-4}$ SVI is limited by the noise of its steps, while the batch method is exact at every pass and keeps converging, geometrically in this example. When a very precise optimum is needed, a common recipe is SVI first and a few batch passes at the end. These numbers describe one data set, one start and one seed; on a problem with more local optima the two methods can also end in different ones.
+
+## SVI for LDA
+
+For [LDA](/notes/bayesian-methods/latent-dirichlet-allocation) with $D$ documents, the global variables are the topics, with Dirichlet variational parameters $\lambda_{kw}$ and prior $\eta$; the local ones are each document's topic proportions and word assignments. The local step on a document is the inner loop of coordinate ascent over its $\gamma_d$ and $\phi_{dn}$, run until it converges. The intermediate topics of a batch are
+
+$$
+\hat\lambda_{kw} = \eta + \frac{D}{B} \sum_{d \in S} \sum_{n=1}^{N_d} \phi_{dnk}\, [w_{dn} = w],
+$$
+
+the expected number of times word $w$ is assigned to topic $k$ in the batch, scaled to the corpus. This is the **online LDA** of [Hoffman, Blei and Bach (2010)](#references), the first special case of SVI. With it, Hoffman et al. (2013) fitted topic models to 1.8 million articles of The New York Times and 3.8 million Wikipedia articles. scikit-learn's `LatentDirichletAllocation(learning_method='online')` implements exactly this update: its `learning_offset` is $\tau$ (default 10), its `learning_decay` is $\kappa$ (default 0.7), and its `batch_size` is $B$ (default 128; checked in version 1.9.1).
+
+<aside class="callout"><strong>Check yourself.</strong> (1) With $N = 10^6$ and $B = 500$, by what factor are the batch statistics multiplied? (2) Why is $\kappa = 0.4$ not allowed in the schedule $(t + \tau)^{-\kappa}$? (3) What does SVI do with $B = N$, sampling without replacement, and $\rho_t = 1$? (4) A colleague runs SVI with a constant $\rho = 0.05$. What happens to the ELBO after a while?<details><summary>Answers</summary>(1) $N/B = 2000$. (2) Then $\sum \rho_t^2 = \sum (t + \tau)^{-0.8}$ diverges: the accumulated noise is infinite, and the iterates do not settle. (3) Exactly batch coordinate ascent: the intermediate parameter is the full update, and a step of 1 jumps to it. (4) It stops improving at a level set by the step: the iterate fluctuates in a noise ball whose size is proportional to $0.05$, as in the stochastic optimization note.</details></aside>
+
+## What changed
+
+| | Coordinate ascent | Stochastic variational inference |
+| --- | --- | --- |
+| Global update | exact, from all $N$ points | unbiased estimate from $B$ points, scaled by $N/B$ |
+| Size of the step | jump to the update, $\rho = 1$ | a fraction $\rho_t = (t + \tau)^{-\kappa}$ of the way |
+| Interpretation | coordinate ascent | stochastic natural-gradient ascent |
+| Cost of one global update | $N$ local steps | $B$ local steps |
+| Mixture, gap $0.001$ | 6 passes | 0.08 passes |
+| Precision at the end | converges to the optimum | a noise floor set by $\rho_t$ |
+| Requirements | conditionally conjugate model | the same, plus a schedule and a batch size |
+
+## Limitations
+
+- **Conjugacy is still required.** The natural gradient has the closed form $\bar\eta - \lambda$ only when the complete conditional of $\beta$ is in the exponential family of $q(\beta)$. A logistic likelihood or a neural network breaks this; the next note removes the requirement.
+- **The local step must be cheap.** SVI assumes that the optimal $\phi_i$ for a given $\lambda$ can be computed quickly. In LDA it is an inner loop per document; in models with complex local structure it can dominate the cost.
+- **A noise floor and three knobs.** The step-size schedule and the batch size decide how fast the gap falls and where it stops; a bad $\kappa$ or $\tau$ can make SVI slower than the batch method. Adaptive schedules exist but add their own settings.
+- **The objective is the same.** SVI optimizes the same mean-field ELBO, so it inherits its biases: underestimated posterior variances and local optima. It reaches them faster; it does not make them better.
+- **Monitoring is not free.** Computing the full ELBO needs a pass over the data, which defeats the purpose; in practice one monitors a held-out likelihood on a sample, as Hoffman et al. did.
+
+## What you should remember
+
+- With global and local variables, the ELBO is a global term plus a sum of local terms, and each local optimum depends only on its data point and $\lambda$.
+- In a conditionally conjugate model the natural gradient of the ELBO with respect to $\lambda$ is $E_\phi[\eta_g(x, z)] - \lambda$: the Fisher information $\nabla^2 A_g(\lambda)$ cancels. Coordinate ascent is the natural-gradient step of length 1.
+- SVI estimates the global update from a mini-batch, $\hat\lambda_S = \alpha + (N/B)\sum_{i \in S} E_{\phi_i}[s(x_i, z_i)]$, which is unbiased, and blends: $\lambda \leftarrow (1 - \rho_t)\lambda + \rho_t \hat\lambda_S$.
+- Steps $\rho_t = (t + \tau)^{-\kappa}$ with $\kappa \in (0.5, 1]$ satisfy the Robbins–Monro conditions; with $\rho_t = 1/t$ the global parameter is the average of the intermediate estimates.
+- On a mixture of 200,000 points, SVI reached a gap of $10^{-3}$ nats per point in 0.08 passes against 6 for coordinate ascent, and then stalled near $10^{-4}$ while coordinate ascent kept converging.
+
+## Code
+
+The natural against the ordinary gradient on one Gaussian mean, one SVI step with the numbers of the worked example, the unbiasedness of the intermediate parameter, and the experiment. Seeds are fixed; exact numbers, and especially the timings, vary across platforms and library versions. The script runs in about 5 seconds on a laptop CPU.
+
+```python
+import time, numpy as np
+
+# 1. natural against Euclidean gradient: q(mu) = N(m, s^2) with natural parameters (m / s^2, -1 / (2 s^2)),
+#    statistics u(mu) = (mu, mu^2); ten points with mean 2, noise variance 1, prior N(0, 100); start at m = 0, s = 1
+lam, lam_hat = np.array([0.0, -0.5]), np.array([10 * 2.0, -(0.01 + 10) / 2])   # lam_hat = E[eta_g], the exact posterior
+m, s2 = 0.0, 1.0
+fisher = np.array([[s2, 2 * m * s2], [2 * m * s2, 2 * s2 ** 2 + 4 * m ** 2 * s2]])   # covariance of (mu, mu^2) under q
+natural, euclid = lam_hat - lam, fisher @ (lam_hat - lam)
+to_mean_prec = lambda l: (round(float(l[0] / (-2 * l[1])), 4), round(float(-2 * l[1]), 2))
+print(natural, euclid, to_mean_prec(lam + natural), to_mean_prec(lam + euclid))
+# [20.    -4.505] [20.   -9.01] (1.998, 10.01) (1.0515, 19.02)
+
+# 2. one SVI step for one component, the worked example: N = 200,000, B = 100, prior precision 0.01
+N, B, prior_prec = 200_000, 100, 0.01
+P, h = 24_000.0, 72_000.0                      # current q(mu_k): precision and precision times mean, so m = 3.0
+P_hat, h_hat = prior_prec + N / B * 12.5, N / B * 40.0   # the batch: sum of phi_ik = 12.5, sum of phi_ik x_i = 40
+rho = (10 + 1) ** -0.7                          # step t = 10, tau = 1, kappa = 0.7
+P, h = (1 - rho) * P + rho * P_hat, (1 - rho) * h + rho * h_hat
+print(round(rho, 4), round(h_hat / P_hat, 4), round(P, 1), round(h / P, 4))
+# 0.1866 3.2 24186.7 3.0386
+
+# 3. data from the Bayesian mixture: K = 8 means in 2-D drawn from N(0, 5^2 I), unit-variance clusters, equal weights
+rng = np.random.default_rng(0)
+K, D, s0 = 8, 2, 10.0                           # s0: prior standard deviation of each mean, 1 / s0^2 = 0.01
+X = rng.normal(0, 5, (K, D))[rng.integers(K, size=N)] + rng.normal(size=(N, D))
+
+# q(mu_k) = N(m_k, I / P_k), stored by its natural parameters h_k = P_k m_k and P_k
+def local_step(Xb, h, P):
+    """phi_ik proportional to exp(E_q[log p(x_i | mu_k)]): the coordinate update of the local variables."""
+    m = h / P[:, None]
+    logit = Xb @ m.T - 0.5 * ((m ** 2).sum(1) + D / P)
+    phi = np.exp(logit - logit.max(1, keepdims=True))
+    return phi / phi.sum(1, keepdims=True)
+
+def elbo(h, P):
+    """ELBO per data point, with every phi_i at its optimum for the current global parameters."""
+    m, s2 = h / P[:, None], 1 / P
+    logit = X @ m.T - 0.5 * ((m ** 2).sum(1) + D * s2)
+    mx = logit.max(1)
+    data = mx + np.log(np.exp(logit - mx[:, None]).sum(1)) - np.log(K) - 0.5 * (X ** 2).sum(1) - np.log(2 * np.pi)
+    glob = -D * np.log(s0) - ((m ** 2).sum(1) + D * s2) / (2 * s0 ** 2) + 0.5 * D * np.log(s2) + 0.5 * D
+    return (data.sum() + glob.sum()) / N
+
+def start():                                    # the same start for both methods: K data points as means, precision 1
+    return X[np.random.default_rng(1).choice(N, K, replace=False)].copy(), np.ones(K)
+
+# 4. the intermediate global parameter of a mini-batch is unbiased: average it over 2000 batches at fixed q
+h0, P0 = start()
+full = 1 / s0 ** 2 + local_step(X, h0, P0).sum(0)
+r = np.random.default_rng(5)
+est = np.mean([1 / s0 ** 2 + N / B * local_step(X[r.integers(N, size=B)], h0, P0).sum(0) for _ in range(2000)], 0)
+print(np.round(full[:4], 0), np.round(est[:4], 0))
+# [39145. 25268. 51657. 11502.] [39145. 25180. 51951. 11468.]
+
+# 5. batch coordinate ascent: each global update waits for a pass over all N points
+h, P = start(); hist_batch, sec_batch = [(0.0, elbo(h, P), 0.0)], 0.0
+for it in range(1, 31):
+    t0 = time.perf_counter()
+    phi = local_step(X, h, P)
+    P, h = 1 / s0 ** 2 + phi.sum(0), phi.T @ X  # lambda = E_phi[eta_g(x, z)]: a natural-gradient step of length 1
+    sec_batch += time.perf_counter() - t0; hist_batch.append((float(it), elbo(h, P), sec_batch))
+
+# 6. SVI: mini-batches of B = 100 points, rho_t = (t + 1)^(-0.7), two passes = 4000 steps
+h, P = start(); r = np.random.default_rng(2); hist_svi, sec_svi = [(0.0, elbo(h, P), 0.0)], 0.0
+for t in range(1, 2 * N // B + 1):
+    t0 = time.perf_counter()
+    idx = r.integers(N, size=B)
+    phi = local_step(X[idx], h, P)
+    P_hat, h_hat = 1 / s0 ** 2 + N / B * phi.sum(0), N / B * phi.T @ X[idx]   # as if the batch were seen N / B times
+    rho = (t + 1.0) ** -0.7
+    P, h = (1 - rho) * P + rho * P_hat, (1 - rho) * h + rho * h_hat
+    sec_svi += time.perf_counter() - t0
+    if t % 20 == 0:                             # evaluate every 0.01 pass; the evaluation is not timed
+        hist_svi.append((t * B / N, elbo(h, P), sec_svi))
+
+best = hist_batch[-1][1]
+print('ELBO per point: batch after 30 passes %.4f, SVI after 2 passes %.4f' % (best, hist_svi[-1][1]))
+print('after one pass: batch %.3f, SVI %.4f' % (hist_batch[1][1], hist_svi[100][1]))
+for tol in (0.1, 0.01, 0.001):
+    b = next(row for row in hist_batch if row[1] >= best - tol)
+    s = next(row for row in hist_svi if row[1] >= best - tol)
+    print('within %g of the batch optimum: batch %g passes (%.3f s), SVI %.2f passes (%.4f s)' % (tol, b[0], b[2], s[0], s[2]))
+print('smallest gap: batch %.1e after 12 passes, SVI %.1e over 2 passes' % (best - hist_batch[12][1], min(best - row[1] for row in hist_svi)))
+# ELBO per point: batch after 30 passes -4.7142, SVI after 2 passes -4.7143
+# after one pass: batch -5.661, SVI -4.7145
+# within 0.1 of the batch optimum: batch 4 passes (0.082 s), SVI 0.01 passes (0.0007 s)
+# within 0.01 of the batch optimum: batch 5 passes (0.101 s), SVI 0.02 passes (0.0014 s)
+# within 0.001 of the batch optimum: batch 6 passes (0.119 s), SVI 0.08 passes (0.0056 s)
+# smallest gap: batch 2.1e-06 after 12 passes, SVI 5.4e-05 over 2 passes
+```
+
+## Next
+
+SVI made variational inference cheap per step, but it still needs a model in which the complete conditional of every variable is in a known exponential family: only then is the natural gradient $\bar\eta - \lambda$ available in closed form. Bayesian logistic regression already breaks this, and a model with a neural network inside breaks it everywhere. The [next note](/notes/bayesian-methods/black-box-variational-inference) estimates the gradient of the ELBO by Monte Carlo for any model whose log joint density can be evaluated, with the score-function and the reparameterization estimators, and arrives at the variational autoencoder.
+
+## References
+
+- M. D. Hoffman, D. M. Blei, C. Wang, J. Paisley. [Stochastic variational inference](https://jmlr.org/papers/v14/hoffman13a.html). *Journal of Machine Learning Research*, 14:1303–1347, 2013. Section 2.3 (the natural gradient, equations 14 and 22), section 2.4 (the noisy natural gradient, Figure 4, the schedule of equation 28), section 4 (LDA and HDP on large corpora).
+- M. D. Hoffman, D. M. Blei, F. Bach. [Online learning for latent Dirichlet allocation](https://papers.nips.cc/paper/2010/hash/71f6278d140af599e06ad9bf1ba03cb0-Abstract.html). NeurIPS, 2010.
+- D. M. Blei, A. Kucukelbir, J. D. McAuliffe. [Variational inference: a review for statisticians](https://arxiv.org/abs/1601.00670). *Journal of the American Statistical Association*, 112(518):859–877, 2017. Section 3 (the Bayesian mixture of Gaussians), section 4.3 (stochastic variational inference).
+- M.-A. Sato. [Online model selection based on the variational Bayes](https://doi.org/10.1162/089976601750265045). *Neural Computation*, 13(7):1649–1681, 2001.
+- S. Amari. [Natural gradient works efficiently in learning](https://doi.org/10.1162/089976698300017746). *Neural Computation*, 10(2):251–276, 1998.
+- H. Robbins, S. Monro. [A stochastic approximation method](https://doi.org/10.1214/aoms/1177729586). *Annals of Mathematical Statistics*, 22(3):400–407, 1951.
+- C. M. Bishop. [*Pattern Recognition and Machine Learning*](https://www.microsoft.com/en-us/research/publication/pattern-recognition-machine-learning/). Springer, 2006. Section 10.2 (variational mixture of Gaussians), section 10.4 (exponential-family distributions).
+- K. P. Murphy. [*Probabilistic Machine Learning: Advanced Topics*](https://probml.github.io/pml-book/book2.html). MIT Press, 2023. Chapter 10 (variational inference), including stochastic and natural-gradient variational inference.
+- D. Barber. [*Bayesian Reasoning and Machine Learning*](http://www.cs.ucl.ac.uk/staff/d.barber/brml/). Cambridge University Press, 2012. Chapter 28 (deterministic approximate inference).
+- Д. П. Ветров, Д. А. Кропотов. [Байесовские методы машинного обучения](http://www.machinelearning.ru/wiki/index.php?title=Байесовские_методы_машинного_обучения_(курс_лекций,_Д.П._Ветров,_Д.А._Кропотов)/2015), course of lectures, Moscow State University, 2015. Lecture 12 (stochastic variational inference) and lecture 13 (variational inference for large data).
