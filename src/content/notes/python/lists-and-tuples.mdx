@@ -1,0 +1,453 @@
+---
+title: Lists and tuples
+description: "A list as a dynamic array of references and why append costs constant time on average, indexing, slicing, shallow and deep copies, the cost of the front of a list and collections.deque, tuples as fixed records, and stable sorting with key functions."
+course: python
+section: Data Structures
+order: 5
+status: published
+tags: [python, list, tuple, dynamic-array, amortized-analysis, slicing, shallow-copy, deep-copy, deque, namedtuple, sorting, timsort]
+prerequisites: ["Values, types and names", Control flow, Functions]
+---
+
+import ListLayout from '../../../components/figures/lists-and-tuples/ListLayout.astro';
+import ListGrowth from '../../../components/figures/lists-and-tuples/ListGrowth.astro';
+import SharedRows from '../../../components/figures/lists-and-tuples/SharedRows.astro';
+import FrontCost from '../../../components/figures/lists-and-tuples/FrontCost.astro';
+
+The [previous note](/notes/python/strings-and-text) treated a string as a sequence of characters that never changes. Most programs also need a sequence that does change: the measurements read so far, the words of a document, the losses of a training run, one appended per step. Python's answer is the **list**, and its fixed-size relative, the **tuple**. Both have been used since the [values note](/notes/python/values-and-names), which showed that a name refers to an object and that assignment copies nothing. This note opens the list object itself. It asks what a list is in memory, why adding to its end is cheap and adding to its front is not, what a copy of a list copies, when to use a tuple instead, and how `sorted` puts a list in order.
+
+**Notation.** $n$ is the length of a list, `len(xs)`. A cost written $O(1)$ ("constant") does not grow with $n$; $O(n)$ ("linear") grows in proportion to $n$: twice the items, about twice the time. **Amortized** $O(1)$ means that one operation may occasionally cost more, but a long run of $m$ operations costs $O(m)$ in total, so the average per operation is constant.
+
+## Baseline: a block of fixed size
+
+The simplest way to store a sequence is a block of memory with room for a fixed number of items, the array of C ([C for systems programming](/notes/acos/c-for-systems-programming#pointers-and-arrays)). Item $i$ sits at a known offset from the start, so reading it is one address computation. The trouble is the size. A block that is full cannot take another item; the program must allocate a larger block and copy everything over.
+
+Suppose it grows the block by exactly one slot each time. Adding the $k$-th item then copies the $k - 1$ items already stored, and building a list of $n$ items copies
+
+$$
+0 + 1 + 2 + \dots + (n-1) = \frac{n(n-1)}{2}
+$$
+
+items in all. For $n = 10^6$ that is about $5 \cdot 10^{11}$ copies, minutes of work to collect a million numbers. A list must grow without paying this.
+
+## What a list is: an array of references
+
+<aside class="callout"><strong>Key idea.</strong> A list is a **dynamic array of references**. The list object holds its length, its capacity and a pointer to a separate array of slots; each slot holds a reference to an object stored elsewhere. Reading or replacing `xs[i]` computes the address of one slot, so it costs $O(1)$. When the array is full, `append` allocates a larger one, larger by a constant factor rather than by one slot, and that makes appending $O(1)$ amortized. Anything that shifts the slots, an insertion or deletion before the end, costs $O(n)$, and copying a list copies the references, never the objects.</aside>
+
+**The rule.** In CPython a list object has three fields besides the object header: `ob_size`, the length; `allocated`, the capacity, the number of slots in its array; and `ob_item`, a pointer to that array ([CPython source, `Include/cpython/listobject.h`](#references)). A slot is a pointer, 8 bytes on a 64-bit machine, whatever object it refers to. `sys.getsizeof` reports the list object plus its slot array, and nothing that the slots refer to:
+
+```text
+>>> import sys
+>>> sys.getsizeof([])
+56
+>>> xs = []
+>>> for v in (10, 20, 30, 40, 50):
+...     xs.append(v)
+...     print(len(xs), sys.getsizeof(xs))
+...
+1 88
+2 88
+3 88
+4 88
+5 120
+>>> sys.getsizeof([10**100] * 3) == sys.getsizeof([0] * 3)
+True
+```
+
+The empty list takes 56 bytes, all header. The first `append` raises the size by 32 bytes, four slots of 8, although the list holds one item: the list **over-allocates**. Appends 2 to 4 cost no memory at all, and the fifth adds 32 bytes more, for a capacity of 8. The last line shows that the size of the elements does not enter: a 101-digit integer and a 0 each take one 8-byte slot in the list.
+
+<ListLayout />
+
+1. `xs = []` creates a list object with length 0, capacity 0 and no array.
+2. The first `append` finds no room. It allocates an array of 4 slots and stores in slot 0 a reference to the object `10`.
+3. The next three appends write into the spare slots. No memory is allocated and nothing moves.
+4. The fifth append finds the array full. CPython asks for an array of 8 slots, copies the 4 references into it, frees the old array and stores the reference to `50` in slot 4. The `int` objects themselves stay where they are.
+5. `xs[4]` computes the address `ob_item + 8 × 4` and reads the reference there. No search and no loop are involved, which is why indexing costs $O(1)$ at any length.
+
+One detail of step 4: CPython grows the array with `realloc` ([Dynamic memory allocation and strings](/notes/acos/memory-allocation#the-contract-of-malloc-and-free)), which may extend the block where it lies when the memory after it is free, so the copy does not always happen. Small arrays come from CPython's own allocator for blocks of up to 512 bytes, larger ones from the C library's `malloc` ([High-level languages and the operating system](/notes/acos/language-runtimes#memory-reference-counting-and-a-cycle-collector)). The analysis below counts it as if it always did, which gives an upper bound.
+
+## Why `append` is cheap on average
+
+`list_resize` in `Objects/listobject.c` chooses the new capacity when a list of length $n - 1$ needs room for $n$ items ([CPython source](#references)):
+
+$$
+\text{new capacity} = \Big(n + \big\lfloor n/8 \big\rfloor + 6\Big) \text{ rounded down to a multiple of } 4.
+$$
+
+Applied from an empty list, it gives the capacities 4, 8, 16, 24, 32, 40, 52, 64, 76, 92, … The left panel of the figure checks the rule against measurement: reading the capacity as `(sys.getsizeof(xs) - 56) // 8` after each append, all 13 changes up to 148 slots fall exactly on it.
+
+<ListGrowth />
+
+**The cost, step by step.** Let $c_1 < c_2 < \dots$ be the capacities the list passes through. We count the references copied by resizes during $n$ appends.
+
+1. A resize happens when the list is full, at length $c_k$, and the next append arrives. It copies the $c_k$ references already stored, at most.
+2. Each capacity is more than $9/8$ of the previous one. The resize at $c_k$ asks for room for $n = c_k + 1$ items, the rule gives $n + \lfloor n/8 \rfloor + 6$ slots, and the rounding down removes at most 3, which leaves more than $c_k + c_k/8$. Over every resize up to $10^6$ items the smallest ratio is 1.125005, just above $9/8$. So, counting back from the last resize $K$ before $n$,
+
+   $$
+   c_{K-j} \le \left(\tfrac{8}{9}\right)^{j} c_K .
+   $$
+
+3. The resizes during $n$ appends copy, in total,
+
+   $$
+   \sum_{k=1}^{K} c_k \;\le\; c_K \sum_{j=0}^{\infty} \left(\tfrac{8}{9}\right)^{j} \;=\; c_K \cdot \frac{1}{1 - 8/9} \;=\; 9\,c_K \;<\; 9n,
+   $$
+
+   the middle step being the sum of a geometric series, and the last because the resize at $c_K$ happened before the $n$-th append, so $c_K < n$.
+4. Each append also writes one reference into its slot. Together, $n$ appends cost fewer than $9n + n = 10n$ reference writes:
+
+   $$
+   \boxed{\;\text{cost of } n \text{ appends} < 10\,n \quad\Longrightarrow\quad O(1) \text{ amortized per append}\;}
+   $$
+
+
+The right panel counts the copies exactly: after $10^6$ appends the resizes have copied 8,445,096 references, 8.45 per append, and the running ratio stays below 9 as step 3 requires. Against the baseline that grows by one slot, the work falls from $5 \cdot 10^{11}$ copies to under $10^7$.
+
+**Why $9/8$ and not 2.** Any constant factor $r > 1$ gives the same argument, with $r/(r-1)$ in place of 9: doubling copies at most $2n$ references. A larger factor copies less and wastes more memory, since just after a resize up to a fraction $1 - 1/r$ of the slots are empty: half of them for doubling, about one in nine for CPython. CPython chose memory. Other languages choose differently; Java's `ArrayList`, for one, grows by half.
+
+**The mistake.** Building a list by `xs = xs + [v]` in a loop throws all of this away. `+` creates a new list each time and copies every reference into it, the baseline's $n(n-1)/2$ again. Use `xs.append(v)` or `xs += [v]`, which extends the list in place, or build the list in one step with a comprehension ([iteration note](/notes/python/iteration-and-generators)).
+
+## Indexing and slicing
+
+**The rule.** For a list of length $n$, `xs[i]` with $0 \le i < n$ is the item at position $i$, and a negative index counts from the end: `xs[-1]` is `xs[n - 1]`. Any other index raises `IndexError`. A **slice** `xs[start:stop:step]` builds a new list from the positions `start`, `start + step`, … that come before `stop`; omitted bounds mean "from the start" and "to the end", and bounds outside the list are clipped rather than reported.
+
+```text
+>>> xs = ['a', 'b', 'c', 'd', 'e']
+>>> xs[0], xs[-1]
+('a', 'e')
+>>> xs[1:4]
+['b', 'c', 'd']
+>>> xs[::2]
+['a', 'c', 'e']
+>>> xs[::-1]
+['e', 'd', 'c', 'b', 'a']
+>>> xs[3:100]
+['d', 'e']
+>>> xs[5]
+Traceback (most recent call last):
+  ...
+IndexError: list index out of range
+>>> xs[1:3] = ['X']
+>>> xs
+['a', 'X', 'd', 'e']
+```
+
+The stop position is excluded, as in `range`, so `xs[:k]` and `xs[k:]` split a list into two parts with no item lost or repeated, and `xs[1:4]` has $4 - 1 = 3$ items. Indexing costs $O(1)$; a slice of $k$ items costs $O(k)$, because it builds a new list and copies $k$ references into it. Assigning to a slice replaces those positions with the items on the right, and the list can grow or shrink: above, two items became one, and the items after them moved left.
+
+## Copying: shallow and deep
+
+Assignment copies nothing, as the [values note](/notes/python/values-and-names#names-are-references-and-assignment-copies-nothing) established. When a copy is wanted, there are two kinds.
+
+**The rule.** A **shallow copy**, `xs.copy()`, `list(xs)`, `xs[:]` or `copy.copy(xs)`, is a new list object whose slots hold the same references as the original: new container, same elements. A **deep copy**, `copy.deepcopy(xs)`, copies the container and, recursively, every mutable object inside it; it keeps a table of objects already copied, so an object shared twice in the original is shared twice in the copy, and a list that contains itself does not send it into an endless loop ([Python documentation, `copy`](#references)).
+
+```text
+>>> import copy
+>>> rows = [[1, 2], [3, 4]]
+>>> shallow = rows.copy()
+>>> deep = copy.deepcopy(rows)
+>>> shallow is rows, shallow[0] is rows[0], deep[0] is rows[0]
+(False, True, False)
+>>> rows[0].append(99)
+>>> shallow
+[[1, 2, 99], [3, 4]]
+>>> deep
+[[1, 2], [3, 4]]
+```
+
+The shallow copy is a different list, but its first slot refers to the same inner list as `rows[0]`, so a change made through `rows` shows in `shallow`. Changing which object a slot refers to is another matter: `rows[0] = [7]` rebinds a slot of `rows` and leaves `shallow` alone. For a list of numbers or strings, which are immutable, a shallow copy is as good as a deep one, since nothing reachable from it can change.
+
+**The repeated row.** The trap `[[0] * 3] * 3`, met in the [values note](/notes/python/values-and-names#aliasing-surprises), is the same mechanism in another operation. `*` on a list builds a list whose slots repeat the references of the operand, exactly as a shallow copy does. `[0] * 3` repeats a reference to the immutable `0`, which is harmless. `[row] * 3` repeats a reference to one mutable list three times:
+
+```text
+>>> grid = [[0] * 3] * 3
+>>> grid[0][0] = 1
+>>> grid
+[[1, 0, 0], [1, 0, 0], [1, 0, 0]]
+>>> grid[0] is grid[1]
+True
+>>> grid = [[0] * 3 for _ in range(3)]
+>>> grid[0][0] = 1
+>>> grid
+[[1, 0, 0], [0, 0, 0], [0, 0, 0]]
+```
+
+<SharedRows />
+
+**How to recognize it.** A change made in one place appears in several. Test the suspects with `is`: two rows, or a row and its copy, for which `is` answers `True` are one object. The cure is to create each inner object separately, as the comprehension does, or with `copy.deepcopy`. For grids of numbers the right tool is a NumPy array, which stores the numbers themselves in one block instead of references to separate objects ([NumPy arrays](/notes/python/numpy-arrays)).
+
+## Inserting and deleting at the front
+
+**The rule.** The slots of a list are contiguous and in order, so an insertion or deletion at position $i$ must move every slot after $i$. `xs.insert(i, x)` and `del xs[i]` or `xs.pop(i)` cost $O(n - i)$: $O(n)$ at the front, $O(1)$ at the end. `x in xs`, `xs.index(x)` and `xs.remove(x)` compare against the items one by one and also cost $O(n)$.
+
+```text
+>>> xs = [1, 2, 3]
+>>> xs.insert(0, 0)
+>>> xs
+[0, 1, 2, 3]
+>>> xs.pop(0), xs
+(0, [1, 2, 3])
+```
+
+The two calls each moved three references, one slot to the right and then back. For three items it does not matter; for a million it does. The figure measures one insertion and one removal at the front against the same pair at the end:
+
+<FrontCost />
+
+At $n = 10^6$ the front costs 211 μs per operation and the end 16 ns, a factor of over ten thousand, and the front's cost grows in step with $n$: about 0.2 ns per 8-byte reference moved, the cost of the `memmove` that shifts the slots.
+
+**`collections.deque`.** When items are added or removed at both ends, as in a queue, use `collections.deque` ("deck", double-ended queue). CPython builds it as a doubly linked list of blocks of 64 references each ([CPython source, `Modules/_collectionsmodule.c`](#references)): adding at either end writes into the end block or links a new one, and nothing moves. `append`, `appendleft`, `pop` and `popleft` are $O(1)$; the price is that `d[i]` in the middle has to walk the blocks and costs $O(n)$. With `maxlen` a deque keeps only the most recent items, discarding from the other end:
+
+```text
+>>> from collections import deque
+>>> d = deque([1, 2, 3], maxlen=3)
+>>> d.appendleft(0)
+>>> d
+deque([0, 1, 2], maxlen=3)
+>>> d.append(4)
+>>> d
+deque([1, 2, 4], maxlen=3)
+```
+
+Breadth-first search keeps its frontier in a deque, taking from the left and adding on the right ([Search and planning](/notes/agents/search-and-planning#baseline-breadth-first-search)), and a bounded deque is a common way to keep the last $k$ losses or rewards of a training loop for a running average.
+
+## Tuples
+
+**The rule.** A **tuple** is an immutable sequence. It is indexed and sliced like a list, but once created it cannot gain, lose or replace an item, and it has no `append` or `sort`. The comma makes a tuple, not the parentheses: `3, 4` is a tuple, `(1)` is the integer 1, and a one-item tuple needs a trailing comma, `(1,)`.
+
+```text
+>>> point = 3, 4
+>>> point
+(3, 4)
+>>> point[0] = 5
+Traceback (most recent call last):
+  ...
+TypeError: 'tuple' object does not support item assignment
+>>> (1), (1,)
+(1, (1,))
+>>> import sys
+>>> sys.getsizeof(()), sys.getsizeof((1, 2, 3)), sys.getsizeof([1, 2, 3])
+(48, 72, 88)
+```
+
+**Why it exists.** Because its length never changes, a tuple stores its references inside the object itself, with no separate array and no spare slots: $48 + 8 \cdot 3 = 72$ bytes for three items against 88 for the list (whose literal was given one spare slot). Because its contents never change, a tuple whose items are all hashable is itself hashable and can be a dictionary key or a set member, which a list cannot; the [next note](/notes/python/dicts-and-sets) explains why. CPython 3.14 stores the hash inside the tuple once computed, which is where 8 of the 48 bytes go ([CPython source, `Include/cpython/tupleobject.h`](#references)). As the values note showed, immutability is shallow: a tuple that holds a list cannot swap that list for another, but the list itself can change, and such a tuple is not hashable.
+
+**Packing and unpacking.** A comma-separated expression **packs** values into a tuple; a comma-separated target **unpacks** any iterable into names, position by position. A starred name collects whatever is left into a list:
+
+```text
+>>> x, y = point
+>>> x, y
+(3, 4)
+>>> a, b = 1, 2
+>>> a, b = b, a
+>>> a, b
+(2, 1)
+>>> first, *rest = [1, 2, 3, 4]
+>>> first, rest
+(1, [2, 3, 4])
+>>> x, y = (1, 2, 3)
+Traceback (most recent call last):
+  ...
+ValueError: too many values to unpack (expected 2, got 3)
+```
+
+`a, b = b, a` swaps two names with no temporary: the right side is evaluated completely, to the objects that `b` and `a` refer to, before either name is rebound. The same unpacking happens in `for i, word in enumerate(words)`, where each item is a pair, and in `return mean, std` from a function, which returns one tuple that the caller unpacks.
+
+**Tuples as records.** A tuple of fixed length whose positions mean something, (name, score) or (x, y), is a record. `collections.namedtuple` gives the positions names, at no cost in memory, since a namedtuple is still a tuple:
+
+```text
+>>> from collections import namedtuple
+>>> Point = namedtuple('Point', ['x', 'y'])
+>>> p = Point(3, 4)
+>>> p
+Point(x=3, y=4)
+>>> p.x, p[1]
+(3, 4)
+>>> p._replace(x=5)
+Point(x=5, y=4)
+>>> p.x = 5
+Traceback (most recent call last):
+  ...
+AttributeError: can't set attribute
+```
+
+`_replace` returns a new record with one field changed, the usual way to "modify" an immutable object. `typing.NamedTuple` declares the same thing with class syntax and type hints, and a dataclass, in the [classes note](/notes/python/classes-and-objects), is the mutable alternative. The machine-learning code of the later courses is full of tuples: the shape of a NumPy array or a PyTorch tensor, `x.shape`, is a tuple such as `(64, 3, 32, 32)`, and a `Dataset` returns each example as an (input, label) pair that the training loop unpacks.
+
+## Sorting
+
+**The rule.** `sorted(iterable)` returns a new sorted list and leaves its argument alone; `xs.sort()` sorts the list in place and returns `None`. Both accept `key`, a function called once per item whose results are compared instead of the items, and `reverse=True`. Both are **stable**: items whose keys are equal keep their original order.
+
+```text
+>>> words = ['pear', 'fig', 'apple', 'kiwi', 'banana']
+>>> sorted(words)
+['apple', 'banana', 'fig', 'kiwi', 'pear']
+>>> sorted(words, key=len)
+['fig', 'pear', 'kiwi', 'apple', 'banana']
+>>> scores = [('cid', 90), ('bob', 85), ('ann', 90), ('dan', 85)]
+>>> sorted(scores, key=lambda r: r[1], reverse=True)
+[('cid', 90), ('ann', 90), ('bob', 85), ('dan', 85)]
+>>> sorted(scores, key=lambda r: (-r[1], r[0]))
+[('ann', 90), ('cid', 90), ('bob', 85), ('dan', 85)]
+```
+
+Sorted by length, `'pear'` stays before `'kiwi'`: both have length 4, and stability keeps them in input order. In the scores, `'cid'` stays before `'ann'` for the same reason. The last line sorts by a tuple key: tuples compare position by position, so the key orders by score descending (through the minus sign) and breaks ties by name. Stability also allows sorting in passes: sort by the secondary key first, then by the primary key, and the secondary order survives within each group.
+
+**Two mistakes.** `xs = xs.sort()` binds `xs` to `None`, because `sort` returns `None`, a deliberate signal that the list was changed in place. And items that cannot be compared with `<` cannot be sorted: `sorted([3, 'a', 1])` raises `TypeError: '<' not supported between instances of 'str' and 'int'`.
+
+**The algorithm.** CPython sorts with **Timsort**, written by Tim Peters in 2002 ([`Objects/listsort.txt`](#references)). It walks the list looking for **runs**, stretches that are already ascending or strictly descending (the latter are reversed in place), extends short runs to a minimum length with binary insertion sort, and merges the runs, switching to a galloping search when one run keeps winning. Since Python 3.11 the order in which runs are merged follows the **powersort** policy of Munro and Wild, which is provably close to optimal for any pattern of run lengths; run detection, insertion and galloping are unchanged ([Munro and Wild, 2018](#references); `listsort.txt` in 3.11 against 3.10). In the worst case Timsort makes $O(n \log n)$ comparisons, and on input that is already in order it makes $n - 1$. Counting the calls to `__lt__` on 1000 items (the Code section):
+
+| Input | Comparisons |
+| --- | --- |
+| already sorted | 999 |
+| two ascending runs: the even numbers, then the odd | 1999 |
+| random order | 8667 |
+
+For random input no comparison sort can do better on average than $\log_2(1000!) \approx 8529$ comparisons, since each comparison at best halves the $1000!$ possible orders; Timsort's 8667 is within 2% of that. Real data is often partly ordered, a log sorted by time with a few late entries, and there Timsort does far less work.
+
+**Where the ML courses use it.** Ranking metrics sort predictions by score ([classification metrics](/notes/ml/classification-metrics) for ROC curves), and nearest-neighbour methods sort distances; for large arrays the work moves to `np.sort` and `np.argsort`, which sort numbers without calling Python code per comparison.
+
+<aside class="callout"><strong>Check yourself.</strong> (1) By the growth rule, what is the capacity of a list after 9 appends to an empty list, and what does `sys.getsizeof` report? (2) A loop does `result = result + [x]` for 100,000 items. Roughly how many references does it copy, and what one-character change makes it linear? (3) After `a = [[1], [2]]; b = a[:]; b[0] = [9]; b[1].append(3)`, what is `a`? (4) A program keeps the last 100 losses with `losses.append(l)` followed by `losses.pop(0)` once the list is full. What does each step cost, and what should it use? (5) Why can `(1, 2)` be a dictionary key and `(1, [2])` not?<details><summary>Answers</summary>(1) The 9th append finds capacity 8 full and asks for $9 + 1 + 6 = 16$, already a multiple of 4: capacity 16, and $56 + 8 \cdot 16 = 184$ bytes. (2) Each `+` copies the whole list built so far, about $n^2/2 = 5 \cdot 10^9$ references in all. `result += [x]` extends in place, amortized $O(1)$ per item. (3) `[[1], [2, 3]]`. The slice is a shallow copy: `b[0] = [9]` rebinds a slot of `b` only, but `b[1]` is the same list as `a[1]`. (4) `pop(0)` moves 99 references every step, $O(n)$ for a window of $n$; a `deque(maxlen=100)` discards the oldest item in $O(1)$ with a plain `append`. (5) A key must be hashable, and a tuple is hashable only if all its items are. The list inside `(1, [2])` can change, so its hash could change too, and the dictionary could no longer find it; the next note gives the details.</details></aside>
+
+## What changed
+
+| | Fixed block, grown by one (the baseline) | `list` | `tuple` | `collections.deque` |
+| --- | --- | --- | --- | --- |
+| Index `xs[i]` | $O(1)$ | $O(1)$ | $O(1)$ | $O(1)$ at the ends, $O(n)$ in the middle |
+| Add at the end | $O(n)$, every time | $O(1)$ amortized, capacity grows by about 9/8 | impossible: immutable | $O(1)$ |
+| Add or remove at the front | $O(n)$ | $O(n)$ | impossible | $O(1)$ |
+| Spare memory | none | up to about one slot in nine, plus a few | none | part of one block at each end |
+| Hashable | no | no | yes, if its items are | no |
+
+## Limitations
+
+- **CPython's numbers.** The growth rule, the 56-byte header and the deque's block size are details of CPython 3.14 on a 64-bit build, not of the language. The free-threaded build allocates a new array on every resize instead of calling `realloc`, so that other threads can keep reading the old one ([CPython source](#references)).
+- **`sys.getsizeof` is shallow.** It counts the list and its slots, not the objects the slots refer to. The memory of a list of a million integers is about 8 MB of slots plus 28 to 32 bytes per distinct `int` object; the [iteration note](/notes/python/iteration-and-generators) measures the total with `tracemalloc`.
+- **Timings are one machine's.** The figures and the Code section measure an Apple M1 with CPython 3.14.7; the shape of the curves, linear against flat, carries over, and the nanoseconds do not.
+- **Not covered.** `array.array`, a compact array of machine numbers in the standard library, `heapq` for priority queues, and `bisect` for binary search in a sorted list.
+
+## What you should remember
+
+- A list is a dynamic array of references: a header with length, capacity and a pointer to the slots. Indexing and replacing an item cost $O(1)$.
+- `append` is $O(1)$ amortized because the capacity grows by a constant factor, about 9/8 in CPython: $n$ appends copy fewer than $9n$ references in all.
+- Inserting or deleting before the end shifts the slots after it and costs $O(n)$; for a queue use `collections.deque`.
+- Slices, `list(xs)`, `xs.copy()` and `*` copy references, not objects: shallow. `copy.deepcopy` copies everything mutable inside. `[[0] * 3] * 3` has one row, three times.
+- A tuple is a fixed, immutable sequence: smaller than a list, hashable when its items are, and the natural form of a record. Unpacking with commas and `*` works on any iterable.
+- `sorted` returns a new list, `list.sort` sorts in place and returns `None`; both take a `key` and are stable. CPython's Timsort, with the powersort merge policy since 3.11, exploits runs that are already ordered.
+
+## Code
+
+The script measures each claim in turn: the capacities from `sys.getsizeof` and the growth rule that reproduces them, the references copied by a million appends, shallow and deep copies and the repeated row, the cost of the front of a list against a deque, tuples and a namedtuple, and the comparisons Timsort makes. It needs only the standard library; run it with `python -I lists.py`. It takes under a second. Sizes are those of a 64-bit build, and the timings vary from machine to machine.
+
+```python
+"""Lists, tuples and deques: growth, copying and the cost of each operation (Python 3.14)."""
+import copy
+import random
+import sys
+import timeit
+from collections import deque, namedtuple
+
+# 1. A list over-allocates: read its capacity from sys.getsizeof (8 bytes per slot)
+EMPTY = sys.getsizeof([])
+def capacity(xs):
+    return (sys.getsizeof(xs) - EMPTY) // 8
+
+xs, caps = [], [0]
+for i in range(130):
+    xs.append(i)
+    if capacity(xs) != caps[-1]:
+        caps.append(capacity(xs))
+print("empty list:", EMPTY, "bytes; capacities:", caps)
+
+# 2. The growth rule of Objects/listobject.c reproduces every capacity
+def grow(newsize, oldsize):
+    new = (newsize + (newsize >> 3) + 6) & ~3
+    if newsize - oldsize > new - newsize:      # a big jump: no spare room
+        new = (newsize + 3) & ~3
+    return new
+
+model, cap = [0], 0
+for n in range(1, 131):
+    if n > cap:
+        cap = grow(n, n - 1)
+        model.append(cap)
+print("rule matches:", model == caps)
+
+# 3. Amortized cost: references copied by all resizes, if every resize moved the array
+cap = copies = 0
+for n in range(1, 10**6 + 1):
+    if n > cap:
+        copies += n - 1
+        cap = grow(n, n - 1)
+print(f"copies for 10**6 appends: {copies}, per append {copies / 10**6:.2f}")
+
+# 4. Copies are shallow unless you ask for deep; * repeats references
+rows = [[1, 2], [3, 4]]
+shallow, deep = rows.copy(), copy.deepcopy(rows)
+rows[0].append(99)
+print("shallow:", shallow, " deep:", deep)
+grid = [[0] * 3] * 3
+grid[0][0] = 1
+print("[[0] * 3] * 3:", grid, grid[0] is grid[2])
+
+# 5. The front of a list costs O(n); a deque's does not
+n, k = 100_000, 2000
+xs, d = list(range(n)), deque(range(n))
+def front():
+    for _ in range(k): xs.insert(0, None); xs.pop(0)
+def back():
+    for _ in range(k): xs.append(None); xs.pop()
+def dq():
+    for _ in range(k): d.appendleft(None); d.popleft()
+for name, f in [("list insert(0)/pop(0)", front), ("list append/pop", back), ("deque appendleft/popleft", dq)]:
+    t = min(timeit.repeat(f, number=1, repeat=5)) / (2 * k) * 1e9
+    print(f"{name:26s} {t:9.1f} ns per operation at n = {n}")
+
+# 6. Tuples: fixed size, no spare slots, records with names
+Point = namedtuple("Point", ["x", "y"])
+p = Point(3, 4)
+x, y = p
+print(p, x + y, p._replace(x=5), sys.getsizeof((1, 2, 3)), sys.getsizeof([1, 2, 3]))
+
+# 7. Sorting is stable and adapts to order already in the data
+class Counted:
+    calls = 0
+    def __init__(self, v): self.v = v
+    def __lt__(self, other):
+        Counted.calls += 1
+        return self.v < other.v
+
+random.seed(0)
+for name, data in [("sorted", list(range(1000))), ("two-run", list(range(0, 1000, 2)) + list(range(1, 1000, 2))),
+                   ("random", random.sample(range(1000), 1000))]:
+    Counted.calls = 0
+    sorted(Counted(v) for v in data)
+    print(f"comparisons to sort 1000 {name} items: {Counted.calls}")
+scores = [("cid", 90), ("bob", 85), ("ann", 90), ("dan", 85)]
+print(sorted(scores, key=lambda r: r[1], reverse=True))
+
+# Output with CPython 3.14.7 on an Apple M1, macOS (arm64); sizes are those of a 64-bit build, timings vary:
+# empty list: 56 bytes; capacities: [0, 4, 8, 16, 24, 32, 40, 52, 64, 76, 92, 108, 128, 148]
+# rule matches: True
+# copies for 10**6 appends: 8445096, per append 8.45
+# shallow: [[1, 2, 99], [3, 4]]  deep: [[1, 2], [3, 4]]
+# [[0] * 3] * 3: [[1, 0, 0], [1, 0, 0], [1, 0, 0]] True
+# list insert(0)/pop(0)        18026.2 ns per operation at n = 100000
+# list append/pop                 14.4 ns per operation at n = 100000
+# deque appendleft/popleft        15.4 ns per operation at n = 100000
+# Point(x=3, y=4) 7 Point(x=5, y=4) 72 88
+# comparisons to sort 1000 sorted items: 999
+# comparisons to sort 1000 two-run items: 1999
+# comparisons to sort 1000 random items: 8667
+# [('cid', 90), ('ann', 90), ('bob', 85), ('dan', 85)]
+```
+
+## Next
+
+Every lookup in this note was by position. Finding an item by its value, `x in xs`, meant comparing against the items one by one, $O(n)$, and a program that asks "have I seen this word?" for every word of a corpus would spend its time searching. The [next note](/notes/python/dicts-and-sets) introduces the hash table behind `dict` and `set`, which finds an item by its value in $O(1)$ on average, and explains why that requires keys that are hashable and never change.
+
+## References
+
+- Python documentation (3.14): [Sequence types: list, tuple, range](https://docs.python.org/3.14/library/stdtypes.html#sequence-types-list-tuple-range) and [Sorting techniques](https://docs.python.org/3.14/howto/sorting.html) (key functions, stability); [`copy`](https://docs.python.org/3.14/library/copy.html); [`collections`](https://docs.python.org/3.14/library/collections.html) (`deque`, `namedtuple`); [`sys.getsizeof`](https://docs.python.org/3.14/library/sys.html#sys.getsizeof); [Time complexity](https://wiki.python.org/moin/TimeComplexity) on the Python wiki.
+- CPython source, tag v3.14.0: [`Objects/listobject.c`](https://github.com/python/cpython/blob/v3.14.0/Objects/listobject.c) (`list_resize`), [`Include/cpython/listobject.h`](https://github.com/python/cpython/blob/v3.14.0/Include/cpython/listobject.h), [`Include/cpython/tupleobject.h`](https://github.com/python/cpython/blob/v3.14.0/Include/cpython/tupleobject.h) (the cached hash), [`Modules/_collectionsmodule.c`](https://github.com/python/cpython/blob/v3.14.0/Modules/_collectionsmodule.c) (the deque's blocks of 64), [`Objects/listsort.txt`](https://github.com/python/cpython/blob/v3.14.0/Objects/listsort.txt) (Timsort and the powersort merge policy; compare the [3.10 version](https://github.com/python/cpython/blob/v3.10.0/Objects/listsort.txt)).
+- J. I. Munro, S. Wild. [Nearly-optimal mergesorts: fast, practical sorting methods that optimally adapt to existing runs](https://doi.org/10.4230/LIPIcs.ESA.2018.63). ESA 2018, LIPIcs 112.
+- L. Ramalho. *Fluent Python*, 2nd ed. O'Reilly, 2022. Ch. 2 (an array of sequences: list, tuple, slicing, `deque`) and ch. 6 (shallow and deep copies).
+- B. Slatkin. *Effective Python*, 3rd ed. Addison-Wesley, 2024. The items on unpacking, slicing and sorting with `key`.
+- T. H. Cormen, C. E. Leiserson, R. L. Rivest, C. Stein. *Introduction to Algorithms*, 4th ed. MIT Press, 2022. §16.4 (dynamic tables and amortized analysis), §8.1 (the lower bound for comparison sorting).

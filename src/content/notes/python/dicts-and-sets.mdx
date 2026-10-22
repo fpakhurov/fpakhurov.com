@@ -1,0 +1,391 @@
+---
+title: Dictionaries and sets
+description: "How dict and set find a key in constant time on average: hashing, open addressing with CPython's probe rule, the compact insertion-ordered layout, the load factor and resizing, why keys must be hashable and unchanging, the worst case, set algebra, Counter and defaultdict."
+course: python
+section: Data Structures
+order: 6
+status: published
+tags: [python, dict, set, hash-table, hashing, open-addressing, load-factor, hashable, counter, defaultdict]
+prerequisites: [Lists and tuples, Functions]
+---
+
+import DictLookup from '../../../components/figures/dicts-and-sets/DictLookup.astro';
+import DictGrowth from '../../../components/figures/dicts-and-sets/DictGrowth.astro';
+import DictWorstCase from '../../../components/figures/dicts-and-sets/DictWorstCase.astro';
+
+The [previous note](/notes/python/lists-and-tuples) ended on a limit of the list: it finds an item by position in constant time, but finding an item by its value, `x in xs`, compares against the items one by one. A word counter that asks "have I seen this word before?" for each of a million words would spend its life searching. This note introduces the data structure that answers such questions in constant time on average, the **hash table**, and its two faces in Python: the **dictionary**, `dict`, which maps keys to values, and the **set**, which holds keys alone. It shows how CPython lays a dictionary out in memory, how a key is found, when the table grows, why only some objects can be keys, and what happens when the averages fail.
+
+**Notation.** $n$ is the number of keys in a table and $m$ the number of slots in its index array, always a power of two in CPython. The **load factor** is $\alpha = n/m$, the fraction of slots in use. `hash(k)` is the hash of key `k`, an integer, and `&` is bitwise AND: for $m = 2^b$, `h & (m - 1)` keeps the lowest $b$ bits of `h`, which is `h % m` for $h \ge 0$.
+
+## Baseline: a list of pairs
+
+A dictionary could be a list of `(key, value)` pairs. Looking up a key means walking the list and comparing each key with `==` until one matches: $O(n)$ per lookup. On this machine (CPython 3.14.7, Apple M1), testing whether the last of $10^5$ integers is in a list takes about 790,000 ns; the same test on a set takes 34 ns, and it still takes 34 ns with $10^6$ items, where the list needs 8 ms. The rest of the note explains how the set avoids looking at the other items.
+
+## Hashing: from a key to a slot
+
+<aside class="callout"><strong>Key idea.</strong> A hash table turns the key itself into a position. A **hash function** maps the key to an integer, the low bits of the integer choose a slot, and the key is stored there, so a lookup computes the same slot and checks one or two candidates instead of all $n$. Two rules make it work: equal keys must have equal hashes, and a key's hash must never change while it is in the table. The table is kept at most two-thirds full, which bounds the expected number of slots examined by a constant, and it doubles or quadruples when full, which keeps insertion $O(1)$ amortized, as for the list.</aside>
+
+**The rule.** `hash(obj)` returns an integer such that `a == b` implies `hash(a) == hash(b)`. The reverse need not hold: different keys may share a hash, a **collision**. A key of a dictionary must be **hashable**: its type defines `__hash__`, and its hash stays the same for as long as it lives ([Python glossary, hashable](#references)).
+
+```text
+>>> hash(3), hash(-1), hash(2**61 - 1), hash(2**61)
+(3, -2, 0, 1)
+>>> hash(1) == hash(1.0) == hash(True)
+True
+>>> hash([1, 2])
+Traceback (most recent call last):
+  ...
+TypeError: unhashable type: 'list'
+>>> import sys
+>>> sys.hash_info.algorithm, sys.hash_info.modulus == 2**61 - 1
+('siphash13', True)
+```
+
+**Why these numbers.** An `int` hashes to its value modulo the prime $2^{61} - 1$, so small integers hash to themselves and $2^{61}$ hashes to 1; the one exception is $-1$, which hashes to $-2$ because $-1$ signals an error inside CPython's C code. A `float` or a `bool` equal to an integer hashes like that integer, which keeps the rule "equal implies equal hashes" across numeric types ([Python documentation, hashing of numeric types](#references)). Strings and bytes are hashed with SipHash, a keyed function: the default since Python 3.11 is the variant SipHash-1-3, and the key is chosen at random when the interpreter starts ([PEP 456](#references)). The same string therefore hashes differently in two runs of a program unless `PYTHONHASHSEED` fixes the key, and so does the iteration order of a set of strings. Lists are mutable, and their type sets `__hash__` to `None`.
+
+**From hash to slot.** With $m$ slots, the first slot tried for a key is `hash(key) & (m - 1)`. A new dictionary has $m = 8$, so the first slot is the low 3 bits of the hash:
+
+```text
+>>> d = {17: 'a', 3: 'b', 9: 'c'}
+>>> [(k, hash(k) & 7) for k in d]
+[(17, 1), (3, 3), (9, 1)]
+>>> d[9]
+'c'
+```
+
+Keys 17 and 9 both start at slot 1. The table must put one of them somewhere else, and the lookup of `d[9]` must find it there.
+
+## Open addressing: where a colliding key goes
+
+**The rule.** CPython resolves collisions by **open addressing**: every key lives in the table itself, and a key whose slot is taken tries other slots in a fixed order, its **probe sequence**, until it finds its own key (a lookup) or an empty slot (the key is absent, or an insertion can go there). For a table of $m$ slots and hash $h$, the sequence is ([CPython source, `Objects/dictobject.c`](#references)):
+
+$$
+\begin{aligned}
+j_0 &= h \mathbin{\&} (m-1), \qquad \text{perturb}_0 = h,\\
+\text{perturb}_{t+1} &= \text{perturb}_t \gg 5, \qquad j_{t+1} = (5\,j_t + 1 + \text{perturb}_{t+1}) \mathbin{\&} (m-1),
+\end{aligned}
+$$
+
+where $\gg 5$ shifts right by 5 bits. The recurrence $j \mapsto 5j + 1 \bmod m$ alone visits every slot of a power-of-two table exactly once before repeating, so an empty slot is always found. Adding `perturb` mixes the higher bits of the hash into the first few steps, so keys that agree in their low bits, such as multiples of 8, still take different paths. Once `perturb` reaches 0 the sequence is the plain recurrence.
+
+In a lookup, each slot visited is checked against the key in three steps of increasing cost: is it the very same object (`is`), is the stored hash equal, and only then is `stored == key`. Comparing hashes first skips most `__eq__` calls, which may be expensive for long strings or user classes.
+
+<DictLookup />
+
+1. `hash(9)` is 9.
+2. The table has 8 slots, so the first slot is $9 \mathbin{\&} 7 = 1$.
+3. Slot 1 refers to entry 0, whose stored hash is 17, not 9. The keys cannot be equal, and `__eq__` is not called: a collision.
+4. $\text{perturb} = 9 \gg 5 = 0$, so the next slot is $(5 \cdot 1 + 1 + 0) \mathbin{\&} 7 = 6$.
+5. Slot 6 refers to entry 2, with hash 9 and key 9, the same object. The lookup returns `'c'`.
+
+The insertion of 9 followed the same path and stopped at the first empty slot, 6. The index array drawn in the figure is not a reconstruction: reading the dictionary's memory with `ctypes` on CPython 3.14.7 gives exactly `[-1, 0, -1, 1, -1, -1, 2, -1]`, and the Code section replays the probe rule to the same result.
+
+## The compact, ordered layout
+
+The figure shows two arrays, not one. Since CPython 3.6 a dictionary keeps its entries, each a triple of hash, key and value (24 bytes), in a dense array in insertion order, and the hash table proper is a separate array of small integers, the **indices**, that hold entry numbers or $-1$ for empty ([CPython source](#references); the design was proposed by Raymond Hettinger in 2012). The indices are 1 byte each for tables of up to 128 slots, 2 bytes up to $2^{15}$, then 4 and 8.
+
+**Why two arrays.** Before 3.6 the table stored the 24-byte entries in the slots themselves, and at most two-thirds of the slots were in use, so a third of the memory was empty entries. In the compact layout only the 1-byte indices are sparse. For $m = 8$, the old layout took $8 \times 24 = 192$ bytes of table; the new one takes 8 bytes of indices plus 5 entries, $5 \times 24 = 120$, in all 128.
+
+**Order.** Iterating over a dictionary walks the entry array, so keys come out in the order they were first inserted. In CPython 3.6 that was an implementation detail; since Python 3.7 it is guaranteed by the language ([What's New in Python 3.7](#references)). Deleting a key empties its entry and marks its index slot as a **dummy**, not as empty, because a later lookup must keep probing past it; inserting the key again appends a new entry at the end:
+
+```text
+>>> d = {17: 'a', 3: 'b', 9: 'c'}
+>>> del d[3]
+>>> d[3] = 'b'
+>>> list(d)
+[17, 9, 3]
+```
+
+Updating the value of an existing key, `d[17] = 'z'`, keeps its position. Sets do not use this layout: a set stores its keys directly in a sparse table and promises no order.
+
+## The load factor and resizing
+
+**The rule.** A table of $m$ slots accepts at most $\lfloor 2m/3 \rfloor$ entries, a load factor of at most $2/3$. The insertion that finds no room replaces the table by one of $m'$ slots, the smallest power of two that is at least $3n$, where $n$ is the number of keys currently stored, and reinserts every key ([CPython source](#references): `USABLE_FRACTION` and `GROWTH_RATE`). Deleted entries are not counted, so a table full of dummies is rebuilt at its own size or smaller.
+
+Starting from 8 slots (5 usable), the sixth key asks for $3 \cdot 5 = 15$, so $m' = 16$, with 10 usable; the eleventh asks for 30, so 32, with 21 usable; then 64, 128, and so on. Measured with `sys.getsizeof`, the size changes at exactly 6, 11, 22, 43, 86, 171, 342, 683 and 1366 keys:
+
+<DictGrowth />
+
+The model in the caption reproduces every measured size to the byte. For 8 slots: $64 + 32 + 8 + 5 \cdot 24 = 224$. For 256 slots, whose indices need 2 bytes: $64 + 32 + 512 + 170 \cdot 24 = 4688$. A resize moves the table from $m$ to $2m$ (three times $2m/3$, rounded up to a power of two), so the amortized argument of the [lists note](/notes/python/lists-and-tuples#why-append-is-cheap-on-average) applies with factor 2: $n$ insertions reinsert fewer than $2n$ keys in all, $O(1)$ amortized each.
+
+**Why two-thirds.** The cap on $\alpha$ is what makes a lookup constant time on average. Assume that every probe lands on a slot chosen at random, independent of the others, an idealization of a good hash ([Cormen et al.](#references), §11.4).
+
+1. A probe hits an occupied slot with probability $\alpha$ and an empty one with probability $1 - \alpha$.
+2. A search for an absent key stops at the first empty slot. It takes exactly $t$ probes with probability $\alpha^{t-1}(1-\alpha)$: $t - 1$ occupied slots, then an empty one.
+3. The expected number of probes is the mean of this geometric distribution,
+
+   $$
+   \mathbb E[T] = \sum_{t \ge 1} t\,\alpha^{t-1}(1-\alpha) = \frac{1}{1-\alpha},
+   $$
+
+   using $\sum_{t \ge 1} t x^{t-1} = 1/(1-x)^2$ for $|x| \lt 1$.
+4. With $\alpha \le 2/3$:
+
+   $$
+   \boxed{\;\mathbb E[T] \le \frac{1}{1 - 2/3} = 3\;}
+   $$
+
+At most three probes on average, whatever $n$ is. A search for a present key stops earlier, at the key. The Code section checks the formula by simulation: 2.01, 2.99 and 9.99 probes at load factors 0.5, 2/3 and 0.9, against 2, 3 and 10. The last number shows why the cap is needed: as $\alpha \to 1$ the cost explodes. CPython's probe sequence is not random, but the `perturb` term makes it behave close enough for good hashes; for consecutive integers it does better, since they fill consecutive slots without any collision.
+
+## Why keys must be hashable and must not change
+
+The rule "equal keys have equal hashes, and a key's hash never changes" is a **contract** between a type and every hash table. Python cannot check it; a type that breaks it gets a dictionary that loses keys. The [data model note](/notes/python/the-data-model#equality-and-hashing-__eq__-and-__hash__) shows how a class defines `__eq__` and `__hash__`; three consequences matter here.
+
+**A key whose hash changes is lost.** The entry stays where the old hash put it, and a lookup with the new hash probes elsewhere:
+
+```text
+>>> class Key:
+...     def __init__(self, v): self.v = v
+...     def __eq__(self, other): return self.v == other.v
+...     def __hash__(self): return hash(self.v)
+...
+>>> k = Key(1)
+>>> d = {k: 'found'}
+>>> k.v = 2
+>>> k in d
+False
+>>> k in list(d)
+True
+>>> Key(1) in d
+False
+```
+
+`k in d` computes `hash(2)`, probes from slot 2, finds nothing and answers `False`, although the key is in the dictionary, as the linear search `k in list(d)` confirms. `Key(1) in d` probes the right slot but finds a stored key whose `v` is now 2, unequal. No lookup can ever reach that entry again. This is why the built-in mutable types, `list`, `dict` and `set`, are unhashable: the error at insertion is better than a key that silently disappears. A tuple is hashable only when everything in it is, and `frozenset` is the immutable, hashable set.
+
+**`__eq__` without `__hash__` makes a class unhashable.** By default, an object of a user class is equal only to itself and hashes by identity, which satisfies the contract. A class that defines `__eq__` and no `__hash__` gets `__hash__ = None`, because the default identity hash would break "equal implies equal hashes":
+
+```text
+>>> class P:
+...     def __init__(self, v): self.v = v
+...     def __eq__(self, other): return self.v == other.v
+...
+>>> P.__hash__ is None
+True
+>>> {P(1)}
+Traceback (most recent call last):
+  ...
+TypeError: cannot use 'P' as a set element (unhashable type: 'P')
+```
+
+**Equal keys are the same key.** Since `1 == 1.0 == True` and their hashes agree, they are one key, and the first one inserted keeps its place while the last value wins:
+
+```text
+>>> {1: 'a', True: 'b', 1.0: 'c'}
+{1: 'c'}
+```
+
+## Average against worst case
+
+Every constant above is an average over keys that hash well. Nothing stops all keys from sharing one hash; then every insertion probes past all earlier keys and calls `__eq__` on each, and a lookup is $O(n)$, building the table $O(n^2)$:
+
+<DictWorstCase />
+
+| Operation | Average | Worst case |
+| --- | --- | --- |
+| `d[k]`, `k in d`, `d[k] = v`, `del d[k]` | $O(1)$ | $O(n)$ |
+| building a dict of $n$ keys | $O(n)$ | $O(n^2)$ |
+| iteration, `d.copy()` | $O(n)$ | $O(n)$ |
+
+**Where the worst case comes from in practice.** A hand-written `__hash__` that returns a constant, or uses only a field that rarely varies, produces the red line. So could an attacker who sends a web server thousands of request parameters crafted to collide, making one request cost seconds of CPU time; this "hash flooding" attack is why string hashing has used a secret random key by default since Python 3.3 ([PEP 456](#references)). Integers keep their predictable hash because it is fast and collision-free for the common cases. A good `__hash__` combines the hashes of exactly the fields that `__eq__` compares, most easily as `hash((self.x, self.y))`.
+
+## Sets and set algebra
+
+**The rule.** A `set` is an unordered collection of distinct hashable objects, a hash table of keys without values. Membership, `add` and `discard` cost $O(1)$ on average. The operators of set algebra build new sets: `|` union, `&` intersection, `-` difference, `^` symmetric difference, and `<=` tests for a subset. `{}` is an empty dict; the empty set is `set()`.
+
+```text
+>>> a = {1, 2, 3, 4}
+>>> b = {3, 4, 5}
+>>> a | b, a & b, a - b, a ^ b
+({1, 2, 3, 4, 5}, {3, 4}, {1, 2}, {1, 2, 5})
+>>> {3, 4} <= a
+True
+>>> words = ['to', 'be', 'or', 'not', 'to', 'be']
+>>> len(set(words))
+4
+>>> list(dict.fromkeys(words))
+['to', 'be', 'or', 'not']
+```
+
+`a & b` loops over the smaller set and looks each element up in the larger, $O(\min(|a|, |b|))$. `set(words)` removes duplicates but forgets the order; `dict.fromkeys(words)` removes them and keeps the order of first appearance, since a dict is ordered.
+
+CPython's set is a separate implementation from the dict ([CPython source, `Objects/setobject.c`](#references)): its table is not compact, it probes up to 9 neighbouring slots before jumping with the `perturb` rule, which suits the cache, it resizes when 60% of the slots are used (counting dummies), and it grows to the smallest power of two above four times the number of keys (twice above 50,000). Measured with `sys.getsizeof`, a set of consecutive integers grows at 5, 19, 77, 307 and 1229 elements.
+
+## Counting and grouping: `Counter` and `defaultdict`
+
+Two patterns come up constantly: counting how often each key occurs, and collecting items into groups by key. Both work with a plain dict and `d.get(k, default)`, and the module `collections` has a type for each ([Python documentation, `collections`](#references)):
+
+```text
+>>> from collections import Counter, defaultdict
+>>> words = 'the cat sat on the mat the end'.split()
+>>> c = Counter(words)
+>>> c.most_common(2)
+[('the', 3), ('cat', 1)]
+>>> c['dog']
+0
+>>> counts = {}
+>>> for w in words:
+...     counts[w] = counts.get(w, 0) + 1
+...
+>>> counts == c
+True
+>>> by_len = defaultdict(list)
+>>> for w in words:
+...     by_len[len(w)].append(w)
+...
+>>> dict(by_len)
+{3: ['the', 'cat', 'sat', 'the', 'mat', 'the', 'end'], 2: ['on']}
+```
+
+A `Counter` is a dict subclass whose missing keys count 0 instead of raising `KeyError`; `most_common(k)` returns the $k$ largest counts, with ties in first-seen order. A `defaultdict(list)` calls `list()` to create the value of a key the first time it is used, so `by_len[3].append(w)` works without checking whether the group exists. The plain-dict alternative for grouping is `d.setdefault(k, []).append(w)`. Merging two dicts is `d1 | d2` (since Python 3.9, [PEP 584](#references)), the right side winning on shared keys.
+
+**The mistake.** `d[k]` for a missing key raises `KeyError`. Use `k in d` to test, `d.get(k)` for a value or `None`, or one of the two types above when a default makes sense. A `defaultdict` has the opposite trap: merely reading `by_len[7]` inserts the key 7 with an empty list.
+
+**Where the ML courses use it.** Every NLP pipeline starts with a dictionary: a vocabulary maps each token to an integer id and back, and a bag-of-words vector is a `Counter` of tokens ([Bag of words and TF-IDF](/notes/nlp/bag-of-words-and-tf-idf)). Results are collected in dicts of metrics, configurations are dicts of hyperparameters, and a PyTorch model's `state_dict()` is a dict from parameter names to tensors.
+
+<aside class="callout"><strong>Check yourself.</strong> (1) In a table of 8 slots, where does the key 25 go after `{17: 'a', 3: 'b', 9: 'c'}`? Follow the probe rule. (2) How many keys can a dict hold before it resizes to 64 slots, and what will `sys.getsizeof` report just after? (3) Why can a list not be a dictionary key, and what would you use as a key for a pair of coordinates? (4) A class defines `__eq__` comparing a `name` field and `__hash__` returning `id(self)`. What goes wrong? (5) What does `len({1, 1.0, True, '1'})` return, and why?<details><summary>Answers</summary>(1) $25 \mathbin{\&} 7 = 1$, taken by 17. $\text{perturb} = 25 \gg 5 = 0$, next $(5 + 1) \mathbin{\&} 7 = 6$, taken by 9. Then $(5 \cdot 6 + 1) \mathbin{\&} 7 = 31 \mathbin{\&} 7 = 7$: empty, so 25 goes to slot 7 as entry 3. (2) A 32-slot table holds 21 keys; the 22nd insertion resizes to 64 slots: $64 + 32 + 64 + 42 \cdot 24 = 1168$ bytes, as measured. (3) A list can change, and its hash would change with it, losing the key; lists are therefore unhashable. Use a tuple `(x, y)`. (4) Two equal objects get different hashes, breaking the contract: a lookup with an equal but different object probes elsewhere and misses, so `Person('ann') in {Person('ann')}` is `False`. Hash the name instead. (5) 2: `1`, `1.0` and `True` are equal with equal hashes, one key; `'1'` is a string, not equal to 1.</details></aside>
+
+## What changed
+
+| | List of pairs (the baseline) | `dict` | `set` |
+| --- | --- | --- | --- |
+| Find by key | $O(n)$ search with `==` | $O(1)$ average: hash, then about 1 to 3 probes | $O(1)$ average |
+| Insert | $O(1)$ append, but duplicates possible | $O(1)$ amortized, one entry per key | $O(1)$ amortized |
+| Order | insertion order | insertion order (guaranteed since 3.7) | none |
+| Keys must be | comparable with `==` | hashable, with a hash that never changes | hashable |
+| Memory | one tuple and one slot per pair | $m$ index bytes plus room for $2m/3$ entries of 24 bytes | $m$ slots of 16 bytes (hash and key), $m$ between about 1.7 and 8 times $n$ |
+| Worst case | $O(n)$ | $O(n)$ when keys collide | $O(n)$ |
+
+## Limitations
+
+- **CPython's implementation.** The probe rule, the 2/3 load factor, the compact layout and the set's linear probing are details of CPython 3.14 that other implementations need not share; the language guarantees only the behaviour: average constant-time operations, insertion order for `dict`, the hashing contract.
+- **Sizes and timings are one machine's.** The byte counts are those of a 64-bit build. The timings come from one Apple M1; the free-threaded build adds per-object locking and different timings.
+- **Not covered.** Split-table dictionaries that share keys between instances of one class (they reappear in the [classes note](/notes/python/classes-and-objects)), `types.MappingProxyType` for read-only views, `collections.OrderedDict` and `ChainMap`. Python 3.15, released in October 2026, adds a built-in immutable, hashable `frozendict` ([PEP 814](#references)).
+
+## What you should remember
+
+- A `dict` and a `set` are hash tables: the key's hash picks a slot, and a lookup examines only the slots on that key's probe sequence. Average cost $O(1)$, worst case $O(n)$.
+- CPython probes with $j \mapsto 5j + 1 + \text{perturb}$ and compares identity, then the stored hash, then `==`.
+- A dict is two arrays: sparse 1-byte indices and dense 24-byte entries in insertion order. Iteration follows insertion order, guaranteed since 3.7.
+- The table is at most 2/3 full, which bounds the expected probes for a missing key by $1/(1-\alpha) \le 3$; when full it is rebuilt with the smallest power of two at least $3n$, so insertion is $O(1)$ amortized.
+- Keys must be hashable, and equal keys must have equal hashes that never change. Mutable built-ins are unhashable; use tuples and frozensets. Defining `__eq__` alone makes a class unhashable.
+- Sets give $O(1)$ membership and set algebra; `Counter` counts, `defaultdict` groups, `dict.fromkeys` removes duplicates in order.
+
+## Code
+
+The script checks the note's claims in order: list against set membership, hashes of numbers, the index table of the figure built with CPython's probe rule, the growth of a dict against the size model, the expected probe count at three load factors by simulation, a key lost by mutation, the worst case with a constant hash, and sets, `Counter` and `defaultdict`. It needs only the standard library and runs in under a second with `python -I dicts.py`. The probe simulation uses a fixed seed; sizes are those of a 64-bit build, and timings vary.
+
+```python
+"""Dictionaries and sets: hashing, probing, growth and the cost of a lookup (Python 3.14)."""
+import random
+import sys
+import timeit
+from collections import Counter, defaultdict
+
+# 1. Baseline: membership in a list compares item by item; in a set it hashes
+n = 100_000
+xs = list(range(n)); s = set(xs); last = n - 1
+t_list = min(timeit.repeat(lambda: last in xs, number=20, repeat=5)) / 20 * 1e9
+t_set = min(timeit.repeat(lambda: last in s, number=20_000, repeat=5)) / 20_000 * 1e9
+print(f"'x in list': {t_list:,.0f} ns   'x in set': {t_set:.0f} ns   (n = {n:,})")
+
+# 2. Hashes: ints hash to themselves (mod 2**61 - 1); equal numbers hash equal; strings use SipHash
+print(hash(3), hash(-1), hash(2**61), hash(1) == hash(1.0) == hash(True), sys.hash_info.algorithm)
+
+# 3. The index table of {17: 'a', 3: 'b', 9: 'c'}: CPython's probe rule, replayed
+def probes(h, size):
+    """The slots visited for hash h in a table of `size` slots (Objects/dictobject.c)."""
+    mask, i, perturb = size - 1, h & (size - 1), h
+    while True:
+        yield i
+        perturb >>= 5
+        i = (i * 5 + perturb + 1) & mask
+
+index = [-1] * 8
+for entry, key in enumerate([17, 3, 9]):
+    slot = next(j for j in probes(hash(key), 8) if index[j] == -1)
+    index[slot] = entry
+print("index table:", index)
+
+# 4. Growth: sys.getsizeof against the model (2/3 usable, resize to the power of two >= 3 * used)
+def model_bytes(m):
+    return 64 + 32 + m * (1 if m <= 128 else 2) + (2 * m // 3) * 24
+d, changes = {}, []
+for k in range(1, 1400):
+    before = sys.getsizeof(d)
+    d[k] = None
+    if sys.getsizeof(d) != before:
+        changes.append((k, sys.getsizeof(d)))
+print("resizes at", [k for k, _ in changes])
+print("model agrees:", [b for _, b in changes] == [model_bytes(8 * 2**i) for i in range(len(changes))])
+
+# 5. Why the load factor is capped: with random probing an unsuccessful search takes 1 / (1 - a) probes
+random.seed(0)
+def mean_probes(load, size=2**14, trials=20_000):
+    full = set(random.sample(range(size), int(load * size)))
+    total = 0
+    for _ in range(trials):
+        total += 1
+        while random.randrange(size) in full:     # each probe lands on a random slot
+            total += 1
+    return total / trials
+for a in (0.5, 2 / 3, 0.9):
+    print(f"load {a:.2f}: {mean_probes(a):.2f} probes, theory {1 / (1 - a):.2f}")
+
+# 6. A key whose hash changes is lost
+class Key:
+    def __init__(self, v): self.v = v
+    def __eq__(self, other): return self.v == other.v
+    def __hash__(self): return hash(self.v)
+k = Key(1)
+d = {k: "found"}
+k.v = 2
+print("after mutation:", k in d, k in list(d), Key(1) in d)
+
+# 7. Worst case: every key collides
+class Bad(Key):
+    def __hash__(self): return 42
+for cls in (Key, Bad):
+    keys = [cls(i) for i in range(2000)]
+    t = min(timeit.repeat(lambda: {key: None for key in keys}, number=1, repeat=3)) / 2000 * 1e9
+    print(f"{cls.__name__}: {t:,.0f} ns per insertion with 2000 keys")
+
+# 8. Sets, Counter and defaultdict
+words = "the cat sat on the mat the end".split()
+a, b = {1, 2, 3, 4}, {3, 4, 5}
+print(a | b, a & b, a - b, a ^ b, Counter(words).most_common(2))
+groups = defaultdict(list)
+for w in words:
+    groups[w[0]].append(w)
+print(dict(groups), list(dict.fromkeys(words)))
+
+# Output with CPython 3.14.7 on an Apple M1, macOS (arm64); sizes are those of a 64-bit build, timings vary:
+# 'x in list': 791,931 ns   'x in set': 34 ns   (n = 100,000)
+# 3 -2 1 True siphash13
+# index table: [-1, 0, -1, 1, -1, -1, 2, -1]
+# resizes at [1, 6, 11, 22, 43, 86, 171, 342, 683, 1366]
+# model agrees: True
+# load 0.50: 2.01 probes, theory 2.00
+# load 0.67: 2.99 probes, theory 3.00
+# load 0.90: 9.99 probes, theory 10.00
+# after mutation: False True False
+# Key: 55 ns per insertion with 2000 keys
+# Bad: 43,871 ns per insertion with 2000 keys
+# {1, 2, 3, 4, 5} {3, 4} {1, 2} {1, 2, 5} [('the', 3), ('cat', 1)]
+# {'t': ['the', 'the', 'the'], 'c': ['cat'], 's': ['sat'], 'o': ['on'], 'm': ['mat'], 'e': ['end']} ['the', 'cat', 'sat', 'on', 'mat', 'end']
+```
+
+## Next
+
+The dictionaries of this note were built by loops: a `for` over the words, one insertion per pass. Python has a shorter form for building lists, dicts and sets, the comprehension, and a way to produce items one at a time without storing them, the generator. Both rest on the protocol that every `for` loop uses. The [next note](/notes/python/iteration-and-generators) states that protocol, builds iterators and generators on it, and measures what laziness saves.
+
+## References
+
+- Python documentation (3.14): [Mapping types: dict](https://docs.python.org/3.14/library/stdtypes.html#mapping-types-dict) and [Set types](https://docs.python.org/3.14/library/stdtypes.html#set-types-set-frozenset); [Hashing of numeric types](https://docs.python.org/3.14/library/stdtypes.html#hashing-of-numeric-types); the glossary entry [hashable](https://docs.python.org/3.14/glossary.html#term-hashable); [`object.__hash__`](https://docs.python.org/3.14/reference/datamodel.html#object.__hash__) in the data model; [`collections`](https://docs.python.org/3.14/library/collections.html) (`Counter`, `defaultdict`); [What's New in Python 3.7](https://docs.python.org/3.14/whatsnew/3.7.html) (insertion order guaranteed); [What's New in Python 3.11](https://docs.python.org/3.14/whatsnew/3.11.html) (SipHash-1-3).
+- CPython source, tag v3.14.0: [`Objects/dictobject.c`](https://github.com/python/cpython/blob/v3.14.0/Objects/dictobject.c) (layout comments, probe rule, `USABLE_FRACTION`, `GROWTH_RATE`), [`Objects/dictnotes.txt`](https://github.com/python/cpython/blob/v3.14.0/Objects/dictnotes.txt), [`Objects/setobject.c`](https://github.com/python/cpython/blob/v3.14.0/Objects/setobject.c).
+- C. Heimes. [PEP 456 — Secure and interchangeable hash algorithm](https://peps.python.org/pep-0456/). 2013.
+- S. D'Aprano, B. Bucher. [PEP 584 — Add Union Operators To dict](https://peps.python.org/pep-0584/). 2019.
+- [PEP 814 — Add frozendict built-in type](https://peps.python.org/pep-0814/). Python 3.15.
+- R. Hettinger. [More compact dictionaries with faster iteration](https://mail.python.org/pipermail/python-dev/2012-December/123028.html). python-dev, December 2012.
+- T. H. Cormen, C. E. Leiserson, R. L. Rivest, C. Stein. *Introduction to Algorithms*, 4th ed. MIT Press, 2022. Ch. 11 (hash tables; §11.4 open addressing and the expected number of probes).
+- L. Ramalho. *Fluent Python*, 2nd ed. O'Reilly, 2022. Ch. 3 (dictionaries and sets) and its discussion of hash tables.
+- B. Slatkin. *Effective Python*, 3rd ed. Addison-Wesley, 2024. The items on `defaultdict`, `get` and missing keys.

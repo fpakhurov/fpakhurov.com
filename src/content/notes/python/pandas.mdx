@@ -1,0 +1,499 @@
+---
+title: Data frames with pandas
+description: "Tables in pandas: Series and DataFrame as labeled columns over arrays, the index with loc and iloc, Copy-on-Write in pandas 3.0, missing values and dtypes, filtering, groupby, merges, pivots, time series, reading CSV, and the pitfalls of chained indexing, slow row loops and leakage."
+course: python
+section: Scientific Python
+order: 20
+status: published
+tags: [python, pandas, dataframe, series, index, copy-on-write, missing-values, groupby, merge, pivot-table, time-series, csv]
+prerequisites: [NumPy arrays, Dictionaries and sets]
+---
+
+import FrameModel from '../../../components/figures/pandas/FrameModel.astro';
+import SplitApplyCombine from '../../../components/figures/pandas/SplitApplyCombine.astro';
+import RowLoops from '../../../components/figures/pandas/RowLoops.astro';
+
+The [previous note](/notes/python/numpy-arrays) ended with what an array cannot hold: a table whose columns have different types, whose rows are identified by a key rather than by a position, and in which some values are missing. That is the shape of nearly every dataset before it becomes a matrix: a list of orders with a customer, a category, an amount and a date. **pandas** represents such a table as a `DataFrame`: a set of named columns, each an array with its own dtype, sharing one set of row labels. This note builds the model first, because the behaviour that surprises people, from a `KeyError` on `s[1]` to an assignment that silently does nothing, follows from it. Then it goes through the operations an analysis is made of: selecting, cleaning, grouping, joining and reshaping, and ends with the mistakes that make pandas code slow or a model's evaluation wrong.
+
+**Conventions.** pandas 3.0.6 with NumPy 2.5.4 on CPython 3.14.7, without PyArrow installed; `import pandas as pd` and `import numpy as np` are assumed. Every example uses small tables built in the code; nothing is downloaded.
+
+## Baseline: a dictionary of lists
+
+Without pandas, a table is a dictionary of columns, each a list or an array:
+
+```python
+orders = {
+    "customer": ["c1", "c2", "c1", "c3"],
+    "category": ["books", "games", "games", "books"],
+    "amount": [12.5, 40.0, 25.0, None],
+}
+```
+
+Every question about it is a loop. "The total per category" needs a [dictionary of sums](/notes/python/dicts-and-sets) built row by row; "orders above 20" needs the positions where one column satisfies a condition, applied to every other column; and a `None` in the middle breaks `sum`. Nothing keeps the columns the same length or in the same order, so sorting one column and forgetting another silently pairs every customer with the wrong amount. NumPy alone does not help: an array has one dtype, and a structured array with named fields gives no grouping, joining or missing values. pandas keeps the dictionary-of-columns idea and adds the two things that are missing: row labels that every column shares, and operations on whole columns.
+
+## Series and DataFrame
+
+<aside class="callout"><strong>Key idea.</strong> A `Series` is a one-dimensional array of values plus an `Index` of labels, one per value. A `DataFrame` is a collection of columns that share one row `Index`; each column is a Series with its own dtype, stored as a NumPy array or a pandas extension array. The column names form a second `Index`. Operations between Series **align on labels**, not on positions.</aside>
+
+```text
+>>> df = pd.DataFrame({"city": ["Oslo", "Lima", "Pune"],
+...                    "temp": [4.0, 19.5, 31.0],
+...                    "rain": [3, 0, 1]})
+>>> df
+   city  temp  rain
+0  Oslo   4.0     3
+1  Lima  19.5     0
+2  Pune  31.0     1
+>>> df.dtypes
+city        str
+temp    float64
+rain      int64
+dtype: object
+>>> df.index
+RangeIndex(start=0, stop=3, step=1)
+>>> type(df["temp"]).__name__, df["temp"].to_numpy()
+('Series', array([ 4. , 19.5, 31. ]))
+```
+
+The dictionary gives the columns in order. With no index given, pandas uses a `RangeIndex`, the labels 0, 1, 2, which costs no memory: it stores only start, stop and step. Each column has its own dtype: `float64` and `int64` are NumPy arrays, and `str` is pandas 3.0's default string dtype ([PDEP 14](#references)). `df["temp"]` is a Series, and `.to_numpy()` returns the NumPy array underneath.
+
+<FrameModel />
+
+**Why columns.** A table is stored column by column because analysis works column by column: `df["temp"].mean()` is one NumPy reduction over one contiguous array, at NumPy speed. Reading one *row* is the expensive direction, since it must collect a value from every column and, with mixed dtypes, box them into Python objects. That asymmetry decides which pandas code is fast, as the last sections measure.
+
+**Alignment.** Arithmetic between two Series matches values by label, and a label present in only one gives a missing value:
+
+```text
+>>> s = pd.Series([10, 20, 30], index=["a", "b", "c"])
+>>> u = pd.Series([1, 2], index=["b", "c"])
+>>> s + u
+a     NaN
+b    21.0
+c    32.0
+dtype: float64
+```
+
+The sum is not position by position, which would fail on lengths 3 and 2; it is `b + b` and `c + c`, and `a` has no partner. The result is `float64` because `NaN`, the missing value of floating point, does not exist among integers.
+
+## The index: `loc` against `iloc`
+
+Because rows have labels and positions, and the two can differ, pandas has two indexers.
+
+**The rule.**
+- `.loc[...]` selects by **label**. A slice of labels includes both ends: `s.loc["a":"b"]` has `a` and `b`.
+- `.iloc[...]` selects by **position**, like a list. A slice excludes its end: `s.iloc[0:1]` has one element.
+- Both take a row selector and, for a DataFrame, a column selector: `df.loc[rows, columns]`.
+- Plain `df[...]` selects **columns** by name, or rows when given a boolean Series. On a Series, `s[...]` uses labels; since pandas 3.0 an integer that is not a label raises `KeyError` instead of falling back to a position.
+
+```text
+>>> s = pd.Series([10, 20, 30], index=["a", "b", "c"])
+>>> s.loc["b"], s.iloc[1], s.loc["a":"b"].tolist(), s.iloc[0:1].tolist()
+(np.int64(20), np.int64(20), [10, 20], [10])
+>>> s[1]
+Traceback (most recent call last):
+...
+KeyError: 1
+>>> t = pd.Series([10, 20, 30], index=[2, 1, 0])
+>>> t.loc[0], t.iloc[0]
+(np.int64(30), np.int64(10))
+```
+
+The last two lines are the mistake the rule prevents. After sorting or filtering, a `DataFrame` keeps its original labels, so label 0 need not be the first row. `t.loc[0]` is the value labelled 0, which is last; `t.iloc[0]` is the first. Code that means "the first row" must say `iloc`. `df.reset_index(drop=True)` renumbers the labels from 0 when the old ones mean nothing.
+
+The index is a hash table from labels to positions, like a [dictionary's](/notes/python/dicts-and-sets), so `loc` with a label is a lookup, not a search through every row. A meaningful index, such as a customer id or a date, is what makes alignment, joins and time series work.
+
+## Copy-on-Write: pandas 3.0
+
+**The rule** ([pandas, Copy-on-Write](#references); PDEP 7). In pandas 3.0, any object derived from a DataFrame or Series, by indexing or by a method, **behaves as a copy**. Changing the derived object never changes the original, and the only way to change a DataFrame is an assignment on that DataFrame itself: `df.loc[rows, col] = value` or `df[col] = values`. To make this cheap, the copy is lazy: the derived object shares the original's arrays until one of the two is written to, and only then is the data copied.
+
+```text
+>>> df = pd.DataFrame({"city": ["Oslo", "Lima", "Pune"],
+...                    "temp": [4.0, 19.5, 31.0], "rain": [3, 0, 1]})
+>>> warm = df[df["temp"] > 10]
+>>> warm["rain"] = 99
+>>> df["rain"].tolist(), warm["rain"].tolist()
+([3, 0, 1], [99, 99])
+>>> col = df["temp"]
+>>> np.shares_memory(col.to_numpy(), df["temp"].to_numpy())
+True
+>>> col.iloc[0] = -1.0
+>>> np.shares_memory(col.to_numpy(), df["temp"].to_numpy()), df["temp"].tolist()
+(False, [4.0, 19.5, 31.0])
+```
+
+`warm` is a filtered table; setting its column changes `warm` only. `col` starts as a column that shares memory with `df`, and the write `col.iloc[0] = -1.0` triggers the copy, so `df` is unchanged and the two no longer share. `col.to_numpy()` is read-only under Copy-on-Write: writing to the array behind pandas' back would bypass the lazy copy.
+
+**What changed from pandas 2.** Before 3.0 the answer to "does this change the original?" depended on whether pandas had returned a view or a copy, which depends on the dtypes and the kind of indexing. `col = df["temp"]; col.iloc[0] = -1.0` changed `df` through the view, and `warm["rain"] = 99` raised the famous `SettingWithCopyWarning`, because pandas could not tell whether the user meant to change `df`. Copy-on-Write removes the question, and pandas 3.0 removed that warning ([What's new in 3.0.0](#references)).
+
+**Chained assignment never works.** `df["temp"][0] = 100.0` first evaluates `df["temp"]`, a new Series, and then sets an element of it; under Copy-on-Write that Series behaves as a copy, so `df` never changes. pandas detects the pattern and warns:
+
+```text
+>>> df["temp"][0] = 100.0
+<python-input-8>:1: ChainedAssignmentError: A value is being set on a copy of a DataFrame or Series through chained assignment.
+Such chained assignment never works to update the original DataFrame or Series, because the intermediate object on which we are setting values always behaves as a copy (due to Copy-on-Write).
+...
+>>> df["temp"].tolist()
+[4.0, 19.5, 31.0]
+>>> df.loc[0, "temp"] = 100.0
+>>> df["temp"].tolist()
+[100.0, 19.5, 31.0]
+```
+
+(The warning is trimmed; it goes on to suggest `.loc`.) `ChainedAssignmentError` is a `Warning`, not an exception, so the program continues with `df` unchanged. The fix is one indexing operation on `df` itself, `df.loc[0, "temp"] = 100.0`. It is the same mistake as `a[mask][0] = 99` on a [NumPy array](/notes/python/numpy-arrays#indexing-basic-fancy-and-boolean), where `a[mask]` is a real copy; in pandas 3.0 every intermediate result behaves that way.
+
+## Missing values and dtypes
+
+**The rule.** pandas marks a missing value according to the column's dtype:
+
+| dtype | missing value | notes |
+| --- | --- | --- |
+| `float64` | `NaN` | an integer column with a gap becomes `float64` |
+| `Int64`, `boolean` (nullable, capital I) | `pd.NA` | keeps integers exact |
+| `str` (the 3.0 default for text) | `NaN` | `StringDtype` with `na_value=nan` |
+| `datetime64` | `NaT` | "not a time" |
+| `object` | `None` or `NaN` | any Python objects; slow |
+
+`isna()` finds missing values whatever their marker; `fillna(v)` replaces them; `dropna()` removes the rows that have them. Reductions skip them by default: `sum` treats them as absent, `mean` divides by the number of present values, `count` counts the present ones.
+
+```text
+>>> m = pd.Series([1, None, 3])
+>>> m.dtype, m.isna().tolist(), m.sum(), m.mean()
+(dtype('float64'), [False, True, False], np.float64(4.0), np.float64(2.0))
+>>> pd.Series([1, None, 3], dtype="Int64").tolist()
+[1, <NA>, 3]
+>>> st = pd.Series(["a", None, "c"])
+>>> st.dtype
+<StringDtype(storage='python', na_value=nan)>
+>>> st.str.upper().tolist()
+['A', nan, 'C']
+>>> pd.Series(["a", 1]).dtype
+dtype('O')
+```
+
+The integers 1 and 3 with a gap become `1.0`, `NaN`, `3.0`: NumPy's `int64` has no spare bit pattern for "missing", so pandas switches to floats. The nullable `Int64` keeps a separate mask of missing positions and stays exact. Text is the `str` dtype by default since pandas 3.0, backed by PyArrow when it is installed and by Python strings otherwise, which is the `storage='python'` shown here; before 3.0 text columns were `object`. Its `.str` methods skip missing values. A column that mixes text and numbers falls back to `object`, an array of pointers to Python objects, which is the slow list-of-objects model of the [NumPy note's baseline](/notes/python/numpy-arrays#baseline-a-list-of-numbers).
+
+The mistake to recognize: `NaN == NaN` is `False` in floating point ([why](/notes/acos/floating-point#special-values)), so `df[df["x"] == np.nan]` selects nothing. Test with `isna()`.
+
+## Filtering, groupby, merge and pivot
+
+The rest of the note uses one small table of orders, read from CSV text in memory:
+
+```text
+>>> import io
+>>> csv = """order,customer,category,amount,date
+... 1,c1,books,12.5,2026-01-03
+... 2,c2,games,40.0,2026-01-03
+... 3,c1,games,25.0,2026-01-10
+... 4,c3,books,,2026-01-17
+... 5,c2,books,8.0,2026-02-01
+... 6,c3,music,15.0,2026-02-07
+... """
+>>> orders = pd.read_csv(io.StringIO(csv), parse_dates=["date"])
+>>> orders.dtypes
+order                int64
+customer               str
+category               str
+amount             float64
+date        datetime64[us]
+dtype: object
+```
+
+**Reading CSV.** `pd.read_csv` takes a path, a URL or any file-like object; `io.StringIO` makes a string behave like a file ([files note](/notes/python/files-and-exceptions)). It reads the header for column names and infers each column's dtype from its text: integers, floats, and the empty field of order 4 as `NaN`. Dates stay text unless named in `parse_dates`; pandas 3.0 infers the resolution and here stores microseconds, `datetime64[us]`. Inference can be wrong for identifiers: a postcode `007` is read as the integer 7. Pass `dtype={"code": "str"}` for such columns, `usecols` to read only some columns, and `na_values` for the markers your data use for "missing".
+
+**Filtering** selects rows with a boolean Series, combined with `&` (and), `|` (or) and `~` (not):
+
+```text
+>>> orders[(orders["amount"] > 10) & (orders["category"] == "games")]
+   order customer category  amount       date
+1      2       c2    games    40.0 2026-01-03
+2      3       c1    games    25.0 2026-01-10
+>>> orders[orders["category"].isin(["books", "music"])]["order"].tolist()
+[1, 4, 5, 6]
+```
+
+The parentheses are required. `&` binds more tightly than `>` and `==`, so without them `orders["amount"] > 10 & orders["category"] == "games"` evaluates `10 & orders["category"]` first and raises `TypeError`. The keywords `and` and `or` do not work either: they ask for the truth value of a whole Series, which is ambiguous, and raise `ValueError`.
+
+### groupby: split, apply, combine
+
+**The rule.** `df.groupby(key)[column].agg(f)` does three things ([Wickham, 2011](#references)):
+
+1. **Split** the rows into groups by the value of the key.
+2. **Apply** the function to the column within each group, giving one value per group.
+3. **Combine** the results into a Series indexed by the group keys, sorted by default.
+
+<SplitApplyCombine />
+
+```text
+>>> orders.groupby("category")["amount"].sum()
+category
+books    20.5
+games    65.0
+music    15.0
+Name: amount, dtype: float64
+>>> orders.groupby("category").agg(n=("order", "size"), paid=("amount", "count"),
+...                                 total=("amount", "sum"), mean=("amount", "mean"))
+          n  paid  total   mean
+category
+books     3     2   20.5  10.25
+games     2     2   65.0  32.50
+music     1     1   15.0  15.00
+>>> orders.groupby("customer")["amount"].transform("sum").tolist()
+[37.5, 48.0, 37.5, 15.0, 48.0, 15.0]
+```
+
+Line by line: the books group has the amounts 12.5, `NaN` and 8.0, and `sum` skips the missing one, 20.5. **Named aggregation**, `name=(column, function)`, computes several summaries at once. `size` counts rows, 3 books orders, while `count` counts present values, 2; the difference is the missing amount, and it is the first thing to check when two counts disagree. `transform` returns one value per original row instead of one per group, here each order's customer total, aligned with the rows so that it can become a new column. Rows whose key is missing are dropped from the groups unless `dropna=False` is given.
+
+**Why it is fast.** pandas factorizes the key column once, turning each category into an integer code, and then runs a compiled loop over the codes that adds each amount to its group's slot. For built-in reductions, given as strings such as `"sum"` or `"mean"`, no Python code runs per row or per group. A Python function, `agg(lambda v: ...)`, is called once per group, which is fine for a few groups and slow for a million.
+
+### merge and join
+
+`left.merge(right, on=key, how=...)` combines two tables by matching key values, like a SQL join:
+
+- `how="inner"` (the default): only keys present in both;
+- `how="left"`: every row of `left`, with missing values where `right` has no match;
+- `how="outer"`: every key from either side;
+- `indicator=True` adds a column `_merge` saying where each row came from.
+
+```text
+>>> customers = pd.DataFrame({"customer": ["c1", "c2", "c4"],
+...                           "region": ["north", "south", "east"]})
+>>> orders.merge(customers, on="customer", how="left")[["order", "customer", "region"]]
+   order customer region
+0      1       c1  north
+1      2       c2  south
+2      3       c1  north
+3      4       c3    NaN
+4      5       c2  south
+5      6       c3    NaN
+>>> orders.merge(customers, on="customer").shape, orders.merge(customers, on="customer", how="outer").shape
+((4, 6), (7, 6))
+```
+
+Customer c3 is not in `customers`, so the left join keeps c3's orders with a missing region, and the inner join drops them: 4 rows. The outer join adds c4, who has no orders: 7 rows.
+
+**The mistake.** If a key appears twice on the right, every matching row on the left is repeated, once per match. A customer listed in two regions turns each of their orders into two rows, and every total computed afterwards is inflated. Pass `validate="many_to_one"`, which raises `MergeError` when the right-hand keys are not unique, and compare row counts before and after a merge. `df.join(other)` is the same operation matching on the index instead of a column.
+
+### pivot tables
+
+`pivot_table` is a groupby on two keys whose result is spread into a grid: one key on the rows, one on the columns.
+
+```text
+>>> m = orders.merge(customers, on="customer", how="left")
+>>> m["region"] = m["region"].fillna("unknown")
+>>> m.pivot_table(index="region", columns="category", values="amount",
+...               aggfunc="sum", fill_value=0)
+category  books  games  music
+region
+north      12.5   25.0    0.0
+south       8.0   40.0    0.0
+unknown     0.0    0.0   15.0
+```
+
+Without the `fillna`, the rows of c3 have a missing region, and a pivot drops missing keys just as groupby does, so the 15.0 of the music order would vanish from the table without a word. `fill_value=0` writes 0 where a combination has no rows, which is right for a sum and wrong for a mean. `melt` is the inverse, turning columns back into rows.
+
+### Time series, in brief
+
+A `datetime64` column supports date arithmetic and the `.dt` accessor (`.dt.month`, `.dt.day_name()`). With the dates as the index, `resample` groups by calendar periods and `rolling` computes moving windows:
+
+```text
+>>> ts = orders.set_index("date")["amount"]
+>>> ts.resample("MS").sum()
+date
+2026-01-01    77.5
+2026-02-01    23.0
+Freq: MS, Name: amount, dtype: float64
+>>> orders["date"].dt.day_name().tolist()[:2]
+['Saturday', 'Saturday']
+```
+
+`resample("MS")` is a groupby on the month, labelled by the month's start: January's orders sum to $12.5 + 40 + 25 = 77.5$. `"W"` would give weeks ending on Sunday, `"D"` days, with empty periods filled by 0 for a sum. Time series is a subject of its own (time zones, irregular sampling, lags); [McKinney's chapter 11](#references) covers it.
+
+## Pitfall: row loops are slow
+
+Code written row by row, with `iterrows` or `apply(..., axis=1)`, gives up the column storage that makes pandas fast. The same computation, price times quantity for every row of a table with the two columns `price` and `qty`, five ways on the setup above, best of three runs:
+
+| rows | `df.price * df.qty` | `zip(df.price, df.qty)` | `itertuples()` | `apply(f, axis=1)` | `iterrows()` |
+| --- | --- | --- | --- | --- | --- |
+| 1 000 | 0.033 ms | 0.12 ms | 0.42 ms | 3.1 ms | 9.6 ms |
+| 100 000 | 0.090 ms | 12.6 ms | 34 ms | 310 ms | 1 048 ms |
+
+<RowLoops />
+
+For 100 000 rows the vectorized product takes 0.09 ms and `iterrows` more than a second, about 12 000 times as long. The reason is the column storage of the [model above](#series-and-dataframe). `iterrows` builds a new Series for every row, which collects one value from each column, finds a common dtype for them and constructs an index: about 10 µs of work per row. `apply(f, axis=1)` does the same and then calls `f`. `itertuples` builds a lightweight named tuple instead, about thirty times cheaper here, and `zip` over two columns iterates their values as Python floats, cheaper again but still a Python loop at about 0.13 µs per row. The vectorized expression is one NumPy multiplication.
+
+The rule of thumb: write the computation as operations on whole columns (arithmetic, comparisons, `np.where` for conditions, `.str` and `.dt` methods, `groupby` with built-in reductions, `merge` instead of a lookup loop). When a row loop is unavoidable, `itertuples` is the cheapest loop. Profile before rewriting ([profiling](/notes/python/debugging-and-profiling#profiling-where-the-time-goes)): the slow loop is often not the one you suspect, and the [performance note](/notes/python/performance) lists the other remedies.
+
+## Pitfall: leakage when preprocessing
+
+pandas makes it easy to clean a whole table in one line, and that is the trap when the table will be split into training and test data. Filling missing values with the column mean, standardizing a column, or encoding a category by its mean target, done on the full table before the split, computes a statistic from the test rows and writes it into the training rows. The model then sees information about the test set, and its test score is too optimistic. The Machine Learning course calls this [train–test contamination](/notes/ml/data-features-and-leakage#traintest-contamination) and shows how far it can move a score.
+
+```python
+# wrong: the fill value is computed with the test rows
+df["income"] = df["income"].fillna(df["income"].mean())
+train, test = df.iloc[:800], df.iloc[800:]
+
+# right: split first, compute every statistic on the training rows only
+train, test = df.iloc[:800].copy(), df.iloc[800:].copy()
+fill = train["income"].mean()
+train["income"] = train["income"].fillna(fill)
+test["income"] = test["income"].fillna(fill)
+```
+
+The same rule holds for any `groupby(...).transform("mean")` of the target, which is the [naive target encoding](/notes/ml/data-features-and-leakage#why-the-naive-target-encoding-leaks): compute it inside each training fold. The Code section below measures the difference on a small synthetic table.
+
+<aside class="callout"><strong>Check yourself.</strong> (1) `s = pd.Series([5, 6, 7], index=[1, 2, 3])`. What are `s.loc[1]`, `s.iloc[1]` and `s.loc[1:2].tolist()`? (2) In pandas 3.0, after `sub = df[df["x"] > 0]; sub["y"] = 0`, has `df` changed? And after `df[df["x"] > 0]["y"] = 0`? How do you set `y` to 0 in those rows of `df`? (3) A column of integers has one missing value. What is its dtype after `read_csv`, and how do you keep it integer? (4) `orders.groupby("category")["amount"].agg(["size", "count"])` gives 3 and 2 for books. Why do they differ? (5) A left merge of 1000 orders with a customer table returns 1040 rows. What happened, and which argument would have caught it? (6) Why is `df.apply(lambda r: r["a"] + r["b"], axis=1)` thousands of times slower than `df["a"] + df["b"]` on a large table?<details><summary>Answers</summary>(1) `5` (the label 1), `6` (the second position), `[5, 6]` (label slices include their end). (2) No: `sub` behaves as a copy, so only `sub` changes. The chained form does not change `df` either, and pandas warns with `ChainedAssignmentError`. Use `df.loc[df["x"] > 0, "y"] = 0`. (3) `float64`, with `NaN` for the gap, because `int64` has no missing value. Read it with `dtype={"col": "Int64"}`, the nullable integer type. (4) `size` counts rows, `count` counts present values; one books order has a missing amount. (5) Some customers appear more than once in the customer table, so their orders were repeated, once per match. `validate="many_to_one"` raises `MergeError` on duplicate right-hand keys. (6) `apply` with `axis=1` builds a Series for every row and calls a Python function on it, about 3 µs per row on the setup of this note; the column expression is one compiled loop over two arrays.</details></aside>
+
+## What changed
+
+| | Dictionary of lists (the baseline) | pandas DataFrame |
+| --- | --- | --- |
+| Columns | lists kept the same length by hand | arrays with their own dtypes, sharing one index |
+| Rows | positions only | labels (`loc`) and positions (`iloc`) |
+| Combining two columns | a loop, by position | vectorized, aligned on labels |
+| Missing values | `None` breaks arithmetic | `NaN`, `pd.NA`, `NaT`; reductions skip them |
+| Totals per group | a dictionary built in a loop | `groupby(...).agg(...)` |
+| Joining tables | nested loops or a lookup dictionary | `merge` |
+| Changing a derived table | changes the original if it is shared | never changes the original (Copy-on-Write, pandas 3.0) |
+
+## Limitations
+
+- **Memory and size.** pandas holds the whole table in memory, and operations create new tables (lazily under Copy-on-Write, but a write still copies). A table that does not fit in a few times the RAM needs reading in chunks (`read_csv(chunksize=...)`) or a different engine, such as Polars or DuckDB, which are not covered here.
+- **Text without PyArrow.** Without PyArrow installed, the `str` dtype stores Python strings, with the per-object memory cost of the [values note](/notes/python/values-and-names). Installing PyArrow makes pandas use Arrow's compact string arrays.
+- **Version specific.** Copy-on-Write, the `str` default and the removed positional fallback of `s[1]` are pandas 3.0 behaviour. Code written for pandas 1 or 2 may rely on the old behaviour; the [migration guide](#references) lists the changes.
+- **One machine.** The timings are from an Apple M1 with pandas 3.0.6. The ratios between row loops and vectorized code are large on any machine; the exact numbers are not.
+
+## What you should remember
+
+- A DataFrame is named columns, each a typed array, sharing one row index. Operations between Series align on labels.
+- `loc` selects by label and includes the end of a slice; `iloc` selects by position and excludes it. After filtering or sorting, labels and positions differ.
+- In pandas 3.0 every derived object behaves as a copy. Change a DataFrame only through one indexing operation on it: `df.loc[rows, col] = value`. Chained assignment never works.
+- Missing values are `NaN` in floats, `pd.NA` in nullable types, `NaT` in dates; test with `isna()`. An integer column with a gap becomes `float64` unless it is `Int64`. Text is the `str` dtype.
+- `groupby` splits, applies and combines; prefer built-in reductions by name. `size` counts rows, `count` counts values.
+- Check row counts around every `merge`; use `validate`. Fill missing keys before a pivot.
+- Write column operations, not row loops: `iterrows` and `apply(axis=1)` are thousands of times slower on large tables.
+- Compute every preprocessing statistic on the training rows only.
+
+## Code
+
+The script builds a synthetic table of 1000 orders and walks through the note: dtypes, label against position, Copy-on-Write and chained assignment, missing values, groupby, a merge with a duplicated key, a pivot, a monthly resample, the timing of row loops against a column expression, and the leakage of a fill value computed before the split. Run it with `python -I frames.py`; it needs pandas 3.0 and NumPy and takes a few seconds. The timings vary between machines and runs; the other lines are exact for pandas 3.0.6 and NumPy 2.5.4.
+
+```python
+"""Data frames with pandas 3.0: the model, Copy-on-Write, grouping, joining and pitfalls (Python 3.14)."""
+import io
+import timeit
+import warnings
+
+import numpy as np
+import pandas as pd
+
+print("pandas", pd.__version__, "numpy", np.__version__)
+rng = np.random.default_rng(0)
+
+# 1. A synthetic table: 1000 orders, written to CSV text and read back
+n = 1000
+raw = pd.DataFrame({
+    "customer": rng.choice(["c1", "c2", "c3", "c4", "c5"], size=n),
+    "category": rng.choice(["books", "games", "music"], size=n, p=[0.5, 0.3, 0.2]),
+    "price": rng.uniform(5, 60, size=n).round(2),
+    "qty": rng.integers(1, 5, size=n),
+    "date": pd.date_range("2026-01-01", periods=n, freq="8h"),
+})
+raw.loc[rng.choice(n, size=50, replace=False), "price"] = np.nan        # 5% missing prices
+df = pd.read_csv(io.StringIO(raw.to_csv(index=False)), parse_dates=["date"])
+print(df.shape, df.dtypes.astype(str).to_dict())
+
+# 2. Labels against positions after a sort
+s = df.sort_values("price", ascending=False)["price"]
+print(s.index[0], s.loc[0] == df["price"].iloc[0], s.iloc[0] == df["price"].max())
+
+# 3. Copy-on-Write: derived objects never change the original; chained assignment never works
+cheap = df[df["price"] < 10]
+cheap["qty"] = 0
+with warnings.catch_warnings(record=True) as caught:
+    warnings.simplefilter("always")
+    df["qty"][0] = 100                                   # chained: has no effect
+print((df["qty"] == 0).sum(), df["qty"].iloc[0] != 100, caught[0].category.__name__)
+df.loc[0, "qty"] = 100                                   # one indexing operation on df itself
+print(df["qty"].iloc[0])
+
+# 4. Missing values: reductions skip them; size against count
+df["revenue"] = df["price"] * df["qty"]
+print(df["price"].isna().sum(), df["revenue"].isna().sum(), round(df["price"].mean(), 2))
+print(df.groupby("category").agg(rows=("price", "size"), priced=("price", "count"),
+                                 revenue=("revenue", "sum")).round(1).to_dict("index"))
+
+# 5. A merge with a duplicated key on the right repeats rows; validate catches it
+regions = pd.DataFrame({"customer": ["c1", "c2", "c3", "c4", "c4"],
+                        "region": ["north", "south", "east", "west", "north"]})
+joined = df.merge(regions, on="customer", how="left")
+print(len(df), len(joined))
+try:
+    df.merge(regions, on="customer", how="left", validate="many_to_one")
+except pd.errors.MergeError as err:
+    print("MergeError:", str(err).splitlines()[0])
+
+# 6. A pivot table and a monthly resample
+print(joined.pivot_table(index="region", columns="category", values="qty", aggfunc="sum", fill_value=0))
+print(df.set_index("date")["revenue"].resample("MS").sum().round(1).tolist())
+
+# 7. Row loops against a column expression
+def best(fn, number):
+    return min(timeit.repeat(fn, number=number, repeat=3)) / number
+
+for name, fn, number in [
+    ("vectorized", lambda: df["price"] * df["qty"], 200),
+    ("zip", lambda: [p * q for p, q in zip(df["price"], df["qty"])], 20),
+    ("itertuples", lambda: [r.price * r.qty for r in df.itertuples()], 5),
+    ("apply", lambda: df.apply(lambda r: r["price"] * r["qty"], axis=1), 1),
+    ("iterrows", lambda: [r["price"] * r["qty"] for _, r in df.iterrows()], 1),
+]:
+    print(f"{name:11} {best(fn, number) * 1e3:8.3f} ms for {len(df)} rows")
+
+# 8. Leakage: a fill value computed with the test rows. Prices drift upward over time,
+#    so the last 200 orders (the test set) are dearer than the first 800.
+drift = df.copy()
+drift["price"] = drift["price"] + np.arange(n) * 0.05
+train_mean = drift["price"].iloc[:800].mean()
+all_mean = drift["price"].mean()
+print(round(train_mean, 2), round(all_mean, 2), "difference", round(all_mean - train_mean, 2))
+
+# Output with CPython 3.14.7, pandas 3.0.6 and NumPy 2.5.4 on an Apple M1 (macOS); timings vary:
+# pandas 3.0.6 numpy 2.5.4
+# (1000, 5) {'customer': 'str', 'category': 'str', 'price': 'float64', 'qty': 'int64', 'date': 'datetime64[us]'}
+# 805 True True
+# 0 True ChainedAssignmentError
+# 100
+# 50 50 31.61
+# {'books': {'rows': 503, 'priced': 480, 'revenue': 40236.3}, 'games': {'rows': 295, 'priced': 279, 'revenue': 21835.1}, 'music': {'rows': 202, 'priced': 191, 'revenue': 13818.8}}
+# 1000 1209
+# MergeError: Merge keys are not unique in right dataset; not a many-to-one merge
+# category  books  games  music
+# region
+# east        260    143     98
+# north       518    307    181
+# south       187    161     96
+# west        288    139     85
+# [7028.4, 6352.5, 7241.7, 6248.9, 6522.5, 5929.3, 6764.7, 7623.4, 6894.9, 7855.9, 7427.8]
+# vectorized     0.028 ms for 1000 rows
+# zip            0.115 ms for 1000 rows
+# itertuples     1.167 ms for 1000 rows
+# apply          3.246 ms for 1000 rows
+# iterrows      11.710 ms for 1000 rows
+# 51.0 56.66 difference 5.66
+```
+
+Reading the output: after sorting by price, the first row has the label 805, not 0. The `0` on the fourth line counts the rows of `df` whose quantity became 0: the change to `cheap` did not reach `df`, and neither did the chained assignment. Among the 1000 orders, 50 prices are missing, so `size` and `count` differ for every category. The left merge grew from 1000 to 1209 rows because customer c4 is listed in two regions, and the pivot counts c4's orders under both regions. `itertuples` takes 1.2 ms here against 0.42 ms in the table above because this table has six columns, not two, and each named tuple holds all of them. The last line is the leak: prices drift upward, and a fill value computed over all rows is 5.66 higher than the mean of the training rows, because it has seen the dearer test period.
+
+## Next
+
+A table of numbers is not yet an answer: whether revenue grows, which category sells most, whether a model's predictions follow the targets, is seen fastest in a figure. The [next note](/notes/python/plotting) draws figures with Matplotlib, from its model of a figure as a tree of objects to a checklist for a figure that says one thing clearly.
+
+## References
+
+- pandas documentation (3.0): [Intro to data structures](https://pandas.pydata.org/docs/user_guide/dsintro.html); [Indexing and selecting data](https://pandas.pydata.org/docs/user_guide/indexing.html); [Copy-on-Write](https://pandas.pydata.org/docs/user_guide/copy_on_write.html); [Working with missing data](https://pandas.pydata.org/docs/user_guide/missing_data.html); [Group by: split-apply-combine](https://pandas.pydata.org/docs/user_guide/groupby.html); [Merge, join, concatenate and compare](https://pandas.pydata.org/docs/user_guide/merging.html); [Reshaping and pivot tables](https://pandas.pydata.org/docs/user_guide/reshaping.html); [Time series](https://pandas.pydata.org/docs/user_guide/timeseries.html); [IO tools: CSV](https://pandas.pydata.org/docs/user_guide/io.html#io-read-csv-table); [Enhancing performance](https://pandas.pydata.org/docs/user_guide/enhancingperf.html).
+- [What's new in 3.0.0](https://pandas.pydata.org/docs/whatsnew/v3.0.0.html) (Copy-on-Write by default, the `str` dtype, datetime resolution inference, removed deprecations) and the [pandas 3.0 migration guide](https://pandas.pydata.org/docs/user_guide/migration-3-strings.html) for strings.
+- pandas enhancement proposals: [PDEP 7 — Consistent copy/view semantics with Copy-on-Write](https://pandas.pydata.org/pdeps/0007-copy-on-write.html); [PDEP 14 — Dedicated string data type by default](https://pandas.pydata.org/pdeps/0014-string-dtype.html).
+- H. Wickham. [The split-apply-combine strategy for data analysis](https://doi.org/10.18637/jss.v040.i01). *Journal of Statistical Software* 40(1), 2011.
+- W. McKinney. *Python for Data Analysis*, 3rd ed. O'Reilly, 2022. Ch. 5 (getting started with pandas), 7 (data cleaning), 8 (join, combine and reshape), 10 (aggregation and group operations), 11 (time series).
+- W. McKinney. [Data structures for statistical computing in Python](https://doi.org/10.25080/Majora-92bf1922-00a). Proceedings of the 9th Python in Science Conference, 2010.
+- J. VanderPlas. *Python Data Science Handbook*, 2nd ed. O'Reilly, 2023. Ch. 3 (data manipulation with pandas).

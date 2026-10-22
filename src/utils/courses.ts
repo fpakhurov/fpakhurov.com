@@ -1474,7 +1474,7 @@ export const courses: Record<CourseKey, Course> = {
     requires: [],
     shortTitle: 'Python',
     description: 'Python from the first line to how the interpreter runs it: values and names, the built-in data structures and what they cost, functions, classes and the data model, packaging and type hints, testing and profiling, CPython internals and concurrency, then NumPy, pandas and Matplotlib.',
-    entry: 'Before you start: nothing beyond using a computer and a terminal. The course uses Python 3.14, the current release; every Code section runs as written and its output is shown. Notes marked as optional depth go into how CPython works and can be skipped on a first reading. The machine-learning courses assume the first three sections and the Scientific Python section.',
+    entry: 'Before you start: nothing beyond using a computer and a terminal. The course uses Python 3.14, and every Code section was run as written on 3.14.7 with its output shown; Python 3.15, released in October 2026, changes little of what the course shows, and the notes say where it does. Notes marked as optional depth go into how CPython works and can be skipped on a first reading. The machine-learning courses assume the first three sections and the Scientific Python section.',
     guide: [{ label: 'The plan of the course', note: 'python/running-python', anchor: 'the-plan-of-the-course' }, { label: 'The course in one paragraph', note: 'python/plotting', anchor: 'the-course-in-one-paragraph' }],
     progression: [
       { label: 'Basics', section: 'Getting Started' },
@@ -1488,7 +1488,7 @@ export const courses: Record<CourseKey, Course> = {
       title: 'Программирование на Python',
       shortTitle: 'Python',
       description: 'Python от первой строки до того, как его выполняет интерпретатор: значения и имена, встроенные структуры данных и их стоимость, функции, классы и модель данных, пакеты и аннотации типов, тестирование и профилирование, устройство CPython и конкурентность, затем NumPy, pandas и Matplotlib.',
-      entry: 'Что нужно знать: ничего, кроме умения пользоваться компьютером и терминалом. Курс использует Python 3.14, текущую версию; каждый раздел «Код» запускается как написан, и его вывод показан. Дополнительный материал разбирает устройство CPython, и при первом чтении его можно пропустить. Курсы по машинному обучению опираются на первые три раздела и на раздел «Научный Python».',
+      entry: 'Что нужно знать: ничего, кроме умения пользоваться компьютером и терминалом. Курс использует Python 3.14: каждый раздел «Код» запущен как написан на версии 3.14.7, и его вывод показан. Python 3.15, вышедший в октябре 2026 года, мало что меняет в показанном, и заметки говорят, где именно. Дополнительный материал разбирает устройство CPython, и при первом чтении его можно пропустить. Курсы по машинному обучению опираются на первые три раздела и на раздел «Научный Python».',
       progression: ['Основы', 'Данные', 'Абстракции', 'Надёжность', 'Устройство', 'Научный'],
       labels: {
         'Getting Started': 'Первые шаги',

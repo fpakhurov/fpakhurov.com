@@ -1,0 +1,606 @@
+---
+title: Closures and decorators
+description: "Functions as objects; closures and the cells that keep an enclosing call's variables alive, with the late-binding trap in loops; decorators as f = deco(f), functools.wraps, decorators with arguments and on classes; functools.cache, lru_cache and partial; where ML code uses them."
+course: python
+section: Abstraction
+order: 11
+status: published
+tags: [python, functions, first-class-functions, closures, cells, nonlocal, late-binding, decorators, functools, wraps, cache, lru-cache, partial, registry]
+prerequisites: [Functions, The data model]
+---
+
+import DecoratorWrap from '../../../components/figures/closures-and-decorators/DecoratorWrap.astro';
+import FibCalls from '../../../components/figures/closures-and-decorators/FibCalls.astro';
+
+The [previous note](/notes/python/the-data-model) ended with an object that behaves like a function: an instance of a class with `__call__`, which remembers a factor between calls. Python's own functions are objects as well, of type `function`, and they can do the same without any class: a function defined inside another function remembers the variables of the call that created it. That is a **closure**, and closures are the material of **decorators**, the `@name` lines above a definition that add timing, logging, caching or registration to a function without touching its body. This note shows what a function object holds, how a closure stores its variables, the trap that storage sets in loops, and how decorators are built from closures, up to the ones the ML courses use every day.
+
+## Functions are objects
+
+`def` creates a function object and binds a name to it, like any assignment of the [names note](/notes/python/values-and-names). The object can be bound to other names, stored in containers and passed to other functions:
+
+```python
+def square(x):
+    """Return x squared."""
+    return x * x
+```
+
+```text
+>>> f = square
+>>> f(7), f is square, f.__name__, f.__doc__
+(49, True, 'square', 'Return x squared.')
+>>> type(square)
+<class 'function'>
+>>> ops = {"sq": square, "neg": lambda x: -x}
+>>> ops["neg"](5)
+-5
+>>> sorted(["pear", "fig", "banana"], key=len)
+['fig', 'pear', 'banana']
+```
+
+`f = square` copies nothing: both names refer to one function object, whose `__name__` is still `'square'`. A `lambda` is the expression form of `def`, limited to one expression, and creates the same kind of object. Passing a function to another function, as `key=len` passes `len` to `sorted`, is how much of Python is customized; a function that takes or returns functions is called a **higher-order function**.
+
+A function object carries more than its code: `__code__` (the compiled bytecode and the names of its variables), `__defaults__` (the default values of its parameters, evaluated once when `def` runs, which is the reason for the mutable-default trap of the [functions note](/notes/python/functions)), and, for a nested function, `__closure__`.
+
+## Baseline: the same lines in every function
+
+Suppose several functions of a program must report what they were called with and what they returned, to trace a bug. The direct way is to edit each of them:
+
+```python
+def add(a, b):
+    result = a + b
+    print(f"add{(a, b)} -> {result!r}")
+    return result
+
+def scale(x, k):
+    result = x * k
+    print(f"scale{(x, k)} -> {result!r}")
+    return result
+```
+
+The tracing lines are the same in every function, they bury the one line that does the work, and removing them later means editing every function again. What we want is to write the tracing once and apply it to any function from outside. That needs a function that takes a function and returns a new one that remembers the old one: a closure.
+
+## Closures: functions that remember
+
+A function defined inside another can use the variables of the enclosing function, and it keeps access to them after the enclosing call has returned:
+
+```python
+def make_counter():
+    count = 0
+    def increment():
+        nonlocal count
+        count += 1
+        return count
+    return increment
+```
+
+```text
+>>> c1 = make_counter()
+>>> c2 = make_counter()
+>>> c1(), c1(), c1(), c2()
+(1, 2, 3, 1)
+>>> c1.__code__.co_freevars
+('count',)
+>>> c1.__closure__
+(<cell at 0x106750490: int object at 0x101924910>,)
+>>> c1.__closure__[0].cell_contents
+3
+```
+
+**The rule.** When the compiler sees that an inner function uses a variable of an enclosing function, it does not store that variable in the enclosing call's frame like an ordinary local. It stores it in a **cell**, a small object that holds one reference. The enclosing function reads and writes the variable through the cell; the inner function object, when it is created, receives a tuple of the cells it needs, its `__closure__`. The names of those variables are the inner code's **free variables**, `co_freevars`. When `make_counter` returns, its frame is gone, but the cell survives because the function `increment` still refers to it.
+
+Each call of `make_counter` creates a new cell and a new inner function, so `c1` and `c2` count independently. This is the same job the `Scale` class of the previous note did with an attribute; a closure is the lighter tool when the state is one or two variables and the behaviour is one function.
+
+**`nonlocal`.** Reading an enclosing variable needs nothing. Assigning to it does, because an assignment inside a function makes the name local to that function, decided when the function is compiled:
+
+```python
+def make_counter():
+    count = 0
+    def increment():
+        count += 1
+        return count
+    return increment
+```
+
+```text
+>>> make_counter()()
+Traceback (most recent call last):
+  ...
+UnboundLocalError: cannot access local variable 'count' where it is not associated with a value
+```
+
+`count += 1` reads `count` before assigning it, and since the assignment makes `count` local to `increment`, the read finds a local with no value yet. `nonlocal count` declares that the name refers to the enclosing function's variable, that is, to the cell. (`global` does the same for module-level names.)
+
+## The late-binding trap
+
+A closure stores the variable, not its value at the moment the inner function was created. It reads the variable when it is called:
+
+```text
+>>> fns = [lambda: i for i in range(3)]
+>>> [f() for f in fns]
+[2, 2, 2]
+```
+
+All three lambdas refer to one variable `i`, in one cell. By the time they are called, the loop has finished and `i` is 2. The same happens with a `def` inside an ordinary `for` loop, and even after the loop: a later assignment to the variable changes what every closure sees.
+
+```text
+>>> handlers = []
+>>> for name in ["a", "b"]:
+...     def h():
+...         return name
+...     handlers.append(h)
+...
+>>> [h() for h in handlers]
+['b', 'b']
+>>> name = "z"
+>>> [h() for h in handlers]
+['z', 'z']
+```
+
+Recognize it by the symptom: several functions created in a loop all behave like the last one. There are two fixes, both of which give each function its own value at creation time:
+
+```text
+>>> fns = [lambda i=i: i for i in range(3)]
+>>> [f() for f in fns]
+[0, 1, 2]
+>>> def make(n):
+...     return lambda: n
+...
+>>> [f() for f in [make(i) for i in range(3)]]
+[0, 1, 2]
+```
+
+A default value is evaluated when the `lambda` is created, so `i=i` copies the current value into a parameter. A factory function such as `make` creates a new cell on each call. `functools.partial`, below, is a third way. The trap matters in GUI and callback code, and in ML code that builds a list of learning-rate schedules or hooks in a loop.
+
+## Decorators: `f = deco(f)`
+
+A **decorator** is a callable that takes a function and returns a replacement for it. The replacement is usually a closure that calls the original:
+
+```python
+def logged(func):
+    def wrapper(*args, **kwargs):
+        print(f"calling {func.__name__}{args}")
+        result = func(*args, **kwargs)
+        print(f"{func.__name__} returned {result!r}")
+        return result
+    return wrapper
+
+@logged
+def add(a, b):
+    """Add two numbers."""
+    return a + b
+```
+
+```text
+>>> add(2, 3)
+calling add(2, 3)
+add returned 5
+5
+>>> add.__name__, add.__doc__
+('wrapper', None)
+>>> add.__closure__[0].cell_contents
+<function add at 0x10a3d0460>
+```
+
+<aside class="callout"><strong>Key idea.</strong> `@deco` above `def f` means `f = deco(f)`, run once, when the definition executes. The decorator receives the new function object, and whatever it returns is bound to the name `f` instead. A wrapper defined inside the decorator keeps the original in its closure and runs code before and after calling it. Nothing about the original function changes; the name now refers to another object.</aside>
+
+<DecoratorWrap />
+
+1. `def logged` binds the name `logged`. When Python reaches `def add`, it creates the original function object, but does not bind `add` to it yet.
+2. Python calls `logged` with the original. Inside the call, the parameter `func` refers to it, through a cell, because the inner function uses `func`.
+3. `def wrapper` creates a new function object whose `__closure__` holds that cell.
+4. `logged` returns `wrapper`, and the name `add` is bound to it. The last line of the session shows the original, still alive, inside the wrapper's cell.
+5. `add(2, 3)` calls `wrapper(2, 3)`. `*args` collects `(2, 3)`, the wrapper prints, calls the original through the cell with the same arguments, prints again and returns 5.
+
+The `@` line is pure syntax. Writing `add = logged(add)` after an undecorated `def` has the same effect, except that with `@` the undecorated function is never bound to the name, even briefly ([Python reference, function definitions](#references)). Two consequences follow from "run once, when the definition executes":
+
+- **Decorator code runs at import time.** A decorator that prints, registers or checks something does it when the module is loaded, before any call. This is what registries (below) rely on.
+- **`*args, **kwargs` make a wrapper general.** The wrapper does not know the signature of the function it wraps, so it accepts any positional and keyword arguments and passes them on unchanged, the packing and unpacking of the [functions note](/notes/python/functions).
+
+## Keeping the name: `functools.wraps`
+
+The session above has a flaw: after decoration, `add.__name__` is `'wrapper'` and the docstring is gone. `help(add)`, `repr(add)` and every tool that reports a function by its `__name__`, such as a log line or a registry, show the wrong name. `functools.wraps` is a decorator for the wrapper that copies the original's metadata onto it:
+
+```python
+import functools
+
+def logged(func):
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        print(f"calling {func.__name__}{args}")
+        return func(*args, **kwargs)
+    return wrapper
+```
+
+```text
+>>> add.__name__, add.__doc__, add.__wrapped__
+('add', 'Add two numbers.', <function add at 0x10a3d0880>)
+>>> add.__wrapped__(2, 3)
+5
+>>> import inspect
+>>> inspect.signature(add)
+<Signature (a, b)>
+```
+
+(`add` here was decorated with the new `logged`.) `wraps` copies `__module__`, `__name__`, `__qualname__`, `__doc__` and the function's attribute dictionary, and adds `__wrapped__`, a reference to the original. `inspect.signature` follows `__wrapped__`, which is how documentation tools and IDEs show `(a, b)` instead of `(*args, **kwargs)`. Use `wraps` in every decorator that returns a wrapper.
+
+## Decorators with arguments
+
+`@retry(times=3)` or `@repeat(3)` look like decorators with arguments. There is no special syntax behind them: the expression after `@` is evaluated first, and its result is the decorator. So `repeat(3)` must return a decorator, which means one more level of nesting:
+
+```python
+def repeat(times):
+    def decorate(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            return [func(*args, **kwargs) for _ in range(times)]
+        return wrapper
+    return decorate
+
+@repeat(3)
+def roll():
+    return "six"
+```
+
+```text
+>>> roll()
+['six', 'six', 'six']
+```
+
+`@repeat(3)` above `def roll` means `roll = repeat(3)(roll)`. Three functions, three roles: `repeat` receives the arguments, `decorate` receives the function, `wrapper` receives each call's arguments, and each inner one is a closure over the variables of the outer ones.
+
+**The common mistake: forgetting the parentheses.** `@repeat` without `(3)` passes the function itself as `times`, and binds the name to `decorate`:
+
+```text
+>>> @repeat
+... def oops():
+...     return 1
+...
+>>> oops()
+Traceback (most recent call last):
+  ...
+TypeError: repeat.<locals>.decorate() missing 1 required positional argument: 'func'
+```
+
+The qualified name `repeat.<locals>.decorate` in the message is the clue: the name `oops` refers to the middle function. The same mistake is common with library decorators whose documentation shows them with parentheses, such as `@torch.no_grad()`.
+
+**Stacking.** Several decorators apply from the bottom up: the one nearest the `def` first.
+
+```python
+def bold(f):
+    return lambda: "<b>" + f() + "</b>"
+
+def italic(f):
+    return lambda: "<i>" + f() + "</i>"
+
+@bold
+@italic
+def hello():
+    return "hi"
+```
+
+```text
+>>> hello()
+'<b><i>hi</i></b>'
+```
+
+This is `hello = bold(italic(hello))`. Order matters whenever decorators interact: a cache placed above a timing decorator caches the timed function, so cached calls are not timed; placed below it, every call is timed and only the work inside is cached.
+
+## Decorating classes, and registries
+
+A decorator can be applied to a class, with the same meaning: `@deco` above `class C` is `C = deco(C)`. A class decorator usually changes the class in place and returns it. `@dataclass` of the [classes note](/notes/python/classes-and-objects#dataclasses) is one: it reads the annotations and adds `__init__`, `__repr__` and `__eq__` to the class. A small one written by hand:
+
+```python
+def add_repr(cls):
+    def __repr__(self):
+        fields = ", ".join(f"{k}={v!r}" for k, v in vars(self).items())
+        return f"{cls.__name__}({fields})"
+    cls.__repr__ = __repr__
+    return cls
+
+@add_repr
+class Run:
+    def __init__(self, lr, seed):
+        self.lr = lr
+        self.seed = seed
+```
+
+```text
+>>> Run(0.01, 42)
+Run(lr=0.01, seed=42)
+```
+
+A decorator does not have to wrap anything. A **registry** decorator records the function or class in a dictionary and returns it unchanged. Because decorators run when the module is imported, importing the module fills the registry:
+
+```python
+MODELS = {}
+
+def register_model(name):
+    def decorate(cls):
+        MODELS[name] = cls
+        return cls
+    return decorate
+
+@register_model("linear")
+class Linear:
+    def __init__(self, n):
+        self.n = n
+
+@register_model("mlp")
+class MLP:
+    def __init__(self, n):
+        self.n = n
+```
+
+```text
+>>> MODELS
+{'linear': <class '__main__.Linear'>, 'mlp': <class '__main__.MLP'>}
+>>> model = MODELS["mlp"](16)
+>>> type(model).__name__, model.n
+('MLP', 16)
+```
+
+This is how a training script can select a model from a string in a configuration file, `MODELS[config["model"]](...)`, without an `if` for every model. Libraries such as timm, Detectron2 and MMDetection organize their models, datasets and losses this way. The catch is the import: a model whose module was never imported is not in the registry, which is why such libraries import all their model modules from a package's `__init__.py` ([next note](/notes/python/modules-and-packages)).
+
+## Caching: `functools.cache` and `lru_cache`
+
+`functools.cache` is a decorator from the standard library that stores each result under its arguments and returns the stored result when the same arguments come again. Its classic use is a recursion that recomputes the same values:
+
+```python
+import functools
+
+@functools.cache
+def fib(n):
+    return n if n < 2 else fib(n - 1) + fib(n - 2)
+```
+
+**Why it matters, derived.** Without the cache, let $c(n)$ be the number of calls that `fib(n)` makes, itself included. Then $c(0) = c(1) = 1$, and for $n \ge 2$ the call makes itself plus the two recursive calls:
+
+$$
+c(n) = 1 + c(n-1) + c(n-2).
+$$
+
+Adding 1 to both sides gives $c(n) + 1 = \bigl(c(n-1) + 1\bigr) + \bigl(c(n-2) + 1\bigr)$, so $c(n) + 1$ satisfies the Fibonacci recurrence, with $c(0) + 1 = c(1) + 1 = 2 = 2F_1 = 2F_2$, where $F_1 = F_2 = 1$ are Fibonacci numbers. Hence
+
+$$
+c(n) = 2F_{n+1} - 1,
+$$
+
+which grows like $\varphi^n$ with $\varphi = (1 + \sqrt5)/2 \approx 1.618$: 177 calls for $n = 10$ and 2,692,537 for $n = 30$. With the cache, `fib(k)` runs its body once for each $k$ from $0$ to $n$: $n + 1$ calls miss the cache, and every other call is a dictionary lookup.
+
+<FibCalls />
+
+```text
+>>> fib(80)
+23416728348467685
+>>> fib.cache_info()
+CacheInfo(hits=78, misses=81, maxsize=None, currsize=81)
+```
+
+81 misses for $n = 80$, as $n + 1$ predicts; the uncached version would need $2F_{81} - 1 \approx 7.6 \times 10^{16}$ calls. In the Code section, the plain `fib(25)` makes 242,785 calls in 31 ms and the cached one 26 calls in 0.01 ms (CPython 3.14.7, Apple M1, one run each; the times vary between runs and machines, the call counts do not).
+
+The rules and their consequences:
+
+- **The arguments are the key, so they must be hashable.** `fib([1])` raises `TypeError: unhashable type: 'list'`, for the reason the [data model note](/notes/python/the-data-model#equality-and-hashing-__eq__-and-__hash__) gave.
+- **`cache` never forgets.** It is `lru_cache(maxsize=None)`, added in Python 3.9. `@functools.lru_cache(maxsize=128)` keeps only the 128 most recently used results and evicts the least recently used one when full, which bounds memory for functions called with many different arguments.
+- **Only for pure functions.** A cached function that reads a file, the clock or a global variable returns a stale answer when they change. `fib.cache_clear()` empties the cache.
+- **Careful with methods.** Decorating a method with `@cache` stores `self` in the key, which keeps every instance alive as long as the cache is; `functools.cached_property` caches a computed attribute on the instance instead.
+
+**`functools.partial`** is the other everyday tool of `functools`. It fixes some arguments of a function and returns a callable that takes the rest:
+
+```text
+>>> int2 = functools.partial(int, base=2)
+>>> int2("1011")
+11
+```
+
+It is the third fix for the late-binding trap, since it captures values at the time it is created, and the usual way to pass a configured function where a one-argument function is expected, such as a `collate_fn` for a PyTorch `DataLoader`.
+
+## Where ML code uses decorators
+
+- **`@torch.no_grad()`** turns off gradient recording for every call of the decorated function, typically an evaluation function. The same object works as a context manager, `with torch.no_grad():`, because its class derives from a helper that turns `__enter__` and `__exit__` into a decorator, as `contextlib.ContextDecorator` does in the Code section ([Deep Learning](/notes/deep-learning/pytorch-and-autograd#the-training-pipeline)). `@torch.compile` replaces a function or module with a compiled version.
+- **`@property`** of the [classes note](/notes/python/classes-and-objects#properties) is a decorator, and so are `@classmethod`, `@staticmethod` and `@dataclass`.
+- **Registries** map names in configuration files to classes, as above.
+- **`@functools.cache`** keeps an expensive object, such as a loaded tokenizer, from being built twice.
+- **`@pytest.fixture` and `@pytest.mark.parametrize`** register test helpers and parameters ([Testing](/notes/python/testing)).
+
+<aside class="callout"><strong>Check yourself.</strong> (1) `def outer(): x = 1; def inner(): return x; x = 2; return inner`. What does `outer()()` return, and why? (2) A list of buttons is built in a loop with `callback=lambda: print(name)`. Every button prints the last name. Give two fixes. (3) Rewrite `@a(1)` `@b` above `def f` as plain assignments. (4) A decorator without `functools.wraps` is applied to `train`. What do `train.__name__` and a traceback through `train` show? (5) Why does `@functools.cache` on a function that takes a NumPy array fail, and what would you cache instead?<details><summary>Answers</summary>(1) 2. `inner` reads `x` through a cell when it is called, and by then `outer` has set the cell to 2. (2) Bind the value at creation: `callback=lambda name=name: print(name)`, or `callback=functools.partial(print, name)`, or a factory function `make_callback(name)` that returns the lambda. (3) `f = a(1)(b(f))`: `b` is applied first, then the decorator returned by `a(1)`. (4) `train.__name__` is `'wrapper'` (or whatever the inner function is called), and the traceback shows a frame for `wrapper` and then one for the original `train`. With `wraps`, `train.__name__` is `'train'`, but the traceback still shows the `wrapper` frame: it reports the name of the code object that ran, which `wraps` does not change. (5) Arrays are mutable and unhashable, so building the cache key raises `TypeError: unhashable type`. Cache on something hashable that determines the array, such as a file path and a version, or convert small arrays to tuples.</details></aside>
+
+## What changed
+
+| | Copied code (the baseline) | Closures and decorators |
+| --- | --- | --- |
+| Where the tracing code lives | inside every function | once, in `logged` |
+| Applying it | edit each function | one `@logged` line per function |
+| Removing it | edit each function again | delete the line |
+| State between calls | globals or a class | a cell in a closure |
+| Metadata of the function | unchanged | preserved with `functools.wraps` |
+| Repeated work in recursion | recomputed, $2F_{n+1} - 1$ calls | `@functools.cache`, $n + 1$ calls |
+
+## Limitations
+
+- A wrapper adds a Python-level call to every call of the function, about as much as the call itself costs for a tiny function. That is irrelevant around a training step and noticeable around a function called millions of times in a loop.
+- Decorators hide behaviour: a reader of `add` must know what `@logged` does. Keep them few and well named.
+- The note leaves out decorators implemented as classes with `__call__`, `functools.singledispatch`, and the precise rules of `typing.ParamSpec` for annotating decorators; the [type hints note](/notes/python/type-hints) touches the last.
+- Cells are a CPython detail of how closures are stored; the language guarantees only the behaviour.
+
+## What you should remember
+
+- Functions are objects: they can be bound to names, stored, passed and returned.
+- A nested function that uses an enclosing variable gets it through a cell, which outlives the enclosing call. `nonlocal` lets the inner function assign to it.
+- Closures read the variable when called, not its value when created. In loops, bind the value with a default argument, a factory or `partial`.
+- `@deco` above `def f` is `f = deco(f)`, executed once at definition time. A decorator with arguments is a function that returns a decorator. Stacked decorators apply bottom-up.
+- Use `functools.wraps` in every wrapper. Use `functools.cache` or `lru_cache` for pure functions with hashable arguments.
+
+## Code
+
+The script runs each mechanism of the note: a counter closure and its cell, the late-binding trap and its fix, a tracing decorator with `wraps`, a decorator with arguments that retries a failing function, a registry of classes, a context manager that also works as a decorator in the shape of `torch.no_grad()`, the call counts of `fib(25)` with and without `functools.cache`, and `partial`. It needs only the standard library; run it with `python -I decorators.py`.
+
+```python
+"""Closures and decorators: cells, the late-binding trap, wraps, arguments, registries, caching (Python 3.14)."""
+import contextlib
+import functools
+import time
+
+
+# 1. A closure keeps the variables of the enclosing call alive in cells
+def make_counter():
+    count = 0
+    def increment():
+        nonlocal count
+        count += 1
+        return count
+    return increment
+
+c1, c2 = make_counter(), make_counter()
+print(c1(), c1(), c1(), c2(), c1.__code__.co_freevars, c1.__closure__[0].cell_contents)
+
+# 2. The late-binding trap: closures see the variable, not its value at creation
+late = [lambda: i for i in range(3)]
+early = [lambda i=i: i for i in range(3)]
+print([f() for f in late], [f() for f in early])
+
+
+# 3. A decorator is f = deco(f); functools.wraps copies the name and docstring
+def logged(func):
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        result = func(*args, **kwargs)
+        print(f"{func.__name__}{args} -> {result!r}")
+        return result
+    return wrapper
+
+@logged
+def add(a, b):
+    """Add two numbers."""
+    return a + b
+
+add(2, 3)
+print(add.__name__, add.__doc__, add.__wrapped__(2, 3))
+
+
+# 4. A decorator with arguments is a function that returns a decorator
+def retry(times):
+    def decorate(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            for attempt in range(1, times + 1):
+                try:
+                    return func(*args, **kwargs)
+                except ValueError as err:
+                    print(f"attempt {attempt} failed: {err}")
+            raise RuntimeError(f"{func.__name__} failed {times} times")
+        return wrapper
+    return decorate
+
+calls = iter([ValueError("flaky"), ValueError("flaky"), "ok"])
+@retry(times=3)
+def fetch():
+    outcome = next(calls)
+    if isinstance(outcome, Exception):
+        raise outcome
+    return outcome
+
+print(fetch())
+
+
+# 5. A registry: a decorator that records classes by name and returns them unchanged
+MODELS = {}
+def register(name):
+    def decorate(cls):
+        MODELS[name] = cls
+        return cls
+    return decorate
+
+@register("linear")
+class Linear:
+    def __init__(self, n):
+        self.n = n
+
+@register("mlp")
+class MLP(Linear):
+    pass
+
+model = MODELS["mlp"](16)
+print(sorted(MODELS), type(model).__name__, model.n)
+
+
+# 6. A context manager that also works as a decorator, the shape of torch.no_grad()
+STATE = {"grad": True}
+class no_grad(contextlib.ContextDecorator):
+    def __enter__(self):
+        self.prev = STATE["grad"]
+        STATE["grad"] = False
+    def __exit__(self, *exc):
+        STATE["grad"] = self.prev
+        return False
+
+@no_grad()
+def evaluate():
+    return STATE["grad"]
+
+with no_grad():
+    inside = STATE["grad"]
+print(evaluate(), inside, STATE["grad"])
+
+
+# 7. functools.cache turns exponential recursion into linear; count the calls
+def count_calls(func):
+    @functools.wraps(func)
+    def wrapper(*args):
+        wrapper.calls += 1
+        return func(*args)
+    wrapper.calls = 0
+    return wrapper
+
+@count_calls
+def fib(n):
+    return n if n < 2 else fib(n - 1) + fib(n - 2)
+
+@functools.cache
+@count_calls
+def fib_cached(n):
+    return n if n < 2 else fib_cached(n - 1) + fib_cached(n - 2)
+
+for name, f in [("plain", fib), ("cached", fib_cached)]:
+    start = time.perf_counter()
+    value = f(25)
+    elapsed = time.perf_counter() - start
+    inner = f if name == "plain" else f.__wrapped__
+    print(f"{name:6s} fib(25) = {value}, {inner.calls} calls, {elapsed * 1e3:.2f} ms")
+print(fib_cached.cache_info())
+
+# 8. functools.partial fixes some arguments
+int_from_binary = functools.partial(int, base=2)
+print(int_from_binary("1011"), int_from_binary.func is int, int_from_binary.keywords)
+
+# Output with CPython 3.14.7 on macOS (arm64); the times vary from run to run, the counts do not:
+# 1 2 3 1 ('count',) 3
+# [2, 2, 2] [0, 1, 2]
+# add(2, 3) -> 5
+# add Add two numbers. 5
+# attempt 1 failed: flaky
+# attempt 2 failed: flaky
+# ok
+# ['linear', 'mlp'] MLP 16
+# False False True
+# plain  fib(25) = 75025, 242785 calls, 31.30 ms
+# cached fib(25) = 75025, 26 calls, 0.01 ms
+# CacheInfo(hits=23, misses=26, maxsize=None, currsize=26)
+# 11 True {'base': 2}
+```
+
+The count 242,785 is $2F_{26} - 1 = 2 \cdot 121{,}393 - 1$, and 26 is $n + 1$. In the cached version `count_calls` sits under `functools.cache`, so it counts only the calls that miss the cache; `f.__wrapped__` reaches it through the attribute that `cache` sets, as `wraps` does.
+
+## Next
+
+The decorators of this note lived in the same file as the functions they decorate, and the registry depended on its modules being imported. Real programs are split across many files and use code that other people wrote and published. The [next note](/notes/python/modules-and-packages) follows `import` from the statement to the file it finds, explains packages, and shows how virtual environments, `pyproject.toml` and lockfiles keep a project's dependencies fixed, so that an experiment can be run again.
+
+## References
+
+- Python documentation (3.14): [Function definitions](https://docs.python.org/3.14/reference/compound_stmts.html#function-definitions) (decorators); [Naming and binding](https://docs.python.org/3.14/reference/executionmodel.html#naming-and-binding) (free variables, `nonlocal`); [`functools`](https://docs.python.org/3.14/library/functools.html) (`wraps`, `cache`, `lru_cache`, `partial`, `cached_property`); [`contextlib.ContextDecorator`](https://docs.python.org/3.14/library/contextlib.html#contextlib.ContextDecorator); [Programming FAQ: Why do lambdas defined in a loop with different values all return the same result?](https://docs.python.org/3.14/faq/programming.html#why-do-lambdas-defined-in-a-loop-with-different-values-all-return-the-same-result).
+- J. Hylton. [PEP 227 — Statically Nested Scopes](https://peps.python.org/pep-0227/). 2000. K. Yee. [PEP 3104 — Access to Names in Outer Scopes](https://peps.python.org/pep-3104/) (`nonlocal`). 2006.
+- K. D. Smith, J. Jewett, S. Montanaro, A. Baxter. [PEP 318 — Decorators for Functions and Methods](https://peps.python.org/pep-0318/). 2003. C. Winter. [PEP 3129 — Class Decorators](https://peps.python.org/pep-3129/). 2007.
+- L. Ramalho. *Fluent Python*, 2nd ed. O'Reilly, 2022. Ch. 7 (functions as first-class objects), ch. 9 (decorators and closures).
+- B. Slatkin. *Effective Python*, 3rd ed. Addison-Wesley. Chapters on functions and on metaclasses and attributes (decorators, `functools.wraps`).
+- D. Beazley, B. K. Jones. *Python Cookbook*, 3rd ed. O'Reilly, 2013. Ch. 9 (metaprogramming: decorators with and without arguments).
+- PyTorch documentation. [`torch.no_grad`](https://docs.pytorch.org/docs/stable/generated/torch.no_grad.html); [`torch.compile`](https://docs.pytorch.org/docs/stable/generated/torch.compile.html).

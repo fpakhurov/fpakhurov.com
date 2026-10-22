@@ -1,0 +1,502 @@
+---
+title: Testing
+description: "Why programs need automated tests and what a unit test is; pytest's plain asserts and how it rewrites them, fixtures, parametrize, temporary files and expected exceptions; doctests; property-based tests; and tolerances and seeds for numerical code."
+course: python
+section: Reliable Code
+order: 14
+status: published
+tags: [python, testing, pytest, unit-test, fixtures, parametrize, doctest, property-based-testing, hypothesis, floating-point]
+prerequisites: [Functions, Files and exceptions, "Modules, packages and environments"]
+---
+
+import PytestRun from '../../../components/figures/testing/PytestRun.astro';
+
+The Abstraction section ended with code split into functions, classes and modules, annotated with types that a checker reads before the program runs. A type checker can say that `mean` is called with a list of numbers; it cannot say that `mean` returns the right number. This note is about knowing that: writing small programs that call your code with chosen inputs and check the outputs, running hundreds of them in a second, and running them again after every change. The tool is **pytest**, the test runner that most Python projects use, including NumPy and pandas. The [next note](/notes/python/debugging-and-profiling) is about what to do when a test fails and the reason is not obvious.
+
+**Setup.** Everything below runs on CPython 3.14.7 with pytest 9.1.1 on an Apple M1 under macOS. pytest is a third-party package: install it into the project's environment with `uv add --dev pytest` or `python -m pip install pytest`, as the [modules and environments note](/notes/python/modules-and-packages) explains. Paths in pytest's output are shortened to `...`.
+
+## Why test?
+
+A program that worked yesterday can stop working today without anyone touching the line that broke. Someone changed a function it calls, or a library it imports, or the shape of the data it reads. Running the program by hand and looking at the output catches some of this, once, for the inputs you thought of that day. An **automated test** is a piece of code that does the looking for you: it calls the code with a fixed input and checks the result against what it should be. A test suite is cheap to run, so it runs after every change, and a change that breaks something is found minutes after it was made instead of weeks later.
+
+Tests also pin down what "correct" means. Writing `assert mean([1, 3]) == 2.0` forces a decision about the mean of an empty list, and that decision then lives in the test suite instead of in someone's memory.
+
+A **unit test** checks one small unit, usually one function, in isolation: fixed input, one call, a check of the output. It runs in milliseconds and, when it fails, points to one function. An **integration test** runs several parts together (read a file, clean the data, fit a model) and catches the errors that live between units. A project needs both; this note is about unit tests, which make up most of a suite.
+
+## Baseline: checking by hand
+
+Take a module `stats.py` with a function that the rest of the course will test:
+
+```python
+def mean(values):
+    if not values:
+        raise ValueError("mean of an empty sequence")
+    return sum(values) / len(values)
+```
+
+The baseline is to try it at the REPL: `mean([1, 2, 3])` prints `2.0`, it looks right, and you move on. Three things fail here. The check is not saved, so nobody will rerun it after the next change. It covers the cases you happened to type. And deciding that `2.0` "looks right" is done by a person, who will not look as carefully the twentieth time.
+
+The first improvement is to write the check down as an `assert` statement. `assert expr` evaluates `expr`; if the result is true, nothing happens; if it is false, Python raises `AssertionError`:
+
+```text
+$ python -c "assert 2.5 == 2"
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+    assert 2.5 == 2
+           ^^^^^^^^
+AssertionError
+```
+
+The check is now automatic, but the message is useless. With `assert mean([1, 2, 3, 4]) == 2` in a script, the report would show the source line and `AssertionError`, and not what `mean` returned. And `assert` statements are removed altogether when Python runs with `-O` (`python -O -c "assert 2.5 == 2; print('assert skipped')"` prints `assert skipped`), so an `assert` never guards anything in production code. pytest fixes the message and adds everything else a suite needs.
+
+## pytest: plain functions and plain asserts
+
+<aside class="callout"><strong>Key idea.</strong> A pytest test is an ordinary function whose name starts with `test`, in a file whose name starts with `test_`, that uses plain `assert`. pytest finds the tests by those names, rewrites every `assert` when it imports the file so that a failure reports the values involved, and supplies the test's arguments from **fixtures**, functions that set up what the test needs and clean up after it.</aside>
+
+The rules of collection, from the pytest documentation ([pytest, "Conventions for Python test discovery"](#references)):
+
+1. Starting from the arguments of the command (the current folder if there are none), pytest walks the folders and collects the files named `test_*.py` or `*_test.py`.
+2. It imports each file and collects the functions named `test*` at module level, and the methods named `test*` of classes named `Test*` that have no `__init__`.
+3. Each collected test is run separately. A test **passes** if it returns, **fails** if it raises (an `AssertionError` or anything else), and is reported as an **error** if a fixture it needs raises during setup.
+
+A test file for `stats.py`, with one wrong expectation on purpose:
+
+```python
+# test_stats.py
+from stats import mean
+
+def test_mean_of_three():
+    assert mean([1, 2, 3]) == 2.0
+
+def test_mean_of_four():
+    assert mean([1, 2, 3, 4]) == 2   # a wrong expectation, on purpose
+```
+
+```text
+$ python -m pytest
+============================= test session starts ==============================
+platform darwin -- Python 3.14.7, pytest-9.1.1, pluggy-1.7.0
+rootdir: .../t1
+collected 10 items
+
+test_stats.py .F....F...                                                 [100%]
+
+=================================== FAILURES ===================================
+______________________________ test_mean_of_four _______________________________
+
+    def test_mean_of_four():
+>       assert mean([1, 2, 3, 4]) == 2   # a wrong expectation, on purpose
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       assert 2.5 == 2
+E        +  where 2.5 = mean([1, 2, 3, 4])
+
+test_stats.py:13: AssertionError
+```
+
+(The full file, shown in pieces below, has ten tests and a second failure that the section on numbers explains; that part of the report is cut here.) Read the report from the line marked `>`: it is the failing line. The lines marked `E` show the comparison with its values filled in, `2.5 == 2`, and where the 2.5 came from: the call `mean([1, 2, 3, 4])`. Each dot in the progress line is a passed test, each `F` a failed one, in file order. The last line, `2 failed, 8 passed in 0.05s`, is the summary, and the exit status of the command is nonzero when anything failed, which is what a continuous-integration service checks.
+
+**Why the message is so detailed: assertion rewriting.** A plain `assert` raises a bare `AssertionError`, as the baseline showed. pytest gets the values because it does not run your test file as written. When it imports a test module, an **import hook** reads the source, parses it into a syntax tree and replaces each `assert` statement with code that evaluates every subexpression into a temporary variable, and, if the test fails, formats those values into the message ([pytest, "Assertion introspection details"](#references)). The rewritten module is compiled and cached in `__pycache__` like any other. Two consequences: rewriting applies only to test modules and to `conftest.py` files (helpers in other modules keep plain asserts unless registered with `pytest.register_assert_rewrite`), and the [syntax tree](/notes/python/how-cpython-runs-code) is the same one the CPython compiler builds, which is why the rewrite is possible at all.
+
+**The common mistake: a test that cannot fail.** `assert (mean([1, 2]), 1.5)` asserts a tuple, and a non-empty tuple is always true. pytest notices while rewriting and prints `PytestAssertRewriteWarning: assertion is always true, perhaps remove parentheses?` in the warnings summary (plain Python gives a `SyntaxWarning` with the same text), but the test is reported as passed whatever `mean` returns: the run ends with `1 passed, 1 warning`. A related trap: a test function whose name does not start with `test`, or a file not named `test_*.py`, is never collected, and "0 tests ran" looks like success at a glance. Make a new test fail once on purpose (change the expected value) before trusting it.
+
+## Fixtures: what a test needs
+
+A test often needs something prepared: a file to read, a small dataset, a model with known weights. A **fixture** is a function decorated with `@pytest.fixture`. A test asks for it by naming it as a parameter, and pytest calls the fixture and passes its return value in ([pytest, "How to use fixtures"](#references)). `tmp_path` is a built-in fixture: a fresh, empty `pathlib.Path` directory, different for every test, so tests cannot see each other's files.
+
+```python
+import pytest
+from stats import read_scores
+
+@pytest.fixture
+def scores_file(tmp_path):
+    path = tmp_path / "scores.csv"
+    path.write_text("ada,91.5\nalan,78\n", encoding="utf-8")
+    return path
+
+def test_read_scores(scores_file):
+    assert read_scores(scores_file) == {"ada": 91.5, "alan": 78.0}
+```
+
+The rule: pytest matches each parameter name of the test to a fixture of the same name, defined in the test file, in a `conftest.py` file in the same folder or above it, or built in. A fixture can itself ask for fixtures (`scores_file` asks for `tmp_path`), so the fixtures form a graph, and pytest sets them up in dependency order.
+
+**Teardown with `yield`.** A fixture that needs cleaning up yields its value instead of returning it; the code after `yield` runs after the test, whether the test passed or failed. The **scope** says how long a value lives: `"function"` (the default, a fresh value for every test), `"module"`, `"session"`. The option `--setup-show` prints the order:
+
+```python
+@pytest.fixture(scope="module")
+def database():
+    yield {"users": 0}               # set up once for the whole file
+
+@pytest.fixture
+def user(database):
+    database["users"] += 1
+    yield "ada"
+    database["users"] -= 1           # undo, so the next test starts clean
+
+def test_one(user, database):
+    assert database["users"] == 1
+
+def test_two(user, database):
+    assert database["users"] == 1
+```
+
+```text
+$ python -m pytest --setup-show -q test_order.py
+
+    SETUP    M database
+        SETUP    F user (fixtures used: database)
+        test_order.py::test_one (fixtures used: database, user) .
+        TEARDOWN F user
+        SETUP    F user (fixtures used: database)
+        test_order.py::test_two (fixtures used: database, user) .
+        TEARDOWN F user
+    TEARDOWN M database
+2 passed in 0.00s
+```
+
+`M` marks the module-scoped fixture, set up once and torn down after the last test of the file; `F` marks the function-scoped one, set up and torn down around each test. Both tests see one user, because `user` undoes its change. Delete the line after its `yield`, and `test_two` fails with `assert 2 == 1`: state leaked from one test into the next. That is the most common source of a test that passes alone and fails in the full suite, and the reason the default scope is the shortest one.
+
+<PytestRun />
+
+1. **Collect.** pytest finds `test_stats.py`, imports it and lists its tests. `parametrize` (next section) turns one function into several items.
+2. **Rewrite.** While importing, the import hook rewrites each `assert` so that it records the values of its subexpressions.
+3. **Resolve fixtures.** For `test_read_scores`, the parameter `scores_file` names a fixture, which needs `tmp_path`, a built-in one.
+4. **Set up.** The fixtures run in dependency order, up to their `return` or `yield`: `tmp_path` creates a directory, `scores_file` writes the file into it.
+5. **Call.** The test runs with the fixture values as arguments.
+6. **Tear down and report.** Code after each `yield` runs in reverse order of setup, and the outcome is recorded: `.` for a pass, `F` with the rewritten message for a failure.
+
+## Many cases: `parametrize`
+
+Three tests that differ only in their data are one test with a table. `@pytest.mark.parametrize` takes the argument names as one string and a list of tuples, and pytest generates one test per tuple:
+
+```python
+@pytest.mark.parametrize("values, expected", [
+    ([5], 5.0),
+    ([1, 3], 2.0),
+    ([-1, 0, 1], 0.0),
+])
+def test_mean_cases(values, expected):
+    assert mean(values) == expected
+```
+
+```text
+$ python -m pytest -v -k cases
+...
+test_stats.py::test_mean_cases[values0-5.0] PASSED                       [ 33%]
+test_stats.py::test_mean_cases[values1-2.0] PASSED                       [ 66%]
+test_stats.py::test_mean_cases[values2-0.0] PASSED                       [100%]
+
+======================= 3 passed, 7 deselected in 0.03s ========================
+```
+
+Each case has its own id in brackets, built from the parameter values (a list becomes `values0`, a number its value), and passes or fails on its own: one bad row does not hide the others, which a loop inside one test would. `-k cases` selects tests whose name contains `cases`, and `-v` prints one line per test.
+
+## Expected exceptions: `pytest.raises`
+
+The empty list is part of `mean`'s contract: it must raise `ValueError`. A test of that uses `pytest.raises` as a context manager:
+
+```python
+def test_mean_of_empty_raises():
+    with pytest.raises(ValueError, match="empty"):
+        mean([])
+```
+
+The rule: the test passes if the block raises an exception of the given type (or a subclass) whose message matches the regular expression `match`, searched with `re.search`. It fails with `DID NOT RAISE` if the block finishes normally, and an exception of another type passes through and fails the test as usual. Keep the block to the one call that should raise; a `with` block of ten lines passes if any of them raises the expected type, including a line you did not mean. The [files and exceptions note](/notes/python/files-and-exceptions) covers the `with` statement and the exception hierarchy that `pytest.raises` relies on.
+
+## Doctests
+
+A **doctest** is an example in a docstring, written as a REPL session, that a tool runs and compares character by character with the output shown ([Python documentation, `doctest`](#references)):
+
+```python
+def mean(values):
+    """Return the arithmetic mean of a non-empty sequence.
+
+    >>> mean([1, 2, 3])
+    2.0
+    >>> mean([])
+    Traceback (most recent call last):
+        ...
+    ValueError: mean of an empty sequence
+    """
+```
+
+```text
+$ python -m doctest -v stats.py
+...
+1 item passed all tests:
+   2 tests in stats.mean
+2 tests in 4 items.
+2 passed.
+Test passed.
+$ python -m pytest --doctest-modules stats.py -v
+...
+stats.py::stats.mean PASSED                                              [100%]
+```
+
+For an exception, only the first line (`Traceback (most recent call last):`) and the last line are compared; the `...` between them stands for the frames. Doctests keep documentation honest: an example that stopped being true fails. They are poor at everything else, because the comparison is on printed text. A dict printed in another order, a float printed with one more digit, or a memory address in a `repr` breaks them. Use them for a few illustrative examples, and write real tests in test files.
+
+## Properties instead of examples
+
+Every test so far checks examples that someone chose. The bugs that survive are in the inputs nobody thought of. A **property** is a statement that must hold for every input of some kind, and a **property-based test** generates many inputs at random and checks the property on each.
+
+Take a run-length encoder, `encode("aaab") == [("a", 3), ("b", 1)]`, and its inverse `decode`. The example tests pass. The property is that decoding undoes encoding: `decode(encode(text)) == text` for every string. A hand-written property test draws random strings with the standard `random` module, from a fixed seed so that a failure can be reproduced:
+
+```python
+import random
+from rle import decode, encode
+
+def test_roundtrip_property():
+    rng = random.Random(0)
+    for trial in range(1000):
+        text = "".join(rng.choice("ab") for _ in range(rng.randint(0, 8)))
+        assert decode(encode(text)) == text, f"trial {trial}: {text!r}"
+```
+
+```text
+$ python -m pytest -q
+.F                                                                       [100%]
+=================================== FAILURES ===================================
+...
+text = ''
+
+    def encode(text):
+        """'aaab' -> [('a', 3), ('b', 1)]"""
+        runs = []
+>       current, count = text[0], 0
+                         ^^^^^^^
+E       IndexError: string index out of range
+
+rle.py:4: IndexError
+```
+
+Trial 21 drew the empty string, and `encode` indexed its first character. The example tests never tried `""`. After adding `if not text: return []` at the top of `encode`, both tests pass. Choosing short strings over a two-letter alphabet is deliberate: small inputs hit edge cases (empty, one run, alternating letters) far more often than long random ones, and a failure on a short input is easy to read.
+
+**Hypothesis.** The library [Hypothesis](#references) does this properly; it is not installed in this course's environment, so what follows is described from its documentation and not run here. A test declares the kind of input with a **strategy**, `@given(st.text())` for strings or `@given(st.lists(st.integers()))` for lists of integers, after `from hypothesis import given, strategies as st`. Hypothesis generates 100 inputs by default (the `max_examples` setting), biased towards edge cases. When one fails, it **shrinks** it: it tries simpler versions of the failing input and reports the simplest one that still fails, so the report would name `text=''` even if the first failure had been a long string. It also saves failing inputs in a local `.hypothesis` folder and tries them first on the next run. The hand-written loop above has none of shrinking, edge-case bias or memory; it has only the idea.
+
+Good properties to look for: a round trip (encode then decode, save then load, serialize then parse); an invariant (sorting keeps the same elements and leaves them in order; a mean lies between the minimum and the maximum); a comparison with a slow, obviously correct version of the same function.
+
+## Testing numerical code
+
+Floating-point arithmetic rounds every result to the nearest number the format can hold, so a computed value is usually not exactly equal to the value the mathematics gives ([the floating-point note](/notes/acos/floating-point#why-01--02-is-not-03) explains why `0.1 + 0.2` is not `0.3`). An exact `==` on floats tests the rounding, not the formula:
+
+```text
+$ python -m pytest
+...
+E       assert 0.19999999999999998 == 0.2
+E        +  where 0.19999999999999998 = mean([0.1, 0.2, 0.3])
+```
+
+The rule is to compare with a **tolerance**. Two tools do it:
+
+```text
+>>> import math, pytest
+>>> x = sum([0.1, 0.2, 0.3]) / 3
+>>> x
+0.19999999999999998
+>>> x == 0.2
+False
+>>> math.isclose(x, 0.2)
+True
+>>> x == pytest.approx(0.2)
+True
+>>> pytest.approx(0.2)
+0.2 ± 2.0e-07
+>>> err = 0.1 + 0.2 - 0.3
+>>> err
+5.551115123125783e-17
+>>> math.isclose(err, 0.0)
+False
+>>> math.isclose(err, 0.0, abs_tol=1e-12)
+True
+>>> err == pytest.approx(0.0)
+True
+```
+
+The exact rules ([Python documentation, `math.isclose`](#references); [pytest, `approx`](#references)):
+
+- `math.isclose(a, b, rel_tol=1e-09, abs_tol=0.0)` is true when $|a - b| \le \max(\text{rel\_tol} \cdot \max(|a|, |b|),\ \text{abs\_tol})$.
+- `actual == pytest.approx(expected, rel=1e-6, abs=1e-12)` is true when $|\text{actual} - \text{expected}| \le \max(\text{rel} \cdot |\text{expected}|,\ \text{abs})$. It also accepts lists, dicts and NumPy arrays and compares element by element: `normalize([1, 3]) == pytest.approx([0.25, 0.75])`.
+
+A relative tolerance scales with the size of the numbers, which is right for most results. It fails near zero: the tolerance $10^{-9} \cdot |0|$ is zero, so `math.isclose(err, 0.0)` is false for an error of $5.6 \cdot 10^{-17}$. Comparing against zero needs an absolute tolerance, which `pytest.approx` has by default and `math.isclose` does not. NumPy arrays have `numpy.testing.assert_allclose`, the same idea with a report of the worst element.
+
+The tolerance should come from the computation, not be loosened until the test passes. A sum of $n$ numbers can accumulate an error of order $n$ times the unit roundoff; an iterative solver stops at its own tolerance; a stochastic estimate has a standard error. A test with a tolerance of $10^{-2}$ on a quantity that should be exact to $10^{-12}$ cannot catch a bug that changes the third digit.
+
+**Seeds.** Code that draws random numbers gives a different answer each run, and a test of it either fails at random or is so loose that it checks nothing. The rule is to pass the generator in, and seed it in the test: `random.Random(42)` for the standard library, `numpy.random.default_rng(42)` for NumPy. The same seed gives the same sequence on every run, so the test is repeatable and a failure can be replayed. Test what must hold for any seed (bootstrap means lie between the minimum and the maximum of the data), plus statistical statements with a tolerance derived from the spread. The machine-learning courses seed every run for the same reason, as the note on [training in practice](/notes/deep-learning/training-in-practice#make-runs-reproducible) explains; the ML course's Code sections print numbers that the text quotes, which only works because the scripts are seeded.
+
+<aside class="callout"><strong>Check yourself.</strong> (1) A test `assert result == 0.3` fails with `assert 0.30000000000000004 == 0.3`. What is the fix, and why is "round both to 10 digits" worse? (2) A fixture opens a temporary database and `return`s it. What is wrong, and how does `yield` fix it? (3) Your test passes alone but fails when the whole suite runs. Name the likely cause. (4) Why does `pytest.approx(0.0)` accept $10^{-17}$ while `math.isclose(1e-17, 0.0)` does not?<details><summary>Answers</summary>(1) `assert result == pytest.approx(0.3)` or `math.isclose(result, 0.3)`. Rounding to a fixed number of digits fails at a rounding boundary: 0.12345678905 and 0.12345678904 differ by $10^{-11}$ but round to different 10-digit numbers. A tolerance has no boundary. (2) Nothing closes it after the test. With `yield db` followed by `db.close()`, the cleanup runs after the test, even if the test failed. (3) Shared state leaking between tests: a module-level variable, a broader-scoped fixture that one test mutates, a file left behind. Function-scoped fixtures and `tmp_path` prevent it. (4) `pytest.approx` has a default absolute tolerance of $10^{-12}$; `math.isclose` has `abs_tol=0.0`, and a relative tolerance against zero is zero.</details></aside>
+
+## What changed
+
+| | Checking by hand | `assert` in a script | pytest |
+| --- | --- | --- | --- |
+| Saved and rerun | no | yes | yes, all tests with one command |
+| Failure message | your judgement | bare `AssertionError` | the values of each subexpression |
+| Setup and cleanup | by hand | by hand | fixtures with `yield`, `tmp_path` |
+| Many cases | retyped | a loop that stops at the first failure | `parametrize`, one result per case |
+| Exceptions | read the traceback | `try`/`except` by hand | `pytest.raises(..., match=...)` |
+| Floats | eyeballed | `==`, which fails on rounding | `pytest.approx`, `math.isclose` |
+| Inputs | the ones you thought of | the ones you thought of | plus generated ones, from a seed |
+
+## Limitations
+
+- **Tests show the presence of bugs, not their absence.** A passing suite says that the cases it checks work. Coverage tools (`coverage.py`, `pytest-cov`) report which lines ran during the tests, which finds untested code but says nothing about whether the tested code is checked well.
+- **Tests are code.** They can be wrong, and a wrong expected value is a bug that the suite protects. Make each new test fail once on purpose.
+- **Unit tests isolate; the real world does not.** Replacing a database or a network service with a fake (`unittest.mock`) makes tests fast and deterministic and can make them pass against a fake that no longer matches the real thing. Some integration tests against the real thing are still needed.
+- **pytest is not the only runner.** The standard library's `unittest` uses classes and `self.assertEqual`; pytest runs `unittest` tests too. This note shows pytest because it is the common choice in scientific Python.
+- **Hypothesis was not run here.** Its description follows its documentation; the hand-written property test is the part that was run.
+
+## What you should remember
+
+- A unit test calls one function with a fixed input and checks the output automatically. Run the suite after every change.
+- pytest collects `test_*` functions from `test_*.py` files and rewrites plain `assert` so that a failure shows the values involved. A failure is read from the `>` line and the `E` lines.
+- Fixtures are requested by parameter name; `yield` separates setup from teardown; the default scope gives every test a fresh value. `tmp_path` is a fresh directory per test.
+- `parametrize` turns a table of cases into separate tests; `pytest.raises(Type, match=...)` checks that a call raises.
+- Doctests check examples in docstrings by comparing printed text; keep them few.
+- A property test checks a statement over many generated inputs; Hypothesis adds shrinking and remembers failures.
+- Compare floats with a tolerance chosen from the computation: `pytest.approx`, `math.isclose` (with `abs_tol` near zero). Pass random generators in and seed them in tests.
+
+## Code
+
+The script is a module and its tests in one file. Run with `python -I test_scores.py`, it calls pytest on itself: the functions under test, a doctest, parametrized cases, an expected exception, a `tmp_path` fixture, tolerances, a seeded stochastic function and a property test. It needs pytest; the run takes well under a second.
+
+```python
+"""Tests for a small scores module, in one file (Python 3.14, pytest 9).
+
+Run with `python -I test_scores.py`; it calls pytest on itself.
+"""
+import math
+import random
+import sys
+
+import pytest
+
+
+# ---- the code under test --------------------------------------------------
+def mean(values):
+    """Arithmetic mean of a non-empty sequence.
+
+    >>> mean([1, 2, 3])
+    2.0
+    """
+    if not values:
+        raise ValueError("mean of an empty sequence")
+    return sum(values) / len(values)
+
+
+def read_scores(path):
+    """Read lines 'name,score' into a dict of floats."""
+    scores = {}
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            name, score = line.strip().split(",")
+            scores[name] = float(score)
+    return scores
+
+
+def bootstrap_means(values, n_resamples, rng):
+    """Means of n_resamples resamples drawn with replacement."""
+    k = len(values)
+    return [mean([values[rng.randrange(k)] for _ in range(k)])
+            for _ in range(n_resamples)]
+
+
+def encode(text):
+    """Run-length encoding: 'aaab' -> [('a', 3), ('b', 1)]."""
+    if not text:
+        return []
+    runs = []
+    current, count = text[0], 0
+    for ch in text:
+        if ch == current:
+            count += 1
+        else:
+            runs.append((current, count))
+            current, count = ch, 1
+    runs.append((current, count))
+    return runs
+
+
+def decode(runs):
+    return "".join(ch * n for ch, n in runs)
+
+
+# ---- the tests -----------------------------------------------------------
+@pytest.mark.parametrize("values, expected", [([5], 5.0), ([1, 3], 2.0), ([-1, 0, 1], 0.0)])
+def test_mean_cases(values, expected):
+    assert mean(values) == expected
+
+
+def test_mean_of_empty_raises():
+    with pytest.raises(ValueError, match="empty"):
+        mean([])
+
+
+def test_mean_of_tenths():
+    assert mean([0.1, 0.2, 0.3]) != 0.2                  # exact comparison fails
+    assert mean([0.1, 0.2, 0.3]) == pytest.approx(0.2)   # relative tolerance 1e-6
+    assert math.isclose(mean([0.1, 0.2, 0.3]), 0.2)      # relative tolerance 1e-9
+
+
+@pytest.fixture
+def scores_file(tmp_path):
+    path = tmp_path / "scores.csv"
+    path.write_text("ada,91.5\nalan,78\n", encoding="utf-8")
+    return path
+
+
+def test_read_scores(scores_file):
+    assert read_scores(scores_file) == {"ada": 91.5, "alan": 78.0}
+
+
+def test_bootstrap_is_reproducible():
+    data = [2.0, 4.0, 4.0, 5.0, 9.0]
+    first = bootstrap_means(data, 200, random.Random(42))
+    second = bootstrap_means(data, 200, random.Random(42))
+    assert first == second                               # same seed, same numbers
+    assert min(data) <= min(first) and max(first) <= max(data)
+    assert mean(first) == pytest.approx(mean(data), abs=0.3)
+
+
+def test_roundtrip_property():
+    rng = random.Random(0)
+    for trial in range(1000):
+        text = "".join(rng.choice("ab") for _ in range(rng.randint(0, 8)))
+        assert decode(encode(text)) == text, f"trial {trial}: {text!r}"
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v", "-p", "no:cacheprovider", "--doctest-modules"]))
+
+# Output with CPython 3.14.7 and pytest 9.1.1 on macOS (arm64); the header and timing vary:
+# ============================= test session starts ==============================
+# platform darwin -- Python 3.14.7, pytest-9.1.1, pluggy-1.7.0 -- .../bin/python
+# rootdir: ...
+# collecting ... collected 9 items
+#
+# test_scores.py::test_scores.mean PASSED                                  [ 11%]
+# test_scores.py::test_mean_cases[values0-5.0] PASSED                      [ 22%]
+# test_scores.py::test_mean_cases[values1-2.0] PASSED                      [ 33%]
+# test_scores.py::test_mean_cases[values2-0.0] PASSED                      [ 44%]
+# test_scores.py::test_mean_of_empty_raises PASSED                         [ 55%]
+# test_scores.py::test_mean_of_tenths PASSED                               [ 66%]
+# test_scores.py::test_read_scores PASSED                                  [ 77%]
+# test_scores.py::test_bootstrap_is_reproducible PASSED                    [ 88%]
+# test_scores.py::test_roundtrip_property PASSED                           [100%]
+#
+# ============================== 9 passed in 0.06s ===============================
+```
+
+`-p no:cacheprovider` stops pytest from writing a `.pytest_cache` folder next to the file. Remove the `if not text` lines from `encode` and the last test fails at trial 21, on the empty string.
+
+## Next
+
+A failing test says that something is wrong and where the check failed. It does not always say why: the wrong value may have been computed three calls earlier, or only on the 10,000th row of the data. The [next note](/notes/python/debugging-and-profiling) is about finding the cause: reading tracebacks closely, stopping a running program with the debugger to look at its variables, logging what a long run does, and, when the program is correct but slow, measuring where the time and memory go.
+
+## References
+
+- pytest documentation (version 9): [Get started](https://docs.pytest.org/en/stable/getting-started.html); [Conventions for Python test discovery](https://docs.pytest.org/en/stable/explanation/goodpractices.html#conventions-for-python-test-discovery); [Assertion introspection details](https://docs.pytest.org/en/stable/how-to/assert.html#assertion-introspection-details); [How to use fixtures](https://docs.pytest.org/en/stable/how-to/fixtures.html) and [the fixture reference](https://docs.pytest.org/en/stable/reference/fixtures.html); [How to parametrize](https://docs.pytest.org/en/stable/how-to/parametrize.html); [`pytest.approx` and `pytest.raises`](https://docs.pytest.org/en/stable/reference/reference.html); [How to run doctests](https://docs.pytest.org/en/stable/how-to/doctest.html).
+- Python documentation (3.14): [The `assert` statement](https://docs.python.org/3.14/reference/simple_stmts.html#the-assert-statement); [`doctest`](https://docs.python.org/3.14/library/doctest.html); [`math.isclose`](https://docs.python.org/3.14/library/math.html#math.isclose); [`random`](https://docs.python.org/3.14/library/random.html); [`unittest`](https://docs.python.org/3.14/library/unittest.html) and [`unittest.mock`](https://docs.python.org/3.14/library/unittest.mock.html).
+- [Hypothesis documentation](https://hypothesis.readthedocs.io/): the quickstart, and [Replaying failed tests](https://hypothesis.readthedocs.io/en/latest/tutorial/replaying-failures.html) (the example database).
+- K. Claessen, J. Hughes. [QuickCheck: a lightweight tool for random testing of Haskell programs](https://doi.org/10.1145/351240.351266). ICFP 2000. The origin of property-based testing.
+- [NumPy documentation, `numpy.testing.assert_allclose`](https://numpy.org/doc/stable/reference/generated/numpy.testing.assert_allclose.html).
+- B. Slatkin. *Effective Python*, 3rd ed. Addison-Wesley, 2024. The chapter on testing and debugging.
+- L. Ramalho. *Fluent Python*, 2nd ed. O'Reilly, 2022.

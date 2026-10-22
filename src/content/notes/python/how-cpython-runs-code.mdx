@@ -1,0 +1,444 @@
+---
+title: How CPython runs code
+description: "What CPython does with a function: tokens, a syntax tree and bytecode; the evaluation loop, the value stack and frames; the specializing adaptive interpreter; reference counting, the cycle collector, immortal objects and small integers; and the status of the experimental JIT in 3.14."
+course: python
+section: Under the Hood
+order: 16
+status: published
+tags: [python, cpython, bytecode, dis, ast, interpreter, frames, specialization, reference-counting, garbage-collection, jit]
+prerequisites: [Running Python, "Values, types and names", Functions, Debugging and profiling]
+---
+
+import ValueStack from '../../../components/figures/how-cpython-runs-code/ValueStack.astro';
+import Specialization from '../../../components/figures/how-cpython-runs-code/Specialization.astro';
+
+The [debugging and profiling note](/notes/python/debugging-and-profiling) found a slow function and a fix, and left two questions open: why one operation costs nanoseconds and another microseconds, and what the frames that the debugger walks really are. The answers are in the interpreter. The [first note](/notes/python/running-python#what-happens-when-you-run-a-file) gave the outline: CPython compiles a file into bytecode, then a loop executes the bytecode. This note opens each stage for one small function, runs it on the interpreter's value stack instruction by instruction, shows how the interpreter rewrites its own instructions as it learns the types it sees, and explains how memory is reclaimed. The ACOS course follows the same interpreter downward, [to the operating system](/notes/acos/language-runtimes); this note stays at the level of Python.
+
+**Setup.** CPython 3.14.7 for macOS on Apple M1, the build that uv installs. Instruction names, specializations and garbage-collector thresholds are CPython details: they change between versions, and other implementations (PyPy, for one) have none of them. Everything shown is real output of this build; folders are shortened to `...`.
+
+## Baseline: "Python reads your code line by line"
+
+A common picture of an interpreter is a program that reads a line of text, works out what it means, does it, and reads the next line. If CPython worked that way, a loop that runs a million times would parse its body a million times, a syntax error on the last line would be found only after the first lines ran, and nothing could be done to make the same line faster on its second run.
+
+None of that holds. A syntax error anywhere stops the file before its first line runs, as the first note showed. A loop body is analysed once. And the same line does get faster after a few runs, which the section on specialization shows. CPython translates before it runs, and what it runs is not text.
+
+## From text to a syntax tree
+
+Take one statement, `total = price * 2`. The first stage, the **tokenizer**, cuts the text into tokens: names, operators, numbers, and markers for the end of a line. The module `tokenize` exposes it:
+
+```text
+>>> import io, tokenize
+>>> src = "total = price * 2\n"
+>>> for tok in tokenize.generate_tokens(io.StringIO(src).readline):
+...     print(tokenize.tok_name[tok.type], repr(tok.string))
+...
+NAME 'total'
+OP '='
+NAME 'price'
+OP '*'
+NUMBER '2'
+NEWLINE '\n'
+ENDMARKER ''
+```
+
+The **parser** checks that the tokens follow the grammar of the language and builds an **abstract syntax tree** (AST): a tree of nodes, one per construct, with the punctuation gone and the structure explicit. The module `ast` prints it:
+
+```text
+>>> import ast
+>>> print(ast.dump(ast.parse("total = price * 2"), indent=2))
+Module(
+  body=[
+    Assign(
+      targets=[
+        Name(id='total', ctx=Store())],
+      value=BinOp(
+        left=Name(id='price', ctx=Load()),
+        op=Mult(),
+        right=Constant(value=2)))])
+```
+
+Read it as the statement's meaning: an assignment whose target is the name `total` (in a `Store` context, it is being written) and whose value is a binary operation, multiplication, of the name `price` (being read) and the constant 2. Operator precedence is already resolved: `a + b * c` parses into a `BinOp` whose right operand is another `BinOp`. Tools that work on code, rather than run it, work on this tree: linters, formatters, type checkers, and pytest, which [rewrites `assert` statements](/notes/python/testing#pytest-plain-functions-and-plain-asserts) by editing the tree before compiling it.
+
+## From the tree to bytecode
+
+The **compiler** walks the tree and emits **bytecode**: a sequence of simple instructions for a virtual machine, stored with everything else the function needs in a **code object**. For a function, the compiler runs once, when the `def` statement is executed, and the code object is attached to the function as `f.__code__`. The module `dis` disassembles it:
+
+```text
+>>> import dis
+>>> def f(price, qty):
+...     total = price * qty
+...     return total + 1
+...
+>>> dis.dis(f)
+  1           RESUME                   0
+
+  2           LOAD_FAST_BORROW_LOAD_FAST_BORROW 1 (price, qty)
+              BINARY_OP                5 (*)
+              STORE_FAST               2 (total)
+
+  3           LOAD_FAST_BORROW         2 (total)
+              LOAD_SMALL_INT           1
+              BINARY_OP                0 (+)
+              RETURN_VALUE
+>>> f.__code__.co_varnames
+('price', 'qty', 'total')
+>>> f.__code__.co_stacksize
+2
+```
+
+Each line of the listing is one instruction: the source line it came from (only where it changes), the instruction's name (its **opcode**), its argument, and in parentheses what the argument means. `RESUME` marks the function's start and is where the interpreter checks for pending work such as signals. `co_varnames` lists the local variables, arguments first, and `LOAD_FAST_BORROW 2 (total)` refers to `total` by its position, 2, in that list. `co_stacksize` is the deepest the value stack ever gets in this function, computed by the compiler.
+
+Three names in the listing are recent. `LOAD_SMALL_INT` (3.14) pushes a small integer encoded in the instruction itself instead of fetching it from the constants table. `LOAD_FAST_LOAD_FAST` (3.13), the first load of the listing without its `_BORROW` suffixes, is a **superinstruction** that does the work of two loads with one dispatch. And the `_BORROW` forms (3.14) push a local variable without incrementing its reference count, which is safe when the compiler can prove that the frame keeps the object alive for as long as the stack holds it; this is why the 3.14 documentation warns that `sys.getrefcount` may return different values than before ([What's New in Python 3.14](#references)). The instruction set is an implementation detail, documented per version in the `dis` module, and it is not stable between versions.
+
+## The evaluation loop and the value stack
+
+<aside class="callout"><strong>Key idea.</strong> CPython's bytecode runs on a **stack machine**. Each call of a function gets a **frame**: an array of slots for its local variables, a **value stack** for intermediate results, and a pointer to the next instruction. A loop written in C fetches an instruction, executes it (usually by popping operands from the value stack and pushing a result) and moves to the next one. Everything that Python code does, it does through this loop, one instruction at a time.</aside>
+
+The rule for each instruction of `f`, from the `dis` documentation ([Python documentation, `dis`](#references)):
+
+- `LOAD_FAST_BORROW i` pushes the value of local slot `i`; `LOAD_FAST_BORROW_LOAD_FAST_BORROW` pushes two.
+- `LOAD_SMALL_INT n` pushes the integer `n`.
+- `BINARY_OP op` pops the top two values, applies the operator to them (the lower one is the left operand) and pushes the result.
+- `STORE_FAST i` pops the top value into local slot `i`.
+- `RETURN_VALUE` pops the top value and returns it to the caller.
+
+Here is `f(3, 4)`, executed instruction by instruction:
+
+<ValueStack />
+
+1. The arguments are already in their slots: `price` is 3 and `qty` is 4. One instruction pushes both values.
+2. `BINARY_OP 5 (*)` pops 4 and 3, multiplies, and pushes 12.
+3. `STORE_FAST 2` pops 12 into the slot of `total`. The stack is empty, as it is between statements.
+4. `LOAD_FAST_BORROW 2` pushes the value of `total` back.
+5. `LOAD_SMALL_INT 1` pushes 1.
+6. `BINARY_OP 0 (+)` pops 1 and 12 and pushes 13.
+7. `RETURN_VALUE` pops 13 and hands it to the caller, which pushes it on its own value stack.
+
+The figure shows why a local variable is cheap. Its name is turned into a slot number at compile time, so reading it is an array access. A global name is different: `LOAD_GLOBAL` looks the name up in the module's dictionary and, if it is not there, in the dictionary of built-ins, at run time. The [performance note](/notes/python/performance) measures what that costs today, which is less than it used to be, for the reason in the next section.
+
+**The loop itself.** The heart of CPython is one C function, `_PyEval_EvalFrameDefault` in `Python/ceval.c`, with the code of each instruction generated from definitions in `Python/bytecodes.c` ([CPython source and internal documentation](#references)). Since 3.14, CPython can also be built with a **tail-calling interpreter**, in which each instruction is a small C function that ends by jumping straight into the next one; with Clang 19 or newer it is a few percent faster on the standard benchmarks ([What's New in Python 3.14](#references)). The build used in this course was compiled that way (its `sysconfig.get_config_var('CONFIG_ARGS')` includes `--with-tail-call-interp`). Python code cannot tell the difference.
+
+**Frames.** A frame holds the code object, the local slots, the value stack, the position of the current instruction, and a link to the frame of the caller. The chain of links is the call stack that a traceback prints and that `pdb`'s `where` walks. From Python, `sys._getframe()` returns the current frame as an object:
+
+```text
+>>> import sys
+>>> def outer():
+...     return inner(10)
+...
+>>> def inner(n):
+...     frame = sys._getframe()
+...     print(frame.f_code.co_name, frame.f_locals, frame.f_lineno)
+...     caller = frame.f_back
+...     print(caller.f_code.co_name, caller.f_lineno)
+...     return n
+...
+>>> outer()
+inner {'n': 10, 'frame': <frame at 0x1019b6d40, file '<python-input-2>', line 3, code inner>} 3
+outer 2
+10
+```
+
+Since 3.11, frames live in a compact internal form on a per-thread stack, and the frame *object* that Python code sees is created only when something asks for it, such as `sys._getframe`, a traceback or a debugger ([What's New in Python 3.11](#references)). That made calls cheaper, but a Python call is still a substantial operation: it allocates a frame, copies the arguments into its slots and starts a new run of the loop's instruction sequence. The [performance note](/notes/python/performance) measures it at about 13 ns on this machine, against about 34 ns for a whole iteration of a simple loop.
+
+## The specializing adaptive interpreter
+
+*Optional depth: how CPython 3.11 and later speed up instructions by rewriting them. The rest of the note does not depend on it.*
+
+`BINARY_OP 5 (*)` does not know what it multiplies. It could be two integers, two floats, a string and an integer, or two NumPy arrays, so the generic instruction looks up the operands' types and calls the multiply operation the left operand's type provides (the `__mul__` of the [data model](/notes/python/the-data-model)), falling back to the right operand's `__rmul__`. That lookup is most of the cost of the instruction. Yet in a real program one particular `*` sees the same types almost every time.
+
+Since Python 3.11 the interpreter exploits that ([PEP 659](#references)). Each instruction that can benefit has an **inline cache**, a few entries of space reserved right after it in the bytecode, which starts with a counter. After a short warm-up the interpreter looks at the operands it actually saw and **rewrites the instruction in place** into a specialized form for those types. A specialized instruction first checks a **guard**, a cheap test that its assumption still holds (both operands exact `int`s, say), and then takes the shortcut. If the guard fails, it runs the generic operation instead and counts a miss; after enough misses, the instruction goes back to its adaptive form and specializes again for whatever it now sees. `dis(f, adaptive=True)` shows the current, rewritten bytecode:
+
+```text
+>>> for _ in range(1000):
+...     _ = f(3, 4)
+...
+>>> dis.dis(f, adaptive=True)
+  1           RESUME_CHECK             0
+
+  2           LOAD_FAST_BORROW_LOAD_FAST_BORROW 1 (price, qty)
+              BINARY_OP_MULTIPLY_INT   5 (*)
+              STORE_FAST               2 (total)
+
+  3           LOAD_FAST_BORROW         2 (total)
+              LOAD_SMALL_INT           1
+              BINARY_OP_ADD_INT        0 (+)
+              RETURN_VALUE
+>>> for _ in range(1000):
+...     _ = f(2.5, 4.0)
+...
+>>> dis.dis(f, adaptive=True)
+  1           RESUME_CHECK             0
+
+  2           LOAD_FAST_BORROW_LOAD_FAST_BORROW 1 (price, qty)
+              BINARY_OP_MULTIPLY_FLOAT 5 (*)
+              STORE_FAST               2 (total)
+
+  3           LOAD_FAST_BORROW         2 (total)
+              LOAD_SMALL_INT           1
+              BINARY_OP_EXTEND         0 (+)
+              RETURN_VALUE
+```
+
+<Specialization />
+
+1. As compiled, the multiplication is the generic `BINARY_OP 5 (*)`, with its cache.
+2. After calls with integers it is `BINARY_OP_MULTIPLY_INT`. On this build the rewrite happened already on the second call of a fresh function; the warm-up is deliberately short.
+3. Calls with floats fail its guard: each runs the generic path and counts a miss.
+4. After enough misses the instruction is `BINARY_OP_MULTIPLY_FLOAT`. The addition, which now sees a float and the integer 1, became `BINARY_OP_EXTEND`, a 3.14 specialization for mixed operand types such as a float and an int.
+
+Attribute access and calls are specialized the same way. Run on objects of one class, `p.x` becomes `LOAD_ATTR_INSTANCE_VALUE`, which reads the attribute from a known position in the object after checking that the object's type has not changed; `len(items)` becomes `LOAD_GLOBAL_BUILTIN` followed by `CALL_LEN`:
+
+```text
+  8           LOAD_FAST_BORROW         0 (p)
+              LOAD_ATTR_INSTANCE_VALUE 0 (x)
+  ...
+ 11           LOAD_GLOBAL_BUILTIN      1 (len + NULL)
+              LOAD_FAST_BORROW         0 (items)
+              CALL_LEN                 1
+```
+
+(from `dis(..., adaptive=True)` of `def norm2(p): return p.x * p.x + p.y * p.y` and `def call_len(items): return len(items)` after 500 calls, trimmed). `LOAD_GLOBAL_BUILTIN` caches where `len` was found, with a version tag of the module's and the built-ins' dictionaries, so the dictionary lookups are skipped as long as nobody assigns a new global.
+
+**What this means for your code.** Code whose types are stable, which is most code, runs on specialized instructions after a few calls; code that mixes types at one place (a function called alternately with ints, floats and strings) keeps falling back to the generic path. Specialization does not change what any program computes, and nothing in the language depends on it. It is also why micro-optimizations that mattered in older Pythons, such as copying a global into a local before a loop, now gain little; the [performance note](/notes/python/performance) measures them.
+
+## Reference counting
+
+The [values and names note](/notes/python/values-and-names) established that names refer to objects and that an object lives as long as something refers to it. CPython implements "as long as" with a **reference count** in every object: storing a reference increments it, dropping one decrements it, and the object is freed the moment the count reaches zero. The ACOS course [describes the mechanism in C](/notes/acos/language-runtimes#memory-reference-counting-and-a-cycle-collector); here is what it looks like from Python. `sys.getrefcount` returns the count, including one temporary reference held by its own argument, and `weakref.finalize` registers a function to run when an object is freed, without keeping it alive:
+
+```python
+import sys, weakref
+
+class Node:
+    pass
+
+freed = []
+a = Node()
+b = a
+weakref.finalize(a, freed.append, "a")
+print(sys.getrefcount(a))   # a, b, and the argument of getrefcount
+del a
+print(freed)                # b still refers to the object
+del b
+print(freed)                # freed at once
+```
+
+```text
+3
+[]
+['a']
+```
+
+`del a` removes a name, not an object: the object still has the reference from `b` and stays. `del b` drops the last reference, and the object is freed during that statement, before the next line runs. This is why a file opened without `with` is usually closed as soon as the last name for it disappears, in CPython. It is not a language guarantee: PyPy, which uses a different collector, closes it later, which is one reason the [files note](/notes/python/files-and-exceptions) insists on `with`. The same rule governs large data: a NumPy array's buffer of numbers is released the moment the last reference to the array disappears, which is how the intermediate arrays of a long computation in the machine-learning courses' scripts give their memory back without any explicit freeing.
+
+## Cycles and the garbage collector
+
+Reference counting cannot free a **cycle**: objects that refer to each other keep each other's counts above zero after the program has dropped every reference to them. CPython adds a **cyclic garbage collector** for those. It examines only container objects (lists, dicts, class instances; not integers or strings, which cannot refer to other objects) and finds groups that are referenced only from inside the group ([Python documentation, `gc`](#references)):
+
+```python
+import gc, weakref
+
+class Node:
+    pass
+
+gc.collect()                  # start from a clean state
+x, y = Node(), Node()
+x.other, y.other = y, x       # a cycle of two objects
+r = weakref.ref(x)            # a reference that does not keep x alive
+del x, y
+print(r() is None)            # the cycle is unreachable but still in memory
+print(gc.collect())           # number of objects the collector found
+print(r() is None)
+print(gc.get_threshold())
+```
+
+```text
+False
+2
+True
+(2000, 10, 10)
+```
+
+After `del x, y` nothing can reach the two nodes, yet they still exist: the weak reference still finds `x`. `gc.collect()` finds both, frees them, and returns 2. The collector also runs on its own. In 3.14.7 it is **generational**, as in 3.13: new containers start in generation 0, which is collected when the number of allocations minus deallocations of containers exceeds the first threshold, 2000; survivors move to older generations, which are collected less often (the other two numbers). Python 3.14.0 to 3.14.4 shipped a new **incremental** collector with only two generations, designed to cut pause times; because of reports of memory growth in production it was reverted to the 3.13 generational collector in 3.14.5, and that is the collector in 3.14.7 and in 3.15 ([What's New in Python 3.14](#references); [`gc` documentation](#references)). Code that calls only `gc.collect()` and `gc.get_threshold()` sees no difference.
+
+**Practical consequences.** Cycles are common and harmless: a tree whose children refer to their parent, an exception that holds a traceback whose frames refer to the exception. They cost memory until the next collection, and a collection costs time proportional to the number of tracked containers. A program that builds millions of long-lived containers can spend noticeable time in collections that find nothing; `gc.freeze()` moves everything that exists now into a permanent generation that later collections skip, and `gc.disable()` turns automatic collection off (reference counting still works). These are for measured problems, not for routine use. Memory that a program keeps by mistake, in a cache that only grows, is not garbage and no collector will free it; [tracemalloc](/notes/python/debugging-and-profiling#memory-tracemalloc) finds it.
+
+## Immortal objects and small integers
+
+Some objects are used everywhere: `None`, `True`, `False`, small integers. Updating their reference counts from every thread and every process that shares memory with the parent costs time and dirties memory pages for nothing. Since 3.12 these objects are **immortal** ([PEP 683](#references)): their count is set to a special large value that increments and decrements leave alone, and they are never freed.
+
+```text
+>>> import sys
+>>> sys.getrefcount(None)
+3221225472
+>>> sys._is_immortal(None), sys._is_immortal(7), sys._is_immortal(10**6)
+(True, True, False)
+>>> a = 256; b = int("256")
+>>> a is b
+True
+>>> a = 257; b = int("257")
+>>> a is b
+False
+>>> a == b
+True
+```
+
+The integers from −5 to 256 are created once when the interpreter starts and reused: any computation whose result is in that range returns the cached object, which is why `int("256") is int("256")` is true and the same test for 257 is false (on this build; checked from −6 to 1025, the cache is exactly −5 to 256). `sys._is_immortal` is new in 3.14 and, as its underscore says, an implementation detail.
+
+**The common mistake** follows directly: comparing numbers or strings with `is`. `x is 256` happens to be true for the cached value and false for 257, so code that "works" in a test with small numbers fails with large ones. Python 3.8 and later print `SyntaxWarning: "is" with 'int' literal. Did you mean "=="?` for a literal on one side. Use `==` for values and keep `is` for identity, which in practice means `is None`.
+
+## The experimental JIT
+
+*Optional depth: the state of just-in-time compilation in CPython 3.14. The rest of the note does not depend on it.*
+
+The specializing interpreter still pays for dispatch: every instruction is fetched, decoded and jumped to. A **just-in-time compiler** removes that by turning hot code into machine code while the program runs; the ACOS note explains [how JITs work in general](/notes/acos/language-runtimes#just-in-time-compilation-briefly). CPython's JIT, described in [PEP 744](#references) and first available as a build option in 3.13, works on traces of specialized micro-operations and produces machine code by **copy-and-patch**: machine-code templates for each micro-operation are compiled when CPython itself is built, and at run time the JIT copies the templates for a hot trace into memory and patches in the operand values.
+
+Its status in 3.14, from the release notes ([What's New in Python 3.14](#references)):
+
+- The official macOS and Windows binaries include the JIT, **off by default**; `PYTHON_JIT=1` in the environment turns it on. Builds from source get the same behaviour with `--enable-experimental-jit=yes-off`, which is how the build used here was configured.
+- It is experimental and not recommended for production. The typical effect ranges from 10 % slower to 20 % faster, depending on the workload.
+- `sys._jit.is_available()` says whether the interpreter was built with it, `sys._jit.is_enabled()` whether it is on.
+- The free-threaded build does not support it.
+
+A measurement on the setup above, a function that runs a `while` loop with integer arithmetic 3,000,000 times, best of 7 runs, twice for each setting: 0.159 and 0.160 s with the JIT off, 0.165 and 0.165 s with `PYTHON_JIT=1`. On this loop the JIT was about 3 % slower, within the range the release notes give. (`python -I` ignores `PYTHON_*` environment variables, so the JIT runs were made without `-I`.) Python 3.15 lists a significantly upgraded JIT among its changes; it was not measured here.
+
+<aside class="callout"><strong>Check yourself.</strong> (1) Why is a syntax error on line 100 reported before line 1 runs? (2) For `return a + b * c`, write the bytecode you expect, in order, and the maximum depth of the value stack. (3) A function is called a million times with floats, then once with a string. What happens to its specialized instructions? (4) After `a = []; a.append(a); del a`, is the list freed? When? (5) Why can `x is 1000` be false when `x == 1000` is true?<details><summary>Answers</summary>(1) The whole file is tokenized, parsed and compiled to bytecode before anything executes. (2) Load `a`, load `b`, load `c`, `BINARY_OP *`, `BINARY_OP +`, `RETURN_VALUE` (the compiler may fuse two loads into one superinstruction); depth 3, because all three values are on the stack before the multiplication. (3) The string call fails the guards and takes the generic path; the result is correct. One miss does not undo the specialization; only repeated misses would make the instruction re-specialize. (4) Not by reference counting: the list refers to itself, so its count stays at 1. The cyclic collector frees it at its next collection of that generation, or at `gc.collect()`. (5) Only −5 to 256 are cached; `x` and the literal 1000 can be two distinct `int` objects with equal values. `is` compares identity.</details></aside>
+
+## What changed
+
+| | The baseline picture | CPython 3.14 |
+| --- | --- | --- |
+| Unit of work | a line of text, parsed every time | bytecode, compiled once per function |
+| Before running | nothing | tokens → syntax tree → code object; syntax errors stop everything |
+| Execution | interpret the text | a C loop over instructions, operands on a value stack |
+| Local variables | looked up by name | numbered slots in the frame |
+| Repeated execution | same cost every time | instructions specialize to the types seen (3.11+) |
+| Freeing memory | (not considered) | reference counts free at once; a generational cycle collector frees cycles |
+| Common objects | ordinary | immortal: `None`, booleans, small ints (3.12+); −5..256 cached |
+| Machine code | none | an experimental JIT, off by default (3.13+, binaries since 3.14) |
+
+## Limitations
+
+- **One implementation, one version.** Every opcode name, the specialization rules, the garbage-collector thresholds and the cached integer range are CPython 3.14 details. Bytecode is not portable between minor versions, and `.pyc` files are versioned for that reason. PyPy runs the same programs with a tracing JIT and a different collector.
+- **The `dis` output is a view, not a contract.** Superinstructions, borrowed loads and specializations appear and disappear between releases; read bytecode to understand costs, not to depend on it.
+- **The JIT measurement is one loop.** It shows that "JIT" does not mean "faster" in 3.14, nothing more.
+- **The free-threaded build differs.** It uses a different reference-counting scheme (biased reference counting), specializes instructions in a thread-safe way, and has no JIT; the [concurrency note](/notes/python/concurrency) measures it.
+
+## What you should remember
+
+- CPython tokenizes, parses into an AST and compiles each function to bytecode once; `tokenize`, `ast` and `dis` show each stage.
+- Bytecode runs on a stack machine: instructions pop operands from the frame's value stack and push results. Local variables are numbered slots; globals are dictionary lookups.
+- A frame holds a call's locals, value stack and current instruction, and links to its caller's frame: that chain is the traceback.
+- Since 3.11, instructions specialize in place to the types they see, behind cheap guards; `dis(f, adaptive=True)` shows it. Stable types run faster.
+- Objects are freed when their reference count reaches zero; cycles need the cyclic collector, which in 3.14.7 is generational (thresholds `(2000, 10, 10)`).
+- `None`, `True`, `False` and the integers −5 to 256 are immortal and cached. Compare values with `==`; use `is` for `None`.
+- The JIT in 3.14 is experimental and off by default (`PYTHON_JIT=1`); measure before expecting a gain.
+
+## Code
+
+The script follows one function through the stages of this note: the node types of its syntax tree, its bytecode, the specialized instructions after calls with ints and then floats, the frame chain, reference counting, a cycle and the collector, immortal objects, and the JIT's status. It needs only the standard library; run it with `python -I inside.py`.
+
+```python
+"""Follow a function through CPython 3.14: tree, bytecode, specialization, memory."""
+import ast
+import dis
+import gc
+import sys
+import weakref
+
+source = "def f(price, qty):\n    total = price * qty\n    return total + 1\n"
+
+# 1. Source -> syntax tree: the node types of the function body
+tree = ast.parse(source)
+print([type(node).__name__ for node in ast.walk(tree.body[0].body[0])])
+
+# 2. Syntax tree -> code object -> bytecode
+namespace = {}
+exec(compile(tree, "<f>", "exec"), namespace)
+f = namespace["f"]
+code = f.__code__
+print(code.co_varnames, code.co_stacksize)
+print([ins.opname for ins in dis.get_instructions(f)])
+
+# 3. Run it: the specializing interpreter rewrites instructions for the types it sees
+for _ in range(100):
+    f(3, 4)
+print([ins.opname for ins in dis.get_instructions(f, adaptive=True) if "BINARY" in ins.opname])
+for _ in range(100):
+    f(2.5, 4.0)
+print([ins.opname for ins in dis.get_instructions(f, adaptive=True) if "BINARY" in ins.opname])
+
+# 4. Frames: each call has one, linked to its caller's
+def inner():
+    frame = sys._getframe()
+    return frame.f_code.co_name, frame.f_back.f_code.co_name
+
+def outer():
+    return inner()
+
+print(outer())
+
+# 5. Reference counting frees an object as soon as the last reference goes
+class Node:
+    pass
+
+freed = []
+a = Node()
+b = a
+weakref.finalize(a, freed.append, "a")
+print(sys.getrefcount(a))            # a, b, and the argument of getrefcount
+del a
+print(freed)                         # [] : b still refers to it
+del b
+print(freed)                         # ['a']: freed at once
+
+# 6. A cycle needs the garbage collector
+gc.collect()
+x, y = Node(), Node()
+x.other, y.other = y, x
+r = weakref.ref(x)
+del x, y
+print(r() is None, gc.collect(), r() is None)
+print(gc.get_threshold())
+
+# 7. Immortal objects and the small-integer cache
+print(sys._is_immortal(None), sys._is_immortal(256), sys._is_immortal(10**6))
+print(int("256") is int("256"), int("257") is int("257"))
+
+# 8. The JIT compiler: built in, but off unless PYTHON_JIT=1
+print(sys._jit.is_available(), sys._jit.is_enabled())
+
+# Output with CPython 3.14.7 on macOS (arm64); instruction names differ in other versions,
+# and the last line depends on how the interpreter was built:
+# ['Assign', 'Name', 'BinOp', 'Store', 'Name', 'Mult', 'Name', 'Load', 'Load']
+# ('price', 'qty', 'total') 2
+# ['RESUME', 'LOAD_FAST_BORROW_LOAD_FAST_BORROW', 'BINARY_OP', 'STORE_FAST', 'LOAD_FAST_BORROW', 'LOAD_SMALL_INT', 'BINARY_OP', 'RETURN_VALUE']
+# ['BINARY_OP_MULTIPLY_INT', 'BINARY_OP_ADD_INT']
+# ['BINARY_OP_MULTIPLY_FLOAT', 'BINARY_OP_EXTEND']
+# ('inner', 'outer')
+# 3
+# []
+# ['a']
+# False 2 True
+# (2000, 10, 10)
+# True True False
+# True False
+# True False
+```
+
+`ast.walk` visits the tree breadth first, which is why the `Store` and `Load` context nodes come after the names. With `PYTHON_JIT=1` and without `-I`, the last line prints `True True`.
+
+## Next
+
+The interpreter's costs are now visible: a dispatch per instruction, a dictionary lookup per global, a frame per call, an object per intermediate result, a reference-count update per stored reference. The [next note](/notes/python/performance) turns that into practice: measure first, choose the data structure with the right complexity, avoid the interpreter's costs in hot loops, and, for numerical work, move the loop out of the interpreter altogether with NumPy.
+
+## References
+
+- Python documentation (3.14): [`dis`](https://docs.python.org/3.14/library/dis.html) (the instruction set of 3.14, `adaptive=True`); [`ast`](https://docs.python.org/3.14/library/ast.html); [`tokenize`](https://docs.python.org/3.14/library/tokenize.html); [`gc`](https://docs.python.org/3.14/library/gc.html); [`sys._getframe`, `sys.getrefcount`, `sys._is_immortal`, `sys._jit`](https://docs.python.org/3.14/library/sys.html); [`weakref`](https://docs.python.org/3.14/library/weakref.html); [the data model](https://docs.python.org/3.14/reference/datamodel.html) (frames and code objects).
+- [What's New in Python 3.11](https://docs.python.org/3.14/whatsnew/3.11.html) (the faster CPython project: specialization, lazy frames); [What's New in Python 3.14](https://docs.python.org/3.14/whatsnew/3.14.html) (the tail-calling interpreter, borrowed references, the incremental collector and its reversion in 3.14.5, binary releases with the JIT); [What's New in Python 3.15](https://docs.python.org/3.15/whatsnew/3.15.html).
+- M. Shannon. [PEP 659 — Specializing Adaptive Interpreter](https://peps.python.org/pep-0659/). 2021.
+- E. Snow, E. Elizondo. [PEP 683 — Immortal Objects, Using a Fixed Refcount](https://peps.python.org/pep-0683/). 2022.
+- B. Bucher, S. Ostrowski. [PEP 744 — JIT Compilation](https://peps.python.org/pep-0744/). 2024.
+- H. Xu, F. Kjolstad. [Copy-and-patch compilation](https://doi.org/10.1145/3485513). OOPSLA 2021.
+- CPython source: [`Python/bytecodes.c`](https://github.com/python/cpython/blob/3.14/Python/bytecodes.c) and [`Python/ceval.c`](https://github.com/python/cpython/blob/3.14/Python/ceval.c); CPython's internal documentation, `InternalDocs/`: [the interpreter](https://github.com/python/cpython/blob/3.14/InternalDocs/interpreter.md), [frames](https://github.com/python/cpython/blob/3.14/InternalDocs/frames.md), [the garbage collector](https://github.com/python/cpython/blob/3.14/InternalDocs/garbage_collector.md) and [the JIT](https://github.com/python/cpython/blob/3.14/InternalDocs/jit.md).
+- A. Shaw. *CPython Internals: Your Guide to the Python 3 Interpreter*. Real Python, 2021. The chapters on the compiler, the evaluation loop and memory management (written for 3.9; the specializing interpreter came later).
+- L. Ramalho. *Fluent Python*, 2nd ed. O'Reilly, 2022. Ch. 6, object references, mutability and recycling.
