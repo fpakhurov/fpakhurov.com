@@ -4,6 +4,22 @@ Notable changes to the site, newest first. Each entry gives the date, what chang
 
 ## 2026-10-22
 
+- **A new course: AI Agents.** It has 27 notes in seven sections, in English and Russian, and runs from the classical agent to current language-model agents. It comes after the NLP course.
+  - **Agents and environments:** what an agent is, search and planning (A*, STRIPS/PDDL), Markov decision processes, games and Monte Carlo tree search.
+  - **Reinforcement learning:** Q-learning and TD, deep Q-networks, policy gradients and actor-critic up to PPO, model-based RL.
+  - **Language models as agents:** the model as a policy, chain of thought, tool use and function calling with constrained decoding, ReAct and the agent loop.
+  - **Memory, planning and reflection:** context and memory, planning with language models, reflection and self-correction, workflows, frameworks and the Model Context Protocol (revision 2026-07-28).
+  - **Agents at work:** coding, web and computer-use, research and multi-agent systems.
+  - **Training agents:** RL for language models (RLHF, GRPO, verifiable rewards), reasoning models and test-time compute, multi-turn agentic RL.
+  - **Evaluation and safety:** evaluating agents (pass@k, pass^k, time horizons), agent security and prompt injection, alignment and oversight, open problems.
+
+  Scope draws on Russell–Norvig, Sutton–Barto, the Berkeley agent courses and the primary papers. Scores are given with their date and setup.
+  - **Code:** every Code section runs offline in Python and NumPy; where a language model would be called, a small scripted stand-in takes its place.
+  - **Figures:** 69, computed at build time.
+  - **Flow diagrams:** a box label with a subscript now gets 2 px more room above its second line, in every course.
+
+  Why: agents are where the NLP course's tools-and-agents note leads, and the subject needs reinforcement learning, which no course covered.
+
 - **A new course: Bayesian Methods in Machine Learning.** It has 15 notes in five sections, in English and Russian, and sits between Machine Learning and Generative Models.
   - **Bayesian modelling:** the Bayesian approach, conjugate priors and the exponential family, Bayesian model selection.
   - **Bayesian linear models:** Bayesian linear regression, the relevance vector machine, the Laplace approximation and Bayesian classification.

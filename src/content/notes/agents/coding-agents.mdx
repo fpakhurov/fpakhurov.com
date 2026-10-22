@@ -1,0 +1,408 @@
+---
+title: Coding agents
+description: "How an agent fixes bugs in a real repository: the repository, shell and tests as its environment, SWE-bench and how its tasks are graded, the agent–computer interface of SWE-agent, the fixed Agentless pipeline, test-time verification, sandboxing, and dated scores."
+course: agents
+section: Agents at Work
+order: 16
+status: published
+tags: [coding-agents, swe-bench, swe-agent, agentless, agent-computer-interface, localization, verification, sandboxing]
+prerequisites: [ReAct and the agent loop, Tool use and function calling, "Workflows, frameworks and protocols"]
+---
+
+import CodingAgentLoop from '../../../components/figures/coding-agents/CodingAgentLoop.astro';
+import StepBudget from '../../../components/figures/coding-agents/StepBudget.astro';
+
+The previous section built the parts of a language-model agent: a loop that reads observations and emits actions, tools with schemas, memory for long tasks, plans, reflection, and the choice between a fixed workflow and an open-ended agent. This section puts those parts to work in four task environments, starting with the one where agents have gone furthest: a software repository. A coding agent receives a description of a bug or a feature, reads and edits files, runs commands, and stops when it believes the change is done. Software is a good environment for agents for a reason that the rest of the note keeps returning to: it contains its own judge. Tests can be run, and a test that passes is evidence that a model's words cannot fake.
+
+**Notation.** A task is a repository in state $R$ and an issue $q$, a text written by a person. The agent produces a patch $\delta$, and $R \oplus \delta$ is the repository with the patch applied. A test $\tau$ either passes or fails on a repository. $T_{\text{F2P}}$ and $T_{\text{P2P}}$ are the two sets of grading tests defined below. $B$ is a step budget: the number of actions the agent may take. In the analysis of verification, a proposed fix is correct with probability $c$, wrong but passing the tests the agent can see with probability $h$, and wrong in a way those tests catch otherwise.
+
+## Baseline: retrieve the files, write the patch in one shot
+
+The first approach treats the task like [retrieval-augmented generation](/notes/nlp/rag): find the files most similar to the issue with a lexical retriever (BM25), put them in the context with the issue, and ask the model to write a patch in the unified diff format. There is no loop: the model never runs anything and never sees whether its patch applies.
+
+On the benchmark introduced below, this baseline fails almost always. In the original SWE-bench paper (October 2023), the best model, Claude 2 with BM25 retrieval, resolved 1.96% of 2,294 tasks ([Jimenez et al., 2024](#references)). Under the same retrieval setup, GPT-4 Turbo resolved 1.31% in the SWE-agent paper (May 2024). The failures have three causes. The retrieved files are often not the ones that need changing. A patch written blind contains small errors (a wrong line number in the diff, a wrong indentation) that make it fail to apply. And nothing tells the model that its fix is wrong, because it never executes the code. Each cause points to something an agent in a loop can do: search and read until it finds the right place, edit through an interface that checks the edit, and run the code.
+
+## The environment of a coding agent
+
+In the vocabulary of [What an agent is](/notes/agents/what-an-agent-is#the-properties-of-task-environments), a repository is partially observable (the agent sees one file or one command output at a time), mostly deterministic (flaky tests and network calls are the exceptions), sequential, static while the agent works, and discrete with an enormous action space. Three things make it up.
+
+- **The repository**: files, their history in version control, and the dependencies installed for them. The agent's percepts are views of it: the lines of a file, a list of search hits, a directory listing.
+- **The shell**: any command a developer could type, from `grep` to running a script. Every command is an action, and its output is the next observation.
+- **The tests**: programs that check the code. They are the reason this environment suits agents. Running the tests is an action whose observation is a verdict on the agent's own work, which in most other environments only a person can give.
+
+The actions are tool calls in the sense of [Tool use and function calling](/notes/agents/tool-use-and-function-calling), and the loop is the one of [ReAct and the agent loop](/notes/agents/react-and-the-agent-loop). What is specific to code is the shape of a successful episode, shown below for the small task of the Code section.
+
+<CodingAgentLoop />
+
+1. **Localize.** Find the code that the issue is about: search for names that appear in it, open the files that match, read until the definition is found.
+2. **Reproduce.** Turn the example of the issue into a test or a script, and check that it fails on the current code. A reproduction converts the issue into something executable.
+3. **Edit.** Change the code. A well-designed edit tool checks the result, here with a linter that rejects an edit containing a syntax error.
+4. **Test.** Run the reproduction and the existing tests. If anything fails, go back to step 3.
+5. **Submit.** The patch $\delta$ is the difference between the repository and its starting state.
+6. **Grade.** Tests the agent never saw decide whether the task is resolved.
+
+Not every agent follows these steps in this order, and some skip the reproduction. But the steps are the ones that the rest of the note refines: localization, editing and verification.
+
+## SWE-bench: what a task is and how it is graded
+
+**SWE-bench** ([Jimenez et al., 2024](#references)) turned the maintenance of open-source software into a benchmark. Its 2,294 tasks come from 12 popular Python repositories, Django, scikit-learn, SymPy and Matplotlib among them. Each task is built from a real GitHub issue and the pull request that resolved it:
+
+- the **input** is the text of the issue and the repository at the commit before the pull request;
+- the **reference patch** is the code change of the pull request;
+- the **tests** are those the pull request added or changed, which the agent does not see.
+
+The grading tests are split by what they do before and after the reference patch $\delta^\star$:
+
+$$
+\begin{aligned}
+T_{\text{F2P}} &= \{\tau : \tau \text{ fails on } R \text{ and passes on } R \oplus \delta^\star\} && \text{(FAIL\_TO\_PASS)} \\
+T_{\text{P2P}} &= \{\tau : \tau \text{ passes on } R \text{ and on } R \oplus \delta^\star\} && \text{(PASS\_TO\_PASS)}.
+\end{aligned}
+$$
+
+The FAIL_TO_PASS tests check that the issue is fixed; the PASS_TO_PASS tests check that nothing that worked before is broken. A candidate patch $\delta$ **resolves** the task if every grading test passes on the patched repository:
+
+$$
+\boxed{\;\operatorname{resolved}(\delta) = \prod_{\tau \,\in\, T_{\text{F2P}} \cup T_{\text{P2P}}} \mathbb 1\big[\tau \text{ passes on } R \oplus \delta\big]\;}
+$$
+
+and the score of a system is the percentage of tasks it resolves. The product makes the criterion strict: a patch that fixes the bug and breaks one unrelated test resolves nothing.
+
+**Worked example.** The task of the Code section has a function `median` that returns `s[n // 2]` of the sorted list, wrong for lists of even length. Its grading tests are:
+
+| test | on $R$ | on $R \oplus \delta^\star$ | set |
+| --- | --- | --- | --- |
+| `test_median_even`: `median([4, 1, 3, 10]) == 3.5` and `median([1.0, 2.0]) == 1.5` | fails | passes | $T_{\text{F2P}}$ |
+| `test_median_odd`: `median([3, 1, 2]) == 2` | passes | passes | $T_{\text{P2P}}$ |
+| `test_mean`: `mean([1, 2, 3]) == 2` | passes | passes | $T_{\text{P2P}}$ |
+
+The patch `return (s[n // 2 - 1] + s[n // 2]) / 2` fixes the even case and breaks the odd one, so `test_median_odd` fails and the product is 0. The patch `return sum(s) / n`, which computes the mean, passes the issue's own example, $(1+2+3+4)/4 = 2.5$, and the odd test, $(1+2+3)/3 = 2$; it fails `median([4, 1, 3, 10])`, whose mean is $4.5$, not $3.5$. The agent cannot tell these patches apart from the correct one by the issue alone. Only tests it does not see separate them.
+
+**Verified, Lite, Pro.** Some tasks of the original set cannot be solved from their description: the issue is ambiguous, or the hidden tests check details the issue never mentions (the exact text of an error message, the name of a new function). In August 2024 OpenAI released **SWE-bench Verified**, 500 tasks screened by 93 professional Python developers, who annotated 1,699 random tasks and kept only those with a well-specified issue and fair tests ([OpenAI, 2024](#references)). SWE-bench Lite (300 tasks) is an earlier subset chosen by simple rules to be cheaper to run. Verified became the standard measure of coding agents for about a year and a half, and then saturated: in February 2026 OpenAI announced that it would stop reporting it, after an audit of tasks that frontier models failed found that most of the audited tasks had tests that reject correct fixes or descriptions that do not specify the fix, and that some models could reproduce reference patches from memory, a sign that the public tasks had leaked into training data ([OpenAI, 2026](#references)). It recommended **SWE-bench Pro** ([Deng et al., 2025](#references)), 1,865 tasks from 41 actively maintained repositories, most of them in held-out and commercial sets that are not public. The lesson generalizes to every benchmark of the course: a public test set is a target that training data drifts toward, and its errors become the ceiling once models are good enough. [Evaluating agents](/notes/agents/evaluating-agents) returns to this.
+
+## The agent–computer interface
+
+**SWE-agent** ([Yang et al., 2024](#references)) asked what a language model needs from the computer it works on. Its answer: an interface designed for the model, as an IDE is designed for a human, which the authors called the **agent–computer interface** (ACI). A plain shell is an interface for people: `cat` on a 2,000-line file floods the context, `sed` edits are easy to get wrong and silent when they are, and `grep -r` can return thousands of lines. SWE-agent replaced these with a small set of commands:
+
+- **a file viewer** that shows a window of 100 lines with line numbers, with commands to scroll and jump to a line;
+- **search commands** that list the files and lines matching a term, with a summary instead of every match when there are too many;
+- **an edit command** that replaces a range of lines and runs a linter on the result; an edit that introduces a syntax error is rejected, and the agent sees the error with the file unchanged;
+- **context management**: older observations are collapsed to a one-line placeholder, keeping the last five in full.
+
+The ablations on SWE-bench Lite, with GPT-4 Turbo (May 2024), measure what each design choice is worth. The full interface resolved 18.0% of the 300 tasks; the table gives the resolve rate with one choice changed.
+
+| change to the interface | resolved (Lite) |
+| --- | --- |
+| none (full SWE-agent) | 18.0% |
+| edit without the linter guardrail | 15.0% |
+| no edit command (shell tools only) | 10.3% |
+| search that prints every match | 12.0% |
+| no search command | 15.7% |
+| file viewer of 30 lines | 14.3% |
+| file viewer of the full file | 12.7% |
+| full history instead of the last five observations | 15.0% |
+
+Two findings stand out. Showing more is not better: the full file and the unsummarized search both cost more than they help, because the model has to find the relevant lines in a long observation, and long contexts degrade its attention. A guardrail is worth more than a capability: the linter turns a silent mistake into an immediate observation. The shell-only agent with the same model resolved 11.0% of Lite; SWE-agent resolved 12.47% of the full 2,294 tasks, against 1.31% for retrieval with the same model.
+
+<aside class="callout"><strong>Key idea.</strong> A coding agent is limited less by what the model knows than by what it sees and how its actions fail. Design the interface for the model: short, structured observations; actions that check themselves and fail loudly; and a test the agent can run, which turns "I think this is fixed" into an observation.</aside>
+
+The same lesson shaped later agents. For the upgraded Claude 3.5 Sonnet (October 2024), Anthropic reported 49% on SWE-bench Verified with an even simpler interface, described in a later write-up: one tool for shell commands and one for viewing and editing files by exact string replacement, the `str_replace` editor that the Code section imitates ([Anthropic, 2025](#references)). String replacement fails loudly when the old text is not found exactly once, which is the same principle as the linter: an edit either does exactly what the model meant or does nothing and says why. Some runs took more than a hundred steps.
+
+## Agentless: a fixed pipeline as a baseline
+
+If the agent spends most of its steps on a predictable sequence (find the file, find the function, edit, test), why let the model choose the sequence? **Agentless** ([Xia et al., 2024](#references)) fixed it in code, a [workflow](/notes/agents/workflows-and-protocols) in the terms of the previous section, and let the model fill in each stage:
+
+1. **Localization, hierarchically.** Show the model the repository's file tree and ask for the files to change; then show the skeletons of those files (class and function signatures) and ask for the classes and functions; then show their code and ask for the exact lines.
+2. **Repair.** Sample several candidate patches for the chosen locations, each written as a search-and-replace edit: the exact old lines and the new ones, which apply cleanly or not at all.
+3. **Patch validation.** Generate reproduction tests from the issue, run them and the repository's existing tests on every candidate, discard those that fail, and pick among the rest by majority over normalized patches.
+
+With GPT-4o (July 2024), Agentless resolved 32.00% of SWE-bench Lite, 96 of 300 tasks, at an average cost of 0.70 US dollars per task, more than any open-source agent at the time. On SWE-bench Verified the same pipeline resolved 33.2% (August 2024). The comparison with SWE-agent is not a contest between two scores, which come from different models and dates; it is a lesson about where the decisions should live. When the steps of a task are known in advance, writing them as a pipeline costs nothing in flexibility that the task needs, and it buys predictability and lower cost. The open-ended agent pays off when the task does not fit the pipeline: an issue whose cause is in a different place than its symptom, a fix that needs a new file, a failure whose explanation only appears when a command is run.
+
+## Localization, editing and verification
+
+The three stages are separate problems, with separate failure modes.
+
+**Localization** is search. Over a repository of thousands of files, the agent must find the few lines that need to change. The signals are names in the issue (functions, classes, error messages), the stack trace if there is one, the structure of the code (who calls the function), and running the reproduction under a debugger or with prints. Localization errors are the most common cause of failure: an agent that edits the wrong function can pass its own tests and still resolve nothing.
+
+**Editing** is producing a change that applies. Three formats are common: rewriting the whole file (simple, expensive and prone to dropping unrelated code), a unified diff (compact, but line numbers and context lines are easy to get wrong), and search-and-replace on exact text (robust, and it fails loudly). Editing through an interface that checks syntax and applicability removes a whole class of failures that have nothing to do with the bug.
+
+**Verification** is checking the change before submitting it, with the only judge that is available at test time: tests the agent can run. It also costs steps, and every loop runs under a [step budget](/notes/agents/react-and-the-agent-loop#stopping-budgets-and-loops). Take the scripted agent of the Code section, with a step budget $B$. Each fix it proposes is correct with probability $c$, wrong but passing its visible tests with probability $h$ (the mean, in the worked example above), and wrong in a way the tests or the linter catch otherwise. An agent that submits its first edit succeeds with probability $c$. An agent that tests and retries stops at the first fix that passes its tests, which is correct with probability $p$ satisfying
+
+$$
+\begin{aligned}
+p &= c + (1 - c - h)\, p && \text{the first fix is correct, or caught and the agent starts over} \\
+\Rightarrow\quad p\,(c + h) &= c && \text{collect the terms in } p \\
+\Rightarrow\quad &\boxed{\,p = \frac{c}{c + h}\,} && \text{with an unlimited budget.}
+\end{aligned}
+$$
+
+Verification removes the caught failures and leaves only those the tests cannot see. With $c = 3/8$ and $h = 1/8$, it doubles the success rate, from $0.375$ to $0.75$. With a finite budget, the price shows:
+
+<StepBudget />
+
+Below 8 steps the agent that tests resolves fewer tasks than the one that does not, because the reproduction test and every test run are steps. At $B = 10$ it resolves $0.612$, and by $B = 20$ almost all of what it can resolve, $0.747$. Two consequences hold beyond this toy. A score is meaningless without its budget, since the same agent moves from $0.125$ to $0.75$ as the budget grows. And the ceiling $c/(c+h)$ is set by $h$, the wrong fixes that pass the agent's own tests: better verification means better tests, which is why strong agents write a reproduction first and then look for edge cases.
+
+The same reasoning extends from retrying to sampling. Generate $N$ candidate patches in parallel, as Agentless does, and select one with the tests or with a learned verifier. Selection succeeds when some candidate is correct and the verifier recognizes it; a perfect verifier would turn the probability that at least one of $N$ samples is correct, pass@$N$, into the success rate. Reasoning models and [test-time compute](/notes/agents/reasoning-models) make this trade between computation and accuracy systematic, and [Training agents with reinforcement learning](/notes/agents/agentic-rl) uses the same tests as rewards.
+
+## Sandboxing
+
+A coding agent runs code it wrote itself, inside a repository someone else wrote, with commands chosen by a model: [code as the action](/notes/agents/tool-use-and-function-calling#code-as-the-action) at its most open. Any of the three can do damage: delete files outside the repository, read credentials, send data over the network, or run forever. The agent must therefore run in a **sandbox**: an environment whose effects stay inside it and can be thrown away.
+
+The standard tool is a container, as in the [ACOS course](/notes/acos/virtual-machines-and-containers#containers-one-kernel-many-views). Namespaces give the agent its own view of the file system, processes and network, so it sees only the repository and its dependencies; control groups cap its memory, processor time and number of processes; a layered image lets every task start from the same clean state and be discarded afterwards. SWE-bench's own evaluation harness runs each task in a Docker container built for its repository. Inside the container the agent should run as an unprivileged user ([Users and permissions](/notes/acos/users-and-permissions)), with the network off unless the task needs it, and with a time limit on every command. A container shares the host's kernel, so a kernel vulnerability can break out of it; for untrusted code at scale, a virtual machine adds a stronger boundary, as the [comparison of what each one isolates](/notes/acos/virtual-machines-and-containers#what-each-one-isolates) shows. The test runner of the Code section executes code in the same Python process and is not a sandbox; it is enough for a toy whose code we wrote ourselves.
+
+Sandboxing protects the host from the agent. It does not protect the task from the agent's mistakes inside the sandbox, nor the agent from instructions hidden in the files it reads, such as a comment in a dependency telling it to upload the environment variables. [Agent security and prompt injection](/notes/agents/agent-security) treats that threat.
+
+## Dated scores
+
+Scores on SWE-bench change monthly, and each one belongs to a model, a scaffold (the interface and the loop around the model), a split of the benchmark and a date. The table lists landmarks; scores in different rows come from different models, scaffolds or splits and are not a ranking.
+
+| date | system: scaffold, model | split | resolved |
+| --- | --- | --- | --- |
+| Oct 2023 | BM25 retrieval, one-shot patch; Claude 2 | full (2,294) | 1.96% |
+| May 2024 | SWE-agent; GPT-4 Turbo | full / Lite (300) | 12.47% / 18.0% |
+| Jul 2024 | Agentless; GPT-4o | Lite | 32.00% |
+| Aug 2024 | Agentless; GPT-4o | Verified (500) | 33.2% |
+| Oct 2024 | shell and string-replace editor; Claude 3.5 Sonnet (upgraded) | Verified | 49% |
+| Nov 2025 | vendor's scaffold, mean of 5 trials; Claude Opus 4.5 | Verified | 80.9% |
+
+In about two years the resolved fraction on comparable tasks went from almost none to most, through better models, interfaces designed for models, verification, and models trained with reinforcement learning on tasks of this kind. The ceiling that ended the run on Verified was the benchmark's own flaws, not the agents.
+
+<aside class="callout"><strong>Check yourself.</strong> (1) A patch fixes the issue and makes one PASS_TO_PASS test fail. Is the task resolved? (2) A shell-only agent opens files with `cat`. Name two ways this hurts, according to the SWE-agent ablations. (3) In the model of verification, a better reproduction test turns half of the wrong-but-passing fixes into caught ones: $h$ goes from $1/8$ to $1/16$. What is the new limit $c/(c+h)$ for $c = 3/8$?<details><summary>Answers</summary>(1) No: resolved is the product over all grading tests, so one failing PASS_TO_PASS test makes it 0. (2) A whole file floods the context, and the full-file viewer resolved 12.7% against 18.0% for a 100-line window; and `cat` with a shell editor gives no structured, self-checking edit, while removing the edit command dropped the rate to 10.3%. (3) $\tfrac{3/8}{3/8 + 1/16} = \tfrac{6}{7} \approx 0.857$.</details></aside>
+
+## What changed
+
+| | one-shot patch | coding agent |
+| --- | --- | --- |
+| how the code is found | a retriever, once | search, read, follow references, run the reproduction |
+| how the change is made | a diff written blind | edits through an interface that checks them |
+| feedback before submitting | none | linter, reproduction test, existing tests |
+| what fails | most tasks, often for formatting reasons | mostly localization and fixes that pass weak tests |
+| cost | one call | tens to hundreds of steps, bounded by a budget |
+| where it runs | nowhere: no code is executed | a sandbox per task |
+
+## Limitations
+
+- **Tests are an imperfect judge.** The agent's tests miss what they do not check, and the grading tests can reject a correct fix or accept a wrong one. A resolved rate measures agreement with a set of tests, not correctness.
+- **Benchmarks leak and saturate.** Public tasks from public repositories end up in training data; the response is held-out and private sets, at the price of results others cannot inspect.
+- **SWE-bench is narrow.** Its tasks are Python, from popular libraries, and mostly small fixes to well-described issues. Building a feature from a vague request, working across services, or judging what a user meant are different tasks.
+- **Cost and latency.** Hundreds of steps per task, each re-reading a long context, cost more than many fixes are worth; a score at an unstated budget hides this.
+- **Passing tests is not good code.** A patch can pass and still be unreadable, slow, or insecure; code review by people remains part of the loop.
+
+## What you should remember
+
+- A coding agent's environment is a repository, a shell and tests; tests make it one of the few environments with a judge available at test time.
+- SWE-bench tasks come from real issues and pull requests; a patch resolves a task when every FAIL_TO_PASS and PASS_TO_PASS test passes. Verified is a 500-task human-screened subset, retired as a headline metric in early 2026 because of flawed tests and contamination.
+- The agent–computer interface matters as much as the model: windowed file views, summarized search, edits that lint themselves and fail loudly, and compact history.
+- Agentless shows that a fixed pipeline (localize, repair, validate) is a strong baseline when the steps are predictable.
+- Verification raises the ceiling from $c$ to $c/(c+h)$ and costs steps; a score means nothing without its budget, model, scaffold, split and date.
+- Run the agent in a disposable sandbox: a container per task, an unprivileged user, no network by default, limits on time and memory.
+
+## Code
+
+A repository in memory with a buggy `median`, the SWE-bench grading criterion, a small agent–computer interface (search, open, a string-replace edit with a lint check, a test runner, submit), a scripted stand-in for the model, one traced episode, and the success rate against the step budget, simulated and exact. NumPy and the standard library only; seeds are fixed, and exact numbers can differ slightly across platforms and library versions. The script runs in about ten seconds.
+
+The stand-in model is a fixed policy: it searches for the name in the issue, opens the files that mention it in a random order, writes a reproduction test, and samples fixes from a list of eight plausible lines. A real model would choose each action from the transcript instead, and its fixes would be better than random draws; the interface, the runner, the grader and the arithmetic of the budget stay the same.
+
+```python
+import builtins, re, types
+import numpy as np
+
+# 1. a repository in memory (path -> text), an issue, and the hidden tests that grade the fix
+REPO = {
+    'stats/core.py': (
+        'def mean(xs):\n'
+        '    return sum(xs) / len(xs)\n'
+        '\n'
+        'def median(xs):\n'
+        '    s = sorted(xs)\n'
+        '    n = len(s)\n'
+        '    return s[n // 2]\n'),
+    'stats/report.py': (
+        'from stats.core import mean, median\n'
+        '\n'
+        'def summary(xs):\n'
+        '    return f"mean={mean(xs):.2f} median={median(xs):.2f}"\n'),
+    'docs/usage.md': 'Call median(xs) to get the middle value of a list.\n',
+    'tests/test_core.py': (
+        'from stats.core import mean, median\n'
+        '\n'
+        'def test_mean():\n'
+        '    assert mean([1, 2, 3]) == 2\n'
+        '\n'
+        'def test_median_odd():\n'
+        '    assert median([3, 1, 2]) == 2\n'),
+}
+ISSUE = 'median([1, 2, 3, 4]) returns 3, but the median of an even-length list is 2.5.'
+FAIL_TO_PASS = ('def test_median_even():\n'                     # hidden from the agent
+                '    assert median([4, 1, 3, 10]) == 3.5\n'
+                '    assert median([1.0, 2.0]) == 1.5\n')
+PASS_TO_PASS = ['test_mean', 'test_median_odd']
+
+# 2. the test runner: execute modules of the in-memory repo with an import hook (NOT a sandbox, see the note)
+def run_tests(repo, extra=''):
+    mods = {}
+    def imp(name, globals=None, locals=None, fromlist=(), level=0):
+        path = name.replace('.', '/') + '.py'
+        if path not in repo: return builtins.__import__(name, globals, locals, fromlist, level)
+        if name not in mods:
+            m = types.ModuleType(name); m.__dict__['__builtins__'] = env
+            mods[name] = m
+            exec(compile(repo[path], path, 'exec'), m.__dict__)
+        return mods[name]
+    env = dict(vars(builtins), __import__=imp)
+    results = {}
+    files = {p: s for p, s in repo.items() if p.startswith('tests/')}
+    if extra: files['hidden'] = 'from stats.core import median\n' + extra
+    for path, src in sorted(files.items()):
+        ns = {'__builtins__': env}
+        try:
+            exec(compile(src, path, 'exec'), ns)
+        except Exception as e:
+            results[path] = f'ERROR {type(e).__name__}'; continue
+        for name, fn in ns.items():
+            if name.startswith('test_') and callable(fn):
+                try: fn(); results[name] = 'PASS'
+                except AssertionError: results[name] = 'FAIL'
+                except Exception as e: results[name] = f'ERROR {type(e).__name__}'
+    return results
+
+def resolved(repo):                     # the SWE-bench criterion: every F2P and every P2P test passes
+    r = run_tests(repo, FAIL_TO_PASS)
+    return all(r.get(t) == 'PASS' for t in ['test_median_even'] + PASS_TO_PASS)
+
+print(run_tests(REPO, FAIL_TO_PASS))
+# {'test_median_even': 'FAIL', 'test_mean': 'PASS', 'test_median_odd': 'PASS'}
+
+# 3. the agent-computer interface: search, open, edit with a lint check, run tests, submit
+class Computer:
+    def __init__(self, repo, lint=True):
+        self.repo, self.lint = dict(repo), lint
+    def search(self, term):
+        hits = [f'{p}:{i + 1}' for p, s in sorted(self.repo.items()) for i, l in enumerate(s.splitlines()) if term in l]
+        return ' '.join(hits)
+    def open(self, path):
+        return '\n'.join(f'{i + 1:3d}| {l}' for i, l in enumerate(self.repo[path].splitlines()))
+    def edit(self, path, old, new):
+        src = self.repo.get(path, '')
+        if src.count(old) != 1: return f'error: old text found {src.count(old)} times'
+        text = src.replace(old, new) if old else new
+        if self.lint and path.endswith('.py'):
+            try: compile(text, path, 'exec')
+            except SyntaxError as e: return f'error: edit rejected, SyntaxError line {e.lineno}'
+        self.repo[path] = text
+        return 'ok'
+    def run_tests(self):
+        r = run_tests(self.repo)
+        bad = [k for k, v in r.items() if v != 'PASS']
+        return 'all passed' if not bad else 'failed: ' + ', '.join(bad)
+    def submit(self):
+        return 'submitted'
+
+# 4. a scripted stand-in for the language model: it explores, writes a reproduction test and samples fixes
+CANDIDATES = [
+    'return s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2',   # correct
+    'return (s[(n - 1) // 2] + s[n // 2]) / 2',                         # correct
+    'return (s[n // 2] + s[~(n // 2)]) / 2',                            # correct
+    'return sum(s) / n',                                                # wrong, but passes the visible tests
+    'return (s[n // 2 - 1] + s[n // 2]) / 2',                           # wrong, fails test_median_odd
+    'return s[n // 2 - 1]',                                             # wrong, fails the reproduction
+    'return s[(n - 1) // 2]',                                           # wrong, fails the reproduction
+    'return s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2] / 2',   # syntax error
+]
+class ScriptedCoder:
+    def __init__(self, rng, verify=True):
+        self.rng, self.verify = rng, verify
+    def run(self, issue, budget, log=None):
+        pc, steps = Computer(REPO, lint=self.verify), 0
+        def act(name, *args):
+            nonlocal steps
+            steps += 1
+            obs = getattr(pc, name)(*args)
+            if log is not None:
+                shown = args[-1] if name == 'edit' and args[1] else args[0] if args else ''
+                log.append(f'{steps:2d} {name:9s} {shown.splitlines()[0] if shown else "":40.40s} -> {obs.splitlines()[0][:38]}')
+            return obs
+        func = re.search(r'(\w+)\(', issue).group(1)                    # 'median'
+        hits = act('search', func).split()
+        files = sorted({h.split(':')[0] for h in hits if not h.startswith('tests/')})
+        target = None
+        for f in self.rng.permutation(files):                           # opens the hits in a random order
+            if steps >= budget: return False, steps
+            if f'def {func}(' in act('open', str(f)): target = str(f); break
+        current = 'return s[n // 2]'
+        if self.verify:
+            if steps >= budget: return False, steps
+            act('edit', 'tests/test_repro.py', '', 'from stats.core import median\n\n'
+                'def test_issue():\n    assert median([1, 2, 3, 4]) == 2.5\n')
+        while steps < budget:
+            new = CANDIDATES[self.rng.integers(len(CANDIDATES))]
+            if act('edit', target, current, new) != 'ok': continue       # the linter rejected it
+            current = new
+            if self.verify:
+                if steps >= budget: break
+                if act('run_tests') != 'all passed': continue
+            if steps >= budget: break
+            act('submit')
+            return resolved(pc.repo), steps
+        return False, steps
+
+log = []
+ok, n = ScriptedCoder(np.random.default_rng(33)).run(ISSUE, budget=30, log=log)
+print('\n'.join(log))
+print('resolved:', ok, 'steps:', n)
+#  1 search    median                                   -> docs/usage.md:1 stats/core.py:4 stats/
+#  2 open      docs/usage.md                            ->   1| Call median(xs) to get the middle
+#  3 open      stats/core.py                            ->   1| def mean(xs):
+#  4 edit      tests/test_repro.py                      -> ok
+#  5 edit      return (s[n // 2 - 1] + s[n // 2]) / 2   -> ok
+#  6 run_tests                                          -> failed: test_median_odd
+#  7 edit      return s[(n - 1) // 2]                   -> ok
+#  8 run_tests                                          -> failed: test_issue
+#  9 edit      return s[n // 2] if n % 2 else (s[n // 2 -> error: edit rejected, SyntaxError line
+# 10 edit      return (s[n // 2] + s[~(n // 2)]) / 2    -> ok
+# 11 run_tests                                          -> all passed
+# 12 submit                                             -> submitted
+# resolved: True steps: 12
+
+# 5. success against the step budget: simulation and the exact distribution
+def exact(budgets, verify):
+    pre = {1 + k + verify: 1 / 3 for k in (1, 2, 3)}                    # search, k opens, (reproduction test)
+    if not verify:
+        return [3 / 8 * sum(p for s, p in pre.items() if s + 2 <= B) for B in budgets]
+    succ = np.zeros(200)
+    frontier = dict(pre)                                                # step count -> probability, still working
+    while frontier:
+        nxt = {}
+        for s, p in frontier.items():
+            succ[s + 3] += p * 3 / 8                                    # correct: edit, test, submit
+            for cost, q in ((2, 3 / 8), (1, 1 / 8)):                    # caught by the tests, or by the linter
+                if s + cost < 150: nxt[s + cost] = nxt.get(s + cost, 0) + p * q
+        frontier = nxt
+    return [succ[:B + 1].sum() for B in budgets]
+
+budgets = [6, 8, 10, 15, 20, 30]
+for verify in (True, False):
+    rng = np.random.default_rng(0)
+    runs = [ScriptedCoder(rng, verify).run(ISSUE, budget=60) for _ in range(20000)]
+    sim = [np.mean([ok and n <= B for ok, n in runs]) for B in budgets]
+    print('verify' if verify else 'no tests', np.round(sim, 3), np.round(exact(budgets, verify), 3))
+# verify [0.127 0.457 0.612 0.73  0.748 0.75 ] [0.125 0.455 0.612 0.729 0.747 0.75 ]
+# no tests [0.373 0.373 0.373 0.373 0.373 0.373] [0.375 0.375 0.375 0.375 0.375 0.375]
+```
+
+## Next
+
+A repository is a friendly environment: its state is text, its actions are commands with exact effects, and its tests judge the result. Most software that people use offers none of this to an agent. It has a graphical interface made for eyes and hands, pages that change while one reads them, and buttons whose effects cannot be undone. The [next note](/notes/agents/computer-use-agents) gives an agent a browser and a desktop: what it observes, how it points at things, why pointing at the right thing is the hard part, and how it is stopped before an irreversible click.
+
+## References
+
+- C. E. Jimenez, J. Yang, A. Wettig, S. Yao, K. Pei, O. Press, K. Narasimhan. [SWE-bench: can language models resolve real-world GitHub issues?](https://arxiv.org/abs/2310.06770) ICLR, 2024. The tasks, the FAIL_TO_PASS and PASS_TO_PASS tests, and the retrieval baseline.
+- J. Yang, C. E. Jimenez, A. Wettig, K. Lieret, S. Yao, K. Narasimhan, O. Press. [SWE-agent: agent–computer interfaces enable automated software engineering](https://arxiv.org/abs/2405.15793). NeurIPS, 2024. Table 1 (main results) and Table 3 (ablations on SWE-bench Lite).
+- C. S. Xia, Y. Deng, S. Dunn, L. Zhang. [Agentless: demystifying LLM-based software engineering agents](https://arxiv.org/abs/2407.01489). arXiv:2407.01489, 2024.
+- OpenAI. [Introducing SWE-bench Verified](https://openai.com/index/introducing-swe-bench-verified/). August 2024.
+- OpenAI. [Why we no longer evaluate SWE-bench Verified](https://openai.com/index/why-we-no-longer-evaluate-swe-bench-verified/). February 2026.
+- X. Deng et al. [SWE-Bench Pro: can AI agents solve long-horizon software engineering tasks?](https://arxiv.org/abs/2509.16941) arXiv:2509.16941, 2025.
+- Anthropic. [Raising the bar on SWE-bench Verified with Claude 3.5 Sonnet](https://www.anthropic.com/research/swe-bench-sonnet). January 2025. The two-tool scaffold and its traces.
+- Anthropic. [Introducing Claude Opus 4.5](https://www.anthropic.com/news/claude-opus-4-5). November 2025. Vendor-reported SWE-bench Verified score.
+- Anthropic. [Building effective agents](https://www.anthropic.com/research/building-effective-agents). December 2024. Appendix on prompt-engineering tools: the agent–computer interface.
+- S. Russell, P. Norvig. [*Artificial Intelligence: A Modern Approach*](https://aima.cs.berkeley.edu/), 4th ed. Pearson, 2021. Chapter 2 (task environments).

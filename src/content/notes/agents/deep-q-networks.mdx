@@ -1,0 +1,351 @@
+---
+title: Deep Q-networks
+description: "Q-learning with a neural network in place of the table: semi-gradient updates, the deadly triad and why it can diverge, experience replay and target networks, the Atari agent, overestimation and Double DQN, and what dueling networks, prioritized replay and Rainbow fix."
+course: agents
+section: Reinforcement Learning
+order: 5
+status: published
+tags: [reinforcement-learning, dqn, function-approximation, deadly-triad, experience-replay, target-network, double-dqn, dueling-network, prioritized-replay, rainbow, atari]
+prerequisites: [Q-learning and temporal-difference learning, Neural networks, Stochastic gradient descent]
+---
+
+import DeadlyTriad from '../../../components/figures/deep-q-networks/DeadlyTriad.astro';
+import DqnLoop from '../../../components/figures/deep-q-networks/DqnLoop.astro';
+import CartPoleDqn from '../../../components/figures/deep-q-networks/CartPoleDqn.astro';
+import MaxBias from '../../../components/figures/deep-q-networks/MaxBias.astro';
+
+The [previous note](/notes/agents/temporal-difference-learning) learned action values from experience, one entry of a table per state and action, with guarantees that hold as long as every entry is visited infinitely often. Interesting tasks never visit the same state twice. A video game shows a new screen at every step, a robot's joints take continuous angles, and a language model's context is practically never repeated. The values must be computed by a function with far fewer parameters than there are states, a function that also carries what was learned in one state over to similar ones. This note puts a neural network in place of the table, shows why the combination can diverge where the table could not, and builds the **deep Q-network** (DQN), whose two stabilizing devices made it the first agent to learn many Atari games from pixels with one set of hyperparameters. It ends with the fixes that followed: Double DQN, dueling networks, prioritized replay and their combination, Rainbow.
+
+**Notation.** As in the previous notes, with these additions. $Q_\theta(s, a)$ is an action-value function with parameters $\theta$, a neural network or a linear function $\theta^\top \phi(s, a)$ of features $\phi$. $\theta^-$ are the parameters of a second copy, the target network. $\mathcal D$ is the replay buffer, a store of past transitions $(s, a, r, s')$, with $d \in \{0, 1\}$ marking whether $s'$ is terminal. $y$ is a regression target and $L(\theta)$ a loss. $N$, $B$ and $C$ are the buffer size, the minibatch size and the number of steps between copies of $\theta$ into $\theta^-$.
+
+## Baseline: a table with one entry per state
+
+A grey-scale Atari screen downsampled to $84 \times 84$ pixels with 256 levels, four consecutive frames stacked, can take $256^{4 \cdot 84 \cdot 84} = 256^{28\,224}$ values. No table has that many rows, and even if it had, almost every row would be visited at most once, so its entry would be an average of one sample. The cart-pole of the Code section, a pole balanced on a cart, has a state of four real numbers: position, velocity, angle and angular velocity; it has no finite table at all. Splitting the continuous state into bins brings the table back, but its size grows exponentially with the number of state variables, and two neighbouring bins are still learned independently.
+
+What is missing is **generalization**: a pole tilted by 3.1 degrees should be treated almost like one tilted by 3.0. The ML course gets generalization from parametric models fitted by gradient descent, and the same tool applies here once Q-learning is written as regression.
+
+## Q-learning as regression
+
+Suppose an oracle gave the true value $y = Q^\star(s, a)$ for the sampled state and action. Fitting $Q_\theta$ to it would be ordinary regression with the squared error $\frac12 (y - Q_\theta(s, a))^2$, and one step of [stochastic gradient descent](/notes/ml/stochastic-and-adaptive-optimizers#a-gradient-from-a-sample) with step size $\alpha$ would be
+
+$$
+\theta \leftarrow \theta - \alpha\, \nabla_\theta \tfrac12 \big( y - Q_\theta(s, a) \big)^2 = \theta + \alpha \big( y - Q_\theta(s, a) \big) \nabla_\theta Q_\theta(s, a).
+$$
+
+There is no oracle. Q-learning's answer is to use its own target, $y = r + \gamma \max_{a'} Q_\theta(s', a')$ (with $y = r$ when $s'$ is terminal), and to treat it as a constant when taking the gradient:
+
+$$
+\boxed{\; \theta \leftarrow \theta + \alpha \Big[ r + \gamma \max_{a'} Q_\theta(s', a') - Q_\theta(s, a) \Big] \nabla_\theta Q_\theta(s, a) \;}
+$$
+
+This is **semi-gradient Q-learning**. With a table, $Q_\theta(s, a) = \theta_{s,a}$ and the gradient is 1 at entry $(s, a)$ and 0 elsewhere, so the update is exactly tabular Q-learning. With linear features, $\nabla_\theta Q_\theta(s, a) = \phi(s, a)$, and the update moves every state that shares features with $s$. With a network, the gradient comes from backpropagation, as in the [PyTorch note](/notes/deep-learning/pytorch-and-autograd#the-computational-graph).
+
+Why "semi"? The target depends on $\theta$ too. The full gradient of the squared TD error $\frac12 \delta^2$ would contain a second term, $-\gamma \nabla_\theta \max_{a'} Q_\theta(s', a')$, that also moves the target. Following the full gradient gives **residual-gradient** methods ([Baird, 1995](#references)), which are true gradient descent and do converge, but slowly, and in a stochastic environment they need two independent samples of $s'$ to be unbiased. The semi-gradient is not the gradient of any fixed objective. It learns faster in practice, and it is what every method of this note uses, but it gives up the guarantee that comes with descending a loss.
+
+## The deadly triad
+
+Three ingredients are each useful and each benign alone, and together they can make the estimates diverge ([Sutton and Barto, 2018](#references), section 11.3):
+
+1. **Function approximation**: one set of parameters for many states, so an update to one state changes others.
+2. **Bootstrapping**: targets built from the current estimates, as in TD and Q-learning, rather than from complete returns.
+3. **Off-policy training**: updates distributed differently from the states the target policy visits, as when Q-learning learns the greedy policy from ε-greedy data, or from old data.
+
+Any two are safe. Linear TD with on-policy updates converges ([Tsitsiklis and Van Roy, 1997](#references)). Monte Carlo targets with function approximation are plain regression. Tabular Q-learning is off-policy and bootstraps, and converges, as the previous note stated. Q-learning with a neural network has all three.
+
+**Worked example.** Two states have features $1$ and $2$, and a linear estimate with one weight $w$ gives them the values $w$ and $2w$. From state 1 the agent moves to state 2 with reward 0; from state 2 the episode ends with reward 0. All true values are 0, which $w = 0$ represents exactly. Now suppose the data contain only the first transition, as can happen off-policy when a behaviour policy visits state 1 but its continuation is never sampled. The TD error is $0 + \gamma \cdot 2w - w = (2\gamma - 1) w$ and the semi-gradient update is
+
+$$
+w \leftarrow w + \alpha (2\gamma - 1)\, w \cdot 1 = \big( 1 + \alpha (2\gamma - 1) \big)\, w .
+$$
+
+For $\gamma > 1/2$ the factor exceeds 1: with $\gamma = 0.9$ and $\alpha = 0.1$ it is $1.08$, and after 60 updates $w$ has grown from 1 to 101. Each update raises the value of state 1 towards $\gamma$ times the value of state 2, and because the two share the weight, raising one raises the other twice as much. Remove any one leg of the triad and the same example converges:
+
+<DeadlyTriad />
+
+The divergence is not caused by noise or a large step size: there is no randomness in this example, and a smaller $\alpha$ only slows it. Better-known counterexamples, such as Baird's seven-state star, show the same effect with features that are linearly independent and a perfect solution available ([Baird, 1995](#references); [Sutton and Barto, 2018](#references), section 11.2). In deep networks, values usually stay bounded in practice, but inflated, oscillating estimates are common ([van Hasselt et al., 2018](#references)). DQN cannot leave the triad, because a network that bootstraps off-policy is what it is. What it can do is make each step look as much as possible like the supervised regression that SGD handles well.
+
+## DQN: experience replay and a target network
+
+<aside class="callout"><strong>Key idea.</strong> Turn Q-learning into a sequence of ordinary regression problems. Store transitions and train on random minibatches of them, so that the data look independent and each transition is reused. Compute targets with a frozen copy of the network, so that the targets stay fixed while the network fits them, and refresh the copy only every $C$ steps.</aside>
+
+[Mnih et al. (2015)](#references), following [Mnih et al. (2013)](#references), minimize, at every step, the loss
+
+$$
+\boxed{\; L(\theta) = \mathbb E_{(s, a, r, s', d) \sim \mathcal U(\mathcal D)} \Big[ \ell\Big( r + \gamma (1 - d) \max_{a'} Q_{\theta^-}(s', a') - Q_\theta(s, a) \Big) \Big] \;}
+$$
+
+where $\mathcal U(\mathcal D)$ is the uniform distribution over the transitions in the buffer, $\ell$ is the Huber loss (quadratic for errors below 1 and linear above, which clips the gradient of large errors), and the gradient is taken with respect to $\theta$ only:
+
+<DqnLoop />
+
+1. **Act.** The agent picks $a$ ε-greedily from $Q_\theta(s, \cdot)$; the environment returns $r$ and $s'$.
+2. **Store.** The transition goes into the buffer $\mathcal D$, which keeps the last $N$ of them.
+3. **Sample.** A minibatch of $B$ transitions is drawn uniformly from the buffer.
+4. **Target.** The target network evaluates each $s'$: $y = r + \gamma (1 - d) \max_{a'} Q_{\theta^-}(s', a')$.
+5. **Step.** One gradient step on $L(\theta)$ moves the online network's $Q_\theta(s, a)$ towards $y$.
+6. **Sync.** Every $C$ steps, $\theta^- \leftarrow \theta$.
+
+**Why replay helps.** Consecutive transitions are strongly correlated: the frames of one second of play look alike, and a minibatch of them is one example repeated, not $B$ independent ones. Sampling from the last million transitions mixes thousands of episodes. Replay also reuses data: in the Atari agent, a gradient step of 32 transitions every 4 steps means 8 samples drawn per step, so a transition that stays in the buffer for a million steps is drawn about 8 times on average. And it averages the training distribution over many past policies, which damps a feedback loop in which the current greedy action decides the next data, which decide the next greedy action. Replay is possible only because Q-learning is off-policy: the stored transitions come from older policies. The idea goes back to [Lin (1992)](#references).
+
+**Why the target network helps.** With $\theta^-$ fixed, the targets $y$ do not move while $\theta$ is fitted to them, so between two copies the problem is a regression with fixed labels. Each copy then starts a new regression, one step of value iteration done by a network: the method is a version of fitted Q-iteration ([Ernst, Geurts and Wehenkel, 2005](#references); [Riedmiller, 2005](#references)). In the two-state example the target network does not save the day: if each regression is solved exactly, $w$ becomes $2\gamma w^-$, and $1.8$ per copy still diverges. A target network slows the feedback between the estimates and their targets; it does not remove the triad.
+
+**Both devices on CartPole.** The Code section trains the same network four ways: with neither device, with replay only, with the target network only, and with both, plus Double DQN, two seeds each.
+
+<CartPoleDqn />
+
+| variant | mean episode length in training | greedy return after training | largest $\lvert Q \rvert$ in training |
+| --- | --- | --- | --- |
+| neither | 10.4 | 9.5 | $5.7 \cdot 10^6$ |
+| replay only | 10.3 | 9.3 | $3.8 \cdot 10^7$ |
+| target network only | 14.1 | 84.2 | 77 |
+| DQN: both | 94.0 | 281.8 | 77 |
+| Double DQN | 106.7 | 151.1 | 57 |
+
+With rewards of 1 per step and $\gamma = 0.99$, no true value can exceed $1/(1 - \gamma) = 100$. Without a target network the estimates reached millions, and the agent drops the pole within about 10 steps, no better than at the start. The target network alone keeps the values bounded but learns slowly, from one transition per update. Both together learn to balance for hundreds of steps. The greedy returns vary a lot between seeds; two runs are not enough to rank DQN against Double DQN.
+
+## The Atari setup
+
+The Arcade Learning Environment ([Bellemare et al., 2013](#references)) exposes Atari 2600 games as environments: the observation is the screen, the actions are joystick positions (up to 18), and the reward is the change in the game score. [Mnih et al. (2015)](#references) used one architecture and one set of hyperparameters for all 49 games they tested:
+
+- **Input.** Each frame converted to grey and downsampled to $84 \times 84$; the last four frames stacked, so that velocities are visible and the state is closer to Markov. Each action is repeated for four frames.
+- **Network.** Three convolutional layers (32 filters of $8 \times 8$ with stride 4, 64 of $4 \times 4$ with stride 2, 64 of $3 \times 3$ with stride 1), a fully connected layer of 512 units, and one linear output per action. One forward pass gives the values of all actions, so the max in the target costs one evaluation, not 18.
+- **Training.** RMSProp, minibatches of 32, a buffer of $10^6$ transitions, a gradient step every 4 actions, the target network copied every $10^4$ updates, ε annealed from 1 to 0.1 over the first million frames, $\gamma = 0.99$, and rewards clipped to $[-1, 1]$ so that one learning rate fits games whose scores differ by orders of magnitude.
+
+Trained for 50 million frames per game, which the paper puts at about 38 days of game experience, the agent outperformed the best previous machine-learning methods on 43 of the 49 games and reached more than 75% of a professional human tester's score on more than half of them ([Mnih et al., 2015](#references); [Google Research, 2015](#references)). The paper's ablation on five games shows that both devices matter, replay the most (scores from its Extended Data Table 3, rounded):
+
+| game | neither | target network only | replay only | both |
+| --- | --- | --- | --- | --- |
+| Breakout | 3 | 10 | 241 | 317 |
+| Enduro | 29 | 142 | 831 | 1006 |
+| River Raid | 1453 | 2868 | 4103 | 7447 |
+| Seaquest | 276 | 1003 | 823 | 2894 |
+| Space Invaders | 302 | 373 | 826 | 1089 |
+
+Reward clipping changes the objective: the agent maximizes the number of times the score increases, not the score. Clipped rewards, frame stacking and action repeat are domain-specific choices, and later work removed some of them, for example by normalizing targets adaptively instead of clipping rewards ([van Hasselt et al., 2016b](#references)).
+
+## Overestimation and Double DQN
+
+The target takes a maximum over estimates, and a maximum of noisy estimates is biased upwards. If the estimates $Q(s', a)$ are unbiased, $\mathbb E[Q(s', a)] = q(a)$, then, because the maximum of a sum is at most the sum of the maxima, or by Jensen's inequality for the convex function $\max$,
+
+$$
+\mathbb E\Big[ \max_a Q(s', a) \Big] \ge \max_a \mathbb E\big[ Q(s', a) \big] = \max_a q(a),
+$$
+
+with equality only when the noise never changes which action is largest. **Worked example.** Ten actions have the same true value, and their estimates carry independent noise with standard deviation $\sigma$. The maximum of ten standard normal variables has mean $1.539$, so the target is too high by $1.539\sigma$ on average, although every single estimate is unbiased. With two actions the bias is $0.564\sigma$. The error is fed back through bootstrapping, so states whose actions are uncertain look systematically better than they are ([Thrun and Schwartz, 1993](#references)).
+
+The tabular version is the **maximization-bias** example of [Sutton and Barto (2018)](#references), example 6.7: from A, going right ends the episode with 0; going left leads to B, whose ten actions end the episode with a reward of mean $-0.1$ and standard deviation 1. Left is worse, and still Q-learning prefers it for a long time:
+
+<MaxBias />
+
+**Double Q-learning** ([van Hasselt, 2010](#references)) separates choosing the action from evaluating it. With two independent estimates $Q^1$ and $Q^2$, take $a^\star = \arg\max_a Q^1(s', a)$ and use $Q^2(s', a^\star)$ as the value. Since the noise of $Q^2$ is independent of the choice, $\mathbb E[Q^2(s', a^\star)] = \mathbb E[q(a^\star)] \le \max_a q(a)$: the estimate is never biased upwards, and in the example above it is unbiased. A simulation of the ten-action example gives $1.539$ for the single estimator and $-0.004$ for the double one. The price is a possible underestimate when the chosen action is not the best.
+
+**Double DQN** ([van Hasselt, Guez and Silver, 2016](#references)) gets the second estimate for free from the two networks DQN already has: the online network chooses, the target network evaluates,
+
+$$
+\boxed{\; y = r + \gamma (1 - d)\, Q_{\theta^-}\Big( s', \arg\max_{a'} Q_\theta(s', a') \Big) \;}
+$$
+
+a change of one line in the code. The two networks are not independent, so the bias is reduced rather than removed. Over 57 Atari games, the median human-normalized score (0% for random play, 100% for a human tester) rose from 79% for DQN to 117% for Double DQN, in the no-op starts evaluation; both figures are as collected by [Hessel et al. (2018)](#references), table 2, from the original publications and their own runs.
+
+## Dueling networks, prioritized replay and Rainbow
+
+Each later improvement fixes one identified weakness of DQN.
+
+**Dueling networks** ([Wang et al., 2016](#references)) split the head of the network into a state value $V(s)$ and advantages $A(s, a)$ and combine them as
+
+$$
+Q(s, a) = V(s) + A(s, a) - \frac{1}{|\mathcal A|} \sum_{a'} A(s, a').
+$$
+
+In many states the action barely matters, a car on an empty road, and a plain Q-network must still learn each action's value separately. The dueling head learns $V(s)$ from every update, whatever action was taken. The subtracted mean makes the split unique: $V = 5$ with $A = (2, 0, 1)$ gives $Q = (6, 4, 5)$, and adding a constant to all advantages would give the same $Q$, so without the mean $V$ and $A$ could drift in opposite directions.
+
+**Prioritized experience replay** ([Schaul et al., 2016](#references)) samples transitions with probability proportional to a power of their last TD error, $P(i) = p_i^\omega / \sum_k p_k^\omega$ with $p_i = |\delta_i|$ plus a small constant. Uniform replay spends most updates on transitions the network already predicts well. Non-uniform sampling changes the distribution the loss is averaged over, so each sample is reweighted by $w_i = (N \cdot P(i))^{-\beta}$, normalized by the largest weight, with $\beta$ increased to 1 during training. **Worked example.** Three transitions with TD errors $2$, $1$ and $0.5$ and $\omega = 0.6$ are drawn with probabilities $0.477$, $0.315$ and $0.208$; with $\beta = 1$ their weights are $0.435$, $0.660$ and $1$.
+
+**Multi-step targets** use the n-step returns of the [previous note](/notes/agents/temporal-difference-learning#between-one-step-and-the-whole-episode-n-step-returns-and-eligibility-traces), so rewards propagate $n$ steps per update. **Distributional RL** ([Bellemare, Dabney and Munos, 2017](#references)) learns the whole distribution of the return on 51 fixed atoms rather than its mean, which gives the network a richer training signal. **Noisy networks** ([Fortunato et al., 2018](#references)) add learned noise to the weights of the linear layers and so replace ε-greedy by exploration that depends on the state.
+
+**Rainbow** ([Hessel et al., 2018](#references)) combined all six: Double DQN, prioritized replay, dueling heads, 3-step targets, distributional learning and noisy networks.
+
+| component | what it fixes |
+| --- | --- |
+| Double Q-learning | the upward bias of the max in the target |
+| prioritized replay | updates wasted on transitions already learned |
+| dueling head | learning a value for every action where only the state matters |
+| multi-step targets | slow propagation of reward, one step per update |
+| distributional learning | a single mean as the only training signal |
+| noisy networks | undirected ε-greedy exploration |
+
+On 57 Atari games with 200 million frames each, Rainbow reached a median human-normalized score of 223% in the no-op starts evaluation, against 79% for DQN, and matched DQN's final performance after 7 million frames. Its ablations found prioritized replay and multi-step targets the most important components; removing Double Q-learning or the dueling head changed the median little ([Hessel et al., 2018](#references)). A later agent, Agent57, was the first to exceed the human benchmark on all 57 games, by adding learned exploration bonuses and a meta-controller over exploration rates ([Badia et al., 2020](#references)).
+
+<aside class="callout"><strong>Check yourself.</strong> (1) In the two-state example, for which discounts does the off-policy update diverge? (2) DQN updates every 4 steps with minibatches of 32 and keeps $10^6$ transitions, so each transition is drawn about 8 times. If the buffer held $10^5$ transitions instead, how often would each be drawn? (3) The online network's estimates in $s'$ are $(1.0, 1.4)$ and the target network's are $(1.2, 0.9)$. What do the DQN and Double DQN targets use for $\max_{a'}$, with $r = 0$, $\gamma = 1$?<details><summary>Answers</summary>(1) When $1 + \alpha(2\gamma - 1) > 1$, that is $\gamma > 1/2$, for any $\alpha > 0$. (2) Still about 8. Each of the 8 draws per step picks a given transition with probability $1/N$, and the transition stays for $N$ steps, so it is drawn $8 \cdot N \cdot (1/N) = 8$ times whatever $N$ is. The buffer size decides how old and how varied the replayed data are, not how often each transition is reused. (3) DQN uses the target network's maximum, $1.2$. Double DQN lets the online network choose the second action ($1.4 > 1.0$) and the target network evaluate it: $0.9$.</details></aside>
+
+## What changed
+
+| | tabular Q-learning | DQN |
+| --- | --- | --- |
+| representation | one entry per state–action pair | a network $Q_\theta(s, \cdot)$ that outputs all actions |
+| update | one entry | a gradient step that moves every state |
+| data | each transition used once, in order | a replay buffer, random minibatches, reuse |
+| target | the current estimates | a frozen target network, refreshed every $C$ steps |
+| guarantee | convergence with probability 1 | none: the deadly triad |
+| scale | small discrete state spaces | raw pixels, 49 Atari games with one set of hyperparameters |
+
+## Limitations
+
+- **No convergence guarantee.** DQN sits inside the deadly triad. Its devices make divergence rare in practice, not impossible, and results vary strongly with seeds and hyperparameters, as the CartPole runs show.
+- **Discrete actions only.** The target needs $\max_{a'} Q(s', a')$, which is one pass of the network for 18 joystick positions but an optimization problem for a continuous action such as a torque. The next note's policy-gradient methods handle continuous actions directly.
+- **Sample inefficiency.** Fifty million frames per game is far more experience than a person needs. Replay helped; learning a model of the environment, two notes ahead, helps more.
+- **Exploration is still ε-greedy.** Games that need a long precise sequence before the first reward, such as Montezuma's Revenge, defeated DQN; noisy networks and count-based bonuses help only partly.
+- **Overestimation is reduced, not removed**, and clipped rewards change the objective the agent optimizes.
+
+## What you should remember
+
+- Function approximation turns Q-learning into regression on its own targets: $\theta \leftarrow \theta + \alpha[r + \gamma \max_{a'} Q_\theta(s', a') - Q_\theta(s, a)] \nabla_\theta Q_\theta(s, a)$, a semi-gradient, not the gradient of a fixed loss.
+- The deadly triad, function approximation plus bootstrapping plus off-policy data, can diverge even without noise; in the two-state example the weight grows by $1 + \alpha(2\gamma - 1)$ per update.
+- DQN stabilizes Q-learning with a replay buffer (independent-looking, reused data) and a target network (fixed regression targets between copies), and it learned 49 Atari games from pixels with one set of hyperparameters.
+- The max over noisy estimates overestimates: $1.539\sigma$ for ten equal actions. Double DQN chooses with the online network and evaluates with the target network.
+- Dueling heads, prioritized replay, multi-step targets, distributional learning and noisy networks each fix one weakness; Rainbow combined them, and prioritized replay and multi-step targets mattered most.
+
+## Code
+
+CartPole written as equations, a DQN with switches for experience replay, the target network and the Double DQN target, the ablation of the figure and the table, and two small checks: the bias of the max of noisy estimates against the double estimator, and the probabilities and weights of prioritized replay. PyTorch on the CPU, one thread; seeds are fixed, and exact numbers vary across platforms and library versions. The script runs in about 35 seconds.
+
+```python
+import math
+import numpy as np
+import torch
+import torch.nn as nn
+
+torch.set_num_threads(1)
+
+# 1. the environment: the cart-pole equations of Barto, Sutton and Anderson (1983), as in Gym's CartPole-v1
+class CartPole:
+    g, m_cart, m_pole, half_len, force, dt = 9.8, 1.0, 0.1, 0.5, 10.0, 0.02
+    def __init__(self, rng):
+        self.rng = rng
+    def reset(self):
+        self.s, self.t = self.rng.uniform(-0.05, 0.05, 4), 0     # position, velocity, angle, angular velocity
+        return self.s.astype(np.float32)
+    def step(self, a):
+        x, v, th, w = self.s
+        f, c, s, m = (self.force if a == 1 else -self.force), math.cos(th), math.sin(th), self.m_cart + self.m_pole
+        tmp = (f + self.m_pole * self.half_len * w * w * s) / m
+        acc_th = (self.g * s - c * tmp) / (self.half_len * (4 / 3 - self.m_pole * c * c / m))
+        acc_x = tmp - self.m_pole * self.half_len * acc_th * c / m
+        self.s = np.array([x + self.dt * v, v + self.dt * acc_x, th + self.dt * w, w + self.dt * acc_th])
+        self.t += 1
+        fell = abs(self.s[0]) > 2.4 or abs(self.s[2]) > 12 * math.pi / 180
+        return self.s.astype(np.float32), 1.0, fell, self.t >= 500  # reward 1 per step; episodes stop at 500
+
+def q_net():
+    return nn.Sequential(nn.Linear(4, 64), nn.ReLU(), nn.Linear(64, 64), nn.ReLU(), nn.Linear(64, 2))
+
+# 2. DQN, with switches for experience replay, the target network and the Double DQN target
+def train(replay=True, target=True, double=False, steps=20_000, seed=0, gamma=0.99,
+          buffer=10_000, batch=64, sync=250, every=2, lr=1e-3):
+    torch.manual_seed(seed); rng = np.random.default_rng(seed)
+    env, q, q_tgt = CartPole(rng), q_net(), q_net()
+    q_tgt.load_state_dict(q.state_dict())
+    opt = torch.optim.Adam(q.parameters(), lr=lr)
+    N = buffer if replay else 1                                   # without replay: only the latest transition
+    S, A, R = np.zeros((N, 4), np.float32), np.zeros(N, np.int64), np.zeros(N, np.float32)
+    S2, D = np.zeros((N, 4), np.float32), np.zeros(N, np.float32)
+    n, s, ret, episodes, q_max = 0, env.reset(), 0.0, [], 0.0
+    for t in range(1, steps + 1):
+        eps = max(0.05, 1 - t / 5000)                               # epsilon from 1 to 0.05 over 5000 steps
+        with torch.no_grad():
+            a = int(rng.integers(2)) if rng.random() < eps else int(q(torch.from_numpy(s)).argmax())
+        s2, r, fell, cut = env.step(a)
+        i = n % N; S[i], A[i], R[i], S2[i], D[i] = s, a, r, s2, float(fell); n += 1
+        s, ret = s2, ret + r
+        if fell or cut:                                             # a cut at 500 steps is not a terminal state
+            episodes.append((t, ret)); s, ret = env.reset(), 0.0
+        if t % every == 0 and n >= (500 if replay else 1):
+            idx = rng.integers(min(n, N), size=batch) if replay else np.array([i])
+            sb, ab, rb, s2b, db = (torch.from_numpy(x[idx]) for x in (S, A, R, S2, D))
+            with torch.no_grad():
+                net = q_tgt if target else q                        # who computes the target
+                if double:                                          # choose with the online net, evaluate with the target
+                    nxt = net(s2b).gather(1, q(s2b).argmax(1, keepdim=True)).squeeze(1)
+                else:
+                    nxt = net(s2b).max(1).values
+                y = rb + gamma * (1 - db) * nxt                     # r + gamma max_a' Q(s', a'), 0 after a fall
+            pred = q(sb).gather(1, ab[:, None]).squeeze(1)
+            loss = nn.functional.smooth_l1_loss(pred, y)            # Huber loss, as in DQN
+            opt.zero_grad(); loss.backward(); opt.step()
+            q_max = max(q_max, pred.abs().max().item())
+        if target and t % sync == 0:
+            q_tgt.load_state_dict(q.state_dict())                   # copy theta into the target network
+    return q, episodes, q_max
+
+def greedy_return(q, episodes=10, seed=100):
+    env, total = CartPole(np.random.default_rng(seed)), 0.0
+    for _ in range(episodes):
+        s, done = env.reset(), False
+        while not done:
+            with torch.no_grad():
+                s, r, fell, cut = env.step(int(q(torch.from_numpy(s)).argmax()))
+            total, done = total + r, fell or cut
+    return total / episodes
+
+# 3. the ablation: which of the two devices matters? two seeds each, 20,000 steps per run
+variants = [('neither', dict(replay=False, target=False)), ('replay only', dict(target=False)),
+            ('target only', dict(replay=False)), ('DQN', {}), ('Double DQN', dict(double=True))]
+curves = {}
+for name, kw in variants:
+    rows = []
+    for seed in (0, 1):
+        q, eps_, q_max = train(seed=seed, **kw)
+        rows.append((len(eps_), 20_000 / len(eps_), greedy_return(q), q_max))
+        curves[(name, seed)] = eps_                                 # (step, return) of every episode
+    m = np.array(rows).mean(0)
+    print(f'{name:11s} episodes {m[0]:6.0f}  mean length {m[1]:6.1f}  greedy return {m[2]:6.1f}  largest |Q| {m[3]:9.3g}')
+# neither     episodes   1924  mean length   10.4  greedy return    9.5  largest |Q|  5.69e+06
+# replay only episodes   1934  mean length   10.3  greedy return    9.3  largest |Q|  3.81e+07
+# target only episodes   1423  mean length   14.1  greedy return   84.2  largest |Q|        77
+# DQN         episodes    217  mean length   94.0  greedy return  281.8  largest |Q|      77.4
+# Double DQN  episodes    188  mean length  106.7  greedy return  151.1  largest |Q|      56.5
+
+# 4. overestimation: ten actions with true value 0 and unit-variance noise; single against double estimator
+rng = np.random.default_rng(0)
+Q1, Q2 = rng.normal(size=(200_000, 10)), rng.normal(size=(200_000, 10))
+rows = np.arange(len(Q1))
+print(round(Q1.max(1).mean(), 3), round(Q2[rows, Q1.argmax(1)].mean(), 3))   # 1.539 -0.004
+
+# 5. prioritized replay: probabilities from TD errors, then importance weights normalized by the largest
+delta = np.array([2.0, 1.0, 0.5])
+P = np.abs(delta) ** 0.6 / (np.abs(delta) ** 0.6).sum()
+w = (len(P) * P) ** -1.0
+print(P.round(3), (w / w.max()).round(3))                     # [0.477 0.315 0.208] [0.435 0.66  1.   ]
+```
+
+With an Atari game in place of CartPole, the same loop needs the convolutional network, frame stacking and many millions of steps on a GPU; the mechanism does not change.
+
+## Next
+
+DQN chooses actions by maximizing over its outputs, which ties it to small discrete action sets, and its policy is always the deterministic argmax of its values, so it cannot represent a policy that should be random. A robot arm has continuous torques, and a language model chooses among tens of thousands of tokens at every step with a probability distribution that is itself the object to train. The [next note](/notes/agents/policy-gradients) drops the value table altogether and adjusts the parameters of a stochastic policy directly, by the gradient of the expected return.
+
+## References
+
+- V. Mnih, K. Kavukcuoglu, D. Silver, A. A. Rusu, J. Veness, M. G. Bellemare, A. Graves, M. Riedmiller, A. K. Fidjeland, G. Ostrovski, et al. [Human-level control through deep reinforcement learning](https://doi.org/10.1038/nature14236). *Nature*, 518:529–533, 2015. Methods; Extended Data Table 1 (hyperparameters) and Table 3 (replay and target network).
+- V. Mnih, K. Kavukcuoglu, D. Silver, A. Graves, I. Antonoglou, D. Wierstra, M. Riedmiller. [Playing Atari with deep reinforcement learning](https://arxiv.org/abs/1312.5602). NIPS Deep Learning Workshop, 2013.
+- Google Research. [From pixels to actions: human-level control through deep reinforcement learning](https://research.google/blog/from-pixels-to-actions-human-level-control-through-deep-reinforcement-learning/). Blog post, February 2015.
+- M. G. Bellemare, Y. Naddaf, J. Veness, M. Bowling. [The Arcade Learning Environment: an evaluation platform for general agents](https://arxiv.org/abs/1207.4708). *Journal of Artificial Intelligence Research*, 47:253–279, 2013.
+- L.-J. Lin. [Self-improving reactive agents based on reinforcement learning, planning and teaching](https://doi.org/10.1007/BF00992699). *Machine Learning*, 8:293–321, 1992.
+- R. S. Sutton, A. G. Barto. [*Reinforcement Learning: An Introduction*](http://incompleteideas.net/book/the-book-2nd.html), 2nd ed. MIT Press, 2018. Chapter 9 (on-policy prediction with approximation), chapter 11 (off-policy methods with approximation; section 11.2, examples of off-policy divergence; section 11.3, the deadly triad), example 6.7 (maximization bias).
+- L. Baird. [Residual algorithms: reinforcement learning with function approximation](https://doi.org/10.1016/B978-1-55860-377-6.50013-X). ICML, 1995.
+- J. N. Tsitsiklis, B. Van Roy. [An analysis of temporal-difference learning with function approximation](https://doi.org/10.1109/9.580874). *IEEE Transactions on Automatic Control*, 42(5):674–690, 1997.
+- H. van Hasselt, Y. Doron, F. Strub, M. Hessel, N. Sonnerat, J. Modayil. [Deep reinforcement learning and the deadly triad](https://arxiv.org/abs/1812.02648). arXiv:1812.02648, 2018.
+- D. Ernst, P. Geurts, L. Wehenkel. [Tree-based batch mode reinforcement learning](https://www.jmlr.org/papers/v6/ernst05a.html). *Journal of Machine Learning Research*, 6:503–556, 2005.
+- M. Riedmiller. [Neural fitted Q iteration: first experiences with a data efficient neural reinforcement learning method](https://doi.org/10.1007/11564096_32). ECML, 2005.
+- S. Thrun, A. Schwartz. Issues in using function approximation for reinforcement learning. *Proceedings of the 1993 Connectionist Models Summer School*, 1993.
+- H. van Hasselt. [Double Q-learning](https://proceedings.neurips.cc/paper/2010/hash/091d584fced301b442654dd8c23b3fc9-Abstract.html). NeurIPS, 2010.
+- H. van Hasselt, A. Guez, D. Silver. [Deep reinforcement learning with double Q-learning](https://arxiv.org/abs/1509.06461). AAAI, 2016.
+- H. van Hasselt, A. Guez, M. Hessel, V. Mnih, D. Silver. [Learning values across many orders of magnitude](https://arxiv.org/abs/1602.07714). NeurIPS, 2016 (cited as 2016b).
+- Z. Wang, T. Schaul, M. Hessel, H. van Hasselt, M. Lanctot, N. de Freitas. [Dueling network architectures for deep reinforcement learning](https://arxiv.org/abs/1511.06581). ICML, 2016.
+- T. Schaul, J. Quan, I. Antonoglou, D. Silver. [Prioritized experience replay](https://arxiv.org/abs/1511.05952). ICLR, 2016.
+- M. G. Bellemare, W. Dabney, R. Munos. [A distributional perspective on reinforcement learning](https://arxiv.org/abs/1707.06887). ICML, 2017.
+- M. Fortunato, M. G. Azar, B. Piot, J. Menick, I. Osband, A. Graves, V. Mnih, R. Munos, D. Hassabis, O. Pietquin, C. Blundell, S. Legg. [Noisy networks for exploration](https://arxiv.org/abs/1706.10295). ICLR, 2018.
+- M. Hessel, J. Modayil, H. van Hasselt, T. Schaul, G. Ostrovski, W. Dabney, D. Horgan, B. Piot, M. Azar, D. Silver. [Rainbow: combining improvements in deep reinforcement learning](https://arxiv.org/abs/1710.02298). AAAI, 2018. Table 2 (median human-normalized scores), figure 3 (ablations).
+- A. P. Badia, B. Piot, S. Kapturowski, P. Sprechmann, A. Vitvitskyi, D. Guo, C. Blundell. [Agent57: outperforming the Atari human benchmark](https://arxiv.org/abs/2003.13350). ICML, 2020.
+- A. G. Barto, R. S. Sutton, C. W. Anderson. [Neuronlike adaptive elements that can solve difficult learning control problems](https://doi.org/10.1109/TSMC.1983.6313077). *IEEE Transactions on Systems, Man, and Cybernetics*, 13(5):834–846, 1983. The cart-pole task.
+- S. Levine. [CS285: Deep Reinforcement Learning](https://rail.eecs.berkeley.edu/deeprlcourse/). University of California, Berkeley. Lectures on deep RL with Q-functions.

@@ -1,0 +1,293 @@
+---
+title: Context and memory
+description: "How an agent works on a task longer than its context window: the window as working memory and its token arithmetic, what to put in it and where, compaction of old steps, long-term memory written and retrieved by the agent, and prompt caching as economics."
+course: agents
+section: Memory, Planning and Reflection
+order: 12
+status: published
+tags: [context-window, context-engineering, lost-in-the-middle, compaction, long-term-memory, memgpt, generative-agents, voyager, prompt-caching]
+prerequisites: [ReAct and the agent loop, Retrieval-augmented generation]
+---
+
+import ContextAssembly from '../../../components/figures/context-and-memory/ContextAssembly.astro';
+import LostInTheMiddle from '../../../components/figures/context-and-memory/LostInTheMiddle.astro';
+import TokenBudget from '../../../components/figures/context-and-memory/TokenBudget.astro';
+
+The [previous note](/notes/agents/react-and-the-agent-loop) closed the agent loop: the model writes a thought and an action, the runtime executes the action, the observation is appended, and the model decides again until a stopping rule fires. Every turn of that loop makes the context longer, and the model reads all of it at every step. A task of a few steps fits easily. A task of a few hundred steps, such as fixing a bug across a repository or answering a question that needs forty searches, does not: the context fills up, each step costs more than the last, and the model's use of what it reads degrades long before the window is full. The NLP course showed [where the memory of a conversation lives](/notes/nlp/tools-and-agents#where-the-memory-of-a-conversation-lives) and how a runtime trims a conversation to a token budget. This note treats the same problem for agents, where it is sharper: what the context window holds and what it costs, what to put in it and in what order, how to compress the old part, how to keep a memory outside the window that the agent writes and reads, and how prompt caching changes the arithmetic.
+
+**Notation.** The context window holds $W$ tokens. The **prefix** of $s$ tokens (system instructions and tool schemas) is the same at every step. Each step adds $d = u + o$ tokens, as in the previous note: $u$ written by the model (a thought and an action) and $o$ of observation. $L_t$ is the number of tokens the model reads at step $t$, and a run has $T$ steps. Prices are relative to the base price of one input token: a token read from the prompt cache costs $\rho$, a token written into it costs $\omega$. A memory $m$ in a long-term store has an importance $\iota(m)$, a time $\tau(m)$ of last access, and an embedding $e(m)$; a query has embedding $e(q)$.
+
+## Baseline: append everything
+
+The loop of the previous note keeps every step. At step $t$ the model reads the prefix and the $t - 1$ steps before it, $L_t = s + (t - 1)\, d$, so the context grows linearly, and, as [the cost of a loop](/notes/agents/react-and-the-agent-loop#the-cost-and-latency-of-a-loop) showed, the input tokens of a whole run grow quadratically:
+
+$$
+\sum_{t=1}^{T} L_t = T s + d\, \frac{T (T - 1)}{2} .
+$$
+
+**Worked example.** A prefix of $s = 3{,}000$ tokens (instructions and twenty tool schemas), $d = 1{,}500$ tokens per step, a window of $W = 128{,}000$ with $4{,}000$ kept free for the reply. The last step that fits is the largest $t$ with $3{,}000 + 1{,}500\,(t-1) \le 124{,}000$, which is $t = 81$. Eighty steps read
+
+$$
+80 \cdot 3{,}000 + 1{,}500 \cdot \frac{80 \cdot 79}{2} = 240{,}000 + 4{,}740{,}000 = 4{,}980{,}000
+$$
+
+input tokens, of which the prefix accounts for under 5%. The last step alone reads 121,500. Three things go wrong at once: the run stops at step 82 whatever the task needs, the cost of a step grows with its index, and, as the next section shows, the model uses a long context less well than a short one. The context window is the agent's **working memory**, in the sense of the cognitive-architecture view of language agents ([Sumers et al., 2024](#references)): everything the model can use in the current step is there, and nothing else is.
+
+<aside class="callout"><strong>Key idea.</strong> Treat the context as a budget that the runtime spends on purpose. Put in it only what the next step needs, in an order the model reads well and the cache can reuse. Replace what is old by a summary, and move what must survive into a store outside the window, from which the agent retrieves it by a score when it becomes relevant again.</aside>
+
+## What goes in, and in what order
+
+The practice of choosing the tokens of each call has come to be called **context engineering**: finding the smallest set of high-signal tokens that makes the desired behaviour likely ([Anthropic, 2025](#references)). A step's context is assembled from parts with different lifetimes:
+
+<ContextAssembly />
+
+1. **The stable prefix** comes first: system instructions, tool schemas, fixed examples. It is identical at every step, which is what makes it cacheable (the last section).
+2. **Retrieved memories** follow: a few items from the long-term store, chosen for this step by a score.
+3. **The model reads the context and writes an action.**
+4. **The observation** returned by the tool is appended to the recent steps.
+5. **Compaction**: when the context passes a high-water mark, the oldest steps are replaced by a summary.
+6. **Writing to memory**: what should outlive the window (an outcome, a fact about the user, a skill that worked) goes to the store.
+
+The budget constraint is one inequality: prefix, retrieved memories, summary, recent steps and the reply must fit, $s + |\text{memories}| + |\text{summary}| + |\text{recent}| + |\text{reply}| \le W$. Every part competes with every other.
+
+### Why order matters: lost in the middle
+
+A model does not read a long context uniformly. [Liu et al. (2024)](#references) gave models a question from NaturalQuestions-Open together with $k$ retrieved Wikipedia passages, exactly one of which contained the answer, and moved that passage from the first to the last position. The [RAG note](/notes/nlp/rag#building-the-context) drew the practical rule from this study; here are its measurements:
+
+<LostInTheMiddle />
+
+With 20 passages (about 4,000 tokens), `gpt-3.5-turbo-0613` answered 75.8% of the questions when the answer passage came first, 53.8% when it was tenth and 63.2% when it was last. Without any passages, from its parameters alone, it answered 56.1%; given only the answer passage, 88.3%. In the middle of the context the passage was worse than useless: the model did better without it. Two further findings matter for agents. The versions of the same models with longer windows (16K for GPT-3.5-Turbo, 100K for Claude-1.3) had the same curves, so a larger window does not mean better use of it; and the dip appeared for every model tested in 2023 (MPT-30B-Instruct, LongChat-13B, GPT-3.5-Turbo, Claude-1.3). A 2025 study of 18 newer models, including GPT-4.1, Claude 4, Gemini 2.5 and Qwen3, found accuracy falling with input length even on simple tasks, such as finding one sentence in a long text, and falling further with semantically similar distractors ([Hong, Troynikov and Huber, 2025](#references)). It called the effect **context rot**. The exact curves differ by model and change with every generation; the direction has held.
+
+Four rules follow, each cheap to apply:
+
+- **Edges for what matters.** The instructions at the start, the current task and the most relevant material at the end, next to where the model writes.
+- **Restate the goal.** In a long run the original request is far behind; agents that keep a short, rewritten plan or to-do list at the end of the context keep the goal near the reader.
+- **Clear what is spent.** A file listing read forty steps ago is rarely needed verbatim; replacing old tool outputs by a one-line note ("listed `src/`, 212 files") is the lightest form of compaction ([Anthropic, 2025](#references)).
+- **Fewer, sharper items.** Distractors cost more than missing context in these studies: five well-chosen memories beat thirty plausible ones.
+
+## Compaction: summarizing the old steps
+
+**Compaction** replaces part of the history by a summary written by a model. A policy needs four numbers: a high-water mark $H \le W$ that triggers it, the number $k$ of recent steps kept verbatim, the size $\sigma$ of the summary, and what the summarizer reads (the old summary and the steps it replaces, so that summaries are recursive). With $H$, the context oscillates between a floor and the mark: right after a compaction it holds $s + \sigma + k d$ tokens, and it grows by $d$ per step until it passes $H$ again.
+
+**Worked example.** The run above with $H = W/2 = 64{,}000$, $k = 8$ and $\sigma = 2{,}000$. At step 41 the context would pass the mark, so the summarizer reads the prefix and the 33 oldest steps, $3{,}000 + 33 \cdot 1{,}500 = 52{,}500$ tokens, and the context drops to $3{,}000 + 2{,}000 + 8 \cdot 1{,}500 = 17{,}000$. It then takes 32 steps to reach the mark again:
+
+<TokenBudget />
+
+Over 80 steps the compacted run reads 2,791,500 tokens and its two summarizer calls 105,500 more, together 58.2% of the 4,980,000 of the append-only run; and it does not stop at step 82. Over 1,000 steps the context never exceeds 63,500 tokens and averages 39,930, so the total grows linearly in $T$ instead of quadratically. Keeping the context at half the window is a choice made for quality as much as for cost: it keeps the model out of the regime where the measurements above degrade.
+
+Compaction is lossy, and what the summary drops is gone. Three practices reduce the damage. Summarize with an explicit list of what to keep (decisions made, open problems, file paths, the user's constraints) and what to drop (raw outputs that were already acted on). Keep the latest steps verbatim, since the next action depends on them most. And write anything that might be needed again in full to an external store before it is summarized away, which is the subject of the next section.
+
+## Long-term memory as retrieval
+
+Memory that outlives the window is retrieval-augmented generation in which the corpus is written by the agent itself. The agent stores records as it works and retrieves a few of them into the context when they become relevant, with the [retriever of the NLP course](/notes/nlp/semantic-search#the-index) or a simpler index. Cognitive psychology supplies the usual division by what is stored, and [Sumers et al. (2024)](#references) carried it over to language agents:
+
+| memory | holds | written when | read by | example |
+| --- | --- | --- | --- | --- |
+| working | the current context | every step | the model, directly | the last eight steps |
+| episodic | what happened | an episode or step ends | similarity to the situation | "the deploy failed because the config file was missing" |
+| semantic | facts about the world or the user | a fact is learned | similarity, or exact keys | "the user wants answers in Spanish" |
+| procedural | how to do something | a procedure succeeds | similarity to the task | a tested function that crafts a pickaxe |
+
+Procedural memory also includes the prompt and the model's weights, which change only by editing or training. Three systems show the design space.
+
+### MemGPT: paging between a main context and external storage
+
+MemGPT ([Packer et al., 2023](#references)) borrows virtual memory from operating systems, where a program sees more memory than the machine has because pages move between RAM and disk. Its **main context**, the prompt, plays RAM and has three parts: read-only system instructions; a **working context**, a block of text the model can edit through function calls (facts about the user, its persona); and a first-in, first-out queue of recent messages whose first entry is a recursive summary of everything evicted. Its **external context** plays disk: **recall storage**, a database of every message, and **archival storage**, a store of arbitrary text with vector search. The model moves data between the two levels itself, by calling functions such as a search of recall storage (the analogue of a page fault) or an insert into archival storage. A queue manager enforces the budget: when the prompt passes a warning threshold (70% of the window in the paper) it inserts a "memory pressure" message so that the model can save what matters, and when it passes the flush threshold it evicts a share of the queue (50% in the paper) into a new recursive summary.
+
+On a task built from the Multi-Session Chat dataset, a question in a sixth session about a detail of the first five, GPT-4 with a fixed context holding a summary of the earlier sessions answered 32.1% correctly; GPT-4 inside MemGPT, which could search the full history, answered 92.5% (accuracy judged by a language model against the gold answer; 2023). The comparison is between a lossy summary and the summary plus search, which is the argument for keeping both.
+
+### Generative Agents: a memory stream scored by recency, importance and relevance
+
+Generative Agents ([Park et al., 2023](#references)) simulated 25 characters in a small town, each driven by a language model with a **memory stream**: a list of observations in natural language, each with a creation time, a time of last access and an importance. Retrieval scores every memory against the current situation $q$ with
+
+$$
+\boxed{\; \text{score}(m) = \alpha_{\text{rec}}\, \widehat{\text{rec}}(m) + \alpha_{\text{imp}}\, \widehat{\iota}(m) + \alpha_{\text{rel}}\, \widehat{\text{rel}}(m, q) \;}
+$$
+
+with three components:
+
+- **recency** $\text{rec}(m) = 0.995^{\,h}$, where $h$ is the number of game hours since the memory was last retrieved, so that retrieval refreshes a memory;
+- **importance** $\iota(m) \in \{1, \dots, 10\}$, an integer the model assigns when the memory is created, in answer to a prompt that calls brushing teeth a 1 and a break-up a 10;
+- **relevance** $\text{rel}(m, q) = \cos\big(e(m), e(q)\big)$, the cosine similarity of embeddings.
+
+The hats mark **min–max scaling** over the candidates, $\hat x = (x - \min x)/(\max x - \min x)$, which puts the three on $[0, 1]$, and all three weights were set to 1. The top-scoring memories that fit in the context are inserted. The agents also wrote **reflections**, higher-level conclusions drawn from recent memories and stored in the same stream, whenever the importance of recent events summed past 150, about two or three times per simulated day.
+
+**Worked example.** At hour 100 the query is "why did the deploy fail last time?". Three memories:
+
+| memory | hours since access | importance | relevance |
+| --- | --- | --- | --- |
+| A: the deploy failed because the config file was missing | 95 | 7 | 0.62 |
+| B: the project deadline moved to Friday | 30 | 8 | 0.10 |
+| C: had coffee while the tests ran | 2 | 2 | 0.05 |
+
+Recencies are $0.995^{95} = 0.6211$, $0.995^{30} = 0.8604$ and $0.995^{2} = 0.9900$; scaled, $0$, $(0.8604 - 0.6211)/(0.9900 - 0.6211) = 0.6487$ and $1$. Importances scale to $5/6 = 0.8333$, $1$ and $0$; relevances to $1$, $0.05/0.57 = 0.0877$ and $0$. The scores are $0 + 0.8333 + 1 = 1.833$ for A, $0.6487 + 1 + 0.0877 = 1.736$ for B and $1 + 0 + 0 = 1$ for C. A wins on relevance although it is the oldest. Min–max scaling makes every score relative to the other candidates: B, which has nothing to do with the deploy, comes close to A only because C is so weak on importance and relevance that B is the best of the rest on both. With more candidates the components spread out, and the weights become a real design choice.
+
+### Voyager: a skill library as procedural memory
+
+Voyager ([Wang et al., 2023](#references)) played Minecraft through code: GPT-4 wrote JavaScript programs against a game API, ran them, and revised them from the game's feedback and its own check of whether the task was done. A program that completed its task was added to a **skill library**, keyed by an embedding of a description of what it does. For a new task, the five skills whose keys were nearest to the task were placed in the prompt, and the model could call them as functions. Skills compose: "craft an iron pickaxe" calls the skills that mine iron and craft sticks. The memory is procedural and executable, and it is written only after verification, so it does not accumulate broken programs.
+
+In the paper's tech-tree experiment (`gpt-4-0314`, three runs of at most 160 prompting iterations each, 2023), Voyager reached a diamond tool in one of three runs and the same system without the skill library in none; both reached iron tools in all three runs, in 21 and 29 iterations on average. In a new world, with tasks it had not seen, the learned library also helped another agent design (AutoGPT) solve tasks it had failed without it.
+
+### What is hard about writing
+
+Retrieval is a solved problem compared with deciding what to write. A store that receives every observation fills with near-duplicates, which crowd out the useful items at retrieval time. Facts change ("the deadline moved to Friday", then to Monday), and a store needs a rule for which version wins, usually the newest with a timestamp, sometimes an explicit update. A wrong memory is worse than a missing one, because it is retrieved with the same confidence as a right one. And whatever reaches the store from a web page or a tool output can be an instruction planted by someone else, which makes memory a channel for [prompt injection](/notes/agents/agent-security) that persists across sessions. Practical systems therefore write less than they could: outcomes of whole episodes, facts confirmed by the user, and procedures that passed a check.
+
+## Prompt caching, as economics
+
+A model's server keeps the attention keys and values of a prompt it has just processed, the [KV cache](/notes/nlp/gpt#making-generation-faster) of the NLP course. If the next request begins with exactly the same tokens, those keys and values can be reused instead of recomputed. Providers expose this as **prompt caching** and price it: as of October 2026, Anthropic's documentation lists cache writes at 1.25 times the base input price for a five-minute lifetime (2 times for one hour) and cache reads at 0.1 times for most models, and OpenAI's lists reads at 0.1 times the input rate with writes at 1.25 times on its newer models ([Anthropic, 2026](#references); [OpenAI, 2026](#references)). The rule that matters is the same everywhere: reuse requires an **exact prefix match**, so a change at position $i$ invalidates everything after it.
+
+An append-only agent loop is the best case. At step $t$ the first $L_{t-1}$ tokens were already sent at step $t - 1$, so they are read from the cache at price $\rho$, and only the $L_t - L_{t-1}$ new ones are written at price $\omega$ (with $L_0 = 0$):
+
+$$
+\begin{aligned}
+C_{\text{cache}} &= \sum_{t=1}^{T} \Big( \rho\, L_{t-1} + \omega\, (L_t - L_{t-1}) \Big) && \text{cached part plus new part, per step} \\
+&= \rho \sum_{t=1}^{T} L_{t-1} + \omega\, L_T && \text{the differences telescope to } L_T - L_0 = L_T \\
+&= \boxed{\, \rho \Big( \sum_{t=1}^{T} L_t - L_T \Big) + \omega\, L_T \,} && \textstyle \sum_{t=1}^{T} L_{t-1} = \sum_{t=1}^{T} L_t - L_T \text{ since } L_0 = 0 .
+\end{aligned}
+$$
+
+Without caching the run costs $\sum_t L_t$. Since $\sum_t L_t$ grows like $T^2$ and $L_T$ like $T$, the ratio of the two tends to $\rho$: a long append-only run costs about a tenth of its uncached price. For the 80-step run, $0.1 \cdot (4{,}980{,}000 - 121{,}500) + 1.25 \cdot 121{,}500 = 637{,}725$ base-price tokens instead of 4,980,000, a factor of 7.8. Caching also shortens the time before the first output token, since a cached prefix is not recomputed.
+
+Compaction and caching pull in different directions. A compaction rewrites the context from the summary onward, so the step after it pays $\omega$ for the whole new context; the summarizer's own call, which reads a prefix that is still cached, is cheap. For the 80-step run the compacted version with caching costs 465,075 base-price tokens, against 637,725 for append-only with caching: compaction still wins, because it rewrites rarely and keeps every later step short. What does not pay is editing the early context at every step, for instance inserting retrieved memories or a timestamp before the history; each such edit throws away the cache for everything behind it. The resulting rules of thumb:
+
+- the stable prefix first, the volatile parts last, and retrieved memories placed after the history or in a block that changes rarely;
+- the history append-only between compactions, and compactions rare;
+- tool lists in a deterministic order (the 2026 revision of the Model Context Protocol asks servers for exactly this, to keep caches warm; see [Workflows, frameworks and protocols](/notes/agents/workflows-and-protocols)).
+
+<aside class="callout"><strong>Check yourself.</strong> (1) With $s = 2{,}000$ and $d = 1{,}000$, how many input tokens does an append-only run of 50 steps read? (2) In the worked example of retrieval, raise the importance of C (the coffee) from 2 to 9. Which memory wins, and what does that say about equal weights? (3) A runtime inserts the current time at the very top of the system prompt on every call. What does that do to the prompt cache, and where should the time go?<details><summary>Answers</summary>(1) $50 \cdot 2{,}000 + 1{,}000 \cdot 50 \cdot 49/2 = 100{,}000 + 1{,}225{,}000 = 1{,}325{,}000$. (2) Importances now scale to $0$, $0.5$ and $1$, so the scores are $0 + 0 + 1 = 1$ for A, $0.6487 + 0.5 + 0.0877 = 1.236$ for B and $1 + 1 + 0 = 2$ for C: the irrelevant memory wins because it is the newest and the most important. With equal weights, relevance is only a third of the score; systems that see this weight relevance more or first discard candidates below a relevance threshold. (3) Every call has a different first line, so the prefix never matches and nothing is ever read from the cache: the run pays at least the full base price on every step, and $\omega$ on top for cache writes. The time belongs at the end, next to the newest message.</details></aside>
+
+## What changed
+
+| | append-only loop | managed context and memory |
+| --- | --- | --- |
+| what the model reads | everything so far | prefix, a few retrieved memories, a summary, recent steps |
+| context size over a run | grows by $d$ per step until it overflows | bounded by the high-water mark $H$ |
+| input tokens of a run | quadratic in $T$ | linear in $T$ |
+| what survives the window | nothing | episodes, facts and skills in a store, retrieved by score |
+| cost per input token | base price | about $\rho$ for a cached prefix |
+| failure mode | stops at the window; degrades in the middle | lossy summaries, wrong or stale memories |
+
+## Limitations
+
+- **Summaries lose information silently.** Nothing marks what a summary dropped, and the model treats the summary as complete. A detail that turns out to matter forty steps later is gone unless it was also written to a store.
+- **Retrieval needs the right query.** The agent retrieves what resembles the current situation; a memory that is relevant for a reason the query does not express is not found. Scores with hand-set weights, such as the one above, are heuristics tuned on one application.
+- **Memory can be wrong, stale or planted.** A store has no built-in notion of truth, and content written from untrusted sources is an attack surface that outlives the session.
+- **Evidence is uneven.** Position effects and context rot are measured carefully on retrieval tasks; the benefit of a particular memory design for long agent tasks is mostly shown on one benchmark per paper, and results from different setups cannot be ranked.
+- **Prices and limits change.** Window sizes, cache prices, cache lifetimes and minimum cacheable lengths differ between providers and models and change within months; the arithmetic carries over, the constants do not.
+
+## What you should remember
+
+- The context window is working memory. An append-only loop reads $T s + d\,T(T-1)/2$ input tokens over $T$ steps and stops when the window is full.
+- Models use long contexts unevenly: information in the middle is used worst, longer windows do not fix it, and accuracy falls with length and with distractors. Put instructions first, the task and the key material last, and clear spent tool outputs.
+- Compaction replaces old steps by a summary when the context passes a high-water mark, keeping the context bounded and the total cost linear; it is lossy, so pair it with an external store.
+- Long-term memory is retrieval over what the agent wrote: episodic, semantic and procedural. MemGPT pages between a main context and external storage; Generative Agents score memories by min–max scaled recency, importance and relevance; Voyager stores verified skills as code.
+- Prompt caching reuses an exact prefix: reads cost about a tenth of the base price, so a long append-only run costs about $\rho$ times its uncached price. Keep the prefix stable, append rather than edit, and compact rarely.
+
+## Code
+
+The token arithmetic of an append-only loop, a compaction policy under a high-water mark, the cost with prompt caching, the retrieval score of the worked example, and a small memory stream with a scripted importance rater and a toy embedding (a hashed bag of words). With a real model the importance comes from a prompt and the embedding from an embedding model; the scoring, the bookkeeping of recency and the compaction policy stay as they are. NumPy and the standard library only; the script runs in well under a second, has no randomness, and its numbers can differ in the last digit across platforms.
+
+```python
+import re
+import numpy as np
+
+# 1. the append-only loop: at step t the model reads the prefix and the t - 1 earlier steps
+s, d, W, reserve = 3_000, 1_500, 128_000, 4_000                 # prefix, tokens per step, window, room for the reply
+context = lambda t: s + (t - 1) * d
+last = max(t for t in range(1, 1000) if context(t) <= W - reserve)
+print(last, sum(context(t) for t in range(1, 81)), 80 * s + d * 80 * 79 // 2)
+# 81 4980000 4980000            (last step that fits; input tokens over 80 steps, by the loop and by the formula)
+
+# 2. compaction: when the context passes the high-water mark H, the prefix stays, the last `keep` steps stay,
+#    and everything else becomes one summary of sigma tokens; the summarizer reads what it replaces
+def run(T, H=None, keep=8, sigma=2_000):
+    history, summary, reads, summarizer = [], 0, [], []
+    for t in range(1, T + 1):
+        reads.append(s + summary + sum(history))                 # what step t reads
+        history.append(d)                                        # what step t adds
+        if H is not None and s + summary + sum(history) > H:
+            summarizer.append(s + summary + sum(history[:-keep]))
+            summary, history = sigma, history[-keep:]
+    return np.array(reads), np.array(summarizer)
+
+H = W // 2
+full, _ = run(80)
+comp, summ = run(80, H)
+print(full.max(), comp.max(), comp.min(), len(summ), summ.tolist())
+# 121500 63500 3000 2 [52500, 53000]   (largest context without and with compaction; smallest; summarizer reads)
+print(full.sum(), comp.sum(), summ.sum(), round((comp.sum() + summ.sum()) / full.sum(), 3))
+# 4980000 2791500 105500 0.582     (input tokens: append-only, compacted, summarizer calls; their ratio)
+long, long_summ = run(1000, H)
+print(len(long_summ), long.max(), round(long.mean()))            # 30 63500 39930: over 1000 steps the context stays bounded
+
+# 3. prompt caching: reading a cached prefix costs rho, writing tokens into the cache costs omega (base price = 1)
+rho, omega = 0.1, 1.25
+def cached_cost(reads, rewrites=()):
+    new = np.diff(np.r_[0, reads])                               # tokens appended since the previous step
+    c = rho * (reads - new) + omega * new
+    for i in rewrites: c[i] = omega * reads[i]                   # after a compaction the prefix changed: write it again
+    return c.sum()
+rew = [i for i in range(1, len(comp)) if comp[i] < comp[i - 1]]
+print(round(full.sum() / 1e6, 3), round(cached_cost(full) / 1e6, 3),
+      round((comp.sum() + summ.sum()) / 1e6, 3), round((cached_cost(comp, rew) + rho * summ.sum()) / 1e6, 3), rew)
+# 4.98 0.638 2.897 0.465 [41, 73]   (millions of base-price tokens: no cache, cache; compaction, compaction with cache)
+
+# 4. the retrieval score of Generative Agents: min-max scaled recency + importance + relevance, all weights 1
+def score(hours_since_access, importance, relevance, decay=0.995):
+    mm = lambda x: (x - x.min()) / (x.max() - x.min() + 1e-12)
+    rec = decay ** np.asarray(hours_since_access, float)
+    return mm(rec) + mm(np.asarray(importance, float)) + mm(np.asarray(relevance, float)), rec
+total, rec = score([95, 30, 2], [7, 8, 2], [0.62, 0.10, 0.05])   # the worked example: memories A, B, C
+print(rec.round(4), total.round(3))                               # [0.6211 0.8604 0.99  ] [1.833 1.736 1.   ]
+
+# 5. a memory stream: write with an importance rating, read by the score, refresh recency on every read
+def embed(text, dim=64):                                         # a toy embedding: hashed bag of words, unit length
+    v = np.zeros(dim)
+    for w in re.findall(r'[a-z]+', text.lower()):
+        v[sum(map(ord, w)) % dim] += 1.0
+    return v / np.linalg.norm(v)
+def rate_importance(text):                                       # scripted stand-in for "rate from 1 to 10" by the model
+    table = {'password': 9, 'deadline': 8, 'failed': 7, 'prefers': 6, 'coffee': 2, 'weather': 1}
+    return max((v for k, v in table.items() if k in text), default=3)
+
+class MemoryStream:
+    def __init__(self):
+        self.items = []
+    def write(self, text, hour):
+        self.items.append(dict(text=text, vec=embed(text), imp=rate_importance(text), last=hour))
+    def read(self, query, hour, k=3):
+        q = embed(query)
+        sc, _ = score([hour - m['last'] for m in self.items], [m['imp'] for m in self.items],
+                      [m['vec'] @ q for m in self.items])
+        top = np.argsort(-sc)[:k]
+        for i in top: self.items[i]['last'] = hour
+        return [(self.items[i]['text'], round(float(sc[i]), 3)) for i in top]
+
+mem = MemoryStream()
+for hour, text in [(0, 'user prefers answers in Spanish'), (2, 'had coffee while the tests ran'),
+                   (5, 'the deploy failed because the config file was missing'), (30, 'weather was sunny today'),
+                   (70, 'project deadline moved to Friday'), (95, 'ran the tests again, all passed')]:
+    mem.write(text, hour)
+for row in mem.read('why did the deploy fail last time', hour=100): print(row)
+# ('the deploy failed because the config file was missing', 1.899)
+# ('ran the tests again, all passed', 1.81)
+# ('project deadline moved to Friday', 1.689)
+print(sum(m['imp'] for m in mem.items))                          # 27: below the reflection threshold of 150
+```
+
+## Next
+
+Memory lets an agent keep what it learned; it does not tell the agent what to do next. The loop so far chooses one action at a time, and on tasks where the order of actions matters, where an early move can make a later goal unreachable, choosing one step at a time fails. The [next note](/notes/agents/planning-with-language-models) asks how well language models plan, and how planning improves when the model is paired with the search and the planners of the first section of the course.
+
+## References
+
+- N. F. Liu, K. Lin, J. Hewitt, A. Paranjape, M. Bevilacqua, F. Petroni, P. Liang. [Lost in the middle: how language models use long contexts](https://arxiv.org/abs/2307.03172). *Transactions of the Association for Computational Linguistics*, 12:157–173, 2024. Section 2 and appendix G (multi-document QA by position), table 1 (closed-book and oracle).
+- K. Hong, A. Troynikov, J. Huber. [Context rot: how increasing input tokens impacts LLM performance](https://www.trychroma.com/research/context-rot). Chroma technical report, July 2025.
+- Anthropic. [Effective context engineering for AI agents](https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents). September 2025. Compaction, structured note-taking and tool-result clearing.
+- T. R. Sumers, S. Yao, K. Narasimhan, T. L. Griffiths. [Cognitive architectures for language agents](https://arxiv.org/abs/2309.02427). *Transactions on Machine Learning Research*, 2024. Working, episodic, semantic and procedural memory.
+- C. Packer, S. Wooders, K. Lin, V. Fang, S. G. Patil, I. Stoica, J. E. Gonzalez. [MemGPT: towards LLMs as operating systems](https://arxiv.org/abs/2310.08560). arXiv:2310.08560, 2023. Section 2 (main and external context, queue manager), table 2 (deep memory retrieval).
+- J. S. Park, J. C. O'Brien, C. J. Cai, M. R. Morris, P. Liang, M. S. Bernstein. [Generative agents: interactive simulacra of human behavior](https://arxiv.org/abs/2304.03442). UIST, 2023. Section 4.1 (memory and retrieval), section 4.2 (reflection).
+- G. Wang, Y. Xie, Y. Jiang, A. Mandlekar, C. Xiao, Y. Zhu, L. Fan, A. Anandkumar. [Voyager: an open-ended embodied agent with large language models](https://arxiv.org/abs/2305.16291). arXiv:2305.16291, 2023. Section 2.2 (skill library), tables 1 and 2.
+- Anthropic. [Prompt caching](https://platform.claude.com/docs/en/docs/build-with-claude/prompt-caching). Claude API documentation, accessed October 2026.
+- OpenAI. [Prompt caching](https://developers.openai.com/api/docs/guides/prompt-caching). API documentation, accessed October 2026.
+- L. Weng. [LLM powered autonomous agents](https://lilianweng.github.io/posts/2023-06-23-agent/). Blog post, June 2023. Section on memory.

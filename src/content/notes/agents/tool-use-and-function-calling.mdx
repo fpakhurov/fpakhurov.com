@@ -1,0 +1,406 @@
+---
+title: Tool use and function calling
+description: "How a language model calls functions: tool definitions in JSON Schema, the round trip of a call, parallel calls, constrained decoding that masks logits so every call is valid by construction, Toolformer's self-supervised training signal, code as the action, and errors and retries."
+course: agents
+section: Language Models as Agents
+order: 10
+status: published
+tags: [tool-use, function-calling, json-schema, constrained-decoding, structured-output, parallel-tool-calls, toolformer, codeact, retries]
+prerequisites: [The language model as a policy, Tool use and agents]
+---
+
+import ToolRoundTrip from '../../../components/figures/tool-use-and-function-calling/ToolRoundTrip.astro';
+import LogitMask from '../../../components/figures/tool-use-and-function-calling/LogitMask.astro';
+
+The [previous note](/notes/agents/chain-of-thought) gave the model room to compute before it answers, but no new information and no way to change anything. Its policy can only write text. The actions of the [policy note](/notes/agents/language-model-as-a-policy) were strings that a hand-written parser had to recognize, and anything the parser did not recognize was lost. Tool use replaces that parser with a contract. Each tool is declared as a typed function, the model emits a call in a fixed structure, and the runtime checks the call, executes it and returns the result. The [tools and agents note](/notes/nlp/tools-and-agents#the-protocol) of the NLP course gives the protocol in four steps. This note goes into each step: what a function definition contains, the exact messages of a round trip, calls made in parallel, how decoding can be constrained so that every call is valid by construction, how models learned to call tools at all, code as the action, and what the runtime does when a call fails.
+
+**Notation.** Tools $f_1, \dots, f_m$, each with a name, a description and a schema $S_i$ for its arguments. A call is a triple (identifier, name, arguments), the arguments a JSON object. $V$ is the vocabulary, $z \in \mathbb R^{|V|}$ the logits at one decoding step and $p = \operatorname{softmax}(z)$; $\mathcal L$ is the set of valid outputs, and a prefix $u$ is **live** if some sequence of tokens extends it to an element of $\mathcal L$. $M(u) \subseteq V$ is the set of tokens allowed after $u$.
+
+## Baseline: actions parsed from free text
+
+The first language-model agents wrote their actions in an ad hoc format, such as `search[Dunmore]` in ReAct, and a regular expression read them. The format is a convention the model follows only probabilistically. It may write `Search: Dunmore`, wrap the action in a sentence, put a quote inside an argument without escaping it, or name a tool that does not exist. Each such slip costs a step, and the costs compound over a long task. **Worked example.** If one action in 50 is malformed, $\varepsilon = 0.02$, an agent that takes 20 actions produces at least one malformed action with probability
+
+$$
+1 - (1 - \varepsilon)^{20} = 1 - 0.98^{20} = 0.33 .
+$$
+
+One run in three hits a parse error, even though each single action is well formed 98 % of the time. Arguments add a second problem: a well-formed call can still pass a string where a number is expected, or an item the shop does not sell.
+
+<aside class="callout"><strong>Key idea.</strong> Declare every tool as a typed function: a name, a description written for the model, and a JSON Schema for its arguments. Let the model emit calls as structured data in a channel of their own, have the runtime validate each call against its schema before executing it, and return every result, errors included, as a message tied to the call. Where validity must be guaranteed, constrain decoding: at each step, set the logit of every token that would make the output impossible to complete to $-\infty$.</aside>
+
+## A function definition
+
+A tool definition has three parts. In the format used by most model providers, a tool of the toy shop of the Code section reads:
+
+```json
+{
+  "name": "get_price",
+  "description": "Price of one item in the shop, in euros.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "item": { "type": "string", "enum": ["lamp", "chair", "desk"] }
+    },
+    "required": ["item"],
+    "additionalProperties": false
+  }
+}
+```
+
+- **The name** is what the model writes to call the tool. It should say what the tool does, because the model chooses tools by reading.
+- **The description** is a prompt. It is the only documentation the model sees, so it states what the tool returns, its units, when to use it and when not to.
+- **The parameters** are a JSON Schema ([JSON Schema, 2020](#references)): the type of each argument, which arguments are required, and constraints such as `enum` (a fixed list of values), `minimum` and `maximum`, `pattern` (a regular expression a string must match) and `additionalProperties: false` (no other keys). The schema serves twice: the chat template renders it into the context so the model knows how to call, and the runtime uses it to check the call.
+
+Providers wrap the same content in slightly different envelopes: `parameters` in OpenAI's API, `input_schema` in Anthropic's, `inputSchema` in the Model Context Protocol. The definitions are part of the context of every call the agent makes, so their tokens are paid at every step; the two definitions of the Code section take 530 characters, roughly 130 tokens at about four characters per token, and real agents with dozens of tools spend thousands.
+
+## The round trip of a tool call
+
+A model that supports tools has been trained on dialogues containing tool definitions, calls and results, in a format with special tokens around calls ([Instruction tuning and alignment](/notes/nlp/instruction-tuning#what-sft-teaches)). When it decides to call, it writes a call block instead of text, and the serving code returns it to the program as structured data rather than as a message for the user. The program, not the model, does the rest.
+
+<ToolRoundTrip />
+
+1. **Define.** The runtime sends the tool definitions and the user's message: *How much do three lamps, two chairs and a desk cost?*
+2. **Call.** The model replies with three calls in one turn, each with an identifier: `c1` get_price(`lamps`), `c2` get_price(`chair`), `c3` get_price(`desk`).
+3. **Validate.** The runtime checks each call against its schema. `c1` fails: `lamps` is not in the `enum`.
+4. **Execute.** The two valid calls run at the same time; the turn waits 0.8 s, the time of the slower one.
+5. **Return.** Three tool messages go back, each carrying the identifier of its call: an error for `c1` that names the allowed values, `41.0` for `c2`, `129.0` for `c3`.
+6. **Continue.** The model reads the error and calls get_price(`lamp`) as `c4`, then the calculator with `3 * 24.5 + 2 * 41.0 + 129.0` as `c5`, and finally answers: *Three lamps, two chairs and a desk cost 284.5 euros.*
+
+Three properties of the protocol carry the weight.
+
+- **Identifiers pair results with calls.** A turn may contain several calls and the results may arrive in any order; the identifier, not the position, tells the model which result answers which call.
+- **Errors are observations.** The validation error for `c1` is sent back like any other result. The model sees why the call failed and fixes it on the next turn; nothing crashes. This is the same move as returning a compiler error to a programmer.
+- **The model never executes anything.** It proposes calls; the runtime decides whether to run them. Checks, permissions, confirmations for actions with side effects and sandboxes all live in the runtime, where they cannot be talked out of by text in the context. A tool result is data, and text inside it that looks like an instruction is still data ([Agent security and prompt injection](/notes/agents/agent-security)).
+
+**Parallel calls.** When several calls do not depend on each other, the model can emit them in one turn and the runtime can run them concurrently. In the example, the first turn's two valid calls take 0.8 s each: in parallel the turn takes 0.8 s, one after another 1.6 s, and the whole task 1.7 s against 2.5 s. The saving in model turns matters as much: one call per turn would need six turns of the model instead of four, and every turn re-reads the whole context. Only independent calls can be parallel: the calculator needs the prices, so it waits for a later turn. LLMCompiler ([Kim et al., 2024](#references)) pushes this further by having the model write a plan of calls with their dependencies first, then dispatching every call as soon as its inputs are ready; on its benchmarks it reported up to 3.7 times lower latency and up to 6.7 times lower cost than a ReAct loop that calls tools one at a time.
+
+## Constrained decoding: valid by construction
+
+Validation catches an invalid call after it was generated. Constrained decoding prevents it. The output has to belong to a set $\mathcal L$ of valid strings, given by a grammar, a regular expression or a JSON Schema. At every step, the decoder removes the tokens that would make the output impossible to complete, and samples from what remains:
+
+$$
+\boxed{\;\tilde z_w = \begin{cases} z_w & \text{if } w \in M(u), \\ -\infty & \text{otherwise,} \end{cases}
+\qquad
+\tilde p(w) = \frac{p(w)\,\mathbb 1[w \in M(u)]}{\sum_{w' \in M(u)} p(w')},
+\qquad M(u) = \{\, w : u w \text{ is live} \,\}.\;}
+$$
+
+The end-of-sequence token is allowed only when $u \in \mathcal L$. Why every output is valid: the empty prefix is live; if $u$ is live, every token in $M(u)$ keeps it live, and $M(u)$ is not empty, because some continuation exists; so every prefix the decoder ever produces is live, and it can stop only at a complete element of $\mathcal L$. Validity holds whatever the model's logits are.
+
+**Worked example.** The Code section constrains a call to the form `{"item": "…", "qty": …}`, with the item in the shop's `enum` and an integer quantity, over a toy vocabulary of 17 tokens. After the prefix `{"item": "`, the stand-in model prefers the plural:
+
+<LogitMask />
+
+The tokens `lamps`, `Sure` and `}` would make the call impossible to complete and are masked. Four tokens remain. In unnormalized terms their weights are $e^{1.5} + e^{0.2} + e^{0} + e^{-0.5} = 7.310$ out of a total of $16.899$, so $\sum_{w \in M(u)} p(w) = 0.433$, and dividing by it gives `lamp` $0.613$, `chair` $0.167$, `de` $0.137$ and `desk` $0.083$. The token `de` stays because `desk` can also be written as `de` followed by `sk`; the item desk thus keeps probability $0.137 + 0.083 = 0.220$ through two tokenizations. Over 2,000 samples at $\tau = 1$, 15.8 % of the unconstrained outputs parse and pass the schema, and 100 % of the constrained ones.
+
+Three details decide whether this works in practice.
+
+- **Tokens are not characters.** A token like `", "qty": ` spans several symbols of the grammar, so the check runs the token's whole string through the automaton. And a character-level prefix can be legal yet dead: in the toy vocabulary the single token `"` after the item is a legal start of `", "qty": `, but no token continues it, so the decoder must check liveness over tokens, not over characters. Efficient implementations compile the regular expression or schema into a finite-state machine and precompute, for every state, the set of tokens that lead to live states, so a step costs a lookup ([Willard and Louf, 2023](#references)). Nested structures, such as JSON objects inside arrays to any depth, need a pushdown automaton or a bound on the depth.
+- **Masking token by token is not conditioning on validity.** The distribution we would like is the model's distribution restricted to valid strings, $p(y \mid y \in \mathcal L) \propto p(y)\,\mathbb 1[y \in \mathcal L]$. Masking renormalizes at each step instead, without looking ahead at how much valid probability each branch leads to. **Worked example.** The valid strings are `ab` and `cd`. The model gives `a` and `c` probability $0.5$ each; after `a` it puts $0.1$ on `b` and the rest on invalid tokens, after `c` it puts $0.9$ on `d`. Conditioning on validity gives $P(\texttt{ab}) = 0.05 / (0.05 + 0.45) = 0.1$ and $P(\texttt{cd}) = 0.9$. Masking keeps both first tokens at $0.5$ and then forces the only valid second token, so it returns `ab` half of the time, a string the model itself considers unlikely. Park et al. ([2024](#references)) show this distortion in real grammars and propose sampling that corrects it.
+- **Valid is not right.** The schema guarantees the shape; it does not choose the right tool or the right item. And forcing a format from the first token can cost accuracy: Tam et al. ([2024](#references)) found that requiring JSON or other strict formats lowered models' scores on reasoning tasks. A common remedy is to let the model reason freely and constrain only the call. OpenAI's structured outputs, introduced in August 2024, apply this kind of constrained decoding to a supplied schema; on the company's own evaluation of complex schemas the constrained model scored 100 %, which is what the construction guarantees.
+
+## How models learned to call tools: Toolformer
+
+A model calls tools well only if its training showed it when a call helps. Toolformer ([Schick et al., 2023](#references)) produced that training data without human labels, in three steps on a plain-text corpus.
+
+1. **Sample.** A prompt with a few examples asks the model to insert candidate calls into ordinary text, such as `[Calculator(18 / 24) → ` before the share in a sentence about a ratio. Positions where the model's probability of starting a call is high are kept, and several calls are sampled at each.
+2. **Execute** every call and insert its result.
+3. **Filter.** Keep a call only if it makes the following text easier to predict. With $L^+$ the model's weighted loss on the next tokens when the call and its result are inserted before them, and $L^-$ the smaller of the losses with no call and with the call but no result,
+
+$$
+\text{keep the call if} \quad L^- - L^+ \ge \tau_f ,
+$$
+
+with $\tau_f = 1$ for most tools. The comparison with the call-without-result case ensures that the result, not the mere presence of a call, is what helps. **Worked example.** Before the text *… is 2.1 million*, the loss of the next tokens is $4.1$ with no call, $4.0$ with the call `[QA(population of the city)]` but no result, and $1.2$ with its result. Then $L^- = \min(4.1, 4.0) = 4.0$ and $L^- - L^+ = 2.8 \ge 1$: the call is kept. A call whose result lowers the loss from $3.2$ to $3.0$ is dropped.
+
+The model is then fine-tuned on the text with the kept calls in it, and at inference the runtime executes a call whenever the model writes one. With GPT-J (6.7 B parameters) and tools for question answering, a calculator, Wikipedia search, translation and a calendar, zero-shot accuracy on math word problems rose from 7.5 % to 40.4 % on ASDiv, 5.2 % to 29.4 % on SVAMP and 9.9 % to 44.0 % on MAWPS, above GPT-3 175B's 14.0 %, 10.0 % and 19.8 % in the same evaluation. Tool use helped only from about 775 M parameters up. Current models learn tool calling in supervised fine-tuning on dialogues with calls, and increasingly by reinforcement learning on tasks whose outcome depends on the calls, the subject of [Training agents with reinforcement learning](/notes/agents/agentic-rl).
+
+## Code as the action
+
+A JSON call names one function. A program can call many, combine their results, loop and branch, all in one action. CodeAct ([Wang et al., 2024](#references)) makes Python code the action space: the model writes a short program, the runtime runs it in an interpreter, and the printed output and any error message become the observation. Across 17 models on API-Bank and on M3ToolEval, a benchmark of 82 tasks that need several tools, code actions gave up to 20 percentage points higher success than JSON or text actions; for `gpt-4-1106-preview` on M3ToolEval, 74.4 % against 52.4 % with JSON and 53.7 % with text, in 5.5 turns on average instead of 7.6 and 7.7. The [NLP course](/notes/nlp/tools-and-agents#code-as-the-tool-interface) shows a small code agent at work.
+
+The price is that the action can do anything the interpreter can do. JSON calls are checked against a schema and dispatched to functions the designer wrote; a program has to be confined instead, in a container or virtual machine with no network and no credentials it does not need ([Virtual machines and containers](/notes/acos/virtual-machines-and-containers#what-each-one-isolates)). Coding agents, which take this to its end, are the subject of [Coding agents](/notes/agents/coding-agents).
+
+## Errors and retries
+
+Calls fail in four ways, and each has its own place in the runtime.
+
+| failure | example | who handles it | how |
+| --- | --- | --- | --- |
+| malformed output | text where a call was expected, broken JSON | the decoder or the runtime | constrained decoding, or return a parse error to the model |
+| invalid arguments | `lamps` not in the `enum`, a string for a number | the runtime, then the model | validate against the schema; return the error message as the result |
+| execution error | a timeout, a server error, an exception in the tool | the runtime | retry transient errors with backoff; return persistent errors to the model |
+| valid but wrong | the right shape, the wrong item or the wrong tool | the model, from later observations | nothing in the protocol catches it; only checking the result does |
+
+**Transient errors are retried by the runtime**, without spending a model turn. If an attempt fails independently with probability $0.3$, three attempts all fail with probability $0.3^3 = 0.027$, so the call succeeds with probability $0.973$. The wait between attempts usually doubles (exponential backoff), so that a service under load is not hit harder. In the flaky run of the Code section, five attempts were needed for four calls, the task took 2.3 s instead of 1.7 s, and the model never saw the failures.
+
+**Retries by the model are not independent.** Asked again with the same context, the model tends to repeat the same mistake, so a retry helps only if the context changes, which is why the error message goes back into it. A useful error message says what was wrong and what is allowed, as the `enum` error does.
+
+**Only idempotent calls may be retried blindly.** Reading a price twice is harmless. Sending a payment or an email twice is not, and a timeout does not tell the runtime whether the first attempt took effect. Calls with side effects need an idempotency key, which lets the receiving service recognize a repeat, or a confirmation step before they run, as in the [NLP course](/notes/nlp/tools-and-agents#agents-a-loop-around-tool-calls).
+
+Tools do not have to be written into the agent's own program. The **Model Context Protocol** (MCP), introduced by Anthropic in November 2024, lets separate servers offer tools with the same three fields, a name, a description and an `inputSchema`, which a client discovers by listing them and invokes by sending calls. [Workflows, frameworks and protocols](/notes/agents/workflows-and-protocols) treats it in detail.
+
+<aside class="callout"><strong>Check yourself.</strong> (1) After some prefix, the allowed tokens have probabilities 0.30 and 0.10 and the disallowed ones 0.60. What does constrained decoding sample, with which probabilities? (2) A tool call fails independently with probability 0.2 per attempt. How many attempts give a success probability of at least 0.99? (3) Why does Toolformer compare the loss with the result against the smaller of the losses without a call and with a call but no result, rather than only against the loss without a call?<details><summary>Answers</summary>(1) The two allowed tokens, with probabilities $0.30 / 0.40 = 0.75$ and $0.10 / 0.40 = 0.25$. (2) $1 - 0.2^k \ge 0.99$ needs $0.2^k \le 0.01$, so $k = 3$ ($0.2^3 = 0.008$). (3) Inserting the call text alone can lower the loss, for example by hinting at the topic of what follows. Comparing against the call without its result keeps only calls whose returned information helps.</details></aside>
+
+## What changed
+
+| | actions parsed from free text | function calling |
+| --- | --- | --- |
+| action format | a convention, read by a regular expression | a call block with name, identifier and JSON arguments |
+| what the model knows about a tool | a line in the prompt | a definition with a description and a schema |
+| invalid actions | lost, or guessed by the parser | rejected by validation and returned as errors, or ruled out by constrained decoding |
+| several actions per turn | no | parallel calls, paired with results by identifier |
+| who executes | the agent program | the runtime, with checks, retries and permissions |
+| how the model learned it | prompt examples | training on calls: Toolformer's filter, then fine-tuning and RL |
+
+## Limitations
+
+- **Schemas check shape, not meaning.** A valid call can be the wrong call, and nothing in the protocol notices.
+- **Constrained decoding distorts the distribution** it samples from, and forcing a format from the first token can hurt reasoning.
+- **Definitions cost context.** Every tool's description is re-read at every step, and models choose less reliably among many similar tools; large tool sets need retrieval of tools or several narrower agents.
+- **Tool results are untrusted input.** A result is text that enters the context, and text can carry instructions.
+- **Side effects make retries dangerous.** A timeout leaves the state of the world unknown.
+- **Code actions need a sandbox.** They are strictly more expressive than JSON calls, and strictly harder to confine.
+
+## What you should remember
+
+- A tool is a name, a description written for the model and a JSON Schema for its arguments. The schema is rendered into the context and used again by the runtime to validate.
+- The round trip: the model emits calls with identifiers; the runtime validates, executes and returns one message per call; errors are returned as results so the model can fix the call.
+- Independent calls can be emitted in one turn and run in parallel: latency becomes the slowest call instead of the sum, and fewer model turns re-read the context.
+- Constrained decoding sets the logits of tokens that would make the output impossible to complete to $-\infty$ and renormalizes. Every output is then valid by induction on live prefixes. The check is over tokens, not characters, and per-step masking is not the same as conditioning on validity.
+- Toolformer kept a sampled call only if its result lowered the loss of the following text by at least $\tau_f$, which turned plain text into training data for tool use.
+- Code as the action composes many calls in one step and needs a sandbox.
+- The runtime retries transient errors with backoff and only for idempotent calls; the model fixes the errors it is shown.
+
+## Code
+
+A tool registry, a validator for the part of JSON Schema in use, a runtime that validates, executes in parallel and retries, a scripted stand-in model that emits calls and reads the results, and a constrained decoder over a toy vocabulary with a liveness check over tokens. With a real model, `toy_model` becomes a request to a model with the tool definitions, and `toy_logits` becomes its next-token logits inside the serving engine; the registry, the validator, the runtime and the mask stay as they are. Seeds are fixed; exact numbers can differ slightly across platforms and library versions. The script runs in under a second.
+
+```python
+import ast, json, operator, re
+from functools import lru_cache
+import numpy as np
+
+# 1. a tool registry: a Python function plus a JSON Schema for its arguments
+TOOLS = {}
+def tool(name, description, parameters, latency):
+    def register(fn):
+        TOOLS[name] = {'fn': fn, 'latency': latency,
+                       'definition': {'name': name, 'description': description, 'parameters': parameters}}
+        return fn
+    return register
+
+PRICES = {'lamp': 24.5, 'chair': 41.0, 'desk': 129.0}            # a toy shop
+@tool('get_price', 'Price of one item in the shop, in euros.',
+      {'type': 'object', 'properties': {'item': {'type': 'string', 'enum': list(PRICES)}},
+       'required': ['item'], 'additionalProperties': False}, latency=0.8)
+def get_price(item):
+    return PRICES[item]
+
+OPS = {ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul, ast.Div: operator.truediv}
+def arith(node):                                                  # +, -, *, / on numbers, nothing else
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)): return node.value
+    if isinstance(node, ast.BinOp) and type(node.op) in OPS: return OPS[type(node.op)](arith(node.left), arith(node.right))
+    raise ValueError('only numbers and + - * / are allowed')
+@tool('calculator', 'Evaluate an arithmetic expression with + - * / and parentheses.',
+      {'type': 'object', 'properties': {'expression': {'type': 'string', 'pattern': r'^[0-9+\-*/(). ]+$'}},
+       'required': ['expression'], 'additionalProperties': False}, latency=0.1)
+def calculator(expression):
+    return arith(ast.parse(expression, mode='eval').body)
+
+# 2. a validator for the part of JSON Schema used here
+TYPES = {'object': dict, 'string': str, 'integer': int, 'number': (int, float), 'boolean': bool, 'array': list}
+def validate(x, schema, path='arguments'):
+    if not isinstance(x, TYPES[schema['type']]): return [f'{path} must be of type {schema["type"]}']
+    errors = []
+    if schema['type'] == 'object':
+        props = schema.get('properties', {})
+        errors += [f'{path}.{k} is required' for k in schema.get('required', []) if k not in x]
+        if schema.get('additionalProperties') is False:
+            errors += [f'{path}.{k} is not allowed' for k in x if k not in props]
+        for k, v in x.items():
+            if k in props: errors += validate(v, props[k], f'{path}.{k}')
+    if 'enum' in schema and x not in schema['enum']: errors.append(f'{path} must be one of {schema["enum"]}')
+    if 'pattern' in schema and not re.search(schema['pattern'], x): errors.append(f'{path} does not match {schema["pattern"]}')
+    return errors
+
+# 3. the runtime: validate, execute, retry transient failures, and return every result as a tool message
+def execute(call, rng, flaky=0.0, retries=3):
+    t = TOOLS.get(call['name'])
+    if t is None: return {'error': f'unknown tool {call["name"]}'}, 0.0, 0
+    try: args = json.loads(call['arguments'])
+    except json.JSONDecodeError as e: return {'error': f'arguments are not JSON: {e.msg}'}, 0.0, 0
+    errors = validate(args, t['definition']['parameters'])
+    if errors: return {'error': '; '.join(errors)}, 0.0, 0          # the model sees why and can fix the call
+    waited = 0.0
+    for attempt in range(1, retries + 1):
+        waited += t['latency']
+        if rng.random() >= flaky: return {'result': t['fn'](**args)}, waited, attempt
+        waited += 0.5 * 2 ** (attempt - 1)                          # transient failure: back off, try again
+    return {'error': 'tool unavailable, try later'}, waited, retries
+
+# 4. a scripted stand-in for the model: it reads the messages and emits calls or an answer
+def toy_model(messages):
+    results = {m['tool_call_id']: json.loads(m['content']) for m in messages if m['role'] == 'tool'}
+    if not results:                                                 # three independent calls in one turn
+        return {'role': 'assistant', 'tool_calls': [
+            {'id': 'c1', 'name': 'get_price', 'arguments': '{"item": "lamps"}'},
+            {'id': 'c2', 'name': 'get_price', 'arguments': '{"item": "chair"}'},
+            {'id': 'c3', 'name': 'get_price', 'arguments': '{"item": "desk"}'}]}
+    if any(r.get('error', '').startswith('tool unavailable') for r in results.values()):
+        return {'role': 'assistant', 'content': 'A tool is unavailable right now; please try again later.'}
+    if 'error' in results.get('c1', {}) and 'c4' not in results:   # read the error, fix the argument
+        return {'role': 'assistant', 'tool_calls': [{'id': 'c4', 'name': 'get_price', 'arguments': '{"item": "lamp"}'}]}
+    if 'c5' not in results:
+        lamp, chair, desk = (results[k]['result'] for k in ('c4', 'c2', 'c3'))
+        return {'role': 'assistant', 'tool_calls': [
+            {'id': 'c5', 'name': 'calculator', 'arguments': json.dumps({'expression': f'3 * {lamp} + 2 * {chair} + {desk}'})}]}
+    return {'role': 'assistant', 'content': f'Three lamps, two chairs and a desk cost {results["c5"]["result"]} euros.'}
+
+def agent(user, rng, flaky=0.0, max_turns=6):
+    messages = [{'role': 'system', 'content': json.dumps([t['definition'] for t in TOOLS.values()])},
+                {'role': 'user', 'content': user}]
+    clock, sequential, attempts = 0.0, 0.0, 0
+    for _ in range(max_turns):
+        reply = toy_model(messages)
+        messages.append(reply)
+        if 'tool_calls' not in reply: return reply['content'], messages, clock, sequential, attempts
+        outs = [execute(c, rng, flaky) for c in reply['tool_calls']]
+        clock += max(w for _, w, _ in outs)                         # parallel calls: wait for the slowest
+        sequential += sum(w for _, w, _ in outs)                    # one after another: wait for all
+        attempts += sum(k for _, _, k in outs)
+        for c, (out, _, _) in zip(reply['tool_calls'], outs):
+            messages.append({'role': 'tool', 'tool_call_id': c['id'], 'content': json.dumps(out)})
+    return None, messages, clock, sequential, attempts
+
+answer, messages, clock, sequential, attempts = agent('How much do three lamps, two chairs and a desk cost?', np.random.default_rng(0))
+for m in messages[2:]: print(m['role'], m.get('tool_calls') or m.get('content'))
+print(answer, round(clock, 2), round(sequential, 2), attempts)
+print(len(messages[0]['content']))                                 # characters of tool definitions, re-sent every turn
+# assistant [{'id': 'c1', 'name': 'get_price', 'arguments': '{"item": "lamps"}'}, {'id': 'c2', 'name': 'get_price', 'arguments': '{"item": "chair"}'}, {'id': 'c3', 'name': 'get_price', 'arguments': '{"item": "desk"}'}]
+# tool {"error": "arguments.item must be one of ['lamp', 'chair', 'desk']"}
+# tool {"result": 41.0}
+# tool {"result": 129.0}
+# assistant [{'id': 'c4', 'name': 'get_price', 'arguments': '{"item": "lamp"}'}]
+# tool {"result": 24.5}
+# assistant [{'id': 'c5', 'name': 'calculator', 'arguments': '{"expression": "3 * 24.5 + 2 * 41.0 + 129.0"}'}]
+# tool {"result": 284.5}
+# assistant Three lamps, two chairs and a desk cost 284.5 euros.
+# Three lamps, two chairs and a desk cost 284.5 euros. 1.7 2.5 4
+# 530
+
+# a flaky tool: the runtime retries with backoff; the model never sees the transient failures
+answer, _, clock, _, attempts = agent('How much do three lamps, two chairs and a desk cost?', np.random.default_rng(4), flaky=0.3)
+print(answer, round(clock, 2), attempts)
+print(round(1 - 0.3 ** 3, 3))                                      # success within 3 independent attempts
+# Three lamps, two chairs and a desk cost 284.5 euros. 2.3 5
+# 0.973
+
+# 5. constrained decoding: a toy vocabulary, and a checker that the output can still become valid
+SEGS = [('lit', ['{"item": "']), ('lit', list(PRICES)), ('lit', ['", "qty": ']), ('int', None), ('lit', ['}'])]
+def match(s, i=0, k=0, partial=True):
+    """Can s[i:] be read as segments k, k+1, ... (only a prefix of them if partial)?"""
+    if i == len(s): return partial or k == len(SEGS)
+    if k == len(SEGS): return False
+    kind, alts = SEGS[k]
+    if kind == 'lit':
+        for v in alts:
+            n = min(len(v), len(s) - i)
+            if s[i:i + n] == v[:n] and (match(s, i + n, k + 1, partial) if n == len(v) else partial): return True
+        return False
+    j = i                                                           # an integer: one or more digits
+    while j < len(s) and s[j].isdigit():
+        j += 1
+        if match(s, j, k + 1, partial): return True
+    return False
+
+@lru_cache(maxsize=None)
+def live(s, depth=0):
+    """Can some sequence of vocabulary tokens complete s? (a legal character prefix is not enough)"""
+    if match(s, partial=False): return True
+    nxt = [w for w in VOCAB if w != '<eos>' and match(s + w)]
+    return depth < 8 and any(live(s + w, depth + 1) for w in nxt)
+
+VOCAB = ['{"', 'item', '": "', '{"item": "', 'lamp', 'lamps', 'chair', 'desk', 'de', 'sk', '", "qty": ',
+         '"', '3', '12', '}', 'Sure', '<eos>']                                      # '"' alone leads to a dead end
+def toy_logits(prefix):
+    z = dict.fromkeys(VOCAB, -4.0)
+    if prefix == '':                          z.update({'Sure': 1.0, '{"': 1.0, '{"item": "': 1.2})
+    elif prefix.endswith('{"'):               z.update({'item': 3.0})
+    elif prefix.endswith('item'):             z.update({'": "': 3.0})
+    elif prefix.endswith('"item": "'):        z.update({'lamps': 2.0, 'lamp': 1.5, 'Sure': 0.5, 'chair': 0.2, 'de': 0.0, 'desk': -0.5, '}': -1.0})
+    elif prefix.endswith('de'):               z.update({'sk': 3.0})
+    elif re.search(r'"(lamps?|chair|desk)$', prefix): z.update({'", "qty": ': 2.0, '"': 1.0, '}': 0.5})
+    elif prefix.endswith('": '):              z.update({'3': 2.0, '12': 1.0})
+    elif re.search(r'\d$', prefix):           z.update({'}': 2.0, '12': 0.0})
+    else:                                     z.update({'<eos>': 3.0})
+    return np.array([z[w] for w in VOCAB])
+
+def decode(rng, constrained, tau=1.0, max_tokens=12):
+    out = ''
+    for _ in range(max_tokens):
+        z = toy_logits(out) / tau
+        if constrained:                                             # mask every token that makes completion impossible
+            ok = [match(out, partial=False) if w == '<eos>' else match(out + w) and live(out + w) for w in VOCAB]
+            z = np.where(ok, z, -np.inf)
+        p = np.exp(z - z.max()); p /= p.sum()
+        w = VOCAB[rng.choice(len(VOCAB), p=p)]
+        if w == '<eos>': break
+        out += w
+    return out
+
+def is_valid(s):
+    try: x = json.loads(s)
+    except json.JSONDecodeError: return False
+    schema = {'type': 'object', 'properties': {'item': {'type': 'string', 'enum': list(PRICES)}, 'qty': {'type': 'integer'}},
+              'required': ['item', 'qty'], 'additionalProperties': False}
+    return not validate(x, schema)
+
+rng = np.random.default_rng(0)
+for constrained in (False, True):
+    outs = [decode(rng, constrained) for _ in range(2000)]
+    print(constrained, np.mean([is_valid(s) for s in outs]), outs[:2])
+# False 0.1575 ['{"item": "lamps", "qty": sk', 'Sure']
+# True 1.0 ['{"item": "chair", "qty": 3}', '{"item": "lamp", "qty": 3}']
+
+# the masking step after '{"item": "': logits, allowed tokens, probabilities before and after
+z = toy_logits('{"item": "')
+ok = np.array([w != '<eos>' and match('{"item": "' + w) and live('{"item": "' + w) for w in VOCAB])
+p = np.exp(z) / np.exp(z).sum()
+q = np.where(ok, p, 0) / p[ok].sum()
+for w in ('lamps', 'lamp', 'Sure', 'chair', 'de', 'desk', '}'):
+    i = VOCAB.index(w); print(f'{w:6s} {z[i]:5.1f} {int(ok[i])} {p[i]:.3f} {q[i]:.3f}')
+print('other', round(float(p[~np.isin(VOCAB, ['lamps', 'lamp', 'Sure', 'chair', 'de', 'desk', '}'])].sum()), 3))
+# lamps    2.0 0 0.437 0.000
+# lamp     1.5 1 0.265 0.613
+# Sure     0.5 0 0.098 0.000
+# chair    0.2 1 0.072 0.167
+# de       0.0 1 0.059 0.137
+# desk    -0.5 1 0.036 0.083
+# }       -1.0 0 0.022 0.000
+# other 0.011
+
+# 6. masking token by token is not conditioning on validity: valid strings 'ab' and 'cd' only
+p1 = {'a': 0.5, 'c': 0.5}; p2 = {'a': {'b': 0.1}, 'c': {'d': 0.9}}     # P(second token | first); the rest is invalid
+joint = {f + s: p1[f] * p2[f][s] for f in p1 for s in p2[f]}
+print({k: round(v / sum(joint.values()), 3) for k, v in joint.items()}, {f + s: p1[f] for f in p1 for s in p2[f]})
+# {'ab': 0.1, 'cd': 0.9} {'ab': 0.5, 'cd': 0.5}
+```
+
+## Next
+
+The model can now reason, and it can act through tools. What remains is the loop that combines the two over many steps: when to think and when to act, how to read what comes back, when to stop, and what the loop costs as its context grows. The [next note](/notes/agents/react-and-the-agent-loop) builds that loop from the ReAct paper, compares it with acting without reasoning and reasoning without acting, and works through a complete trace.
+
+## References
+
+- T. Schick, J. Dwivedi-Yu, R. Dessì, R. Raileanu, M. Lomeli, L. Zettlemoyer, N. Cancedda, T. Scialom. [Toolformer: language models can teach themselves to use tools](https://arxiv.org/abs/2302.04761). NeurIPS, 2023. Section 2 (sampling, executing and filtering calls) and section 4 (experiments).
+- X. Wang, Y. Chen, L. Yuan, Y. Zhang, Y. Li, H. Peng, H. Ji. [Executable code actions elicit better LLM agents](https://arxiv.org/abs/2402.01030). ICML, 2024. CodeAct and M3ToolEval.
+- S. Kim, S. Moon, R. Tabrizi, N. Lee, M. W. Mahoney, K. Keutzer, A. Gholami. [An LLM compiler for parallel function calling](https://arxiv.org/abs/2312.04511). ICML, 2024.
+- B. T. Willard, R. Louf. [Efficient guided generation for large language models](https://arxiv.org/abs/2307.09702). arXiv, 2023. The Outlines library.
+- K. Park, J. Wang, T. Berg-Kirkpatrick, N. Polikarpova, L. D'Antoni. [Grammar-aligned decoding](https://arxiv.org/abs/2405.21047). NeurIPS, 2024.
+- Z. R. Tam, C.-K. Wu, Y.-L. Tsai, C.-Y. Lin, H. Lee, Y.-N. Chen. [Let me speak freely? A study on the impact of format restrictions on performance of large language models](https://arxiv.org/abs/2408.02442). arXiv, 2024.
+- S. Yao et al. [ReAct: synergizing reasoning and acting in language models](https://arxiv.org/abs/2210.03629). ICLR, 2023. Actions parsed from text.
+- JSON Schema. [JSON Schema specification, draft 2020-12](https://json-schema.org/specification). 2020.
+- OpenAI. [Introducing structured outputs in the API](https://openai.com/index/introducing-structured-outputs-in-the-api/). August 2024.
+- Anthropic. [Introducing the Model Context Protocol](https://www.anthropic.com/news/model-context-protocol). November 2024; the [specification](https://modelcontextprotocol.io/specification).
+- Y. Qin et al. [Tool learning with foundation models](https://arxiv.org/abs/2304.08354). arXiv, 2023. A survey.

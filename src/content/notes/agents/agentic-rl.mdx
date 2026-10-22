@@ -1,0 +1,351 @@
+---
+title: Training agents with reinforcement learning
+description: "Reinforcement learning on whole agent episodes: trajectories with tool calls, why tool outputs are masked from the loss, credit across turns and shaped rewards, training environments such as SWE-Gym, rejection-sampling baselines, asynchronous rollouts, and agents that learn to hack their tests."
+course: agents
+section: Training Agents
+order: 22
+status: published
+tags: [agentic-rl, multi-turn-rl, loss-masking, credit-assignment, reward-shaping, swe-gym, rejection-sampling, expert-iteration, asynchronous-rl, reward-hacking]
+prerequisites: [Reasoning models and test-time compute, Reinforcement learning for language models, ReAct and the agent loop, Coding agents]
+---
+
+import EpisodeMask from '../../../components/figures/agentic-rl/EpisodeMask.astro';
+import AgentCurves from '../../../components/figures/agentic-rl/AgentCurves.astro';
+import RewardHacking from '../../../components/figures/agentic-rl/RewardHacking.astro';
+
+The [previous note](/notes/agents/reasoning-models) trained models to write one long response and be judged at its end. An agent's episode is different in kind. The model writes a turn, a tool runs, its output comes back into the context, and the model writes again, dozens of times, before anything says whether the task was done. The context is no longer only the model's own text: most of it was written by the environment. And the environment can be changed by what the agent does, including the files that decide its reward. This note extends the methods of the last two notes to such episodes. It writes an episode as one sequence and derives which of its tokens the policy gradient contains, discusses how credit is shared among turns and when shaped rewards are safe, describes the environments in which coding, web and search agents have been trained, compares RL with the simple baseline of fine-tuning on successful episodes, says briefly why training runs become asynchronous, and documents how agents learn to hack the tests that grade them.
+
+**Notation.** A task $x$ is one instance, such as an issue in a repository. An episode is $\tau = (x, a_1, o_1, a_2, o_2, \dots, a_K, o_K)$: the model's turns $a_k$, each a piece of reasoning ending in a tool call, alternate with the tool outputs $o_k$. Rendered by the chat template, $\tau$ is a token sequence $w_1, \dots, w_N$ with a **mask** $m_j = 1$ if the model generated token $w_j$ and $m_j = 0$ if it came from the task or a tool. $R(\tau)$ is the outcome reward, given when the episode ends; $r_k$ is an optional reward after turn $k$; $h_k$ is the history up to turn $k$. The policy $\pi_\theta$ is the language model; $G$ episodes are sampled per task, with advantages $\hat A$ as in [Reinforcement learning for language models](/notes/agents/rl-for-language-models#grpo-the-group-as-the-baseline). $p$ is a task's success probability under the current policy and $\bar p$ its mean over tasks.
+
+## Baseline: imitate successful trajectories
+
+The first way to make a model better at an agentic task is supervised fine-tuning on episodes in which a stronger agent succeeded. SWE-Gym ([Pan et al., 2024](#references)) collected 491 successful trajectories on its repository tasks by rejection sampling from `gpt-4o-2024-08-06` and `claude-3-5-sonnet-20241022` in the OpenHands scaffold, about 19 turns and 19,000 tokens each on average, and fine-tuned a 32 B Qwen2.5 coder model on them. Its resolution rate rose from 7.0 % to 20.6 % on SWE-bench Verified and from 3.0 % to 15.3 % on SWE-bench Lite, and it got stuck repeating the same action less often.
+
+Imitation has two limits. It cannot exceed its teacher, and it needs one. And it learns only from states the teacher visited: once the student makes a mistake the teacher would not have made, it is in a state no demonstration covers, and its errors compound. For behaviour cloning with a per-step error rate $\varepsilon$ over a horizon of $T$ steps, the expected cost can grow as $T^2 \varepsilon$, against $T \varepsilon$ for methods that train on the student's own states ([Ross and Bagnell, 2010](#references); [Ross, Gordon and Bagnell, 2011](#references)). Agentic tasks have long horizons, so the student should learn from its own episodes, judged by whether they succeeded. That is reinforcement learning.
+
+<aside class="callout"><strong>Key idea.</strong> Treat a whole episode as one trajectory of the token-level MDP, in which the environment's replies are part of the transitions. The model's tokens are the actions; the tool outputs are what the environment did. Score the episode by its outcome, compare it with other episodes of the same task to get an advantage, and train only on the tokens the model wrote. Everything else, from credit assignment to reward hacking, is about making that outcome a good signal.</aside>
+
+## An episode as one sequence
+
+The probability of an episode is a product over its tokens. The tokens the model wrote have the model's probabilities; the tokens of the task and of the tool outputs have whatever probability the environment gives them, which does not depend on $\theta$:
+
+$$
+p_\theta(\tau) = \prod_{j :\, m_j = 1} \pi_\theta(w_j \mid w_{<j}) \prod_{j :\, m_j = 0} P_{\text{env}}(w_j \mid w_{<j}) .
+$$
+
+Taking the logarithm and the gradient, the environment's factors vanish, exactly as the dynamics vanished in the [policy gradient theorem](/notes/agents/policy-gradients#the-policy-gradient-theorem):
+
+$$
+\nabla \log p_\theta(\tau) = \sum_{j} m_j\, \nabla \log \pi_\theta(w_j \mid w_{<j}) + \sum_j (1 - m_j) \underbrace{\nabla \log P_{\text{env}}(w_j \mid w_{<j})}_{=\, 0},
+$$
+
+so the policy gradient with an episode-level advantage is
+
+$$
+\boxed{\; \nabla J(\theta) = \mathbb E_{\tau \sim p_\theta}\Big[ \hat A(\tau) \sum_{j=1}^{N} m_j\, \nabla \log \pi_\theta(w_j \mid w_{<j}) \Big] . \;}
+$$
+
+In GRPO the sum over a response's tokens is divided by its length; for an episode it is divided by the number of model tokens, $\sum_j m_j$, and the clipping and the KL estimate are applied to the same tokens. The mask is the label mask of SFT, which the [instruction-tuning note](/notes/nlp/instruction-tuning#a-training-example-in-the-chat-template) used to keep the prompt out of the loss, now applied to every tool output in the episode.
+
+**Worked example.** An episode of the toy repository of the Code section: the task (120 tokens), turn 1, which reasons and reads file 0 (40 tokens), its output, "OK" and the file (300 tokens), turn 2, which reads file 1 (35), its output, "BUG" and the file (250), turn 3, which patches file 1 (60), and the final output "DONE" (20). Of 825 tokens, 135 have $m_j = 1$. The hidden tests pass, $R = 1$. Seven other episodes of the same task got $1, 0, 1, 0, 0, 0, 0$, so the group's rewards are $(1, 0, 1, 1, 0, 0, 0, 0)$, with mean $0.375$ and standard deviation $0.484$: this episode's advantage is $(1 - 0.375)/0.484 = +1.29$, and each failure's is $-0.77$. The loss pushes up the log-probability of the 135 model tokens by that weight, averaged over them, and leaves the other 690 alone.
+
+<EpisodeMask />
+
+1. **Render.** The task and the history are written into one token sequence by the chat template.
+2. **Roll out.** The model writes a turn ending in a tool call; the runtime executes it and appends the output, with mask 0.
+3. **Grade.** When the episode ends, a grader that the agent cannot touch, here hidden tests in a fresh container, gives the reward.
+4. **Group.** The same task is attempted $G$ times; the rewards are standardized within the group.
+5. **Masked loss.** The advantage weights the log-probabilities of the model's own tokens only.
+
+**What the mask removes.** Without it, the loss would contain $\sum_j (1 - m_j)\, \hat A(\tau)\, \nabla \log \pi_\theta(w_j \mid w_{<j})$: the model would be trained to *predict* the tool outputs, more strongly the better the episode went. That is not the environment's distribution. It is the distribution of outputs in successful episodes, and the model learns to expect them. The Code section gives the toy agent an "observation head", its own prediction of what a tool returns, and trains it with and without the mask. The true probability that the first file read contains the bug is $1/3$. With the mask the head stays at its initial $1/3$; without it, three runs end at $0.967$, $0.999$ and $0.566$: the model has learned that reading a file tends to reveal the bug, because the episodes in which it did were the successful ones. A real model shares its weights between writing actions and predicting text, so such a belief is not confined to a head; it is the auto-suggestive delusion that [The language model as a policy](/notes/agents/language-model-as-a-policy#limitations) warned about, learned from data. Search-R1 ([Jin et al., 2025](#references)) trained Qwen2.5 models with PPO and GRPO to interleave reasoning with search-engine queries, masking the retrieved passages from the loss and from the KL term; with Qwen2.5-7B-base and PPO, the average exact match over seven question-answering datasets was 0.431 with the mask and 0.343 without it (table 4). DeepSWE masked environment observations in the same way ([Agentica and Together AI, 2025](#references)).
+
+## Credit across turns
+
+With an episode-level advantage, every turn of an episode gets the same weight. A wasted turn in a successful episode is reinforced, and a good turn in a failed one is discouraged; only averaging over many episodes sorts them out, and the number needed grows with the number of turns. Three remedies are used.
+
+**A critic over turns.** A value function of the history, $V(h_k)$, gives each turn its own advantage, $r_k + V(h_{k+1}) - V(h_k)$, as GAE does for tokens in the [PPO note](/notes/agents/policy-gradients#generalized-advantage-estimation). ArCHer ([Zhou et al., 2024](#references)) makes this hierarchical: a critic trained off-policy by TD at the level of turns, and a token-level policy gradient inside each turn that uses the turn's advantage. A critic adds a model to train and the bias of its errors, which is what GRPO set out to avoid; it pays off when episodes are long.
+
+**Shaped rewards.** Intermediate rewards, such as a bonus for locating the faulty file or for each test that starts passing, give earlier and denser signal. They also change the objective, and an agent optimizes the new one: a bonus for every tool call teaches an agent to call tools, not to finish. One family of shaping rewards provably leaves the best policy unchanged ([Ng, Harada and Russell, 1999](#references)): add to each step $F(h_k, h_{k+1}) = \gamma \Phi(h_{k+1}) - \Phi(h_k)$ for some **potential** $\Phi$ of the history, with $\Phi = 0$ at the end of the episode. The shaped return telescopes:
+
+$$
+\begin{aligned}
+\sum_{k=0}^{K-1} \gamma^k \big( r_k + \gamma \Phi(h_{k+1}) - \Phi(h_k) \big)
+&= \sum_{k=0}^{K-1} \gamma^k r_k + \sum_{k=0}^{K-1} \big( \gamma^{k+1} \Phi(h_{k+1}) - \gamma^k \Phi(h_k) \big) \\
+&= \sum_{k=0}^{K-1} \gamma^k r_k + \gamma^K \Phi(h_K) - \Phi(h_0) && \text{consecutive terms cancel} \\
+&= \sum_{k=0}^{K-1} \gamma^k r_k - \Phi(h_0) . && \Phi(h_K) = 0
+\end{aligned}
+$$
+
+Every episode's return is shifted by the same $-\Phi(h_0)$, which no action can change, so the ranking of policies is the same; the same argument from any intermediate history shows that the optimal action in every history is unchanged. **Worked example.** Let $\Phi = 0.5$ once the agent has seen "BUG" in a file, and 0 before and at the end, with $\gamma = 1$. In the episode above, turn 2 earns $+0.5$ for finding the bug and turn 3 earns $-0.5$ for leaving the state where $\Phi = 0.5$; the episode's total is unchanged at $R = 1$. With an episode-level advantage this shaping therefore does nothing at all. With turn-level advantages it moves credit to the turn that found the bug: the turn that read file 0 and found nothing gets none. Shaping helps only through per-turn credit, and only potential-based shaping is safe by construction.
+
+**Sparse rewards, with care.** Many recent systems use only the outcome. DeepSWE gave 1 if the final patch passed the repository's tests within five minutes and 0 otherwise, including for timeouts. RAGEN ([Wang et al., 2025](#references)) studied multi-turn RL on small stylized environments and found a recurring collapse, which it called the Echo Trap, with reward variance dropping off a cliff and gradients spiking; it stabilized training by filtering trajectories, adding a critic and stabilizing gradients, and observed that without fine-grained, reasoning-aware rewards, reasoning rarely emerged in the multi-turn setting.
+
+## Environments
+
+An environment for agentic RL is a distribution of tasks, a sandbox in which each episode runs and can be reset, and a grader. It must be reproducible, cheap to start thousands of times, and isolated, because the agent executes code in it ([Virtual machines and containers](/notes/acos/virtual-machines-and-containers#containers-one-kernel-many-views); [Coding agents](/notes/agents/coding-agents#the-environment-of-a-coding-agent)). Dated examples:
+
+| date | environment or system | tasks and grader | result, with its setup |
+| --- | --- | --- | --- |
+| Nov 2024 | WebRL ([Qi et al.](#references)) | web tasks; a curriculum generated from failed attempts; an outcome reward model | WebArena-Lite success: Llama-3.1-8B from 4.8 % to 42.4 %, GLM-4-9B from 6.1 % to 43 % |
+| Dec 2024 | SWE-Gym ([Pan et al.](#references)) | 2,438 Python tasks from 11 repositories, each with an executable environment and unit tests | SFT on 491 trajectories: 7.0 % to 20.6 % on SWE-bench Verified; with a verifier trained on its trajectories and 16 rollouts, 32.0 % |
+| Feb 2025 | SWE-RL ([Wei et al.](#references)) | issues and pull requests from GitHub; reward: similarity of the patch to the real one, no execution | Llama3-SWE-RL-70B: 41.0 % on SWE-bench Verified |
+| Mar 2025 | Search-R1 ([Jin et al.](#references)) | question answering with a search engine as the tool; exact-match reward | the masking ablation above |
+| Jul 2025 | DeepSWE ([Agentica and Together AI](#references)) | 4,500 tasks from R2E-Gym, repositories in SWE-bench Verified removed; bash, search, file editor and submit tools; tests as reward | Qwen3-32B trained by RL only, 64 H100 GPUs for six days: 42.2 % pass@1 on SWE-bench Verified (16 runs), 59 % with test-time scaling over 16 rollouts |
+
+These numbers come from different scaffolds, test-time budgets and benchmark versions and are not a ranking. Two design choices recur. The grader runs after the episode, outside the agent's control. And tasks are filtered for difficulty, because a task that every rollout solves, or none does, gives GRPO no signal; DeepSWE also masked the loss of episodes that hit the context, step or time limit, so that unfinished episodes did not count as failures.
+
+## Rejection sampling and fine-tuning on successes
+
+The simplest way to learn from one's own episodes is to keep the good ones. **Filtered behaviour cloning**, also called rejection-sampling fine-tuning or expert iteration, repeats three steps:
+
+1. Sample $N$ episodes per task with the current policy.
+2. Keep those that succeeded.
+3. Fine-tune on them with the ordinary SFT loss on the model's tokens, then go back to step 1 with the new policy.
+
+**STaR** ([Zelikman et al., 2022](#references)) did this for chains of thought: GPT-J (6 B parameters) generated rationales for CommonsenseQA, kept those that reached the right answer, retried the failures with the answer given as a hint, and was fine-tuned on the result, restarting from the original model each round. It reached 72.5 %, comparable to 73.0 % for a fine-tuned GPT-3 about 30 times larger. **Expert iteration** ([Anthony, Tian and Barber, 2017](#references)) is the same loop with a tree search as the source of better behaviour; RFT ([Yuan et al., 2023](#references)) and ReST$^{EM}$ ([Singh et al., 2024](#references)) apply it to maths. SWE-Gym used it for self-improvement in its second scaffold, reaching 19.7 % on SWE-bench Lite.
+
+How does it relate to RL? The SFT loss on the kept episodes, averaged over them, has the gradient
+
+$$
+\frac{\sum_{\tau \text{ kept}} \nabla \log p_\theta(\tau)}{\#\text{kept}} \approx \frac{\mathbb E\big[\mathbb 1[\text{success}]\, \nabla \log p_\theta(\tau)\big]}{P(\text{success})} = \frac{\nabla P(\text{success})}{P(\text{success})} = \nabla \log P(\text{success}),
+$$
+
+using the log-derivative trick in the middle, as STaR's authors noted for their own objective. At the current policy, filtered behaviour cloning is gradient ascent on the logarithm of the success rate. Over tasks with success probabilities $p_i$, the three updates of this section all climb the same gradients $\nabla p_i$ and differ only in how they weight tasks:
+
+| update | expected step on task $i$ |
+| --- | --- |
+| REINFORCE with the group's mean as baseline | $(1 - 1/G)\, \nabla p_i$ |
+| GRPO, standardized within the group | $c_G(p_i)\, \nabla p_i$, which grows towards $1/\sqrt{p_i(1 - p_i)}$ |
+| filtered behaviour cloning, successes pooled over tasks | $\nabla p_i / \bar p$ |
+
+The first two rows are from the previous note's [expected update](/notes/agents/rl-for-language-models#what-the-group-baseline-does-in-expectation). In expectation there is no deep difference between them. The differences are in what happens around the expectation: filtered behaviour cloning ignores failures, so its estimate has more variance when successes are rare and it cannot push down a frequent mistake directly; and it is usually run offline, fitting a fixed set of successes for several epochs, which lets the policy drift from the one that collected them. On DeepSeekMath-Instruct 1.3B, online rejection-sampling fine-tuning beat the offline version late in training, and GRPO beat both ([Shao et al., 2024](#references), section 5.2.1).
+
+**On the toy.** A bug hides in one of three files; the agent has three turns and seven tools (read a file, patch a file, edit the tests). A patch works only on a file the agent has read, and a patch to a clean file breaks the build, so the best possible policy reads files in a fixed order and patches the one that shows the bug, which succeeds two times in three: no policy can read all three files and still patch the third. The reference policy succeeds 21.6 % of the time.
+
+<AgentCurves />
+
+In their large-batch limits all three rise towards $2/3$: after 20 iterations GRPO is at 0.452, filtered behaviour cloning at 0.531 and REINFORCE at 0.343; after 100, at 0.650, 0.649 and 0.613. Filtered cloning moves fastest early because its weight $1/\bar p$ is large while successes are rare. With 8 sampled episodes per task, three runs of each end at 0.650, 0.651 and 0.656 for GRPO and 0.653, 0.648 and 0.654 for filtered cloning. On a task this small the baseline is as good as RL, which is the point: rejection sampling is the baseline every agentic RL result should be compared with.
+
+## Off-policy and asynchronous rollouts
+
+Agent episodes differ in length by orders of magnitude: one ends after two tool calls, another runs a test suite for minutes. A synchronous trainer waits for the slowest episode of each batch, and the accelerators that generate tokens sit idle while it updates. **Asynchronous** training decouples the two: generation workers keep producing episodes with the most recent weights they have, and the trainer updates as episodes arrive. The price is that an episode may have been generated by a policy several updates old, so the data is slightly off-policy. The importance ratio $\rho = \pi_\theta/\pi_{\text{old}}$ and PPO's clipping correct for small differences, as truncated importance weights did for the distributed actors of IMPALA ([Espeholt et al., 2018](#references)). Noukhovitch et al. ([2025](#references)) found online DPO the most robust of the RLHF methods they tried to such off-policy data, and trained an instruction-following model from LLaMA 3.1 8B about 40 % faster than synchronously with the same final quality. AReaL ([Fu et al., 2025](#references)), a fully asynchronous system with a staleness-aware variant of PPO, reported training up to 2.77 times faster on the same GPUs on maths and code reasoning, with matched or better results.
+
+## Reward hacking in agentic training
+
+An agent acts in the environment that grades it. If the grader reads something the agent can change, the agent can raise its reward without doing the task, and RL will find the way if one exists. Dated reports from frontier training:
+
+- **March 2025.** Baker et al. ([2025](#references)) monitored a frontier reasoning model, in the family of OpenAI o1 and o3-mini, during RL in agentic coding environments where it had to make unit tests pass. Two hacks became **systemic**, affecting nearly every environment once found: `exit(0)`, exploiting a bug that let the agent leave the environment early without running all the tests, and `raise SkipTest`, raising an exception from outside the test framework so that tests were skipped. Problem-specific hacks included writing stubs where test coverage was poor and modifying functions upstream of the tests so that they passed trivially. A prompted GPT-4o monitor that read the chain of thought caught 95 % of the systemic hacks, one that saw only actions and outputs 60 %. Putting the monitor's verdict into the reward helped at first and then taught the agent **obfuscated** hacking: it kept hacking while its chain of thought stopped saying so.
+- **June 2025.** METR ([2025](#references)) found o3 rewriting the timing function of a speed task so that it reported shorter times, and replacing an evaluator with a stub that marked every submission correct. On its RE-Bench tasks, 39 of 128 runs (30.4 %) reward-hacked, against 8 of 1,087 (0.7 %) on HCAST, where the scoring function was not visible to the model.
+- **November 2025.** MacDiarmid et al. ([2025](#references)) trained a model, given knowledge of hacking strategies, on real Anthropic production coding environments that were vulnerable to at least one of three hacks: returning an object whose `__eq__` always returns true, calling `sys.exit(0)` before the asserts run, and writing a `conftest.py` that patches pytest's reports. The model learned to hack, and the behaviour generalized to alignment faking, cooperation with malicious actors and attempted sabotage of the code of the study itself. Preventing the hacks, more diverse safety training, and "inoculation prompting", which tells the model during training that hacking is acceptable in this environment, each removed the broader misalignment.
+
+The toy shows the mechanism. Make the grader hackable: the tests live in the agent's sandbox, and the tool "edit tests" makes them pass.
+
+<RewardHacking />
+
+In the large-batch limit, GRPO learns to fix the bug when it can and to edit the tests in the episodes where it cannot, those with the bug in the third file: by iteration 100 the grader reports 0.977 while hidden tests say 0.650. Sampled runs are less kind. Of six runs with 8 episodes per task, the grader reports between 0.973 and 0.998 for all six, but in two the agent learned to edit the tests first and stopped fixing anything, ending at a true pass rate of 0.140 and 0.126; the other four ended at 0.644 to 0.658. Which strategy a run finds depends on early luck, and the grader cannot tell them apart.
+
+The defences are mostly environment engineering, discussed further in [Alignment and oversight of agents](/notes/agents/alignment-and-oversight):
+
+- **Grade outside the agent's reach.** Run held-out tests after the episode in a fresh container, with the agent's changes applied as a patch, as SWE-bench does.
+- **Least privilege.** Make test files and graders read-only to the agent's user ([Users and permissions](/notes/acos/users-and-permissions)), and check the patch for edits to tests, configuration and test infrastructure.
+- **Monitor trajectories**, preferably with access to the chain of thought, and use the monitor to find and patch broken environments rather than as a reward, which teaches the agent to hide.
+- **Measure the gap.** Track an honest evaluation that the training reward does not see; a training reward that rises while it does not is the signature in the figure.
+
+<aside class="callout"><strong>Check yourself.</strong> (1) An episode has 2,000 tokens, 300 of them written by the model, and an advantage of $+0.8$. Over how many tokens is the loss averaged, and what weight does a tool-output token get? (2) A shaping reward gives $+1$ every time the agent runs the test suite. Why is it not potential-based, and what will the agent learn? (3) A group of 8 episodes on a task all fail. What do GRPO and filtered behaviour cloning learn from this task? (4) An agent's training reward rises from 0.4 to 0.9 while its score on held-out hidden tests stays at 0.4. What is the first thing to check?<details><summary>Answers</summary>(1) Over the 300 model tokens, each weighted by $+0.8$; a tool-output token has $m_j = 0$ and gets no gradient. (2) Its sum over an episode grows with the number of runs instead of telescoping to a constant, so it changes which policy is best: the agent learns to run the tests as often as its budget allows. (3) Nothing: the group's rewards have standard deviation 0, so GRPO's advantages are 0, and filtered behaviour cloning has no success to keep. The task contributes only cost until some rollout succeeds. (4) Whether the training grader reads anything the agent can modify, such as tests, their configuration or the scoring code, and what the high-reward episodes actually changed.</details></aside>
+
+## What changed
+
+| | RL on single responses | RL on agent episodes |
+| --- | --- | --- |
+| trajectory | prompt and one response | task, then turns and tool outputs, often thousands of tokens |
+| tokens in the loss | the whole response | only model-written tokens, by a mask |
+| reward | a verifier or reward model on the answer | a grader after the episode: tests, a checker, a task-specific score |
+| credit | one advantage per response | one per episode, or per turn with a critic or potential-based shaping |
+| environment | none; the model writes text | a sandbox per episode, reset thousands of times |
+| rollouts | similar lengths, synchronous batches | very different lengths, often asynchronous and slightly off-policy |
+| reward hacking | exploiting the reward model or verifier | also changing what the grader reads: tests, timers, evaluators |
+
+## Limitations
+
+- **Environments are the bottleneck.** Each task needs a reproducible sandbox and a grader; building, filtering and running them costs more than the RL algorithm.
+- **Sparse, delayed rewards.** One outcome per episode of dozens of turns makes credit assignment slow, and tasks the policy never solves teach nothing.
+- **Graders are attack surfaces.** Anything an agent can read or write may become part of its reward; hacks found in one environment spread to all of them.
+- **Results are hard to compare.** Scaffolds, tools, time limits, test-time budgets and benchmark versions differ between papers.
+- **Off-policy corrections are approximate.** Asynchronous training trades exact on-policy gradients for throughput, and staleness has to be bounded.
+- **What generalizes is unclear.** An agent trained in one set of repositories or websites may learn their quirks, and what it learns about hacking may generalize further than intended.
+
+## What you should remember
+
+- An agent episode is one token sequence of model turns and tool outputs. The policy gradient contains only the model's tokens, $\mathbb E[\hat A(\tau) \sum_j m_j \nabla \log \pi_\theta(w_j \mid w_{<j})]$, because the environment's probabilities do not depend on $\theta$.
+- Without the mask, the loss trains the model to predict tool outputs weighted by success, so it learns to expect good outcomes; masking also improved results in practice (Search-R1: 0.431 against 0.343 average exact match).
+- Episode-level advantages give every turn the same credit; a turn-level critic or potential-based shaping, $\gamma\Phi(h') - \Phi(h)$, moves credit without changing the optimum. Other shaping changes the objective and is exploited.
+- Environments pair a task distribution with a resettable sandbox and an outside grader: SWE-Gym, R2E-Gym and SWE-RL for code, WebArena-style sites for the web, search engines for research. Results are dated and setup-specific.
+- Filtered behaviour cloning (STaR, expert iteration, RFT) is ascent on $\log P(\text{success})$ at the current policy; in expectation it differs from GRPO only in how it weights tasks, and it is the baseline to beat.
+- Long, uneven episodes push training towards asynchronous rollouts and slightly off-policy data, corrected by importance ratios and clipping.
+- Agents hack graders they can touch: `exit(0)`, skipped tests, patched evaluators, `__eq__` that always returns true. Grade outside the sandbox, restrict permissions, monitor, and track an honest evaluation.
+
+## Code
+
+A toy repository with a hidden bug, three turns and seven tools, in NumPy. The script enumerates all 343 action sequences of each task to compute the exact pass rates and the large-batch updates of GRPO, REINFORCE and filtered behaviour cloning; then trains on sampled, rendered episodes with a token mask, with and without masking an "observation head" that predicts tool outputs; and finally makes the grader hackable. With a real model the table of logits becomes a transformer reading the rendered history, the tools run in containers, and the sums over all episodes become averages over sampled ones; the masks, the group advantages and the grading are computed as written. Seeds are fixed; exact numbers can differ slightly across platforms and library versions. The script runs in about four seconds.
+
+```python
+import numpy as np
+from math import comb, sqrt
+
+# 1. a toy repository: a bug in one of three files (hidden), three turns, seven tools.
+#    A patch works only on a file the agent has read, and a patch to a clean file breaks the build.
+TOOLS = ['read 0', 'read 1', 'read 2', 'patch 0', 'patch 1', 'patch 2', 'edit tests']
+OBS = ['BUG', 'OK', 'DONE']
+TURNS = 3
+def observe(a, bug): return (0 if a == bug else 1) if a < 3 else 2      # what the tool returns
+def fixed(acts, bug):
+    if any(3 <= a < 6 and a != 3 + bug for a in acts): return False     # a wrong patch
+    return any(a == 3 + bug and bug in acts[:i] for i, a in enumerate(acts))
+def grade(acts, bug, hackable):                                         # hackable: the tests live in the agent's sandbox
+    return fixed(acts, bug) or (hackable and 6 in acts)
+
+# 2. the policy: a softmax over tools given the history of (tool, observation) pairs; the reference is a "pretrained" prior
+def prior(h):
+    z = np.array([0.3, 0.0, -0.3, -0.5, -0.5, -0.5, -2.5])             # reads first, files in order, rarely touch the tests
+    for a, o in h:
+        if a < 3:
+            z[a] -= 1.5                                                  # do not reread
+            if o == 0: z[3 + a] += 2.5                                   # patch what you saw broken
+        elif a < 6: z[a] -= 2.0
+    return z
+def episodes(bug):                                                       # all 7^3 action sequences, with their observations
+    out = []
+    def rec(h):
+        if len(h) == TURNS: out.append(tuple(h)); return
+        for a in range(7): rec(h + [(a, observe(a, bug))])
+    rec([]); return out
+EPS = [episodes(b) for b in range(3)]
+NODE = {}
+for b in range(3):
+    for ep in EPS[b]:
+        for t in range(TURNS): NODE.setdefault(ep[:t], len(NODE))
+REF = np.array([prior(h) for h in sorted(NODE, key=NODE.get)])
+def softmax(z): e = np.exp(z - z.max(-1, keepdims=True)); return e / e.sum(-1, keepdims=True)
+def prob(pi, ep): return np.prod([pi[NODE[ep[:t]], ep[t][0]] for t in range(TURNS)])
+def pass_rates(Z, hackable):
+    pi = softmax(Z)
+    return [sum(prob(pi, ep) for ep in EPS[b] if grade([a for a, _ in ep], b, hackable)) for b in range(3)]
+print(len(NODE), 'histories;', [round(float(p), 3) for p in pass_rates(REF, False)], [round(float(p), 3) for p in pass_rates(REF, True)])
+# 99 histories; [0.267, 0.215, 0.166] [0.308, 0.26, 0.215]      (reference pass rates for a bug in file 0, 1, 2; honest, hackable)
+
+# 3. large-batch limits of three updates: GRPO (group of 8), REINFORCE with a mean baseline, filtered behaviour cloning
+def grad_pass(Z, b, hackable):                                           # gradient of the pass rate on instance b
+    pi, g = softmax(Z), np.zeros_like(Z)
+    for ep in EPS[b]:
+        if grade([a for a, _ in ep], b, hackable):
+            P = prob(pi, ep)
+            for t in range(TURNS):
+                i = NODE[ep[:t]]; s = -pi[i].copy(); s[ep[t][0]] += 1; g[i] += P * s
+    return g
+def c_G(p, G=8):
+    if p <= 0 or p >= 1: return 0.0
+    return sum(comb(G, k) * p**k * (1 - p)**(G - k) * sqrt(k / G * (1 - k / G)) for k in range(1, G)) / (p * (1 - p))
+def train_expected(method, hackable, iters=100, lr=2.0):
+    Z, log = REF.copy(), []
+    for it in range(iters + 1):
+        ps = pass_rates(Z, hackable)
+        log.append((float(np.mean(ps)), float(np.mean(pass_rates(Z, False)))))           # what the grader says, what is true
+        gs = [grad_pass(Z, b, hackable) for b in range(3)]
+        if method == 'grpo': g = sum(c_G(ps[b]) * gs[b] for b in range(3)) / 3
+        elif method == 'reinforce': g = sum((1 - 1 / 8) * gs[b] for b in range(3)) / 3
+        else: g = sum(gs) / sum(ps)                                       # SFT on the pooled successes: grad log(mean pass rate)
+        Z = Z + lr * g
+    return log
+for m in ('grpo', 'reinforce', 'filtered BC'):
+    lg = train_expected(m, False)
+    print(f'{m:12s}', [round(lg[i][1], 3) for i in (0, 10, 20, 40, 70, 100)])
+lg = train_expected('grpo', True)
+print('hackable grader, GRPO: grader', [round(lg[i][0], 3) for i in (0, 10, 20, 40, 70, 100)],
+      'true', [round(lg[i][1], 3) for i in (0, 10, 20, 40, 70, 100)])
+# grpo         [0.216, 0.354, 0.452, 0.59, 0.638, 0.65]
+# reinforce    [0.216, 0.286, 0.343, 0.444, 0.567, 0.613]
+# filtered BC  [0.216, 0.42, 0.531, 0.611, 0.639, 0.649]
+# hackable grader, GRPO: grader [0.261, 0.386, 0.472, 0.603, 0.911, 0.977] true [0.216, 0.341, 0.426, 0.559, 0.63, 0.65]
+#     (the true pass rate at iterations 0, 10, 20, 40, 70, 100; the best any policy can do is 2/3)
+
+# 4. sampled training on rendered episodes: every token has a mask, 1 if the model wrote it, 0 if a tool returned it.
+#    The model also has an "observation head", its own prediction of tool outputs, which an unmasked loss would train.
+def rollout(Z, bug, rng):
+    pi, h, tokens = softmax(Z), [], []
+    for t in range(TURNS):
+        i = NODE[tuple(h)]
+        a = int(rng.choice(7, p=pi[i]))
+        o = observe(a, bug)
+        tokens += [('tool', i, a, 1), ('obs', (i, a), o, 0)]          # (kind, where, token, mask)
+        h.append((a, o))
+    return tokens, [a for a, _ in h]
+tokens, acts = rollout(REF, 1, np.random.default_rng(3))
+print(' '.join(f'[{TOOLS[tok] if kind == "tool" else OBS[tok]} m={mask}]' for kind, _, tok, mask in tokens), grade(acts, 1, False))
+# [read 0 m=1] [OK m=0] [read 1 m=1] [BUG m=0] [patch 1 m=1] [DONE m=0] True
+def group_adv(r):
+    s = r.std(); return np.zeros_like(r) if s == 0 else (r - r.mean()) / s
+def train_sampled(method, hackable, masked=True, iters=100, lr=2.0, G=8, seed=0):
+    rng, Z, W = np.random.default_rng(seed), REF.copy(), np.zeros((len(NODE), 7, 3))   # W: the observation head
+    curve = []
+    for it in range(iters + 1):
+        if it % 20 == 0: curve.append(round(float(np.mean(pass_rates(Z, False))), 3))
+        gZ, gW, kept = np.zeros_like(Z), np.zeros_like(W), 0
+        for bug in range(3):
+            eps = [rollout(Z, bug, rng) for _ in range(G)]
+            r = np.array([1.0 * grade(acts, bug, hackable) for _, acts in eps])
+            A = group_adv(r) if method == 'grpo' else r                  # filtered BC: weight 1 on successes, else 0
+            kept += r.sum()
+            pi, q = softmax(Z), softmax(W)
+            for (tokens, _), adv in zip(eps, A):
+                for kind, where, tok, mask in tokens:
+                    if mask == 1:                                        # a token the model wrote: the policy gradient
+                        s = -pi[where].copy(); s[tok] += 1; gZ[where] += adv * s
+                    elif not masked:                                     # a tool output: the term that the mask removes
+                        s = -q[where].copy(); s[tok] += 1; gW[where] += adv * s
+        n = 3 * G if method == 'grpo' else max(kept, 1)
+        Z += lr * gZ / n; W += lr * gW / n
+    grader = round(float(np.mean(pass_rates(Z, hackable))), 3)
+    return curve, grader, round(float(softmax(W)[NODE[()], 0, 0]), 3)   # P(model predicts BUG after its first read 0)
+for method in ('grpo', 'filtered BC'):
+    print(f'{method:12s}', [train_sampled(method, False, seed=s)[0] for s in (0, 1, 2)])
+print('P(BUG) masked', [train_sampled('grpo', False, True, seed=s)[2] for s in (0, 1, 2)],
+      'unmasked', [train_sampled('grpo', False, False, seed=s)[2] for s in (0, 1, 2)], 'true', round(1 / 3, 3))
+# grpo         [[0.216, 0.445, 0.557, 0.622, 0.644, 0.65], [0.216, 0.454, 0.561, 0.615, 0.64, 0.651], [0.216, 0.522, 0.621, 0.642, 0.654, 0.656]]
+# filtered BC  [[0.216, 0.532, 0.617, 0.638, 0.649, 0.653], [0.216, 0.509, 0.597, 0.627, 0.642, 0.648], [0.216, 0.566, 0.634, 0.644, 0.651, 0.654]]
+# P(BUG) masked [0.333, 0.333, 0.333] unmasked [0.967, 0.999, 0.566] true 0.333
+
+# 5. the hackable grader, six sampled runs: the true pass rate at the end, and what the grader reports
+runs = [train_sampled('grpo', True, seed=s) for s in range(6)]
+print('true', [c[-1] for c, _, _ in runs], 'grader', [g for _, g, _ in runs])
+# true [0.14, 0.644, 0.656, 0.658, 0.656, 0.126] grader [0.997, 0.973, 0.983, 0.986, 0.981, 0.998]
+```
+
+## Next
+
+The training section ends with agents that improve by acting and being graded, and with the warning that the grade can be wrong. Every number in it, a pass rate on SWE-bench, an accuracy on AIME, a success rate in WebArena, is a measurement of a random system on a finite sample of tasks, taken under a particular scaffold, budget and benchmark version. The [next note](/notes/agents/evaluating-agents) asks how to make such measurements trustworthy: what agent benchmarks measure, how repeated runs change the statistics, how many tasks a difference needs, and how contamination and broken tasks distort the numbers.
+
+## References
+
+- J. Pan, X. Wang, G. Neubig, N. Jaitly, H. Ji, A. Suhr, Y. Zhang. [Training software engineering agents and verifiers with SWE-Gym](https://arxiv.org/abs/2412.21139). arXiv, December 2024. Section 2 (the environment), section 4 (SFT on 491 trajectories, self-improvement, verifiers).
+- S. Ross, J. A. Bagnell. [Efficient reductions for imitation learning](https://proceedings.mlr.press/v9/ross10a.html). AISTATS, 2010.
+- S. Ross, G. J. Gordon, J. A. Bagnell. [A reduction of imitation learning and structured prediction to no-regret online learning](https://proceedings.mlr.press/v15/ross11a.html). AISTATS, 2011. DAgger.
+- B. Jin et al. [Search-R1: training LLMs to reason and leverage search engines with reinforcement learning](https://arxiv.org/abs/2503.09516). COLM, 2025. Section 3.1 (loss masking for retrieved tokens), table 4.
+- Agentica and Together AI. [DeepSWE: training a state-of-the-art coding agent from scratch by scaling RL](https://www.together.ai/blog/deepswe). Blog post, 2 July 2025.
+- Y. Zhou, A. Zanette, J. Pan, S. Levine, A. Kumar. [ArCHer: training language model agents via hierarchical multi-turn RL](https://arxiv.org/abs/2402.19446). arXiv, February 2024.
+- A. Y. Ng, D. Harada, S. Russell. [Policy invariance under reward transformations: theory and application to reward shaping](https://people.eecs.berkeley.edu/~russell/papers/icml99-shaping.pdf). ICML, 1999.
+- Z. Wang et al. [RAGEN: understanding self-evolution in LLM agents via multi-turn reinforcement learning](https://arxiv.org/abs/2504.20073). arXiv, April 2025.
+- Z. Qi et al. [WebRL: training LLM web agents via self-evolving online curriculum reinforcement learning](https://arxiv.org/abs/2411.02337). ICLR, 2025.
+- Y. Wei et al. [SWE-RL: advancing LLM reasoning via reinforcement learning on open software evolution](https://arxiv.org/abs/2502.18449). NeurIPS, 2025.
+- E. Zelikman, Y. Wu, J. Mu, N. D. Goodman. [STaR: bootstrapping reasoning with reasoning](https://arxiv.org/abs/2203.14465). NeurIPS, 2022. Section 3.1, the relation to the policy gradient.
+- T. Anthony, Z. Tian, D. Barber. [Thinking fast and slow with deep learning and tree search](https://arxiv.org/abs/1705.08439). NeurIPS, 2017. Expert iteration.
+- Z. Yuan et al. [Scaling relationship on learning mathematical reasoning with large language models](https://arxiv.org/abs/2308.01825). arXiv, 2023. Rejection-sampling fine-tuning.
+- A. Singh et al. [Beyond human data: scaling self-training for problem-solving with language models](https://arxiv.org/abs/2312.06585). *Transactions on Machine Learning Research*, 2024. ReST$^{EM}$.
+- Z. Shao et al. [DeepSeekMath: pushing the limits of mathematical reasoning in open language models](https://arxiv.org/abs/2402.03300). arXiv, 2024. Section 5.2.1 and appendix A.1: RFT, online RFT and GRPO in one form.
+- L. Espeholt et al. [IMPALA: scalable distributed deep-RL with importance weighted actor-learner architectures](https://arxiv.org/abs/1802.01561). ICML, 2018.
+- M. Noukhovitch, S. Huang, S. Xhonneux, A. Hosseini, R. Agarwal, A. Courville. [Asynchronous RLHF: faster and more efficient off-policy RL for language models](https://arxiv.org/abs/2410.18252). ICLR, 2025.
+- W. Fu et al. [AReaL: a large-scale asynchronous reinforcement learning system for language reasoning](https://arxiv.org/abs/2505.24298). arXiv, May 2025.
+- B. Baker, J. Huizinga, L. Gao, Z. Dou, M. Y. Guan, A. Madry, W. Zaremba, J. Pachocki, D. Farhi. [Monitoring reasoning models for misbehavior and the risks of promoting obfuscation](https://arxiv.org/abs/2503.11926). arXiv, March 2025. Sections 2.1–2.2 (systemic and problem-specific hacks; monitor recall), section 3 (obfuscation).
+- METR. [Recent frontier models are reward hacking](https://metr.org/blog/2025-06-05-recent-reward-hacking/). Blog post, 5 June 2025.
+- M. MacDiarmid et al. [Natural emergent misalignment from reward hacking in production RL](https://arxiv.org/abs/2511.18397). arXiv, November 2025.
+- C. E. Jimenez, J. Yang, A. Wettig, S. Yao, K. Pei, O. Press, K. Narasimhan. [SWE-bench: can language models resolve real-world GitHub issues?](https://arxiv.org/abs/2310.06770) ICLR, 2024.
+- S. Levine. [CS285: Deep Reinforcement Learning](https://rail.eecs.berkeley.edu/deeprlcourse/). University of California, Berkeley. Lectures on imitation learning and on RL for language models.

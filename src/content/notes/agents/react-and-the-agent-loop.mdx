@@ -1,0 +1,349 @@
+---
+title: ReAct and the agent loop
+description: "How reasoning and acting are interleaved in one loop: the ReAct formulation and its results against acting or reasoning alone, a complete trace step by step, stopping rules, step budgets and loops, error recovery, plan-and-execute, and the token and latency arithmetic of a growing context."
+course: agents
+section: Language Models as Agents
+order: 11
+status: published
+tags: [react, agent-loop, reasoning-and-acting, stopping-criteria, step-budget, error-recovery, plan-and-execute, context-length, cost]
+prerequisites: [Chain of thought and reasoning, Tool use and function calling]
+---
+
+import ReActLoop from '../../../components/figures/react-and-the-agent-loop/ReActLoop.astro';
+import ContextGrowth from '../../../components/figures/react-and-the-agent-loop/ContextGrowth.astro';
+
+The two previous notes gave the policy two abilities separately. [Chain of thought](/notes/agents/chain-of-thought) lets it compute before it answers, but only with what it already knows. [Tool use](/notes/agents/tool-use-and-function-calling) lets it fetch information and act, but says nothing about how to decide which call to make next or what to make of the result. An agent needs both in one loop: it reasons about what it has seen, acts, reads the observation, and reasons again. The NLP course showed the pattern in a [first agent loop](/notes/nlp/tools-and-agents#agents-a-loop-around-tool-calls). This note builds it carefully. It states ReAct's formulation and what it measured against acting alone and reasoning alone, works through a complete trace, and then turns to the questions every loop has to answer: when to stop, how to break out of a cycle, how to recover from a bad step, when to plan everything first, and what the loop costs as its context grows.
+
+**Notation.** $\mathcal A$ is the set of environment actions and $\mathcal L$ the set of strings of language. The context $c_t$ is the instructions, the examples, the question and every earlier thought, action and observation. A step writes $\hat a_t \in \hat{\mathcal A} = \mathcal A \cup \mathcal L$. $T_{\max}$ is the step budget. In the cost model, $L_t$ is the number of tokens the model reads at step $t$, $s$ the tokens before the first step (instructions, tool definitions, examples and the task), $u$ the tokens the model writes per step (thought and action), $o$ the tokens of one observation, and $d = u + o$.
+
+## Baseline: acting alone, or reasoning alone
+
+Two simpler policies fall short in opposite ways.
+
+**Act only.** The model is prompted with examples of action–observation trajectories and writes one action after another. It can fetch information, but it has nowhere to write down what it has learned, what remains to be found, or why the last search failed. On a question that needs facts from two pages, it has to keep the plan implicit in the sequence of actions.
+
+**Reason only.** The model writes a chain of thought and answers from what it remembers. It plans well and fabricates freely: nothing outside the model checks the facts its chain relies on.
+
+Yao et al. ([2023](#references)) compared both with their combination on two knowledge tasks, prompting PaLM-540B with six examples for HotpotQA (questions that need two Wikipedia pages) and three for FEVER (claims to verify), the agent acting through a Wikipedia interface:
+
+| method | HotpotQA, exact match | FEVER, accuracy |
+| --- | --- | --- |
+| standard prompting | 28.7 | 57.1 |
+| reason only: chain of thought | 29.4 | 56.3 |
+| reason only: chain of thought with self-consistency | 33.4 | 60.4 |
+| act only | 25.7 | 58.9 |
+| ReAct | 27.4 | 60.9 |
+| chain of thought with self-consistency, then ReAct | 34.2 | 64.6 |
+| ReAct, then chain of thought with self-consistency | 35.1 | 62.0 |
+
+ReAct beat acting alone on both tasks. Against reasoning alone the result was mixed: better on FEVER, slightly worse on HotpotQA. The best results came from combining the two, which the error analysis below explains. Supervised systems of the time scored 67.5 and 89.5, far above all prompted methods.
+
+<aside class="callout"><strong>Key idea.</strong> Let the policy's action space include thoughts: text that changes only the context, not the environment. A thought costs no environment step, and it changes what the next action is conditioned on. Interleave thought, action and observation, and the policy can decompose the task, read each observation, track its progress and react to surprises, while every fact it uses comes from the environment.</aside>
+
+## ReAct: thoughts as actions
+
+ReAct ([Yao et al., 2023](#references)) augments the action space to $\hat{\mathcal A} = \mathcal A \cup \mathcal L$. At each step the policy writes $\hat a_t \sim \pi(\cdot \mid c_t)$, and the context grows in one of two ways:
+
+$$
+\boxed{\;c_{t+1} = \begin{cases} (c_t,\, \hat a_t) & \text{if } \hat a_t \in \mathcal L \quad \text{(a thought: no observation)}, \\ (c_t,\, \hat a_t,\, o_{t+1}) & \text{if } \hat a_t \in \mathcal A \quad \text{(an action: the environment answers)}. \end{cases}\;}
+$$
+
+A thought is an action whose only effect is on the agent's own context: the context is the agent's memory, and a thought is a write to it. The environment is untouched, so a thought can never be wrong in the way an action can, but it can be wrong as reasoning, and every later step reads it.
+
+For the knowledge tasks, $\mathcal A$ had three actions: `search[entity]` returns the first five sentences of the entity's Wikipedia page, or five similar titles if no page has that name; `lookup[string]` returns the next sentence of the current page that contains the string, like Ctrl+F in a browser; `finish[answer]` ends the episode. The examples in the prompt were human-written trajectories in which thoughts do several jobs: decompose the question, extract the relevant fact from an observation, note what is known and what is still missing, reformulate a failed search, and decide that the answer is complete. For knowledge tasks every action is preceded by a thought, *dense* thoughts. For decision-making tasks with many steps, the examples placed thoughts only where they matter, *sparse* thoughts, and the model decided when to write one.
+
+<ReActLoop />
+
+1. **Read.** The model reads the context $c_t$: the instructions, the example trajectories, the question and every earlier step.
+2. **Think.** It writes a thought, which is appended to the context. The environment is not called.
+3. **Act.** It writes an action, such as `search[Dunmore]`.
+4. **Check.** The runtime parses the action and applies the stopping rules: a `finish` action, an exhausted step budget, a call repeated with the same result.
+5. **Observe.** The tool runs, and its observation is appended to the context. The loop returns to step 1.
+
+### What the error analysis shows
+
+The authors labelled 200 HotpotQA trajectories by hand, 50 correct and 50 wrong from each of ReAct and chain of thought ([Yao et al., 2023](#references), Table 2). Among the failures, 56 % of chain of thought's were hallucinated facts or reasoning, against 0 % of ReAct's. ReAct's failures were of other kinds: 47 % reasoning errors, including getting stuck repeating the same thought and action, and 23 % searches that returned nothing useful, after which the model could not find its way back. Among the successes, 14 % of chain of thought's correct answers rested on a hallucinated trace, against 6 % of ReAct's.
+
+The two methods fail in complementary ways, which is why combining them worked best. *ReAct, then chain of thought with self-consistency* falls back to 21 sampled chains of thought, voted at temperature 0.7, when ReAct has not answered within 7 steps on HotpotQA or 5 on FEVER. *Self-consistency, then ReAct* switches to ReAct when the most frequent of the 21 answers has fewer than half the votes, a sign that the model's own knowledge is uncertain.
+
+### Decision-making tasks and fine-tuning
+
+On ALFWorld, text games in which an agent has to complete household tasks such as putting a cleaned object somewhere, ReAct with sparse thoughts succeeded in 71 % of 134 unseen games with the best of six prompts, and 57 % averaged over them, against 45 % for acting alone with its best prompt and 37 % for BUTLER, an imitation-learning agent trained on expert trajectories. On WebShop, finding and buying a product that matches a request in a simulated online shop, ReAct succeeded on 40.0 % of the tasks against 30.1 % for acting alone and 28.7 % for a model trained by imitation and reinforcement learning; human experts reached 59.6 %. All of these prompted results used PaLM-540B. Fine-tuning on 3,000 ReAct trajectories with correct answers changed the picture of scale: fine-tuned PaLM-8B beat every prompting method on PaLM-62B, and fine-tuned PaLM-62B beat every prompting method on PaLM-540B, on HotpotQA. Modern agent models are trained on such trajectories by default.
+
+## A complete trace
+
+The Code section runs the loop on a toy knowledge base of five pages about a fictional river valley, with the tools `search`, `lookup` and `calculate`, driven by a scripted policy. The question: *How many years after the founding of the town on the Kessa River was its old mill built?* The run takes seven steps.
+
+```
+Thought 1: I need the town on the Kessa River, the year it was founded and the year its old mill was built.
+Action 1: search[Kessa River]
+Observation 1: The Kessa River is a river of the northern valley. It is 412 km long. It flows through the town of Dunmore before it reaches the sea.
+Thought 2: The town is Dunmore. Next, when it was founded.
+Action 2: search[Dunmore]
+Observation 2: Dunmore is a market town in the northern valley. It lies on the Kessa River. It is known for its wool trade.
+Thought 3: The first sentences do not give the founding year; look it up in the page.
+Action 3: lookup[founded]
+Observation 3: (Result 1 / 1) Dunmore was founded in 1312 by a charter of the duke.
+Thought 4: Dunmore was founded in 1312. Now the old mill.
+Action 4: search[Old Mill]
+Observation 4: Could not find Old Mill. Similar: ['Old Mill of Dunmore', 'Old Harbour', 'Kessa River'].
+Thought 5: There is no page Old Mill, but Old Mill of Dunmore is suggested; that is the mill of Dunmore.
+Action 5: search[Old Mill of Dunmore]
+Observation 5: The Old Mill of Dunmore is a watermill on the Kessa River. It was built in 1561. It ground grain until 1950.
+Thought 6: The mill was built in 1561 and Dunmore was founded in 1312.
+Action 6: calculate[1561 - 1312]
+Observation 6: 249
+Thought 7: The mill was built 249 years after the town was founded.
+Action 7: finish[249]
+```
+
+Step by step:
+
+1. **Decompose.** The first thought turns one question into three facts to find, in an order where each depends on the one before: the town, then its founding year, then the mill.
+2. **Extract.** The observation is three sentences of text; the thought pulls out the one fact needed, the name *Dunmore*, and states the next subgoal.
+3. **Change tools.** The founding year is not in the first sentences. The thought notices the gap and the action switches from `search` to `lookup` inside the open page.
+4. **Track progress.** The thought records 1312, which is now in the context for the rest of the episode, and moves to the last subgoal. The search fails.
+5. **Recover.** The failure is an observation like any other. It lists similar titles, and the thought picks the one that matches the town, using the fact from step 2.
+6. **Compute.** The thought collects both years; the arithmetic goes to a tool rather than being done in the model's head.
+7. **Stop.** The answer is complete, and the policy ends the episode itself.
+
+The thoughts carry the state of the task: which facts are known, which is next, why a search failed. An act-only policy would have to infer all of that from the raw sequence of actions and observations at every step. The context the model reads grew from 78 to 387 tokens of the crude count used in the code, by about 50 per step; the cost section below follows that growth.
+
+## Stopping, budgets and loops
+
+A loop needs rules for ending that do not depend on the model's judgement alone.
+
+- **A final action.** The model ends the episode with `finish[answer]`, or by replying without a call. This is the only successful ending.
+- **A step budget** $T_{\max}$. ReAct used 7 steps on HotpotQA and 5 on FEVER before falling back to chain of thought. A budget is best set from the runs that succeed: if successful runs of a task take at most 9 steps in 95 % of cases, a budget of about 12 stops the runaway runs while cutting off few good ones.
+- **Token, cost and time budgets**, for the same reason, since steps differ in length.
+- **Repetition.** The same action returning the same observation means no progress. The runtime can detect the repeat exactly, flag it in the observation, and stop the run when it happens again.
+- **No progress.** A weaker signal, such as many steps without a new fact or file changed, can trigger a stop or a request for help.
+
+**Why loops happen.** At temperature zero the policy is a deterministic function of its context. If an action fails and the observation adds little to the context, the next context is almost the same as the last one, and so is the next action. The agent reaches a fixed point: the same search, the same failure, the same thought. The ReAct authors traced this failure to greedy decoding. Changing the context breaks the cycle, which is why a flag such as *Repeated action with the same result: try something else* works where a silent retry does not. In the Code section, a policy that repeats a failed search once is flagged on its second attempt, takes the suggestion on the third and finishes in 8 steps instead of 7. When the page it needs does not exist, the policy alternates between two searches, the runtime sees the second repeat and stops the run after 6 steps; with a budget of 4, the original task stops before its answer.
+
+When a budget runs out, the loop has three honest options: return the best partial answer marked as incomplete, fall back to another method (as ReAct falls back to self-consistency), or ask the user. Returning a guess as if it were an answer is not one of them.
+
+## Error recovery
+
+The NLP course notes that reliability compounds: with ten steps that must all succeed, each with probability $0.95$, the task succeeds with probability $0.95^{10} = 0.599$ ([Tool use and agents](/notes/nlp/tools-and-agents#limitations)). Recovery changes the arithmetic. Suppose a step goes wrong with probability $e$, and a wrong step is noticed and repaired with probability $\rho$, at the cost of one extra step. A step then fails for good with probability $e(1 - \rho)$:
+
+$$
+\begin{aligned}
+P(\text{success}) &= \big(1 - e\,(1 - \rho)\big)^{n}, \\
+e = 0.05,\ \rho = 0.6,\ n = 10: \quad P(\text{success}) &= 0.98^{10} = 0.817 \quad \text{instead of } 0.599, \\
+\mathbb E[\text{extra steps}] &= n\,e\,\rho = 10 \times 0.05 \times 0.6 = 0.3 .
+\end{aligned}
+$$
+
+Recovery is worth far more than its cost in steps, and most of it comes from a few mechanisms.
+
+- **Informative observations.** A failed search that lists similar titles, a validation error that names the allowed values ([Tool use and function calling](/notes/agents/tool-use-and-function-calling#errors-and-retries)), a test failure with its traceback. The observation is the agent's only evidence that something went wrong.
+- **Thoughts that read the failure.** Step 5 of the trace is a recovery: the thought interprets the failure and chooses a different action.
+- **Fallbacks** to another method when the loop stalls, as in ReAct's combination with self-consistency.
+- **Replanning and reflection.** Revising the plan when an observation contradicts it, and writing down, after a failed attempt, what went wrong for the next attempt: the subjects of [Planning with language models](/notes/agents/planning-with-language-models) and [Reflection and self-correction](/notes/agents/reflection-and-self-correction).
+
+Recovery depends on noticing. A step that is wrong but looks fine, such as a plausible number read from the wrong page, is never repaired, and it is the common case in practice.
+
+## Plan first, then execute
+
+ReAct decides one step at a time, and every step re-reads the whole context. The alternative is to plan everything first. In **plan-and-execute** designs, a planner call writes the whole sequence of tool calls, with placeholders for results that later calls use; workers execute the calls without calling the model; and a final call composes the answer from the results. ReWOO ([Xu et al., 2023](#references)) has this structure, with evidence variables `#E1`, `#E2` standing for the results. On HotpotQA with `gpt-3.5-turbo`, it reached 42.4 % accuracy with 1,986 tokens per question, against 40.8 % with 9,795 tokens for ReAct: about five times fewer tokens, because the model is called for the plan and the answer instead of once per step. The prompting counterpart, plan-and-solve ([Wang et al., 2023](#references)), asks the model in one chain of thought to devise a plan first and then carry it out step by step.
+
+The price is adaptivity. A plan written before any observation cannot react to a surprise, such as the failed search in step 4 of the trace, unless the design adds a replanning step when a result is missing or unexpected. Plan-and-execute fits tasks whose structure is known in advance and whose tools rarely fail; the step-by-step loop fits exploration. [Planning with language models](/notes/agents/planning-with-language-models) develops the planning side.
+
+## The cost and latency of a loop
+
+Every step sends the whole context to the model again. In the notation of [Context and memory](/notes/agents/context-and-memory), $s$ tokens come before the first step and every step adds $d = u + o$ tokens: $u$ written by the model, its thought and action, and $o$ of observation. The model reads $L_t = s + (t - 1)\,d$ tokens at step $t$, and over $T$ steps
+
+$$
+\boxed{\;\sum_{t=1}^{T} L_t = T s + d\,\frac{T(T - 1)}{2}\;}
+$$
+
+input tokens, while it writes only $T u$. The first term grows linearly with the number of steps and the second quadratically; the second overtakes the first once $T - 1 > 2s / d$. The split of $d$ matters because the two parts cost differently: written tokens are generated one at a time and are priced higher, observation tokens are only read.
+
+**Worked example.** Take $s = 2{,}000$ tokens of instructions, tool definitions and task, $u = 80$ tokens of thought and action and $o = 220$ tokens of observation per step, so $d = 300$. The quadratic term overtakes the linear one after $1 + 4{,}000 / 300 = 14.3$ steps.
+
+- **10 steps.** The last step reads $L_{10} = 2{,}000 + 9 \times 300 = 4{,}700$ tokens. In total the model reads $10 \times 2{,}000 + 300 \times 45 = 33{,}500$ tokens and writes $800$.
+- **40 steps.** The last step reads $13{,}700$ tokens, and the total is $40 \times 2{,}000 + 300 \times 780 = 314{,}000$ tokens read for $3{,}200$ written: almost a hundred tokens read for every token written.
+
+At illustrative prices of 3 dollars per million input tokens and 15 per million output tokens, the 10-step run costs $0.1005 + 0.012 = 0.11$ dollars and the 40-step run $0.94 + 0.05 = 0.99$ dollars: four times the steps, nine times the cost. Prompt caching bills the repeated prefix at a fraction of the price; if cached reads cost a tenth and new tokens the full price, the 40-step run costs $0.18$ dollars instead of $0.99$. [Context and memory](/notes/agents/context-and-memory#prompt-caching-as-economics) derives the general formula, with the price of writing into the cache, and what invalidates a cache.
+
+**Latency** adds up per step. With an illustrative prefill speed of 5,000 tokens per second, generation at 50 tokens per second and half a second per tool call, step $t$ takes $L_t / 5{,}000 + 80 / 50 + 0.5$ seconds. The 10-step run takes $33{,}500 / 5{,}000 + 10 \times 2.1 = 27.7$ seconds; with the cached prefix not recomputed, $21.9$. Generation and tools dominate here, and caching does not shrink them; fewer steps, parallel calls and shorter thoughts do.
+
+<ContextGrowth />
+
+Two consequences shape the following notes. The context cannot grow without bound: at 300 tokens per step, a window of 128,000 tokens is full after about 420 steps, long before the end of many coding tasks, and models use information in the middle of a long context less reliably than at its start or end ([Liu et al., 2024](#references); [Context and memory](/notes/agents/context-and-memory#why-order-matters-lost-in-the-middle)). And the cost per step rises over an episode, so long tasks need the context to be summarized, trimmed or moved to external memory, the subject of the next note.
+
+<aside class="callout"><strong>Check yourself.</strong> (1) With $s = 1{,}000$ and $d = 500$, how many input tokens does a 20-step loop read in total, and how many does its last step read? (2) A loop at temperature 0 calls a search that fails, and the failure message is always the same. Why is it likely to call the same search again, and what is the cheapest way for the runtime to stop it? (3) Why does plan-and-execute need far fewer tokens than ReAct on a task of five tool calls?<details><summary>Answers</summary>(1) The last step reads $1{,}000 + 19 \times 500 = 10{,}500$; the total is $20 \times 1{,}000 + 500 \times 190 = 115{,}000$. (2) The policy is a deterministic function of the context, and the context after the failure differs from the one before only by an uninformative observation, so the same action is the most likely again. Detect the repeated action with the same result, and change the context by flagging it in the observation, or stop the run when it repeats. (3) ReAct calls the model once per step, and each call re-reads the growing context: five or six calls of growing length. Plan-and-execute calls the model to plan and to answer, and the workers run the tools without the model.</details></aside>
+
+## What changed
+
+| | act only | reason only | ReAct |
+| --- | --- | --- | --- |
+| action space | $\mathcal A$ | $\mathcal L$, then an answer | $\mathcal A \cup \mathcal L$ |
+| source of facts | the environment | the model's memory | the environment |
+| where the plan lives | implicit in the actions | in the chain | in the thoughts, revised by observations |
+| typical failure | loses track, cannot interpret results | hallucinated facts | reasoning errors, loops, unhelpful searches |
+| inspectable | the actions | the chain | the whole trajectory |
+| cost per step | one call | one call in total | one call per step, on a growing context |
+
+## Limitations
+
+- **Thoughts can be wrong and are believed.** Every later step reads them; a wrong thought early in a trajectory steers all the rest, and as the previous note showed, a thought need not reflect what drove the action.
+- **Loops and stalls.** Deterministic decoding and uninformative observations produce cycles that only the runtime can break.
+- **The context grows with every step.** Cost grows quadratically with the number of steps without caching, and the window eventually fills.
+- **Greedy, one step at a time.** ReAct does not plan ahead or backtrack except by writing new thoughts; search over trajectories is a different design.
+- **Results depend on the interface.** The same model scores differently with a search tool that returns five sentences or the whole page, and benchmark numbers transfer poorly between tool implementations.
+- **Prompted ReAct is weaker than trained ReAct.** The fine-tuning results show that a small model trained on trajectories beats a large model prompted with a few; agents are now trained, not only prompted.
+
+## What you should remember
+
+- ReAct adds thoughts to the action space: $\hat{\mathcal A} = \mathcal A \cup \mathcal L$. A thought only extends the context; an action also returns an observation.
+- Against acting alone, thoughts decompose the task, extract facts from observations, track progress and handle failures. Against reasoning alone, every fact comes from the environment: in the ReAct error analysis, hallucination caused 56 % of chain-of-thought failures and none of ReAct's.
+- With PaLM-540B prompted: HotpotQA 27.4 (ReAct) against 29.4 (chain of thought) and 25.7 (act only); FEVER 60.9 against 56.3 and 58.9; ALFWorld 71 % against 45 % for act only (best of six prompts); combining ReAct with self-consistency gave the best results.
+- Stop on a final action, a step budget, token, cost or time budgets, and exact repetition; flag a repeat in the observation to change the context, and stop when it recurs.
+- Recovery multiplies reliability: $(1 - e(1 - \rho))^n$ instead of $(1 - e)^n$. It needs informative observations and thoughts that read them.
+- Plan-and-execute writes all calls first and saves tokens (ReWOO: about five times fewer on HotpotQA), at the cost of reacting to surprises only by replanning.
+- A loop reads $T s + d\, T(T-1)/2$ input tokens over $T$ steps and writes only $T u$; prompt caching bills the repeated prefix cheaply; latency is dominated by generation and tools.
+
+## Code
+
+A complete ReAct loop over a toy knowledge base of five pages, with `search`, `lookup` and `calculate` tools, a parser for `tool[argument]` actions, a step budget and a repetition check, driven by a scripted policy that reads its context with regular expressions and writes a thought and an action. The last part computes the cost model of the worked example. With a real model, `toy_policy` becomes a call to the model with the context as its prompt and a stop sequence after the action line; the environment, the parser, the stopping rules and the token accounting stay as they are. The script has no randomness and runs in a fraction of a second.
+
+```python
+import ast, operator, re
+
+# 1. the environment: a toy knowledge base with search, lookup and a calculator
+PAGES = {
+    'Kessa River': 'The Kessa River is a river of the northern valley. It is 412 km long. It flows through the town of '
+                   'Dunmore before it reaches the sea. Its main tributary is the Brann. It freezes in most winters.',
+    'Dunmore': 'Dunmore is a market town in the northern valley. It lies on the Kessa River. It is known for its wool '
+               'trade. Its population was 18,400 in 2020. Dunmore was founded in 1312 by a charter of the duke.',
+    'Old Mill of Dunmore': 'The Old Mill of Dunmore is a watermill on the Kessa River. It was built in 1561. '
+                           'It ground grain until 1950. Today it is a museum.',
+    'Brann': 'The Brann is a river of the northern valley and a tributary of the Kessa River.',
+    'Old Harbour': 'The Old Harbour is the port at the mouth of the Kessa River.',
+}
+OPS = {ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul, ast.Div: operator.truediv}
+def arith(n):
+    if isinstance(n, ast.Constant) and isinstance(n.value, (int, float)): return n.value
+    if isinstance(n, ast.BinOp) and type(n.op) in OPS: return OPS[type(n.op)](arith(n.left), arith(n.right))
+    raise ValueError('only numbers and + - * /')
+
+class KnowledgeBase:
+    def __init__(self, pages): self.pages, self.page, self.hits = pages, None, []
+    def sentences(self, title): return re.findall(r'[^.]+\.', self.pages[title])
+    def step(self, tool, arg):
+        if tool == 'search':
+            if arg in self.pages:
+                self.page = arg
+                return ' '.join(s.strip() for s in self.sentences(arg)[:3])      # the first three sentences
+            words = set(arg.lower().split())
+            similar = sorted(self.pages, key=lambda t: -len(words & set(t.lower().split())))[:3]
+            return f'Could not find {arg}. Similar: {similar}.'
+        if tool == 'lookup':
+            if self.page is None: return 'No page is open.'
+            hits = [s.strip() for s in self.sentences(self.page) if arg.lower() in s.lower()]
+            return f'(Result 1 / {len(hits)}) {hits[0]}' if hits else 'No more results.'
+        if tool == 'calculate':
+            try: return str(arith(ast.parse(arg, mode='eval').body))
+            except (SyntaxError, ValueError) as e: return f'Error: {e}'
+        return f'Unknown action {tool}.'
+
+# 2. a scripted stand-in for the model: it reads its context and writes a thought and an action
+QUESTION = 'How many years after the founding of the town on the Kessa River was its old mill built?'
+def toy_policy(context, stubborn=False):
+    obs = re.findall(r'Observation \d+: (.*)', context)
+    last = obs[-1] if obs else ''
+    town = re.search(r'flows through the town of (\w+)', context)
+    founded = re.search(r'founded in (\d{4})', context)
+    built = re.search(r'built in (\d{4})', context)
+    if not obs:
+        return 'I need the town on the Kessa River, the year it was founded and the year its old mill was built.', 'search[Kessa River]'
+    if last.startswith('Could not find'):
+        if stubborn and 'Repeated' not in context:                  # greedy decoding, unchanged context: same action again
+            return 'Let me search for the old mill.', 'search[Old Mill]'
+        title = next(t for t in re.findall(r"'([^']+)'", last) if town.group(1) in t)
+        return f'There is no page Old Mill, but {title} is suggested; that is the mill of {town.group(1)}.', f'search[{title}]'
+    if built and founded:
+        if re.fullmatch(r'\d+', last):
+            return f'The mill was built {last} years after the town was founded.', f'finish[{last}]'
+        return f'The mill was built in {built.group(1)} and {town.group(1)} was founded in {founded.group(1)}.', \
+               f'calculate[{built.group(1)} - {founded.group(1)}]'
+    if founded:
+        return f'{town.group(1)} was founded in {founded.group(1)}. Now the old mill.', 'search[Old Mill]'
+    if town and town.group(1) in PAGES and f'{town.group(1)} is' in last:
+        return 'The first sentences do not give the founding year; look it up in the page.', 'lookup[founded]'
+    if town:
+        return f'The town is {town.group(1)}. Next, when it was founded.', f'search[{town.group(1)}]'
+    return 'I am stuck.', 'finish[unknown]'
+
+# 3. the loop: parse, act, observe, append; stop on finish, on the step budget, or on a repeated action
+def tokens(text): return len(re.findall(r'\w+|[^\w\s]', text))       # a crude token count
+SYSTEM = ('Answer the question by interleaving Thought, Action and Observation steps. Actions: search[entity] returns '
+          'the first sentences of a page, lookup[keyword] the next sentence of the open page that contains the keyword, '
+          'calculate[expression] does arithmetic, finish[answer] ends the task.')
+
+def react(question, pages, max_steps=8, max_repeats=2, stubborn=False):
+    env, context, seen, sizes, repeats = KnowledgeBase(pages), f'{SYSTEM}\nQuestion: {question}\n', set(), [], 0
+    for t in range(1, max_steps + 1):
+        sizes.append(tokens(context))                                 # what the model reads at this step
+        thought, action = toy_policy(context, stubborn)
+        m = re.fullmatch(r'(\w+)\[(.*)\]', action)
+        if m is None:
+            obs = 'Invalid action; write tool[argument].'
+        elif m.group(1) == 'finish':
+            context += f'Thought {t}: {thought}\nAction {t}: {action}\n'
+            return m.group(2), t, 'finish', context, sizes
+        else:
+            obs = env.step(m.group(1), m.group(2))
+            if (action, obs) in seen:                                 # the same call with the same result
+                repeats += 1
+                if repeats == max_repeats: return None, t, 'loop', context, sizes
+                obs += ' Repeated action with the same result: try something else.'
+            seen.add((action, obs.split(' Repeated')[0]))
+        context += f'Thought {t}: {thought}\nAction {t}: {action}\nObservation {t}: {obs}\n'
+    return None, max_steps, 'budget', context, sizes                  # the step budget ran out
+
+answer, steps, reason, trace, sizes = react(QUESTION, PAGES)
+print(trace)                                                          # the trace printed in the note
+print(answer, steps, reason, sizes)
+print(react(QUESTION, PAGES, stubborn=True)[:3])                      # a repeated search is caught, then recovered
+print(react(QUESTION, PAGES, max_steps=4)[:3])                        # the budget stops a run that needs 7 steps
+print(react(QUESTION, {k: v for k, v in PAGES.items() if k != 'Old Mill of Dunmore'})[:3])   # the page is missing
+# 249 7 finish [78, 145, 195, 243, 295, 358, 387]
+# ('249', 8, 'finish')
+# (None, 4, 'budget')
+# (None, 6, 'loop')
+
+# 4. the cost of a loop: s tokens before the first step, u written and o observed tokens per step
+def loop_cost(T, s=2000, u=80, o=220, p_in=3e-6, p_out=15e-6, cached=0.1, prefill=5000, decode=50, tool=0.5):
+    L = [s + (t - 1) * (u + o) for t in range(1, T + 1)]            # context length L_t read at step t
+    inp, new = sum(L), L[-1]                                          # with caching only L_T is read at full price
+    cost = inp * p_in + T * u * p_out
+    cost_cached = new * p_in + (inp - new) * cached * p_in + T * u * p_out
+    latency = inp / prefill + T * (u / decode + tool)
+    latency_cached = new / prefill + T * (u / decode + tool)
+    return L[-1], inp, round(cost, 4), round(cost_cached, 4), round(latency, 1), round(latency_cached, 1)
+
+for T in (10, 40): print(T, loop_cost(T))
+# 10 (4700, 33500, 0.1125, 0.0347, 27.7, 21.9)
+# 40 (13700, 314000, 0.99, 0.1792, 146.8, 86.7)
+#   (steps; tokens read at the last step; total read; dollars; with caching; seconds; with caching)
+```
+
+## Next
+
+The loop works as long as everything it needs fits in its context. Long tasks break that assumption: the context grows by every observation, the cost of each step grows with it, and the window eventually fills. The [next note](/notes/agents/context-and-memory) treats the context as a resource to be managed: what to keep, what to summarize, what to move into external memory that the agent writes and retrieves, and how agents built on such memory behave over days rather than minutes.
+
+## References
+
+- S. Yao, J. Zhao, D. Yu, N. Du, I. Shafran, K. Narasimhan, Y. Cao. [ReAct: synergizing reasoning and acting in language models](https://arxiv.org/abs/2210.03629). ICLR, 2023. Table 1 (HotpotQA and FEVER), Table 2 (error analysis), and the ALFWorld and WebShop results.
+- Z. Yang, P. Qi, S. Zhang, Y. Bengio, W. W. Cohen, R. Salakhutdinov, C. D. Manning. [HotpotQA: a dataset for diverse, explainable multi-hop question answering](https://arxiv.org/abs/1809.09600). EMNLP, 2018.
+- J. Thorne, A. Vlachos, C. Christodoulopoulos, A. Mittal. [FEVER: a large-scale dataset for fact extraction and VERification](https://arxiv.org/abs/1803.05355). NAACL, 2018.
+- M. Shridhar, X. Yuan, M.-A. Côté, Y. Bisk, A. Trischler, M. Hausknecht. [ALFWorld: aligning text and embodied environments for interactive learning](https://arxiv.org/abs/2010.03768). ICLR, 2021.
+- S. Yao, H. Chen, J. Yang, K. Narasimhan. [WebShop: towards scalable real-world web interaction with grounded language agents](https://arxiv.org/abs/2207.01206). NeurIPS, 2022.
+- B. Xu, Z. Peng, B. Lei, S. Mukherjee, Y. Liu, D. Xu. [ReWOO: decoupling reasoning from observations for efficient augmented language models](https://arxiv.org/abs/2305.18323). arXiv, 2023. Table 2.
+- L. Wang, W. Xu, Y. Lan, Z. Hu, Y. Lan, R. K.-W. Lee, E.-P. Lim. [Plan-and-solve prompting: improving zero-shot chain-of-thought reasoning by large language models](https://arxiv.org/abs/2305.04091). ACL, 2023.
+- N. F. Liu, K. Lin, J. Hewitt, A. Paranjape, M. Bevilacqua, F. Petroni, P. Liang. [Lost in the middle: how language models use long contexts](https://arxiv.org/abs/2307.03172). *Transactions of the Association for Computational Linguistics*, 12, 2024.
+- Anthropic. [Building effective agents](https://www.anthropic.com/engineering/building-effective-agents). December 2024.
+- L. Weng. [LLM powered autonomous agents](https://lilianweng.github.io/posts/2023-06-23-agent/). Blog post, June 2023.
