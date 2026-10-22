@@ -10,7 +10,6 @@
 
 export type PrerequisiteTarget = { note: string; anchor?: string } | { href: string };
 
-const MML = 'https://mml-book.github.io/';
 const D2L_LINEAR = 'https://d2l.ai/chapter_linear-classification/index.html';
 
 const background: Record<string, PrerequisiteTarget> = {
@@ -23,13 +22,13 @@ const background: Record<string, PrerequisiteTarget> = {
   'Теория вероятностей': { note: 'probability/what-probability-is' },
   'Математическое ожидание': { note: 'probability/expectation-and-variance' },
   'Условная вероятность': { note: 'probability/conditional-probability-and-bayes' },
-  // Mathematics: Deisenroth, Faisal and Ong, "Mathematics for Machine Learning".
-  'Linear algebra': { href: MML },
-  'Calculus': { href: MML },
-  'Determinants': { href: MML },
-  'Линейная алгебра': { href: MML },
-  'Математический анализ': { href: MML },
-  'Определители': { href: MML },
+  // Mathematics: the notes of the Mathematics for Machine Learning course.
+  'Linear algebra': { note: 'math/vectors-and-linear-maps' },
+  'Calculus': { note: 'math/derivatives-and-taylor-series' },
+  'Determinants': { note: 'math/determinants-and-eigenvalues' },
+  'Линейная алгебра': { note: 'math/vectors-and-linear-maps' },
+  'Математический анализ': { note: 'math/derivatives-and-taylor-series' },
+  'Определители': { note: 'math/determinants-and-eigenvalues' },
   'Trigonometry': { href: 'https://en.wikipedia.org/wiki/Trigonometric_functions' },
   'Тригонометрия': { href: 'https://ru.wikipedia.org/wiki/Тригонометрические_функции' },
   // Neural networks and other machine-learning background: the notes of the ML course.
