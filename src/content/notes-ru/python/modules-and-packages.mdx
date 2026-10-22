@@ -1,0 +1,433 @@
+---
+title: "Модули, пакеты и окружения"
+description: "Что делает import, шаг за шагом: кэш sys.modules, искатели и sys.path, пакеты с __init__.py и относительные импорты, __name__ == '__main__'; затем виртуальные окружения, pip и uv, pyproject.toml и файлы блокировки, которые делают эксперимент по ML воспроизводимым."
+course: python
+section: Абстракции
+order: 12
+status: published
+tags: [python, modules, packages, import, sys-path, sys-modules, relative-imports, venv, pip, uv, pyproject, lockfile, reproducibility]
+prerequisites: [Как запускать Python, Функции, Замыкания и декораторы]
+---
+
+import ImportSearch from '../../../components/figures/modules-and-packages/ImportSearch.astro';
+
+[Предыдущая заметка](/ru/notes/python/closures-and-decorators) закончилась реестром, который заполняется при импорте модуля, и замечанием, что модели, модуль которой ни разу не импортировали, в нём нет. До сих пор каждая программа курса была одним файлом, использующим стандартную библиотеку. Настоящие программы разбиты на множество файлов, и большая часть их кода написана другими людьми: NumPy, pandas, PyTorch. В этой заметке мы прослеживаем инструкцию `import` от написанной строки до файла, который она находит и выполняет, показываем, как файлы объединяются в пакеты, а затем обращаемся к вопросу, с которым любой проект по ML сталкивается в первый же день: с какими версиями каких библиотек работает этот код и как другому человеку получить в точности те же.
+
+**Соглашения.** Пути показаны для macOS и Linux (`.venv/bin/python`); в Windows интерпретатор окружения — `.venv\Scripts\python.exe`. Версии инструментов — установленные на 22 октября 2026 года: CPython 3.14.7, pip 26.2.1, uv 0.12.9.
+
+## Отправная точка: один длинный файл \{#baseline-one-long-file\}
+
+Первый проект растёт в одном файле: загрузка данных, их очистка, модель, обучение, графики. На нескольких сотнях строк в нём становится трудно что-либо найти, а второй проект начинается с копирования вспомогательных функций первого. Исправление, сделанное в одной копии, никогда не доходит до другой. Разбиение кода на файлы, которые импортируют друг друга, решает обе проблемы — если мы понимаем, что делает `import`.
+
+## Модули \{#modules\}
+
+**Модуль** (module) — это файл с кодом на Python, а его импорт даёт объект типа `module`, атрибуты которого — имена, определённые в файле. Возьмём файл `helpers.py`:
+
+```python
+print("executing helpers.py, __name__ =", __name__)
+RATE = 0.2
+
+def tax(x):
+    return x * RATE
+
+if __name__ == "__main__":
+    print("run as a script:", tax(100))
+```
+
+и файл `main.py` рядом с ним:
+
+```python
+import sys
+import helpers
+import helpers
+
+print(helpers.tax(50), "helpers" in sys.modules, sys.modules["helpers"] is helpers)
+print(type(helpers).__name__, sorted(k for k in vars(helpers) if not k.startswith("__")))
+```
+
+```text
+$ python main.py
+executing helpers.py, __name__ = helpers
+10.0 True True
+module ['RATE', 'tax']
+```
+
+Модуль импортирован дважды, а выполнен один раз. Его глобальные имена, `RATE` и `tax`, стали атрибутами объекта модуля и доступны как `helpers.tax`. Формы инструкции различаются только тем, какое имя они связывают в импортирующем файле:
+
+| Инструкция | Связывает | Примечания |
+| --- | --- | --- |
+| `import helpers` | `helpers`, модуль | обычная форма; источник каждого имени остаётся виден |
+| `import numpy as np` | `np`, модуль | псевдоним, общепринятый для нескольких библиотек |
+| `from helpers import tax` | `tax`, функцию | всё равно импортирует и выполняет весь модуль |
+| `from helpers import *` | каждое публичное имя | скрывает, откуда берутся имена; вне REPL лучше не использовать |
+
+`from helpers import tax` копирует ссылку: если `helpers` позже перепривяжет свой `tax`, у импортирующего файла останется старая функция. Это снова модель имён из [заметки о значениях](/ru/notes/python/values-and-names), применённая к модулям.
+
+## Что делает `import` \{#what-import-does\}
+
+<aside class="callout"><strong>Ключевая идея.</strong> `import name` (1) возвращает модуль из кэша `sys.modules`, если он там есть; иначе (2) спрашивает список **искателей** (finders), где находится модуль, и последний из них просматривает по порядку папки `sys.path`; (3) создаёт объект модуля, сохраняет его в `sys.modules` и один раз выполняет в нём код модуля; и (4) связывает имя в импортирующем модуле. Побеждает первый подходящий файл, а модуль выполняется только при первом импорте.</aside>
+
+<ImportSearch />
+
+1. **Кэш.** `sys.modules` — словарь, отображающий имена модулей в объекты модулей. Если имя там есть, инструкция только связывает имя; ни один файл не читается. Поэтому второй `import helpers` ничего не напечатал, и поэтому импорт большой библиотеки в десяти файлах стоит одной загрузки.
+2. **Искатели.** Иначе Python запрашивает у каждого объекта из `sys.meta_path` **спецификацию** (spec) — описание того, где находится модуль и как его загрузить. В обычном CPython 3.14 их три: `BuiltinImporter` для модулей, вкомпилированных в интерпретатор, таких как `sys`; `FrozenImporter` для модулей, хранящихся внутри исполняемого файла интерпретатора, например частей самого механизма импорта; и `PathFinder`. Инструменты могут добавлять перед ними собственные искатели.
+3. **`sys.path`.** `PathFinder` берёт по порядку каждую папку из `sys.path` и ищет в ней папку пакета `numpy/`, файл `numpy.py` или скомпилированное расширение, такое как `numpy.cpython-314-darwin.so`. Первое совпадение завершает поиск.
+4. **Загрузка.** Загрузчик (loader) создаёт пустой объект модуля, помещает его в `sys.modules` и выполняет код модуля, используя словарь модуля как глобальное пространство имён. Для исходного файла он использует кэшированный байт-код из `__pycache__`, если исходник не менялся, как описывала [первая заметка](/ru/notes/python/running-python#what-happens-when-you-run-a-file). Модуль попадает в `sys.modules` до выполнения своего кода, что важно для циклических импортов (ниже).
+5. **Связывание.** Наконец инструкция связывает `numpy` (или псевдоним, или импортированные имена) в пространстве имён модуля, который её выполнил.
+
+Если отказываются все искатели, инструкция возбуждает `ModuleNotFoundError: No module named 'numpy'`, что почти всегда означает «не установлен в окружении, которым пользуется этот интерпретатор», а не «не установлен вообще».
+
+**Что лежит в `sys.path`.** По порядку:
+
+1. Папка запускаемого скрипта (`python train.py`) или текущая папка для `python -m`, `python -c` и REPL.
+2. Папки из переменной окружения `PYTHONPATH`, если она задана.
+3. Стандартная библиотека: zip-файл (`python314.zip`, обычно отсутствует), папка библиотеки `lib/python3.14` и `lib-dynload` для её скомпилированных модулей расширения.
+4. `site-packages`, где лежат установленные сторонние пакеты: собственный каталог окружения, как объясняют следующие разделы.
+
+Флаг `-I` (изолированный режим, которым пользуются разделы «Код» этого курса) и более узкий `-P` (Python 3.11) не включают первую запись, так что случайный файл в текущей папке не может перехватить импорт. Поэтому скрипт, запущенный с `-I`, не может импортировать лежащий рядом модуль, если сам не добавит эту папку в `sys.path`, как делает раздел «Код».
+
+**Типичная ошибка: заслонение (shadowing).** Поскольку собственная папка скрипта стоит первой, лежащий там файл с именем библиотеки подменяет библиотеку. Скрипт `game.py` рядом с собственным файлом `random.py`:
+
+```text
+$ python game.py
+my random.py
+Traceback (most recent call last):
+  File ".../shadow/game.py", line 2, in <module>
+    print(random.randint(1, 6))
+          ^^^^^^^^^^^^^^
+AttributeError: module 'random' has no attribute 'randint' (consider renaming '.../shadow/random.py' since it has the same name as the standard library module named 'random' and prevents importing that standard library module)
+```
+
+Начиная с Python 3.13 сообщение называет виновника. Классические жертвы — файлы с именами `random.py`, `math.py`, `numpy.py`, `torch.py` или `test.py`, созданные, чтобы попробовать одноимённую библиотеку. Узнать ошибку можно по `AttributeError` на функции, которая у библиотеки заведомо есть, и по `module.__file__`, указывающему в собственную папку проекта.
+
+## `if __name__ == "__main__"` \{#if-\_\_name\_\_--\_\_main\_\_\}
+
+У каждого модуля есть глобальная переменная `__name__`. Когда модуль импортируется, это имя модуля, `"helpers"`. Когда файл запускается как главная программа, через `python helpers.py` или `python -m helpers`, это `"__main__"`:
+
+```text
+$ python helpers.py
+executing helpers.py, __name__ = __main__
+run as a script: 20.0
+```
+
+Поэтому блок под `if __name__ == "__main__":` выполняется, когда файл — программа, и пропускается, когда он — библиотека. Эта идиома позволяет одному файлу быть и тем и другим; обычно это модуль с небольшой точкой входа для командной строки или с демонстрацией. Она обязательна в одной распространённой ситуации в ML: `multiprocessing` и `DataLoader` из PyTorch с `num_workers > 0` запускают рабочие процессы, и при методе запуска `spawn` (по умолчанию в macOS и Windows) или `forkserver` (по умолчанию в Linux начиная с Python 3.14) каждый рабочий процесс заново импортирует главный модуль; код на верхнем уровне скрипта, например цикл обучения, выполнился бы снова в каждом рабочем процессе ([ACOS, обращение к системе](/ru/notes/acos/language-runtimes#calling-the-system-os-subprocess-and-signals)). Работу нужно поместить в функцию `main()` и вызывать её под этой проверкой.
+
+## Пакеты \{#packages\}
+
+**Пакет** (package) — это папка модулей, которую саму можно импортировать. Обычный пакет содержит файл `__init__.py`:
+
+```text
+shop/
+    __init__.py
+    cart.py
+    payments/
+        __init__.py
+        card.py
+```
+
+```python
+# shop/__init__.py
+print("initializing package", __name__)
+from .cart import Cart
+
+# shop/cart.py
+from .payments.card import charge
+
+class Cart:
+    def __init__(self):
+        self.items = []
+    def checkout(self):
+        return charge(sum(self.items))
+
+# shop/payments/card.py
+def charge(amount):
+    return f"charged {amount}"
+```
+
+```text
+>>> import sys
+>>> import shop
+initializing package shop
+>>> cart = shop.Cart()
+>>> cart.items += [3, 4]
+>>> cart.checkout()
+'charged 7'
+>>> sorted(m for m in sys.modules if m.startswith("shop"))
+['shop', 'shop.cart', 'shop.payments', 'shop.payments.card']
+```
+
+Правила:
+
+- **Импорт пакета выполняет его `__init__.py`.** Пакет — объект модуля, пространство имён которого — то, что определил `__init__.py`. Здесь он импортирует `Cart`, чтобы пользователи могли писать `shop.Cart` вместо `shop.cart.Cart`; библиотеки используют `__init__.py` именно так, чтобы предоставить короткий публичный интерфейс, как это делают `numpy` и `torch`.
+- **Подмодули находятся через пакет.** У пакета есть `__path__`, список папок, и `import shop.payments.card` импортирует `shop`, затем ищет `payments` в `shop.__path__`, затем `card` в пути этого пакета. Каждый уровень попадает в `sys.modules` под своим именем через точку.
+- **Папка без `__init__.py`** — это **пакет пространства имён** (namespace package, [PEP 420](#references)): его можно импортировать, у него нет кода инициализации, и он может быть разнесён по нескольким папкам. Он предназначен для больших дистрибутивов, разделённых на отдельно устанавливаемые части; для собственного кода стоит писать `__init__.py`, пусть даже пустой, и избегать сюрпризов.
+
+**Абсолютные и относительные импорты.** Внутри пакета `from shop.payments.card import charge` (абсолютный импорт) и `from .payments.card import charge` (относительный) импортируют одно и то же. Одна точка означает «пакет, которому принадлежит этот модуль», две точки — его родительский пакет, и так далее. Относительные импорты разрешаются относительно `__package__` модуля, поэтому работают только в модулях, импортированных как часть пакета. Прямой запуск такого файла завершается ошибкой:
+
+```text
+$ python shop/payments/report.py
+Traceback (most recent call last):
+  File ".../shop/payments/report.py", line 1, in <module>
+    from ..cart import Cart
+ImportError: attempted relative import with no known parent package
+$ python -m shop.payments.report
+initializing package shop
+report sees Cart
+```
+
+Запущенный как файл, `report.py` — это модуль `__main__` без пакета. Запущенный через `-m` по имени с точками из папки, которая содержит `shop/`, он — модуль `shop.payments.report`, и `..` означает `shop`. Это главное практическое различие между `python file.py` и `python -m name`, о котором шла речь в [первой заметке](/ru/notes/python/running-python#a-module-python--m).
+
+**Типичная ошибка: циклические импорты.** Если `pk/x.py` начинается с `from . import y`, а `pk/y.py` — с `from .x import f`, то импорт `pk.x` начинает выполнять `x`, который импортирует `y`, а тот запрашивает `f` из `x` — модуля, который уже есть в `sys.modules` (его поместил туда шаг 4), но ещё не дошёл до строки, определяющей `f`:
+
+```text
+ImportError: cannot import name 'f' from partially initialized module 'pk.x' (most likely due to a circular import) (.../pk/x.py)
+```
+
+Исправления структурные: вынести то, что нужно обоим модулям, в третий модуль, который не импортирует ни один из них, или импортировать модуль, а не имя (`from . import x`, а затем `x.f()` в момент вызова, когда `x` уже выполнился до конца).
+
+## Зачем нужны окружения \{#why-environments-exist\}
+
+`pip install numpy` копирует NumPy в одну папку `site-packages`, и каждая программа, запущенная этим интерпретатором, видит одну и ту же копию. Двум проектам, которым нужны разные версии библиотеки, невозможно угодить одновременно, обновление для одного проекта может сломать другой, а интерпретатор, пришедший с операционной системой, принадлежит операционной системе: начиная с [PEP 668](#references), многие дистрибутивы Linux и Homebrew помечают его как внешне управляемый (externally managed), и pip отказывается в него устанавливать.
+
+**Виртуальное окружение** (virtual environment) — это папка с собственным `site-packages` и небольшим файлом конфигурации, указывающим на базовый интерпретатор. Оно использует стандартную библиотеку базового интерпретатора и больше ничего не копирует:
+
+```text
+$ python3.14 -m venv .venv
+$ ls .venv .venv/bin
+.venv:
+bin  include  lib  pyvenv.cfg
+
+.venv/bin:
+Activate.ps1  activate  activate.csh  activate.fish  python  python3  python3.14  𝜋thon
+$ .venv/bin/python -c "import sys; print(sys.prefix != sys.base_prefix)"
+True
+```
+
+Правило, на котором всё держится ([документация `venv`, How venvs work](#references)): при запуске `python` ищет `pyvenv.cfg` рядом с исполняемым файлом или на одну папку выше. Если находит, то устанавливает `sys.prefix` в папку окружения, и `site-packages` в `sys.path` становится `.venv/lib/python3.14/site-packages`, а `sys.base_prefix` продолжает указывать на базовую установку, стандартная библиотека которой и используется. `bin/python` — лишь символическая ссылка на базовый интерпретатор. (`𝜋thon` — шуточный псевдоним, который добавляет `venv` в 3.14; это та же ссылка.)
+
+**Активация** (activation) — удобство, а не требование. `source .venv/bin/activate` ставит `.venv/bin` первым в `PATH` оболочки, чтобы `python` и `pip` означали программы окружения, и меняет приглашение командной строки. Прямой вызов `.venv/bin/python` даёт тот же эффект без активации. Окружение одноразово: его пересоздают по списку требований, никогда не копируют между машинами и никогда не добавляют в git.
+
+## Установка пакетов: pip и uv \{#installing-packages-pip-and-uv\}
+
+**pip** поставляется с Python и устанавливает пакеты из Python Package Index, PyPI, в окружение того интерпретатора, который его запускает, поэтому надёжная форма — `python -m pip`:
+
+```text
+$ python -m pip install "numpy>=2.3,<3" pandas
+$ python -m pip freeze > requirements.txt
+```
+
+Пакеты распространяются в виде **колёс** (wheels) — zip-файлов, которые распаковываются в `site-packages` как есть и, если содержат скомпилированный код, собираются отдельно для каждой версии Python и платформы (`numpy-2.5.3-cp312-cp312-macosx_14_0_arm64.whl` — это NumPy 2.5.3 для CPython 3.12 на macOS 14 или новее на arm64). pip разрешает зависимости запрошенного, скачивает совместимые колёса и устанавливает их; `pip freeze` перечисляет установленное, по одному `name==version` в строке. Спецификаторы версий — из [PEP 440](#references): `==2.5.4` — ровно эта версия, `>=2.3,<3` — диапазон, `~=2.5.0` — любая 2.5.x начиная с 2.5.0.
+
+**uv** — менеджер пакетов и проектов от Astral, написанный на Rust и впервые выпущенный в 2024 году ([документация uv](#references)). Он делает то же, что pip, `venv`, `pip-tools` и установщик Python, одной командой и с глобальным кэшем, который ускоряет установку. Работа с проектом:
+
+```text
+$ uv init --bare expt          # создаёт expt/pyproject.toml
+$ cd expt
+$ uv add "numpy>=2.3" pandas   # записывает зависимости, разрешает, фиксирует версии, ставит в .venv
+$ uv add --dev pytest          # зависимость только для разработки
+$ uv run python train.py       # запуск в окружении проекта, которое сначала синхронизируется
+$ uv sync                      # приводит .venv в точное соответствие с файлом блокировки
+```
+
+В 2026 году оба инструмента — хороший выбор. pip есть всегда, и его достаточно для одного окружения; uv управляет всем проектом и его файлом блокировки, и именно им пользуются курсы этого сайта. Conda остаётся распространённой там, где вместе с пакетами должны приходить библиотеки не на Python, например определённые версии CUDA.
+
+## `pyproject.toml` \{#pyprojecttoml\}
+
+Проект описывает себя в файле `pyproject.toml` в своём корне, в формате TOML. Таблица `[project]` стандартизирована [PEP 621](#references), и её читает любой современный инструмент:
+
+```toml
+[project]
+name = "expt"
+version = "0.1.0"
+requires-python = ">=3.14"
+dependencies = [
+    "numpy>=2.3",
+    "pandas>=3.0",
+]
+
+[dependency-groups]
+dev = ["pytest>=9.0"]
+```
+
+`dependencies` перечисляет то, что нужно коду для работы, в виде диапазонов: проект должен работать с любой NumPy начиная с 2.3. `requires-python` указывает версии интерпретатора. `[dependency-groups]` ([PEP 735](#references)) перечисляет то, что нужно разработчикам, но не пользователям, например программу запуска тестов. У проекта, который предназначен для установки как пакет, есть также таблица `[build-system]` ([PEP 518](#references)), называющая инструмент, который собирает его колесо.
+
+## Файлы блокировки и воспроизводимые эксперименты \{#lockfiles-and-reproducible-experiments\}
+
+Диапазоны в `pyproject.toml` правильны для библиотеки и неправильны для эксперимента. `numpy>=2.3`, разрешённый в марте и в октябре, даёт разные версии, и результат, который зависит от изменённого значения по умолчанию, исправленной ошибки или нового потока случайных чисел, невозможно воспроизвести. **Файл блокировки** (lockfile) записывает итог одного разрешения зависимостей: точную версию каждого пакета, прямого и косвенного, откуда он взят и хеш каждого файла.
+
+```toml
+# uv.lock, одна запись (хеши сокращены)
+[[package]]
+name = "numpy"
+version = "2.5.3"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/.../numpy-2.5.3-cp312-cp312-macosx_14_0_arm64.whl", hash = "sha256:a72f87…", size = 5445405 },
+    ...
+]
+```
+
+`uv lock` пишет `uv.lock`; `uv sync` устанавливает ровно то, что в нём записано, и проверяет каждый скачанный файл по его хешу. Стандартный формат файлов блокировки — `pylock.toml`, определённый [PEP 751](#references) (принят в марте 2025 года): `uv export --format pylock.toml` пишет такой файл, и pip 26.2.1 умеет создать его командой `pip lock`, всё ещё помеченной как экспериментальная. Более старый аналог — `requirements.txt` со всеми закреплёнными версиями из `pip freeze`, который записывает версии, но не хеши и не граф зависимостей.
+
+Для эксперимента по ML воспроизводимость требует больше, чем файл блокировки, и каждая часть обходится дёшево:
+
+1. **Коммитьте `pyproject.toml` и файл блокировки** вместе с кодом и пересоздавайте окружение из них (`uv sync`), никогда — вручную.
+2. **Зафиксируйте версию интерпретатора.** `requires-python` задаёт диапазон; файл `.python-version` (его пишет `uv init`) или разрешение в файле блокировки закрепляет то, что использует проект.
+3. **Учитывайте платформу.** Колёса со скомпилированным кодом различаются по операционной системе, процессору и, для PyTorch, версии CUDA; файл блокировки может охватывать несколько платформ, но результат, полученный на машине с GPU, воспроизводится на машине того же типа.
+4. **Записывайте версии вместе с результатами.** `importlib.metadata.version("numpy")` возвращает установленную версию; сохраняйте её, коммит git и начальные значения генераторов случайных чисел (seeds) в журнале каждого запуска.
+5. **Знайте, чего файл блокировки исправить не может.** Некоторые GPU-ядра недетерминированы, а суммы с плавающей точкой зависят от порядка операций; тогда одно и то же окружение даёт результаты, равные с точностью до допуска, а не побитово. [Курс «Глубокое обучение»](/ru/notes/deep-learning/pytorch-and-autograd) по этой причине задаёт начальные значения генераторов.
+
+<aside class="callout"><strong>Проверьте себя.</strong> (1) `train.py` выполняет `import utils`, а `utils.py` печатает строку в начале. `train.py` также импортирует `model.py`, который тоже импортирует `utils`. Сколько раз напечатается строка и почему? (2) Ноутбук коллеги падает с `ModuleNotFoundError: No module named 'pandas'`, хотя `pip install pandas` в терминале прошёл успешно. Назовите вероятную причину и команду, которая её покажет. (3) Почему `python shop/payments/report.py` падает на относительном импорте, а `python -m shop.payments.report` работает? (4) Скрипт запускает `DataLoader` с четырьмя рабочими процессами, а его цикл обучения стоит на верхнем уровне, без проверки `__name__`. Что произойдёт в macOS? (5) Что записывает файл блокировки такого, чего не записывает `dependencies = ["numpy>=2.3"]`, и почему такое разделение правильно?<details><summary>Ответы</summary>(1) Один раз. Первый импорт выполняет `utils.py` и сохраняет модуль в `sys.modules`; второй находит его там и только связывает имя. (2) Ядро ноутбука запускает другой интерпретатор или окружение, чем `pip` в терминале. В ноутбуке `import sys; sys.executable` показывает, какой это интерпретатор, а `python -m pip install` с этим интерпретатором (или `%pip install` в ноутбуке) устанавливает в нужное место. (3) Запущенный как файл, модуль — это `__main__` без пакета, поэтому `..` не на что ссылаться. Запущенный через `-m` по имени с точками, он — `shop.payments.report`, его `__package__` — `shop.payments`, и `..cart` — это `shop.cart`. (4) Рабочие процессы запускаются методом `spawn`, который заново импортирует главный модуль в каждом процессе, поэтому каждый рабочий процесс начинает цикл обучения и пытается создать собственные рабочие процессы; `multiprocessing` пресекает это ошибкой `RuntimeError`, сообщающей, что новый процесс был запущен до того, как текущий завершил фазу начальной загрузки, и требующей проверки `if __name__ == "__main__":`. (5) Точную версию каждого пакета, прямого и косвенного, его источник и хеши файлов. Диапазон говорит, что код поддерживает, — это нужно библиотеке, чтобы её можно было сочетать с другими; блокировка говорит, что на самом деле содержало одно окружение, — это нужно эксперименту, чтобы его можно было повторить.</details></aside>
+
+## Что изменилось \{#what-changed\}
+
+| | Один длинный файл (отправная точка) | Модули, пакеты и окружения |
+| --- | --- | --- |
+| Повторное использование кода | копирование и вставка | `import` из модуля или пакета |
+| Сколько раз выполняется общий код | каждая копия отдельно | один раз за процесс, кэш в `sys.modules` |
+| Где ищет Python | только в папке скрипта | `sys.path`: папка скрипта, стандартная библиотека, `site-packages` окружения |
+| Версии библиотек | что установлено глобально | своё для каждого проекта, в виртуальном окружении |
+| Объявление зависимостей | в README, если вообще | `pyproject.toml`, в виде диапазонов |
+| Повторение эксперимента | надежда | файл блокировки, версия Python и записанные версии |
+
+## Ограничения \{#limitations\}
+
+- Систему импорта можно расширять собственными искателями и загрузчиками, хуками импорта и `importlib.resources` для файлов данных; заметка показывает только путь по умолчанию.
+- Упаковка библиотеки для других — с бэкендами сборки, колёсами для нескольких платформ и публикацией на PyPI — отдельная тема; её охватывает [Python Packaging User Guide](#references).
+- Версии инструментов меняются быстро: команды здесь — команды uv 0.12.9 и pip 26.2.1. Стандарты, которые они реализуют (PEP 440, 621, 735, 751), меняются медленно.
+- Python 3.15, выпущенный в октябре 2026 года, добавляет явные отложенные импорты, `lazy import json`, которые откладывают загрузку модуля до его первого использования ([PEP 810](#references), принят в ноябре 2025 года). Описанное здесь поведение обычного `import` не меняется.
+
+## Что нужно запомнить \{#what-you-should-remember\}
+
+- `import` проверяет `sys.modules`, спрашивает искателей, просматривает `sys.path` по порядку, один раз выполняет модуль и связывает имя. Побеждает первое совпадение в `sys.path`, поэтому никогда не называйте файл именем библиотеки.
+- `if __name__ == "__main__":` отделяет программную часть файла от библиотечной; скриптам, которые запускают рабочие процессы, эта проверка необходима.
+- Пакет — это папка с `__init__.py`; относительные импорты работают внутри пакетов, поэтому модули пакета запускают через `python -m`.
+- Виртуальное окружение — это папка с собственным `site-packages`, которую интерпретатор находит через `pyvenv.cfg`. Одно на проект, пересоздаётся, а не копируется.
+- `pyproject.toml` объявляет диапазоны; файл блокировки записывает точные версии и хеши. Для экспериментов коммитьте оба и записывайте версии вместе с результатами.
+
+## Код \{#code\}
+
+Скрипт строит небольшой проект во временной папке и прогоняет на нём систему импорта: кэш, спецификацию модуля, пакет с относительными импортами, искатели и источники (origins), о которых сообщает `find_spec`, `__name__` в модуле, запущенном как программа, относительный импорт, запущенный обоими способами, заслонение `random` и новое виртуальное окружение. Ему нужна только стандартная библиотека и не нужна сеть; запуск — `python -I modules.py`. Он работает меньше секунды и в конце удаляет свою папку.
+
+```python
+"""Modules, packages and environments: the import system at work, in a temporary folder (Python 3.14)."""
+import importlib
+import importlib.metadata
+import importlib.util
+import shutil
+import subprocess
+import sys
+import tempfile
+import venv
+from pathlib import Path
+
+root = Path(tempfile.mkdtemp())
+files = {
+    "helpers.py": 'print("running helpers.py as", __name__)\nRATE = 0.2\n'
+                  'def tax(x):\n    return x * RATE\n'
+                  'if __name__ == "__main__":\n    print("tax(100) =", tax(100))\n',
+    "shop/__init__.py": 'print("initializing package", __name__)\nfrom .cart import Cart\n',
+    "shop/cart.py": "from .payments.card import charge\n\nclass Cart:\n    def __init__(self):\n"
+                    "        self.items = []\n    def checkout(self):\n        return charge(sum(self.items))\n",
+    "shop/payments/__init__.py": "",
+    "shop/payments/card.py": 'def charge(amount):\n    return f"charged {amount}"\n',
+    "shop/payments/report.py": "from ..cart import Cart\nprint('report sees', Cart.__name__)\n",
+    "shadow/random.py": 'print("my own random.py")\n',
+    "shadow/game.py": "import random\nprint(random.randint(1, 6))\n",
+}
+for name, text in files.items():
+    (root / name).parent.mkdir(parents=True, exist_ok=True)
+    (root / name).write_text(text)
+
+# 1. sys.path определяет, где ищет импорт; -I не включает папку скрипта, поэтому добавляем нашу
+print("isolated:", bool(sys.flags.isolated), "| first entries:", [Path(p).name for p in sys.path[:2]])
+sys.path.insert(0, str(root))
+
+# 2. Модуль выполняется один раз; последующие импорты возвращают объект из кэша sys.modules
+import helpers
+import helpers
+print(helpers.tax(50), sys.modules["helpers"] is helpers, Path(helpers.__file__).name)
+print("spec:", helpers.__spec__.name, "found by", type(helpers.__spec__.loader).__name__)
+importlib.reload(helpers)                       # снова выполняет файл в тот же объект модуля
+
+# 3. Пакет: его импорт выполняет __init__.py; подмодули используют относительные импорты
+import shop
+cart = shop.Cart()
+cart.items += [3, 4]
+print(cart.checkout(), sorted(m for m in sys.modules if m.startswith("shop")))
+print("package path:", Path(shop.__path__[0]).name, "| cart.__package__:", shop.cart.__package__)
+
+# 4. Искатели из sys.meta_path и что find_spec сообщает о модулях трёх видов
+print([f.__name__ if isinstance(f, type) else type(f).__name__ for f in sys.meta_path])  # инструменты могут добавить свои
+for name in ("sys", "json", "helpers"):
+    spec = importlib.util.find_spec(name)
+    origin = spec.origin if spec.origin in ("built-in", "frozen") else Path(spec.origin).name
+    print(f"  {name:8s} origin={origin:12s} package={spec.submodule_search_locations is not None}")
+
+# 5. __name__: "__main__" при запуске, имя модуля при импорте; -m запускает модуль, найденный по имени
+def run(*args, cwd=root, python=sys.executable):
+    out = subprocess.run([python, *args], cwd=cwd, capture_output=True, text=True)
+    return (out.stdout + out.stderr).strip().splitlines()
+
+print(run("helpers.py"))
+print(run("shop/payments/report.py")[-1])      # относительный импорт в файле, запущенном как скрипт
+print(run("-m", "shop.payments.report"))       # тот же файл, запущенный как модуль своего пакета
+print(run("game.py", cwd=root / "shadow")[-1][:62] + " ...")
+
+# 6. Виртуальное окружение: свой site-packages, та же стандартная библиотека
+env = root / ".venv"
+venv.create(env, with_pip=False)
+print([line.split(" = ")[0] for line in (env / "pyvenv.cfg").read_text().splitlines()])
+env_python = env / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")
+print(run("-I", "-c", "import sys; print(sys.prefix != sys.base_prefix, sys.path[-1].endswith('site-packages'))",
+          python=env_python))
+
+# 7. Какие версии в этом окружении? Записываем их с каждым экспериментом
+for dist in ("numpy", "pandas"):
+    try:
+        print(dist, importlib.metadata.version(dist))
+    except importlib.metadata.PackageNotFoundError:
+        print(dist, "not installed in this environment")
+
+shutil.rmtree(root)                            # удаляем временную папку
+
+# Вывод в CPython 3.14.7 на macOS (arm64), запуск в окружении, созданном uv
+# (uv добавляет искатель _Finder; у обычного интерпретатора только три остальных):
+# isolated: True | first entries: ['python314.zip', 'python3.14']
+# running helpers.py as helpers
+# 10.0 True helpers.py
+# spec: helpers found by SourceFileLoader
+# running helpers.py as helpers
+# initializing package shop
+# charged 7 ['shop', 'shop.cart', 'shop.payments', 'shop.payments.card']
+# package path: shop | cart.__package__: shop
+# ['_Finder', 'BuiltinImporter', 'FrozenImporter', 'PathFinder']
+#   sys      origin=built-in     package=False
+#   json     origin=__init__.py  package=True
+#   helpers  origin=helpers.py   package=False
+# ['running helpers.py as __main__', 'tax(100) = 20.0']
+# ImportError: attempted relative import with no known parent package
+# ['initializing package shop', 'report sees Cart']
+# AttributeError: module 'random' has no attribute 'randint' (co ...
+# ['home', 'include-system-site-packages', 'version', 'executable', 'command']
+# ['True True']
+# numpy 2.5.4
+# pandas 3.0.6
+```
+
+Первая строка показывает изолированный режим в действии: `sys.path` начинается со стандартной библиотеки, а не с папки скрипта. `importlib.reload` напечатал строку `helpers` второй раз; это единственный способ снова выполнить код модуля в том же процессе, и он обновляет существующий объект модуля, а не создаёт новый. Две последние строки зависят от того, что установлено в окружении.
+
+## Дальше \{#next\}
+
+Модули этой заметки теперь можно импортировать откуда угодно, а `pyproject.toml` говорит, какие версии NumPy и pandas им нужны. Чего они по-прежнему не говорят — что принимают и возвращают их собственные функции: принимает ли `tax` число с плавающей точкой или строку, может ли функция вернуть `None`. [Следующая заметка](/ru/notes/python/type-hints) добавляет эти сведения в виде аннотаций типов и показывает, что Python 3.14 делает с ними во время выполнения (почти ничего) и что с ними делает проверяющая программа типов до запуска программы.
+
+## Литература \{#references\}
+
+- Документация Python (3.14): [The import system](https://docs.python.org/3.14/reference/import.html); [Modules](https://docs.python.org/3.14/tutorial/modules.html) в учебнике; [`importlib`](https://docs.python.org/3.14/library/importlib.html) и [`importlib.metadata`](https://docs.python.org/3.14/library/importlib.metadata.html); [The initialization of the `sys.path` module search path](https://docs.python.org/3.14/library/sys_path_init.html); [`venv`](https://docs.python.org/3.14/library/venv.html) (How venvs work); [`__main__`](https://docs.python.org/3.14/library/__main__.html); [Command line and environment](https://docs.python.org/3.14/using/cmdline.html) (`-I`, `-P`, `-m`).
+- PEP: [PEP 328](https://peps.python.org/pep-0328/) (абсолютные и относительные импорты); [PEP 420](https://peps.python.org/pep-0420/) (пакеты пространства имён); [PEP 440](https://peps.python.org/pep-0440/) (спецификаторы версий); [PEP 518](https://peps.python.org/pep-0518/) (требования системы сборки); [PEP 621](https://peps.python.org/pep-0621/) (метаданные проекта в `pyproject.toml`); [PEP 668](https://peps.python.org/pep-0668/) (внешне управляемые окружения); [PEP 735](https://peps.python.org/pep-0735/) (группы зависимостей); [PEP 751](https://peps.python.org/pep-0751/) (формат файла для записи зависимостей, `pylock.toml`); [PEP 810](https://peps.python.org/pep-0810/) (явные отложенные импорты, Python 3.15).
+- [Python Packaging User Guide](https://packaging.python.org/), Python Packaging Authority.
+- [Документация pip](https://pip.pypa.io/), включая `pip lock`.
+- Astral. [Документация uv](https://docs.astral.sh/uv/): проекты, `uv.lock`, `uv export`.
+- L. Ramalho. *Fluent Python*, 2nd ed. O'Reilly, 2022.
+- B. Slatkin. *Effective Python*, 3rd ed. Addison-Wesley. Глава о совместной работе (модули, пакеты, виртуальные окружения).
+- D. Beazley, B. K. Jones. *Python Cookbook*, 3rd ed. O'Reilly, 2013. Гл. 10 (модули и пакеты).

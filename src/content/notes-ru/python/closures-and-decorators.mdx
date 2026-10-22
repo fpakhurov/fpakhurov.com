@@ -1,0 +1,606 @@
+---
+title: Замыкания и декораторы
+description: "Функции как объекты; замыкания и ячейки, которые сохраняют переменные объемлющего вызова, и ловушка позднего связывания в циклах; декораторы как f = deco(f), functools.wraps, декораторы с аргументами и декораторы классов; functools.cache, lru_cache и partial; где их использует код машинного обучения."
+course: python
+section: Абстракции
+order: 11
+status: published
+tags: [python, functions, first-class-functions, closures, cells, nonlocal, late-binding, decorators, functools, wraps, cache, lru-cache, partial, registry]
+prerequisites: [Функции, Модель данных]
+---
+
+import DecoratorWrap from '../../../components/figures/closures-and-decorators/DecoratorWrap.astro';
+import FibCalls from '../../../components/figures/closures-and-decorators/FibCalls.astro';
+
+[Предыдущая заметка](/ru/notes/python/the-data-model) закончилась объектом, который ведёт себя как функция: экземпляром класса с `__call__`, который помнит множитель между вызовами. Собственные функции Python — тоже объекты, типа `function`, и они умеют то же самое без всякого класса: функция, определённая внутри другой функции, помнит переменные вызова, который её создал. Это **замыкание** (closure), а замыкания — материал для **декораторов** (decorators), строк `@name` над определением, которые добавляют функции замер времени, журналирование, кэширование или регистрацию, не трогая её тело. В этой заметке мы разбираем, что хранит объект функции, как замыкание хранит свои переменные, какую ловушку это хранение ставит в циклах и как из замыканий строятся декораторы, вплоть до тех, которыми курсы по ML пользуются каждый день.
+
+## Функции — это объекты \{#functions-are-objects\}
+
+`def` создаёт объект функции и связывает с ним имя, как любое присваивание из [заметки об именах](/ru/notes/python/values-and-names). Этот объект можно связать с другими именами, положить в контейнер и передать другим функциям:
+
+```python
+def square(x):
+    """Return x squared."""
+    return x * x
+```
+
+```text
+>>> f = square
+>>> f(7), f is square, f.__name__, f.__doc__
+(49, True, 'square', 'Return x squared.')
+>>> type(square)
+<class 'function'>
+>>> ops = {"sq": square, "neg": lambda x: -x}
+>>> ops["neg"](5)
+-5
+>>> sorted(["pear", "fig", "banana"], key=len)
+['fig', 'pear', 'banana']
+```
+
+`f = square` ничего не копирует: оба имени ссылаются на один объект функции, у которого `__name__` по-прежнему `'square'`. `lambda` — форма `def` в виде выражения, ограниченная одним выражением, и создаёт объект того же вида. Передача функции другой функции, как `key=len` передаёт `len` в `sorted`, — основной способ настройки поведения в Python; функция, которая принимает или возвращает функции, называется **функцией высшего порядка** (higher-order function).
+
+Объект функции несёт больше, чем свой код: `__code__` (скомпилированный байт-код и имена переменных), `__defaults__` (значения параметров по умолчанию, которые вычисляются один раз, когда выполняется `def`, — отсюда ловушка изменяемого значения по умолчанию из [заметки о функциях](/ru/notes/python/functions)) и, у вложенной функции, `__closure__`.
+
+## Отправная точка: одни и те же строки в каждой функции \{#baseline-the-same-lines-in-every-function\}
+
+Допустим, несколько функций программы должны сообщать, с какими аргументами их вызвали и что они вернули, чтобы отследить ошибку. Прямой путь — отредактировать каждую из них:
+
+```python
+def add(a, b):
+    result = a + b
+    print(f"add{(a, b)} -> {result!r}")
+    return result
+
+def scale(x, k):
+    result = x * k
+    print(f"scale{(x, k)} -> {result!r}")
+    return result
+```
+
+Строки трассировки одинаковы во всех функциях, они заслоняют единственную строку, которая делает работу, а чтобы потом их убрать, придётся снова править каждую функцию. Нам нужно написать трассировку один раз и применять её к любой функции снаружи. Для этого нужна функция, которая принимает функцию и возвращает новую, помнящую старую, — замыкание.
+
+## Замыкания: функции, которые помнят \{#closures-functions-that-remember\}
+
+Функция, определённая внутри другой, может использовать переменные объемлющей функции и сохраняет к ним доступ после того, как объемлющий вызов завершился:
+
+```python
+def make_counter():
+    count = 0
+    def increment():
+        nonlocal count
+        count += 1
+        return count
+    return increment
+```
+
+```text
+>>> c1 = make_counter()
+>>> c2 = make_counter()
+>>> c1(), c1(), c1(), c2()
+(1, 2, 3, 1)
+>>> c1.__code__.co_freevars
+('count',)
+>>> c1.__closure__
+(<cell at 0x106750490: int object at 0x101924910>,)
+>>> c1.__closure__[0].cell_contents
+3
+```
+
+**Правило.** Когда компилятор видит, что внутренняя функция использует переменную объемлющей функции, он не хранит эту переменную в кадре объемлющего вызова как обычную локальную. Он хранит её в **ячейке** (cell) — маленьком объекте, который держит одну ссылку. Объемлющая функция читает и пишет переменную через ячейку; внутренний объект функции при создании получает кортеж нужных ему ячеек — свой `__closure__`. Имена этих переменных — **свободные переменные** (free variables) внутреннего кода, `co_freevars`. Когда `make_counter` возвращает управление, её кадр исчезает, но ячейка остаётся жить, потому что на неё по-прежнему ссылается функция `increment`.
+
+Каждый вызов `make_counter` создаёт новую ячейку и новую внутреннюю функцию, поэтому `c1` и `c2` считают независимо. Это та же работа, которую класс `Scale` из предыдущей заметки делал с помощью атрибута; замыкание — более лёгкий инструмент, когда состояние — одна-две переменные, а поведение — одна функция.
+
+**`nonlocal`.** Чтение объемлющей переменной ничего не требует. Присваивание требует, потому что присваивание внутри функции делает имя локальным для этой функции, и решается это при компиляции функции:
+
+```python
+def make_counter():
+    count = 0
+    def increment():
+        count += 1
+        return count
+    return increment
+```
+
+```text
+>>> make_counter()()
+Traceback (most recent call last):
+  ...
+UnboundLocalError: cannot access local variable 'count' where it is not associated with a value
+```
+
+`count += 1` читает `count` до присваивания, а поскольку присваивание делает `count` локальной для `increment`, чтение находит локальную переменную, у которой ещё нет значения. `nonlocal count` объявляет, что имя ссылается на переменную объемлющей функции, то есть на ячейку. (`global` делает то же для имён уровня модуля.)
+
+## Ловушка позднего связывания \{#the-late-binding-trap\}
+
+Замыкание хранит переменную, а не её значение в момент создания внутренней функции. Оно читает переменную, когда его вызывают; это называется **поздним связыванием** (late binding):
+
+```text
+>>> fns = [lambda: i for i in range(3)]
+>>> [f() for f in fns]
+[2, 2, 2]
+```
+
+Все три лямбды ссылаются на одну переменную `i` в одной ячейке. К моменту их вызова цикл уже закончился, и `i` равно 2. То же происходит с `def` внутри обычного цикла `for` и даже после цикла: последующее присваивание переменной меняет то, что видит каждое замыкание.
+
+```text
+>>> handlers = []
+>>> for name in ["a", "b"]:
+...     def h():
+...         return name
+...     handlers.append(h)
+...
+>>> [h() for h in handlers]
+['b', 'b']
+>>> name = "z"
+>>> [h() for h in handlers]
+['z', 'z']
+```
+
+Узнать ошибку можно по симптому: несколько функций, созданных в цикле, ведут себя как последняя. Исправлений два, и оба дают каждой функции своё значение в момент создания:
+
+```text
+>>> fns = [lambda i=i: i for i in range(3)]
+>>> [f() for f in fns]
+[0, 1, 2]
+>>> def make(n):
+...     return lambda: n
+...
+>>> [f() for f in [make(i) for i in range(3)]]
+[0, 1, 2]
+```
+
+Значение по умолчанию вычисляется, когда создаётся `lambda`, поэтому `i=i` копирует текущее значение в параметр. Функция-фабрика вроде `make` при каждом вызове создаёт новую ячейку. `functools.partial`, о которой ниже, — третий способ. Ловушка важна в коде графических интерфейсов и обратных вызовов, а также в коде ML, который в цикле строит список расписаний шага обучения или хуков.
+
+## Декораторы: `f = deco(f)` \{#decorators-f--decof\}
+
+**Декоратор** — это вызываемый объект, который принимает функцию и возвращает ей замену. Замена обычно — замыкание, которое вызывает оригинал:
+
+```python
+def logged(func):
+    def wrapper(*args, **kwargs):
+        print(f"calling {func.__name__}{args}")
+        result = func(*args, **kwargs)
+        print(f"{func.__name__} returned {result!r}")
+        return result
+    return wrapper
+
+@logged
+def add(a, b):
+    """Add two numbers."""
+    return a + b
+```
+
+```text
+>>> add(2, 3)
+calling add(2, 3)
+add returned 5
+5
+>>> add.__name__, add.__doc__
+('wrapper', None)
+>>> add.__closure__[0].cell_contents
+<function add at 0x10a3d0460>
+```
+
+<aside class="callout"><strong>Ключевая идея.</strong> `@deco` над `def f` означает `f = deco(f)` и выполняется один раз, когда выполняется определение. Декоратор получает новый объект функции, и то, что он возвращает, связывается с именем `f` вместо неё. Обёртка (wrapper), определённая внутри декоратора, держит оригинал в своём замыкании и выполняет код до и после его вызова. В исходной функции ничего не меняется; меняется объект, на который ссылается имя.</aside>
+
+<DecoratorWrap />
+
+1. `def logged` связывает имя `logged`. Когда Python доходит до `def add`, он создаёт исходный объект функции, но пока не связывает с ним `add`.
+2. Python вызывает `logged`, передавая оригинал. Внутри вызова параметр `func` ссылается на него через ячейку, потому что внутренняя функция использует `func`.
+3. `def wrapper` создаёт новый объект функции, `__closure__` которого содержит эту ячейку.
+4. `logged` возвращает `wrapper`, и имя `add` связывается с ним. Последняя строка сеанса показывает оригинал, по-прежнему живой, внутри ячейки обёртки.
+5. `add(2, 3)` вызывает `wrapper(2, 3)`. `*args` собирает `(2, 3)`, обёртка печатает строку, вызывает оригинал через ячейку с теми же аргументами, снова печатает и возвращает 5.
+
+Строка с `@` — чистый синтаксис. Запись `add = logged(add)` после недекорированного `def` даёт тот же эффект, за исключением того, что с `@` недекорированная функция никогда, даже на мгновение, не связывается с именем ([справочник Python, определения функций](#references)). Из «выполняется один раз, когда выполняется определение» следуют два вывода:
+
+- **Код декоратора выполняется при импорте.** Декоратор, который что-то печатает, регистрирует или проверяет, делает это при загрузке модуля, до любого вызова. На этом держатся реестры (ниже).
+- **`*args, **kwargs` делают обёртку универсальной.** Обёртка не знает сигнатуры функции, которую оборачивает, поэтому принимает любые позиционные и именованные аргументы и передаёт их без изменений — упаковка и распаковка из [заметки о функциях](/ru/notes/python/functions).
+
+## Сохранить имя: `functools.wraps` \{#keeping-the-name-functoolswraps\}
+
+У сеанса выше есть изъян: после декорирования `add.__name__` равно `'wrapper'`, а строка документации пропала. `help(add)`, `repr(add)` и любой инструмент, который сообщает о функции по её `__name__`, например строка журнала или реестр, показывают не то имя. `functools.wraps` — декоратор для обёртки, который копирует на неё метаданные оригинала:
+
+```python
+import functools
+
+def logged(func):
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        print(f"calling {func.__name__}{args}")
+        return func(*args, **kwargs)
+    return wrapper
+```
+
+```text
+>>> add.__name__, add.__doc__, add.__wrapped__
+('add', 'Add two numbers.', <function add at 0x10a3d0880>)
+>>> add.__wrapped__(2, 3)
+5
+>>> import inspect
+>>> inspect.signature(add)
+<Signature (a, b)>
+```
+
+(Здесь `add` декорирована новой версией `logged`.) `wraps` копирует `__module__`, `__name__`, `__qualname__`, `__doc__` и словарь атрибутов функции и добавляет `__wrapped__` — ссылку на оригинал. `inspect.signature` следует по `__wrapped__`, и поэтому инструменты документации и IDE показывают `(a, b)`, а не `(*args, **kwargs)`. Используйте `wraps` в каждом декораторе, который возвращает обёртку.
+
+## Декораторы с аргументами \{#decorators-with-arguments\}
+
+`@retry(times=3)` или `@repeat(3)` выглядят как декораторы с аргументами. Особого синтаксиса за ними нет: выражение после `@` вычисляется первым, и его результат и есть декоратор. Значит, `repeat(3)` должен вернуть декоратор, а это ещё один уровень вложенности:
+
+```python
+def repeat(times):
+    def decorate(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            return [func(*args, **kwargs) for _ in range(times)]
+        return wrapper
+    return decorate
+
+@repeat(3)
+def roll():
+    return "six"
+```
+
+```text
+>>> roll()
+['six', 'six', 'six']
+```
+
+`@repeat(3)` над `def roll` означает `roll = repeat(3)(roll)`. Три функции, три роли: `repeat` получает аргументы, `decorate` получает функцию, `wrapper` получает аргументы каждого вызова, и каждая внутренняя — замыкание над переменными внешних.
+
+**Типичная ошибка: забытые скобки.** `@repeat` без `(3)` передаёт саму функцию в качестве `times` и связывает имя с `decorate`:
+
+```text
+>>> @repeat
+... def oops():
+...     return 1
+...
+>>> oops()
+Traceback (most recent call last):
+  ...
+TypeError: repeat.<locals>.decorate() missing 1 required positional argument: 'func'
+```
+
+Подсказка — квалифицированное имя `repeat.<locals>.decorate` в сообщении: имя `oops` ссылается на среднюю функцию. Та же ошибка часто встречается с библиотечными декораторами, которые в документации показаны со скобками, например `@torch.no_grad()`.
+
+**Стопка декораторов.** Несколько декораторов применяются снизу вверх: первым — ближайший к `def`.
+
+```python
+def bold(f):
+    return lambda: "<b>" + f() + "</b>"
+
+def italic(f):
+    return lambda: "<i>" + f() + "</i>"
+
+@bold
+@italic
+def hello():
+    return "hi"
+```
+
+```text
+>>> hello()
+'<b><i>hi</i></b>'
+```
+
+Это `hello = bold(italic(hello))`. Порядок важен, когда декораторы взаимодействуют: кэш, поставленный над декоратором замера времени, кэширует функцию вместе с замером, так что вызовы из кэша не замеряются; поставленный под ним, кэш оставляет замер на каждом вызове и кэширует только работу внутри.
+
+## Декорирование классов и реестры \{#decorating-classes-and-registries\}
+
+Декоратор можно применить к классу с тем же смыслом: `@deco` над `class C` — это `C = deco(C)`. Декоратор класса обычно меняет класс на месте и возвращает его. Таков `@dataclass` из [заметки о классах](/ru/notes/python/classes-and-objects#dataclasses): он читает аннотации и добавляет в класс `__init__`, `__repr__` и `__eq__`. Маленький декоратор, написанный вручную:
+
+```python
+def add_repr(cls):
+    def __repr__(self):
+        fields = ", ".join(f"{k}={v!r}" for k, v in vars(self).items())
+        return f"{cls.__name__}({fields})"
+    cls.__repr__ = __repr__
+    return cls
+
+@add_repr
+class Run:
+    def __init__(self, lr, seed):
+        self.lr = lr
+        self.seed = seed
+```
+
+```text
+>>> Run(0.01, 42)
+Run(lr=0.01, seed=42)
+```
+
+Декоратор не обязан ничего оборачивать. Декоратор-**реестр** (registry) записывает функцию или класс в словарь и возвращает их без изменений. Поскольку декораторы выполняются при импорте модуля, импорт модуля заполняет реестр:
+
+```python
+MODELS = {}
+
+def register_model(name):
+    def decorate(cls):
+        MODELS[name] = cls
+        return cls
+    return decorate
+
+@register_model("linear")
+class Linear:
+    def __init__(self, n):
+        self.n = n
+
+@register_model("mlp")
+class MLP:
+    def __init__(self, n):
+        self.n = n
+```
+
+```text
+>>> MODELS
+{'linear': <class '__main__.Linear'>, 'mlp': <class '__main__.MLP'>}
+>>> model = MODELS["mlp"](16)
+>>> type(model).__name__, model.n
+('MLP', 16)
+```
+
+Так обучающий скрипт может выбрать модель по строке из файла конфигурации, `MODELS[config["model"]](...)`, без отдельного `if` для каждой модели. Так организуют свои модели, наборы данных и функции потерь библиотеки вроде timm, Detectron2 и MMDetection. Загвоздка — импорт: модели, модуль которой ни разу не импортировали, в реестре нет, поэтому такие библиотеки импортируют все модули моделей из `__init__.py` пакета ([следующая заметка](/ru/notes/python/modules-and-packages)).
+
+## Кэширование: `functools.cache` и `lru_cache` \{#caching-functoolscache-and-lru_cache\}
+
+`functools.cache` — декоратор из стандартной библиотеки, который сохраняет каждый результат под его аргументами и возвращает сохранённый результат, когда те же аргументы приходят снова. Классический пример — рекурсия, которая заново вычисляет одни и те же значения:
+
+```python
+import functools
+
+@functools.cache
+def fib(n):
+    return n if n < 2 else fib(n - 1) + fib(n - 2)
+```
+
+**Почему это важно: вывод.** Пусть без кэша $c(n)$ — число вызовов, которое делает `fib(n)`, включая его самого. Тогда $c(0) = c(1) = 1$, а при $n \ge 2$ вызов — это он сам плюс два рекурсивных вызова:
+
+$$
+c(n) = 1 + c(n-1) + c(n-2).
+$$
+
+Прибавив 1 к обеим частям, получаем $c(n) + 1 = \bigl(c(n-1) + 1\bigr) + \bigl(c(n-2) + 1\bigr)$, так что $c(n) + 1$ удовлетворяет рекуррентному соотношению Фибоначчи, причём $c(0) + 1 = c(1) + 1 = 2 = 2F_1 = 2F_2$, где $F_1 = F_2 = 1$ — числа Фибоначчи. Отсюда
+
+$$
+c(n) = 2F_{n+1} - 1,
+$$
+
+что растёт как $\varphi^n$ с $\varphi = (1 + \sqrt5)/2 \approx 1.618$: 177 вызовов при $n = 10$ и 2 692 537 при $n = 30$. С кэшем `fib(k)` выполняет своё тело один раз для каждого $k$ от $0$ до $n$: $n + 1$ вызовов не находят результата в кэше, а каждый остальной вызов — поиск в словаре.
+
+<FibCalls />
+
+```text
+>>> fib(80)
+23416728348467685
+>>> fib.cache_info()
+CacheInfo(hits=78, misses=81, maxsize=None, currsize=81)
+```
+
+81 промах кэша при $n = 80$, как и предсказывает $n + 1$; версии без кэша понадобилось бы $2F_{81} - 1 \approx 7.6 \times 10^{16}$ вызовов. В разделе «Код» обычный `fib(25)` делает 242 785 вызовов за 31 мс, а кэшированный — 26 вызовов за 0.01 мс (CPython 3.14.7, Apple M1, по одному запуску; время меняется между запусками и машинами, число вызовов — нет).
+
+Правила и их следствия:
+
+- **Аргументы служат ключом, поэтому они должны быть хешируемыми.** `fib([1])` возбуждает `TypeError: unhashable type: 'list'` по причине, которую привела [заметка о модели данных](/ru/notes/python/the-data-model#equality-and-hashing-__eq__-and-__hash__).
+- **`cache` ничего не забывает.** Это `lru_cache(maxsize=None)`, добавленный в Python 3.9. `@functools.lru_cache(maxsize=128)` хранит только 128 последних использованных результатов и, заполнившись, вытесняет тот, что использовался давнее всех; это ограничивает память для функций, которые вызываются с множеством разных аргументов.
+- **Только для чистых функций.** Кэшированная функция, которая читает файл, часы или глобальную переменную, вернёт устаревший ответ, когда они изменятся. `fib.cache_clear()` очищает кэш.
+- **Осторожно с методами.** Декорирование метода через `@cache` сохраняет `self` в ключе, и каждый экземпляр живёт столько же, сколько кэш; `functools.cached_property` вместо этого кэширует вычисляемый атрибут в самом экземпляре.
+
+**`functools.partial`** — другой повседневный инструмент `functools`. Он фиксирует часть аргументов функции и возвращает вызываемый объект, который принимает остальные:
+
+```text
+>>> int2 = functools.partial(int, base=2)
+>>> int2("1011")
+11
+```
+
+Это третье исправление ловушки позднего связывания, поскольку `partial` захватывает значения в момент своего создания, и обычный способ передать настроенную функцию туда, где ожидается функция одного аргумента, например `collate_fn` для `DataLoader` в PyTorch.
+
+## Где декораторы используются в коде ML \{#where-ml-code-uses-decorators\}
+
+- **`@torch.no_grad()`** выключает запись градиентов на время каждого вызова декорированной функции, обычно функции оценки модели. Тот же объект работает и как контекстный менеджер, `with torch.no_grad():`, потому что его класс происходит от вспомогательного класса, превращающего `__enter__` и `__exit__` в декоратор, как это делает `contextlib.ContextDecorator` в разделе «Код» ([Глубокое обучение](/ru/notes/deep-learning/pytorch-and-autograd#the-training-pipeline)). `@torch.compile` заменяет функцию или модуль скомпилированной версией.
+- **`@property`** из [заметки о классах](/ru/notes/python/classes-and-objects#properties) — декоратор, как и `@classmethod`, `@staticmethod` и `@dataclass`.
+- **Реестры** отображают имена из файлов конфигурации в классы, как выше.
+- **`@functools.cache`** не даёт построить дорогой объект, например загруженный токенизатор, дважды.
+- **`@pytest.fixture` и `@pytest.mark.parametrize`** регистрируют вспомогательные функции тестов и параметры ([Тестирование](/ru/notes/python/testing)).
+
+<aside class="callout"><strong>Проверьте себя.</strong> (1) `def outer(): x = 1; def inner(): return x; x = 2; return inner`. Что возвращает `outer()()` и почему? (2) Список кнопок строится в цикле с `callback=lambda: print(name)`. Каждая кнопка печатает последнее имя. Предложите два исправления. (3) Перепишите `@a(1)` `@b` над `def f` в виде обычных присваиваний. (4) Декоратор без `functools.wraps` применён к `train`. Что показывают `train.__name__` и трассировка (traceback), проходящая через `train`? (5) Почему `@functools.cache` на функции, принимающей массив NumPy, не работает, и что кэшировать вместо этого?<details><summary>Ответы</summary>(1) 2. `inner` читает `x` через ячейку в момент вызова, а к тому времени `outer` записал в ячейку 2. (2) Связать значение в момент создания: `callback=lambda name=name: print(name)`, или `callback=functools.partial(print, name)`, или функция-фабрика `make_callback(name)`, возвращающая лямбду. (3) `f = a(1)(b(f))`: сначала применяется `b`, затем декоратор, который вернул `a(1)`. (4) `train.__name__` равно `'wrapper'` (или другое имя внутренней функции), а трассировка показывает кадр `wrapper`, а за ним кадр исходной `train`. С `wraps` `train.__name__` равно `'train'`, но трассировка по-прежнему показывает кадр `wrapper`: она сообщает имя выполнявшегося объекта кода, а его `wraps` не меняет. (5) Массивы изменяемы и нехешируемы, поэтому построение ключа кэша возбуждает `TypeError: unhashable type`. Кэшировать по чему-то хешируемому, что определяет массив, например по пути к файлу и версии, или превращать небольшие массивы в кортежи.</details></aside>
+
+## Что изменилось \{#what-changed\}
+
+| | Скопированный код (отправная точка) | Замыкания и декораторы |
+| --- | --- | --- |
+| Где живёт код трассировки | внутри каждой функции | один раз, в `logged` |
+| Как его применить | править каждую функцию | одна строка `@logged` на функцию |
+| Как его убрать | снова править каждую функцию | удалить строку |
+| Состояние между вызовами | глобальные переменные или класс | ячейка в замыкании |
+| Метаданные функции | не меняются | сохраняются с `functools.wraps` |
+| Повторная работа в рекурсии | вычисляется заново, $2F_{n+1} - 1$ вызовов | `@functools.cache`, $n + 1$ вызовов |
+
+## Ограничения \{#limitations\}
+
+- Обёртка добавляет к каждому вызову функции вызов на уровне Python, для крошечной функции примерно столько же, сколько стоит сам вызов. Вокруг шага обучения это несущественно, а вокруг функции, которую в цикле вызывают миллионы раз, заметно.
+- Декораторы прячут поведение: читатель `add` должен знать, что делает `@logged`. Их стоит держать немногочисленными и хорошо названными.
+- Заметка не рассматривает декораторы, реализованные как классы с `__call__`, `functools.singledispatch` и точные правила `typing.ParamSpec` для аннотирования декораторов; последнего касается [заметка об аннотациях типов](/ru/notes/python/type-hints).
+- Ячейки — деталь того, как CPython хранит замыкания; язык гарантирует только поведение.
+
+## Что нужно запомнить \{#what-you-should-remember\}
+
+- Функции — объекты: их можно связывать с именами, хранить, передавать и возвращать.
+- Вложенная функция, которая использует объемлющую переменную, получает её через ячейку, переживающую объемлющий вызов. `nonlocal` позволяет внутренней функции присваивать ей.
+- Замыкания читают переменную в момент вызова, а не её значение в момент создания. В циклах значение нужно связывать аргументом по умолчанию, фабрикой или `partial`.
+- `@deco` над `def f` — это `f = deco(f)`, выполняемое один раз при определении. Декоратор с аргументами — функция, которая возвращает декоратор. Стопка декораторов применяется снизу вверх.
+- Используйте `functools.wraps` в каждой обёртке. Используйте `functools.cache` или `lru_cache` для чистых функций с хешируемыми аргументами.
+
+## Код \{#code\}
+
+Скрипт запускает каждый механизм заметки: замыкание-счётчик и его ячейку, ловушку позднего связывания и её исправление, декоратор трассировки с `wraps`, декоратор с аргументами, который повторяет неудачный вызов, реестр классов, контекстный менеджер, который работает и как декоратор, по образцу `torch.no_grad()`, число вызовов `fib(25)` с `functools.cache` и без него и `partial`. Ему нужна только стандартная библиотека; запуск — `python -I decorators.py`.
+
+```python
+"""Closures and decorators: cells, the late-binding trap, wraps, arguments, registries, caching (Python 3.14)."""
+import contextlib
+import functools
+import time
+
+
+# 1. Замыкание сохраняет переменные объемлющего вызова в ячейках
+def make_counter():
+    count = 0
+    def increment():
+        nonlocal count
+        count += 1
+        return count
+    return increment
+
+c1, c2 = make_counter(), make_counter()
+print(c1(), c1(), c1(), c2(), c1.__code__.co_freevars, c1.__closure__[0].cell_contents)
+
+# 2. Ловушка позднего связывания: замыкания видят переменную, а не её значение в момент создания
+late = [lambda: i for i in range(3)]
+early = [lambda i=i: i for i in range(3)]
+print([f() for f in late], [f() for f in early])
+
+
+# 3. Декоратор — это f = deco(f); functools.wraps копирует имя и строку документации
+def logged(func):
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        result = func(*args, **kwargs)
+        print(f"{func.__name__}{args} -> {result!r}")
+        return result
+    return wrapper
+
+@logged
+def add(a, b):
+    """Add two numbers."""
+    return a + b
+
+add(2, 3)
+print(add.__name__, add.__doc__, add.__wrapped__(2, 3))
+
+
+# 4. Декоратор с аргументами — это функция, которая возвращает декоратор
+def retry(times):
+    def decorate(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            for attempt in range(1, times + 1):
+                try:
+                    return func(*args, **kwargs)
+                except ValueError as err:
+                    print(f"attempt {attempt} failed: {err}")
+            raise RuntimeError(f"{func.__name__} failed {times} times")
+        return wrapper
+    return decorate
+
+calls = iter([ValueError("flaky"), ValueError("flaky"), "ok"])
+@retry(times=3)
+def fetch():
+    outcome = next(calls)
+    if isinstance(outcome, Exception):
+        raise outcome
+    return outcome
+
+print(fetch())
+
+
+# 5. Реестр: декоратор, который записывает классы по имени и возвращает их без изменений
+MODELS = {}
+def register(name):
+    def decorate(cls):
+        MODELS[name] = cls
+        return cls
+    return decorate
+
+@register("linear")
+class Linear:
+    def __init__(self, n):
+        self.n = n
+
+@register("mlp")
+class MLP(Linear):
+    pass
+
+model = MODELS["mlp"](16)
+print(sorted(MODELS), type(model).__name__, model.n)
+
+
+# 6. Контекстный менеджер, который работает и как декоратор, — устройство torch.no_grad()
+STATE = {"grad": True}
+class no_grad(contextlib.ContextDecorator):
+    def __enter__(self):
+        self.prev = STATE["grad"]
+        STATE["grad"] = False
+    def __exit__(self, *exc):
+        STATE["grad"] = self.prev
+        return False
+
+@no_grad()
+def evaluate():
+    return STATE["grad"]
+
+with no_grad():
+    inside = STATE["grad"]
+print(evaluate(), inside, STATE["grad"])
+
+
+# 7. functools.cache превращает экспоненциальную рекурсию в линейную; считаем вызовы
+def count_calls(func):
+    @functools.wraps(func)
+    def wrapper(*args):
+        wrapper.calls += 1
+        return func(*args)
+    wrapper.calls = 0
+    return wrapper
+
+@count_calls
+def fib(n):
+    return n if n < 2 else fib(n - 1) + fib(n - 2)
+
+@functools.cache
+@count_calls
+def fib_cached(n):
+    return n if n < 2 else fib_cached(n - 1) + fib_cached(n - 2)
+
+for name, f in [("plain", fib), ("cached", fib_cached)]:
+    start = time.perf_counter()
+    value = f(25)
+    elapsed = time.perf_counter() - start
+    inner = f if name == "plain" else f.__wrapped__
+    print(f"{name:6s} fib(25) = {value}, {inner.calls} calls, {elapsed * 1e3:.2f} ms")
+print(fib_cached.cache_info())
+
+# 8. functools.partial фиксирует часть аргументов
+int_from_binary = functools.partial(int, base=2)
+print(int_from_binary("1011"), int_from_binary.func is int, int_from_binary.keywords)
+
+# Вывод в CPython 3.14.7 на macOS (arm64); время меняется от запуска к запуску, число вызовов — нет:
+# 1 2 3 1 ('count',) 3
+# [2, 2, 2] [0, 1, 2]
+# add(2, 3) -> 5
+# add Add two numbers. 5
+# attempt 1 failed: flaky
+# attempt 2 failed: flaky
+# ok
+# ['linear', 'mlp'] MLP 16
+# False False True
+# plain  fib(25) = 75025, 242785 calls, 31.30 ms
+# cached fib(25) = 75025, 26 calls, 0.01 ms
+# CacheInfo(hits=23, misses=26, maxsize=None, currsize=26)
+# 11 True {'base': 2}
+```
+
+Число 242 785 — это $2F_{26} - 1 = 2 \cdot 121\,393 - 1$, а 26 — это $n + 1$. В кэшированной версии `count_calls` стоит под `functools.cache`, поэтому считает только вызовы, не нашедшие результата в кэше; `f.__wrapped__` добирается до него через атрибут, который устанавливает `cache`, как это делает `wraps`.
+
+## Дальше \{#next\}
+
+Декораторы этой заметки жили в том же файле, что и декорируемые функции, а реестр зависел от того, импортированы ли его модули. Настоящие программы разбиты на множество файлов и используют код, который написали и опубликовали другие люди. [Следующая заметка](/ru/notes/python/modules-and-packages) прослеживает `import` от инструкции до найденного файла, объясняет пакеты и показывает, как виртуальные окружения, `pyproject.toml` и файлы блокировки (lockfiles) фиксируют зависимости проекта, чтобы эксперимент можно было повторить.
+
+## Литература \{#references\}
+
+- Документация Python (3.14): [Function definitions](https://docs.python.org/3.14/reference/compound_stmts.html#function-definitions) (декораторы); [Naming and binding](https://docs.python.org/3.14/reference/executionmodel.html#naming-and-binding) (свободные переменные, `nonlocal`); [`functools`](https://docs.python.org/3.14/library/functools.html) (`wraps`, `cache`, `lru_cache`, `partial`, `cached_property`); [`contextlib.ContextDecorator`](https://docs.python.org/3.14/library/contextlib.html#contextlib.ContextDecorator); [Programming FAQ: Why do lambdas defined in a loop with different values all return the same result?](https://docs.python.org/3.14/faq/programming.html#why-do-lambdas-defined-in-a-loop-with-different-values-all-return-the-same-result).
+- J. Hylton. [PEP 227 — Statically Nested Scopes](https://peps.python.org/pep-0227/). 2000. K. Yee. [PEP 3104 — Access to Names in Outer Scopes](https://peps.python.org/pep-3104/) (`nonlocal`). 2006.
+- K. D. Smith, J. Jewett, S. Montanaro, A. Baxter. [PEP 318 — Decorators for Functions and Methods](https://peps.python.org/pep-0318/). 2003. C. Winter. [PEP 3129 — Class Decorators](https://peps.python.org/pep-3129/). 2007.
+- L. Ramalho. *Fluent Python*, 2nd ed. O'Reilly, 2022. Гл. 7 (функции как полноправные объекты), гл. 9 (декораторы и замыкания).
+- B. Slatkin. *Effective Python*, 3rd ed. Addison-Wesley. Главы о функциях и о метаклассах и атрибутах (декораторы, `functools.wraps`).
+- D. Beazley, B. K. Jones. *Python Cookbook*, 3rd ed. O'Reilly, 2013. Гл. 9 (метапрограммирование: декораторы с аргументами и без).
+- Документация PyTorch. [`torch.no_grad`](https://docs.pytorch.org/docs/stable/generated/torch.no_grad.html); [`torch.compile`](https://docs.pytorch.org/docs/stable/generated/torch.compile.html).

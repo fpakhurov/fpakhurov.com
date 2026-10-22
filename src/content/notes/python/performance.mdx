@@ -1,0 +1,325 @@
+---
+title: Writing fast Python
+description: "Making Python code faster in the order that pays: measure first and bound the gain with Amdahl's law, choose the right data structure, cut interpreter overhead in hot loops, prefer built-ins, vectorize with NumPy, and know when compiled code is worth it."
+course: python
+section: Under the Hood
+order: 17
+status: published
+tags: [python, performance, complexity, amdahl, timeit, comprehensions, numpy, vectorization, cython, numba]
+prerequisites: [Dictionaries and sets, "Iteration, comprehensions and generators", Debugging and profiling, How CPython runs code]
+---
+
+import MembershipPlot from '../../../components/figures/performance/MembershipPlot.astro';
+import SumOfSquares from '../../../components/figures/performance/SumOfSquares.astro';
+
+The [previous note](/notes/python/how-cpython-runs-code) showed what CPython pays for each line: a dispatch per bytecode instruction, a dictionary lookup per global name, a frame per call, a heap object per intermediate number. This note turns those costs into practice. It takes the order that pays off: find where the time goes, fix the algorithm, then trim the interpreter's overhead in the loop that remains, and, for numerical work, move the loop out of the interpreter entirely. Every number is measured, because intuition about speed is wrong often enough to be useless.
+
+**Setup.** CPython 3.14.7 and NumPy 2.5.4 (linked against Apple's Accelerate library) on an Apple M1 under macOS, 8 GB. Each number below was measured once, as the best of several runs; on another machine the numbers differ, and only comparisons within one table mean anything.
+
+**Notation.** $T$ is the running time of a whole program, $p$ the fraction of $T$ spent in the part we speed up, $s$ the factor by which that part gets faster, and $S$ the speed-up of the whole program. $n$ is the size of the input.
+
+## Baseline: optimizing by intuition
+
+The common way to make a program faster is to look at it, find the line that looks expensive, and rewrite it in a cleverer form. The word-counting program of the [debugging note](/notes/python/debugging-and-profiling#profiling-where-the-time-goes) shows why that fails. It has three steps: build 100,000 random words, normalize them with `strip` and `lower`, and collect the distinct ones. The normalization looks wasteful (two string methods and a new string per word), and it is the obvious target. Timed separately on the setup above, the three steps take 0.0213 s, 0.0061 s and 1.4323 s. Making the normalization infinitely fast would save 0.4 % of the run.
+
+## Measure first, and bound the gain
+
+<aside class="callout"><strong>Key idea.</strong> Speed comes from three places, in decreasing order of payoff: doing less work (a better algorithm or data structure), doing the remaining work in fewer interpreter steps (built-ins, comprehensions, fewer calls in the hot loop), and taking the loop out of the interpreter (NumPy, or compiled code). Profile first to find the part that dominates, and use Amdahl's law to know how much any change can gain before making it.</aside>
+
+**Where the bound comes from.** Split the run into the part we speed up, which takes $pT$, and the rest, $(1-p)T$. Speeding the part up by a factor $s$ leaves the rest unchanged:
+
+$$
+\begin{aligned}
+T_{\text{new}} &= (1-p)\,T + \frac{p\,T}{s}, \\
+S = \frac{T}{T_{\text{new}}} &= \frac{1}{(1-p) + p/s}.
+\end{aligned}
+$$
+
+As $s$ grows without bound, $p/s \to 0$, so
+
+$$
+S \le \frac{1}{1-p}.
+$$
+
+This is **Amdahl's law** ([Amdahl, 1967](#references); the ACOS course [applies it to compiled code](/notes/acos/performance-optimization#amdahls-law-for-an-optimization)). Two consequences: a part that takes 2 % of the time can never give more than 2 % of savings, however clever the rewrite; and a part that takes 98 % bounds the speed-up only at 50×.
+
+**Worked example.** For the word count, $T = 1.4597$ s and the distinct-word step takes $1.4323$ s, so $p = 1.4323 / 1.4597 = 0.981$ and the bound is $1/(1-0.981) \approx 53$. Replacing the list in that step with a set (next section) brings the step down to $0.0033$ s, so $s = 1.4323/0.0033 \approx 434$, and the law predicts
+
+$$
+S = \frac{1}{0.0188 + 0.981/434} = \frac{1}{0.0188 + 0.0023} \approx 47.5.
+$$
+
+The whole program, measured in the same session, went from 1.4597 s to 0.0308 s: $S = 47.4$. For the normalization step, $p = 0.0061/1.4597 = 0.0042$, and even $s = 10$ would give $S = 1.004$.
+
+The tools for measuring are those of the [debugging note](/notes/python/debugging-and-profiling#measuring-time-properly): `cProfile` to find the part, `perf_counter` with repeats and `timeit` to time it, and minimums and medians rather than single runs.
+
+## Algorithmic wins: the right data structure
+
+The distinct-word step spends its time on one expression, `w not in seen`, with `seen` a list. The rule for `in` on a list is a linear scan: compare `w` with each element in order until one is equal or the list ends. On a set it is a hash lookup: compute `hash(w)`, go to the slot it selects, compare with the few entries there. The [dictionaries and sets note](/notes/python/dicts-and-sets) shows the hash table; here is what the difference costs as the container grows. Each point is one membership test of an absent element, `-1 in data`, the worst case for a list:
+
+<MembershipPlot />
+
+**Reading the plot.** The list line has slope 1 on log–log axes: ten times more elements, ten times the time. The cost per element is constant, $7.8$ ns for $n = 10^6$ ($7{,}801{,}743\ \text{ns} / 10^6$), the price of following one pointer to an integer object and calling the generic object comparison on it, in C. The set line is flat at about 11 ns whatever $n$ is. The [dictionaries and sets note](/notes/python/dicts-and-sets#baseline-a-list-of-pairs) reports 34 ns for a set lookup because it times a present key through a `lambda`: each test there also pays a Python function call and an `==` between two equal but distinct integer objects, while here the absent `-1` is compiled into timeit's own loop and lands in an empty slot. At $n = 10^6$ the list is about 700,000 times slower.
+
+**From one test to the whole loop.** The distinct-word loop performs one membership test per word. With $m$ words and a list that grows to $k$ distinct entries, each test scans up to $k$ entries, so the loop costs up to
+
+$$
+m \cdot k \cdot c_{\text{list}} \approx 10^5 \cdot 3000 \cdot 7.8\ \text{ns} \approx 2.3\ \text{s},
+$$
+
+with $c_{\text{list}}$ the cost per compared element. That is an upper bound: early words see a shorter list, and a word that is present stops the scan when it is found, on average halfway, which brings the estimate near the measured 1.43 s. With a set, each test costs a constant $c_{\text{set}} \approx 11$ ns plus the hashing of the string, about $10^5 \cdot 11\ \text{ns} \approx 1$ ms for the tests: the measured 3.3 ms includes the loop itself and the inserts. The cost went from proportional to $m k$ to proportional to $m$.
+
+The same reasoning applies to every structure. The usual replacements:
+
+| Slow pattern | Cost | Replacement | Cost |
+| --- | --- | --- | --- |
+| `x in some_list` in a loop | $O(n)$ per test | a `set` or `dict` built once | $O(1)$ on average |
+| `lst.pop(0)`, `lst.insert(0, x)` | $O(n)$, shifts every element | `collections.deque` | $O(1)$ at both ends |
+| counting with `lst.count(x)` per item | $O(n)$ per item | `collections.Counter` or a dict | $O(1)$ per item |
+| searching a sorted list linearly | $O(n)$ | `bisect` | $O(\log n)$ |
+| `s += piece` in a loop to build a string | can copy the string each time | `"".join(pieces)` | $O(\text{total length})$ |
+| recomputing a pure function on the same arguments | each call | `functools.cache` | one dict lookup after the first |
+
+The [lists note](/notes/python/lists-and-tuples) and the [dictionaries and sets note](/notes/python/dicts-and-sets) derive these costs. No constant-factor trick in the rest of this note comes close to a factor of 400, which is why the data structure comes first.
+
+## Interpreter costs, measured on 3.14
+
+Once the algorithm is right, the remaining time is spent executing bytecode. Each variant below runs a loop of a million iterations that does almost nothing, so the difference between variants is the cost of the one thing they change. One run of each, best of 5, in nanoseconds per iteration:
+
+| Loop body | ns per iteration | What changes in the bytecode |
+| --- | --- | --- |
+| `t += i * SCALE`, with `SCALE` a module global | 35.4 | `LOAD_GLOBAL`: a dictionary lookup, cached by specialization |
+| `t += i * scale`, with `scale` a local copy | 34.1 | `LOAD_FAST`: an array slot |
+| `t += i * self.scale` | 36.3 | `LOAD_ATTR`: an attribute lookup, specialized to a fixed offset |
+| `t += i * scale`, with `scale = self.scale` before the loop | 34.2 | `LOAD_FAST` again |
+| `t += i * 3` | 34.1 | a constant |
+| `t += times3(i)`, a function returning `i * 3` | 46.9 | a call: a new frame, arguments copied, a return |
+| `out.append(i * 3)` in a `for` loop | 32.7 | method lookup and call per element |
+| `[i * 3 for i in range(n)]` | 30.1 | `LIST_APPEND`, a single instruction |
+
+What the numbers say about CPython 3.14:
+
+- **Globals and attributes cost little once specialized.** A global costs about 1.3 ns more than a local here, and `self.scale` about 2 ns more than a hoisted local. In CPython 3.10 and earlier, before the [specializing interpreter](/notes/python/how-cpython-runs-code#the-specializing-adaptive-interpreter), each was a full dictionary lookup on every execution, and the classic advice to copy globals and attributes into locals before a hot loop gained more than it does now. It still helps a little and never hurts; it is no longer where the time is.
+- **A Python function call is the expensive step.** Moving `i * 3` into a function adds about 13 ns per iteration, almost 40 % of the loop. In a hot loop, inline a tiny function, or better, restructure so that the loop happens inside one call (the next section).
+- **Comprehensions beat `append` loops modestly.** About 8 % here: the comprehension avoids looking up and calling `out.append` on each iteration. Write comprehensions because they are clearer; the speed is a bonus.
+- **Everything is at least 30 ns.** Each iteration, however trivial, executes several bytecode instructions, allocates a new integer for `i * 3`, and updates reference counts. That floor is the price of the interpreter, and the only way below it is to stop iterating in Python.
+
+**The common mistake** is to apply all of these micro-optimizations everywhere: aliasing every method, inlining every function, writing loops in a cramped style. They make code harder to read for a few percent, and only in the loop that the profiler named. Everywhere else they cost readability for nothing.
+
+## Built-ins and comprehensions against explicit loops
+
+The interpreter's floor is per iteration *in Python*. A built-in function written in C also iterates, but its loop runs as machine code, with no bytecode dispatch between elements. The rule: when a built-in or a standard-library function does the whole loop (`sum`, `min`, `max`, `sorted`, `any`, `all`, `str.join`, `math.fsum`, `math.sumprod`, `itertools`), call it instead of writing the loop.
+
+The rule has a subtlety that the measurements make visible. Take the sum of squares of the same million floats, held as a Python list `xs`:
+
+| Code | ns per element |
+| --- | --- |
+| `for x in xs: t += x * x` | 18.97 |
+| `sum(x * x for x in xs)` | 20.17 |
+| `sum([x * x for x in xs])` | 26.13 |
+| `math.sumprod(xs, xs)` | 5.28 |
+
+`sum` runs in C, but the generator it consumes runs in the interpreter: each element still costs a resumption of the generator frame, a multiplication in bytecode and a new float object. The generator version is no faster than the plain loop, and the list-comprehension version is slower, because it first builds a list of a million floats and then sums it. Only `math.sumprod` (new in 3.12), which multiplies and adds inside one C loop, escapes the per-element bytecode, and it is 3.6 times faster than the loop. The general rule follows: a built-in helps when the *per-element work* moves into C, not merely the loop around it.
+
+## Vectorization with NumPy
+
+`math.sumprod` still reads each element from a Python `float` object: a 24-byte heap object that the list points to. NumPy stores the same million numbers as one contiguous block of 8-byte doubles, and its operations run C loops directly over that block ([NumPy documentation, "What is NumPy?"](#references)). That is **vectorization**: writing the computation as operations on whole arrays, so that the loop over elements happens in compiled code.
+
+<SumOfSquares />
+
+The figure puts all seven versions on one logarithmic scale. Three groups appear, one per model of what runs:
+
+- **The interpreter, one element at a time** (red): 19 to 26 ns per element. Every element is a heap object; every operation is a bytecode instruction.
+- **A C loop over Python objects** (amber): `math.sumprod`, 5.3 ns. No bytecode, but each element must be fetched through a pointer and unboxed.
+- **A C loop over raw doubles** (green): `(arr * arr).sum()` takes 0.37 ns per element; `arr @ arr`, a dot product handed to the BLAS library, 0.16 ns. That is 119 times faster than the plain loop. (The [NumPy arrays note](/notes/python/numpy-arrays#measured-a-loop-against-a-vector) times the same computations the same way, as the best of five single calls on a million elements, but in a separate session, and reports 37× and 113×: the gap is run-to-run variation, mostly in `(x * x).sum()`, which took 0.53 ns per element there against 0.37 here.) The data is contiguous, so it streams through the [caches](/notes/acos/caches) at full speed; the loop body is a few machine instructions, and the processor's [vector units](/notes/acos/data-level-parallelism) process several doubles per instruction. `arr * arr` first writes a temporary array of a million products and then sums it, which is why the fused dot product is twice as fast again.
+
+**The common mistake** is the top row. `for x in arr` over a NumPy array costs 76.4 ns per element, four times slower than the same loop over a list: each `arr[i]` read creates a new `numpy.float64` object, and arithmetic on NumPy scalars goes through NumPy's general machinery, which is slower than Python's own float operations. A NumPy array is fast only when the code never touches its elements one by one in Python. The [NumPy arrays note](/notes/python/numpy-arrays) teaches how to write computations that way, with broadcasting and reductions; the [Machine Learning course](/notes/ml/what-machine-learning-is) writes every model that way, and [PyTorch](/notes/deep-learning/pytorch-and-autograd) applies the same idea to tensors on the GPU.
+
+## When to reach for compiled code
+
+Sometimes the hot loop does not fit array operations: it has data-dependent branches, works element by element on a structure NumPy does not have, or its intermediate arrays would not fit in memory. The options, as of October 2026, from the least to the most effort:
+
+- **numba** compiles a decorated function (`@numba.njit`) to machine code with LLVM on its first call, for code that uses numbers, NumPy arrays and simple loops. Loops that would take 20 ns per element in CPython typically run at the speed of C. It supports a subset of Python, and each release supports specific Python and NumPy versions, so check that the version you need is covered before depending on it ([numba documentation](#references)).
+- **Cython** compiles a Python-like language with optional C type declarations into a C extension module. Untyped code gains little; typed loops run at C speed. It needs a C compiler and a build step ([Cython documentation](#references)).
+- **A C, C++ or Rust extension**, through the C API, pybind11 or nanobind, or PyO3 for Rust. The most control and the most work: memory management, the GIL and packaging are yours to handle. Most of NumPy, pandas and PyTorch is written this way.
+- **PyPy**, an alternative Python implementation with a tracing JIT, runs unchanged pure-Python code several times faster on loop-heavy programs, but has to support each C extension separately and follows CPython's versions with a delay.
+
+CPython's own experimental JIT is not yet one of these options: in 3.14 it is off by default, and on the [loop measured in the previous note](/notes/python/how-cpython-runs-code#the-experimental-jit) it was 3 % slower. For CPU-bound work that is already as fast as it can be on one core, the remaining lever is to use several cores, the subject of the [next note](/notes/python/concurrency).
+
+<aside class="callout"><strong>Check yourself.</strong> (1) A function takes 30 % of a program's time. What is the best possible speed-up of the whole program from optimizing it? (2) A loop runs `if word in stopwords` for each of a million words, with `stopwords` a list of 500 words. Estimate the cost of the tests from the plot, and the cost with a set. (3) Why is `sum(x * x for x in xs)` not faster than the explicit loop? (4) Why can `for x in arr` over a NumPy array be slower than over a list?<details><summary>Answers</summary>(1) $1/(1-0.3) \approx 1.43$, even if the function took no time at all. (2) Assuming a per-element cost for strings similar to the 7.8 ns measured for integers, a list of 500 costs up to about $500 \cdot 7.8 \approx 3900$ ns per test when the word is absent, so up to about 4 s for a million words (less when words are found early); a set costs about 11 ns plus hashing per test, around 0.01 to 0.02 s. (3) `sum` runs in C, but the generator expression is bytecode: the multiplication and the creation of each float happen in the interpreter for every element. (4) Each element read from the array is boxed into a new `numpy.float64` object, and scalar arithmetic on those goes through NumPy's general machinery.</details></aside>
+
+## What changed
+
+| | Intuition (the baseline) | Measured approach |
+| --- | --- | --- |
+| What to optimize | the line that looks slow | the part the profile names; Amdahl's law bounds the gain |
+| First move | rewrite cleverly | change the data structure or the algorithm: factors of 10 to 1000 |
+| In the hot loop | micro-optimize everything | fewer calls, comprehensions, built-ins that do the per-element work in C: up to a few × |
+| Numerical work | Python loops | NumPy operations on whole arrays: about 100× |
+| Still too slow | give up, or rewrite everything in C | numba, Cython or an extension for one function |
+
+## Limitations
+
+- **One machine, one version.** The table of interpreter costs is specific to CPython 3.14 on one processor; in 3.10 the global and attribute rows differed far more, and future versions will move them again. Re-measure on your own setup before relying on a ratio.
+- **Microbenchmarks isolate one cost.** Real loops mix several, and their costs interact with caches and memory allocation. A microbenchmark says what a change can gain at most in that loop, not what the program will gain; Amdahl's law and a profile of the real program say that.
+- **The fastest code is not always the right code.** Readability, memory and correctness constraints (floating-point summation order, for one: NumPy's pairwise summation and a sequential loop can differ in the last digits) come first.
+- **numba, Cython and extensions were not run here.** They are described from their documentation; their speed depends heavily on the code.
+
+## What you should remember
+
+- Profile first. Amdahl's law: speeding up a fraction $p$ of the time by $s$ gives $S = 1/((1-p) + p/s)$, never more than $1/(1-p)$.
+- The data structure comes first: `in` on a list is a scan (7.8 ns per element here), on a set a hash lookup (about 11 ns at any size).
+- On 3.14, specialization makes globals and attributes nearly as cheap as locals; a Python function call (about 13 ns here) and the per-iteration floor of about 30 ns are what remain.
+- Built-ins help when the per-element work happens in C; a generator fed to `sum` still runs in the interpreter.
+- NumPy runs loops in C over contiguous doubles: about 100× faster than a Python loop, and slower than a list if you iterate over it element by element.
+- When nothing else works, compile one function: numba, Cython, or an extension.
+
+## Code
+
+The script measures the three levels of this note: membership in a list against a set as the size grows, the interpreter costs of globals, calls and comprehensions, and the sum of squares in five ways from a Python loop to NumPy. It needs NumPy and runs in about 17 seconds on the setup above; run it with `python -I fast.py`.
+
+```python
+"""Measure what makes Python code fast (Python 3.14, NumPy)."""
+import math
+import time
+import timeit
+
+import numpy as np
+
+
+def best_ns(f, *args, n_items, repeat=5):
+    """Best of `repeat` runs of f(*args), in nanoseconds per item."""
+    runs = []
+    for _ in range(repeat):
+        t0 = time.perf_counter()
+        f(*args)
+        runs.append(time.perf_counter() - t0)
+    return min(runs) / n_items * 1e9
+
+
+# 1. The data structure: membership in a list is a scan, in a set a hash lookup
+print("n        list (ns)   set (ns)")
+for n in [10, 100, 1_000, 10_000, 100_000]:
+    data = list(range(n))
+    s = set(data)
+    row = []
+    for stmt in ("-1 in data", "-1 in s"):
+        timer = timeit.Timer(stmt, globals={"data": data, "s": s})
+        number, _ = timer.autorange()
+        row.append(min(timer.repeat(repeat=3, number=number)) / number * 1e9)
+    print(f"{n:<8} {row[0]:10.1f} {row[1]:10.1f}")
+
+# 2. Interpreter costs: globals, attributes, calls, comprehensions
+N = 1_000_000
+SCALE = 3
+
+
+def use_global(n):
+    t = 0
+    for i in range(n):
+        t += i * SCALE
+    return t
+
+
+def use_local(n):
+    scale = SCALE
+    t = 0
+    for i in range(n):
+        t += i * scale
+    return t
+
+
+def times3(i):
+    return i * 3
+
+
+def inline(n):
+    t = 0
+    for i in range(n):
+        t += i * 3
+    return t
+
+
+def called(n):
+    t = 0
+    for i in range(n):
+        t += times3(i)
+    return t
+
+
+def append_loop(n):
+    out = []
+    for i in range(n):
+        out.append(i * 3)
+    return out
+
+
+def comprehension(n):
+    return [i * 3 for i in range(n)]
+
+
+for name, f in [("global", use_global), ("local", use_local), ("inline", inline),
+                 ("call", called), ("append loop", append_loop), ("comprehension", comprehension)]:
+    print(f"{name:14} {best_ns(f, N, n_items=N):5.1f} ns per item")
+
+# 3. Leaving the interpreter: the same sum of squares, five ways
+arr = np.random.default_rng(0).random(N)
+xs = arr.tolist()
+
+
+def loop(values):
+    t = 0.0
+    for x in values:
+        t += x * x
+    return t
+
+
+ways = [
+    ("loop over list", lambda: loop(xs)),
+    ("sum(generator)", lambda: sum(x * x for x in xs)),
+    ("math.sumprod", lambda: math.sumprod(xs, xs)),
+    ("numpy sum", lambda: (arr * arr).sum()),
+    ("numpy arr @ arr", lambda: arr @ arr),
+]
+for name, f in ways:
+    print(f"{name:16} {best_ns(f, n_items=N):6.2f} ns per item   sum {f():.4f}")
+print(f"loop over array  {best_ns(loop, arr, n_items=N, repeat=2):6.2f} ns per item")
+
+# Output with CPython 3.14.7 and NumPy 2.5.4 on an Apple M1 (macOS); every time varies
+# from run to run and across machines, the sums do not:
+# n        list (ns)   set (ns)
+# 10             95.7       11.1
+# 100           750.1       11.1
+# 1000         7574.3       11.1
+# 10000       77027.1       11.2
+# 100000     781745.7       11.1
+# global          35.4 ns per item
+# local           34.1 ns per item
+# inline          34.2 ns per item
+# call            46.6 ns per item
+# append loop     32.6 ns per item
+# comprehension   30.2 ns per item
+# loop over list    19.30 ns per item   sum 333560.6157
+# sum(generator)    20.95 ns per item   sum 333560.6157
+# math.sumprod       5.41 ns per item   sum 333560.6157
+# numpy sum          0.41 ns per item   sum 333560.6157
+# numpy arr @ arr    0.17 ns per item   sum 333560.6157
+# loop over array   74.26 ns per item
+```
+
+The numbers of this run differ from those in the figures and tables by a few percent, which is the run-to-run spread on this machine; the figures use the earlier, separate measurements described in their captions.
+
+## Next
+
+Every speed-up so far used one processor core. The M1 has eight, and a CPU-bound Python program uses one of them. The [next note](/notes/python/concurrency) asks how to use the others: threads, which in the default build of CPython take turns under the global interpreter lock; processes, which do not share it; the free-threaded build of 3.14, which removes it; and asyncio, which is not about cores at all but about waiting for many things at once.
+
+## References
+
+- G. M. Amdahl. [Validity of the single processor approach to achieving large scale computing capabilities](https://doi.org/10.1145/1465482.1465560). AFIPS Spring Joint Computer Conference, 1967.
+- Python documentation (3.14): [`timeit`](https://docs.python.org/3.14/library/timeit.html); [Time complexity of the built-in types](https://wiki.python.org/moin/TimeComplexity) (Python wiki); [`collections`](https://docs.python.org/3.14/library/collections.html); [`bisect`](https://docs.python.org/3.14/library/bisect.html); [`functools.cache`](https://docs.python.org/3.14/library/functools.html#functools.cache); [`math.sumprod`](https://docs.python.org/3.14/library/math.html#math.sumprod).
+- NumPy documentation: [What is NumPy?](https://numpy.org/doc/stable/user/whatisnumpy.html) (vectorization) and [Broadcasting](https://numpy.org/doc/stable/user/basics.broadcasting.html).
+- [numba documentation](https://numba.readthedocs.io/) (the `@njit` decorator and supported Python features); [Cython documentation](https://cython.readthedocs.io/); [PyO3 user guide](https://pyo3.rs/); [pybind11 documentation](https://pybind11.readthedocs.io/); [PyPy](https://pypy.org/).
+- J. VanderPlas. *Python Data Science Handbook*, 2nd ed. O'Reilly, 2022. Ch. 2 ("Computation on NumPy Arrays: Universal Functions").
+- M. Gorelick, I. Ozsvald. *High Performance Python*, 2nd ed. O'Reilly, 2020.
+- B. Slatkin. *Effective Python*, 3rd ed. Addison-Wesley, 2024. The chapter on performance.
+- L. Ramalho. *Fluent Python*, 2nd ed. O'Reilly, 2022.

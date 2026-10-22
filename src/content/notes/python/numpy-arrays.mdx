@@ -1,0 +1,460 @@
+---
+title: NumPy arrays
+description: "The NumPy array as one block of memory described by a dtype, a shape and strides: views against copies, fixed-width types and overflow, vectorized ufuncs and why they are fast, broadcasting, indexing, reductions, the matrix product and seeded random numbers."
+course: python
+section: Scientific Python
+order: 19
+status: published
+tags: [python, numpy, ndarray, strides, views, dtype, ufunc, vectorization, broadcasting, indexing, matmul, random]
+prerequisites: [Lists and tuples, Writing fast Python]
+---
+
+import ArrayLayout from '../../../components/figures/numpy-arrays/ArrayLayout.astro';
+import Broadcasting from '../../../components/figures/numpy-arrays/Broadcasting.astro';
+import LoopVsVector from '../../../components/figures/numpy-arrays/LoopVsVector.astro';
+
+The [previous note](/notes/python/concurrency) spread work over threads and processes to use more of the machine. For numerical work a larger gain comes first, before any parallelism: running the loop in compiled code instead of in the interpreter. A Python list of a million numbers is a million separate objects, and a loop over it pays the bytecode loop, a type check and a reference count for every element. NumPy stores the same numbers as one block of raw machine values and runs each operation as a loop in C over that block. This note explains what a NumPy array is in memory, because that one picture predicts when an operation is a free view and when it copies, why integers can overflow, why vectorized code is fast, and how arrays of different shapes combine. Everything the machine-learning courses compute with, from the [normal equations](/notes/ml/least-squares#the-normal-equations) to a batch of images, is built on it.
+
+**Conventions.** NumPy 2.5.4 on CPython 3.14.7, Apple M1, macOS; `import numpy as np` is assumed in every snippet. Arrays print with `array(...)` in the REPL and without it under `print`.
+
+## Baseline: a list of numbers
+
+The obvious way to hold a million measurements is a list of floats, and the obvious way to compute with them is a loop:
+
+```python
+def sum_of_squares(xs):
+    total = 0.0
+    for v in xs:
+        total += v * v
+    return total
+```
+
+The [lists note](/notes/python/lists-and-tuples) showed what the list is: an array of pointers, each to a separate `float` object of 24 bytes somewhere on the heap. A list of 1000 floats takes 8056 bytes for the pointers plus 24 000 for the objects; the same numbers as a NumPy array take 8000 bytes, one 8-byte double each. And each iteration of the loop executes eight bytecode instructions, each of which checks the types of its operands, allocates a new float object for each result and adjusts reference counts ([How CPython runs code](/notes/python/how-cpython-runs-code#the-evaluation-loop-and-the-value-stack)). Measured on the setup above, the loop costs 19.6 ns per element, the same for 1000 elements and for a million: the cost is the interpreter's, not the arithmetic's. The processor can multiply and add two doubles in well under a nanosecond.
+
+The [performance note](/notes/python/performance) measured the same gap from the other side and named its remedy: move the loop out of Python. NumPy is that remedy for numbers, and to use it well we need its model of data.
+
+## What an array is
+
+<aside class="callout"><strong>Key idea.</strong> A NumPy array (`ndarray`) is a pointer to one block of memory plus three pieces of description: a **dtype** (how to read one element: 8-byte integer, 4-byte float, …), a **shape** (how many elements along each axis) and **strides** (how many bytes to step in memory to move one position along each axis). The elements are raw machine values, not Python objects. Every operation either reads the block through a new description (a **view**, no data copied) or writes a new block (a **copy**).</aside>
+
+**Notation.** An array with $d$ axes has shape $(n_0, \dots, n_{d-1})$ and strides $(s_0, \dots, s_{d-1})$ in bytes; $b$ is the size of one element in bytes (`itemsize`). The element with index $(i_0, \dots, i_{d-1})$ sits at
+
+$$
+\text{address}(i_0, \dots, i_{d-1}) = \text{start} + \sum_{k=0}^{d-1} i_k\, s_k .
+$$
+
+The strides are what make one block of memory look like a matrix. For a freshly created array NumPy chooses them in one of two orders:
+
+- **C order** (row-major, the default): the last index changes fastest. Moving along the last axis steps one element, $s_{d-1} = b$, and each earlier axis steps over a whole block of the axis after it, $s_k = s_{k+1}\, n_{k+1}$.
+- **Fortran order** (column-major, `order="F"`): the first index changes fastest, $s_0 = b$ and $s_k = s_{k-1}\, n_{k-1}$.
+
+For a $3 \times 4$ array of 8-byte integers, C order gives $s_1 = 8$ and $s_0 = 8 \cdot 4 = 32$: the next column is 8 bytes on, the next row 32. Fortran order gives $s_0 = 8$ and $s_1 = 8 \cdot 3 = 24$.
+
+<ArrayLayout />
+
+The REPL shows the description directly:
+
+```text
+>>> a = np.arange(12).reshape(3, 4)
+>>> a
+array([[ 0,  1,  2,  3],
+       [ 4,  5,  6,  7],
+       [ 8,  9, 10, 11]])
+>>> a.dtype, a.shape, a.strides, a.itemsize, a.nbytes
+(dtype('int64'), (3, 4), (32, 8), 8, 96)
+>>> f = np.asfortranarray(a)
+>>> f.strides, f.flags["C_CONTIGUOUS"], f.flags["F_CONTIGUOUS"]
+((8, 24), False, True)
+>>> a[2, 1], f[2, 1]
+(np.int64(9), np.int64(9))
+```
+
+Line by line: `np.arange(12)` creates 12 consecutive integers, and `reshape(3, 4)` describes the same 96 bytes as three rows of four. The default integer dtype is `int64` on 64-bit platforms. `np.asfortranarray` copies the data into column-major order: the values are the same, the bytes are arranged differently, and the strides say how. Indexing `a[2, 1]` uses the formula: $2 \cdot 32 + 1 \cdot 8 = 72$ bytes from the start in `a`, $2 \cdot 8 + 1 \cdot 24 = 40$ in `f`. A single element comes back as a NumPy scalar, `np.int64(9)`; `.item()` converts it to a Python `int`.
+
+**Why the order matters.** Memory is read in cache lines, 64 bytes on most x86 processors and 128 on the M1 used here ([caches](/notes/acos/caches#row-major-and-column-major-traversal)). A loop, or a NumPy operation, that walks along the axis with the small stride uses every byte of each line it loads; one that walks along the axis with the large stride loads a line for each element. NumPy's own operations pick a good order where they can, but the order still matters when data are handed to other code: C and PyTorch expect row-major data, Fortran libraries such as LAPACK column-major.
+
+## Views and copies
+
+Because an array is a description of memory, many operations only write a new description.
+
+**The rule.** These return a **view**, a new array object that shares the data block:
+- basic slicing with integers and `start:stop:step` (`a[1]`, `a[:, 1]`, `a[::2, ::3]`): the start moves and the strides are multiplied by the step;
+- `.T` and `transpose`: the shape and the strides are reversed;
+- `reshape` and `ravel`, **when** the new shape can be described by strides over the same memory; otherwise they copy.
+
+These always return a **copy**, a new block: fancy indexing with a list or array of integers, boolean indexing, `.copy()`, `flatten()`, and arithmetic (`a + 1` is a new array). `np.shares_memory(x, y)` tells whether two arrays overlap in memory.
+
+```text
+>>> a = np.arange(12).reshape(3, 4)
+>>> col = a[:, 1]
+>>> col, col.strides, np.shares_memory(a, col)
+(array([1, 5, 9]), (32,), True)
+>>> a[::2, ::3], a[::2, ::3].strides
+(array([[ 0,  3],
+       [ 8, 11]]), (64, 24))
+>>> a.T.strides, np.shares_memory(a, a.T)
+((8, 32), True)
+>>> np.shares_memory(a, a.reshape(4, 3)), np.shares_memory(a, a.T.reshape(12))
+(True, False)
+>>> np.shares_memory(a, a[[0, 2]]), np.shares_memory(a, a[a % 2 == 0])
+(False, False)
+```
+
+The column `a[:, 1]` starts 8 bytes in and steps 32 bytes, one row, per element; nothing was copied. `a[::2, ::3]` takes every second row and every third column: strides $2 \cdot 32 = 64$ and $3 \cdot 8 = 24$. The transpose reverses the strides to `(8, 32)`. `a.reshape(4, 3)` reads the same 12 numbers in the same order, so it is a view. `a.T.reshape(12)` asks for the transpose's elements in row order, `0, 4, 8, 1, …`: no single stride walks the original block in that order, so NumPy copies. Since NumPy 2.1, `np.reshape(x, shape, copy=False)` raises `ValueError: Unable to avoid creating a copy while reshaping.` instead of copying silently, which is a useful assertion in code that must not copy. The index list `[0, 2]` and the boolean mask can pick any elements in any order, which no strides can describe: they copy.
+
+**The mistake.** A view shares its data, so writing through it changes the original:
+
+```text
+>>> a = np.arange(12).reshape(3, 4)
+>>> row = a[1]
+>>> row[0] = 100
+>>> a[1]
+array([100,   5,   6,   7])
+```
+
+This is the [aliasing of the values note](/notes/python/values-and-names#names-are-references-and-assignment-copies-nothing) one level down: two array objects, one block of memory. It differs from lists, whose slices are copies. Two consequences follow. A function that receives a slice can change the caller's array, so take `.copy()` when a function must not. And a small view keeps the whole block alive: `big[:10]` of a 1 GB array holds the gigabyte until the view is gone, so `big[:10].copy()` is the way to keep only ten elements.
+
+## dtypes and overflow
+
+**The rule.** Every element of an array has the same dtype, a fixed-width machine type: `int8` to `int64`, `uint8` to `uint64`, `float16`, `float32`, `float64`, `complex128`, `bool`, and fixed-width strings and Python objects (`object`, which brings back the cost of Python objects). Arithmetic on fixed-width integers **wraps around** modulo $2^{\text{bits}}$ without an error, exactly as the [processor does](/notes/acos/data-representation#overflow-and-wraparound). Python's own `int` never overflows ([values note](/notes/python/values-and-names)); a NumPy integer does.
+
+```text
+>>> x = np.array([100, 120, 127], dtype=np.int8)
+>>> x + 1
+array([ 101,  121, -128], dtype=int8)
+>>> x * 2
+array([-56, -16,  -2], dtype=int8)
+>>> x + 200
+Traceback (most recent call last):
+...
+OverflowError: Python integer 200 out of bounds for int8
+>>> np.array([1, 2], dtype=np.uint8) - 3
+array([254, 255], dtype=uint8)
+```
+
+$127 + 1 = 128$ does not fit in `int8`, whose range is $-128$ to $127$, and wraps to $128 - 256 = -128$. $120 \cdot 2 = 240$ becomes $240 - 256 = -16$. No warning is raised for arrays; checking every element would cost as much as the arithmetic. The third line shows the promotion rule of NumPy 2 ([NEP 50](#references)): a Python number in an expression is "weak" and takes the array's dtype, so `x + 1` stays `int8`, and a Python integer that does not fit raises `OverflowError` instead of wrapping. A NumPy scalar or array is "strong": `np.float32` array plus `np.float64(1)` gives `float64`, while plus the Python float `1.0` stays `float32`.
+
+Where it bites: images are stored as `uint8` (0 to 255), and `img1 - img2` or `img * 2` wraps instead of going negative or saturating. Convert first, `img.astype(np.int16)` or `img.astype(np.float32) / 255`.
+
+**float32 against float64.** A `float64` has a 53-bit significand, about 16 decimal digits, and machine epsilon $2.2 \cdot 10^{-16}$; a `float32` has 24 bits, about 7 digits, and epsilon $1.2 \cdot 10^{-7}$ ([rounding, ulp and machine epsilon](/notes/acos/floating-point#rounding-ulp-and-machine-epsilon)). Half the bytes means half the memory traffic and twice the SIMD lanes, which is why deep learning computes in `float32` and narrower ([narrow formats](/notes/acos/floating-point#narrow-formats-for-machine-learning)). The price shows up in long sums:
+
+```text
+>>> v = np.full(10_000_000, 0.1, dtype=np.float32)
+>>> v.sum(), np.cumsum(v)[-1], v.sum(dtype=np.float64)
+(np.float32(1.0000001e+06), np.float32(1.087937e+06), np.float64(1000000.0149011612))
+>>> np.float32(16777216) + np.float32(1)
+np.float32(1.6777216e+07)
+```
+
+Ten million copies of 0.1 should sum to $10^6$. `v.sum()` is close because NumPy sums in pairs, a tree of additions whose rounding errors grow like $\log n$ rather than $n$. `np.cumsum` must add one element at a time, left to right, and once the running total is near $10^6$ each added 0.1 is rounded to a multiple of the total's ulp, $1/16$ there: the result is 9% too large. The last line is the reason: at $2^{24} = 16\,777\,216$ the gap between consecutive `float32` values is 2, so adding 1 changes nothing. Accumulate in `float64` (`dtype=np.float64`) when a sum has millions of terms.
+
+## Vectorized operations: ufuncs
+
+A **universal function** (ufunc) applies one scalar operation to every element: `np.add` (the `+` operator), `np.multiply`, `np.sqrt`, `np.exp`, comparisons and about a hundred more. `x * x` calls `np.multiply(x, x)`.
+
+**The rule.** A ufunc takes arrays of compatible shapes (the broadcasting rule below), chooses an inner loop for their dtypes, allocates the output and runs the loop over all elements. Each ufunc also has methods that build on the same loop: `reduce` (`np.add.reduce(x)` is `x.sum()`), `accumulate` (`np.cumsum`) and `outer`.
+
+**Why it is fast.** Three costs of the Python loop disappear at once:
+
+1. **Dispatch happens once per array, not once per element.** The interpreter executes one call; the type check and the choice of the C loop are made once.
+2. **The inner loop is typed C over raw values.** There are no objects to allocate, no reference counts, no type checks inside it. It walks memory with a fixed stride, which the cache and the prefetcher handle well.
+3. **The inner loop uses SIMD instructions.** On this M1 NumPy's loops are compiled for the NEON/ASIMD vector registers, which hold two `float64` or four `float32` values and operate on all of them in one instruction ([data-level parallelism](/notes/acos/data-level-parallelism#simd-instructions-several-numbers-in-one-register)).
+
+The price is the fixed overhead of a call, about half a microsecond here, and a temporary array for every intermediate result: `(x * x).sum()` writes the whole array `x * x` to memory and reads it back.
+
+## Measured: a loop against a vector
+
+The sum of squares four ways, on the setup above, for arrays of random floats from 10 to a million elements: the Python loop over a list, the same loop over the NumPy array, `(x * x).sum()`, and `x @ x`, the dot product, which NumPy hands to the BLAS library (Apple Accelerate in this build). Each number is the best of five repetitions, divided by the number of elements.
+
+| elements | loop over a list | loop over an array | `(x * x).sum()` | `x @ x` |
+| --- | --- | --- | --- | --- |
+| 10 | 0.26 µs | 1.4 µs | 0.62 µs | 0.53 µs |
+| 1 000 | 19.3 µs | 99 µs | 1.0 µs | 0.68 µs |
+| 1 000 000 | 19.6 ms | 101 ms | 0.53 ms | 0.17 ms |
+
+<LoopVsVector />
+
+What the measurement shows:
+
+- For a million elements the vectorized sum is 37 times faster than the list loop and `x @ x` 113 times. The list loop's 19.6 ns per element is flat: the interpreter's cost does not depend on the size.
+- For ten elements the list loop wins. The vector pays its fixed overhead of about 0.5 µs, and there are too few elements to recover it. Vectorize work on large arrays, not on three numbers.
+- A Python loop over a NumPy array is the slowest of all, five times slower than over a list: every `for v in x` creates a NumPy scalar object from the raw value, and arithmetic on NumPy scalars goes through more machinery than on Python floats. Iterating over an array element by element gives up everything the array offers.
+- `(x * x).sum()` writes a temporary array `x * x` and reads it back. At a million elements that temporary is 8 MB and still fits in the M1's shared cache: the 0.53 ns in the table is one run, and repeated runs gave 0.38 to 0.39 ns, the same as at 100 000. The cost per element rises clearly only at ten million elements, to about 0.47 ns, when the 80 MB temporary goes to memory and back. `x @ x` computes the same number in one pass with no temporary.
+
+These are measurements on one machine; the [debugging and profiling note](/notes/python/debugging-and-profiling#measuring-time-properly) explains how to time code reliably. On another machine the ratios differ while the shape of the picture does not.
+
+## Broadcasting
+
+Arithmetic between arrays of different shapes is common: subtract the mean of each column from a matrix, add a bias vector to every row of a batch. NumPy defines it by one rule instead of requiring copies to equal shapes.
+
+**The rule** ([NumPy, Broadcasting](#references)). To combine two arrays:
+
+1. Line up their shapes on the **right**. If one has fewer axes, pad its shape on the left with 1s.
+2. Compare the sizes axis by axis. Two sizes are **compatible** when they are equal or one of them is 1. Any other pair raises `ValueError`.
+3. The result has, on each axis, the larger of the two sizes.
+4. An operand of size 1 on an axis is used as if repeated along it. Nothing is copied: the repeated axis gets stride 0, so every position reads the same element.
+
+Worked: a column of shape `(3, 1)` plus a row of shape `(4,)`.
+
+<Broadcasting />
+
+1. Line up on the right: `(3, 1)` and `(4,)`; the row has one axis fewer.
+2. Pad the row on the left: `(4,)` becomes `(1, 4)`. The pairs are $3$ with $1$ and $1$ with $4$: compatible on both axes.
+3. Stretch: the column is used as if it had four identical columns, the row as if it had three identical rows. Both read their own few elements with stride 0 along the stretched axis.
+4. Add elementwise. The result has shape `(3, 4)`: entry $(i, j)$ is $\text{col}_i + \text{row}_j$.
+
+```text
+>>> col = np.array([[0], [10], [20]])
+>>> row = np.array([1, 2, 3, 4])
+>>> col + row
+array([[ 1,  2,  3,  4],
+       [11, 12, 13, 14],
+       [21, 22, 23, 24]])
+>>> np.broadcast_to(row, (3, 4)).strides
+(0, 8)
+>>> np.broadcast_shapes((8, 1, 6, 1), (7, 1, 5))
+(8, 7, 6, 5)
+>>> np.ones(3) + np.ones(4)
+Traceback (most recent call last):
+...
+ValueError: operands could not be broadcast together with shapes (3,) (4,)
+```
+
+The everyday use is centering the columns of a data matrix $X$ of shape $(n, d)$: `X.mean(axis=0)` has shape $(d,)$, which lines up with the last axis of $X$, so `X - X.mean(axis=0)` subtracts each column's mean from that column. Centering the rows needs the means as a column: `X.mean(axis=1, keepdims=True)` has shape $(n, 1)$.
+
+**The mistake.** Broadcasting never asks whether you meant it. Two cases are silent:
+
+```text
+>>> X = np.array([[1., 2., 3.], [4., 5., 6.], [7., 8., 18.]])
+>>> X - X.mean(axis=1)
+array([[-1., -3., -8.],
+       [ 2.,  0., -5.],
+       [ 5.,  3.,  7.]])
+>>> y = np.array([1., 2., 3.])
+>>> pred = np.array([[1.], [2.], [3.]])
+>>> (y - pred).shape, ((y - pred) ** 2).mean()
+((3, 3), np.float64(1.3333333333333333))
+```
+
+The row means `[2, 5, 11]` have shape `(3,)`, which lines up with the **columns**: the first column has 2 subtracted, the second 5, the third 11, which is not what "subtract each row's mean" means. For a non-square $X$ the shapes would clash and raise; for a square one the bug is silent. The second case is the classic error in a loss: a model returns predictions of shape $(n, 1)$, the targets have shape $(n,)$, and `y - pred` is an $n \times n$ matrix of every target minus every prediction. The predictions here are perfect, and the "mean squared error" is 1.33. Check shapes with `assert pred.shape == y.shape`, or flatten with `pred[:, 0]`. [PyTorch uses the same broadcasting rules](/notes/deep-learning/pytorch-and-autograd#broadcasting) and has the same trap.
+
+## Indexing: basic, fancy and boolean
+
+Three kinds of index select elements, and the kind decides whether you get a view.
+
+- **Basic**: integers, slices, `None` (`np.newaxis`, a new axis of size 1) and `...`. Returns a view, as above.
+- **Fancy** (integer arrays): `a[[2, 0]]` takes rows 2 and 0 in that order; `a[[0, 1, 2], [3, 2, 1]]` takes the elements $(0,3), (1,2), (2,1)$. Returns a copy.
+- **Boolean** (a mask of the same shape): `a[a > 5]` returns the elements where the mask is true, as a 1-D copy.
+
+```text
+>>> a = np.arange(12).reshape(3, 4)
+>>> a[[2, 0]]
+array([[ 8,  9, 10, 11],
+       [ 0,  1,  2,  3]])
+>>> a[[0, 1, 2], [3, 2, 1]]
+array([3, 6, 9])
+>>> a[a > 8]
+array([ 9, 10, 11])
+>>> a[a > 8] = 0
+>>> a
+array([[0, 1, 2, 3],
+       [4, 5, 6, 7],
+       [8, 0, 0, 0]])
+```
+
+Reading through a fancy or boolean index copies, but **assigning** through one writes into the original: `a[a > 8] = 0` is a single call to `a.__setitem__`, which writes in place. The trap is to combine the two: `a[a > 8][0] = 99` first makes a copy with `__getitem__`, then changes the copy, and `a` is untouched. The same chained-indexing trap returns in [pandas](/notes/python/pandas). The ML courses use fancy indexing to look up rows of a table by index: the Machine Learning course's [target encoding](/notes/ml/data-features-and-leakage#code) indexes an array of per-category means with an array of category numbers.
+
+## Reductions and `axis`
+
+A **reduction** combines many elements into one: `sum`, `mean`, `std`, `min`, `max`, `argmax`, `any`, `all`.
+
+**The rule.** Without `axis`, the reduction runs over all elements. With `axis=k`, it runs along axis $k$, and axis $k$ disappears from the shape: an array of shape $(3, 4)$ reduced with `axis=0` has shape $(4,)$, one result per column; with `axis=1`, shape $(3,)$, one per row. `keepdims=True` keeps the reduced axis with size 1, so the result broadcasts back against the input.
+
+```text
+>>> a = np.arange(12).reshape(3, 4)
+>>> a.sum(), a.sum(axis=0), a.sum(axis=1)
+(np.int64(66), array([12, 15, 18, 21]), array([ 6, 22, 38]))
+>>> a.sum(axis=1, keepdims=True).shape
+(3, 1)
+>>> a.argmax(axis=1)
+array([3, 3, 3])
+```
+
+A way to remember it: `axis=0` collapses the rows, so you get one number per column. In the ML courses $X$ has one row per object, and `X.mean(axis=0)` is the vector of feature means; a batch of logits has shape (batch, classes), and `logits.argmax(axis=1)` is the predicted class of each object.
+
+## The matrix product `@`
+
+`*` is elementwise. The matrix product is the operator `@`, which calls `np.matmul`.
+
+**The rule.** For 2-D arrays of shapes $(n, k)$ and $(k, m)$, `A @ B` has shape $(n, m)$ and entry $(i, j) = \sum_l A_{il} B_{lj}$; the inner sizes must match. A 1-D first operand is treated as a row, a 1-D second operand as a column, and the added axis is removed from the result, so `A @ x` of shapes $(n, k)$ and $(k,)$ is a vector of shape $(n,)$ and `x @ x` is a scalar. With more than two axes, the last two are the matrices and the leading ones are a **batch**, broadcast by the rule above.
+
+```text
+>>> A = np.array([[1, 2], [3, 4]])
+>>> x = np.array([1, 1])
+>>> A @ x, A * x
+(array([3, 7]), array([[1, 2],
+       [3, 4]]))
+>>> (np.ones((5, 3, 4)) @ np.ones((4, 2))).shape
+(5, 3, 2)
+>>> np.ones((2, 3)) @ np.ones((2, 3))
+Traceback (most recent call last):
+...
+ValueError: matmul: Input operand 1 has a mismatch in its core dimension 0, with gufunc signature (n?,k),(k,m?)->(n?,m?) (size 2 is different from 3)
+```
+
+`A @ x` is $(1 + 2, 3 + 4) = (3, 7)$, the matrix applied to the vector; `A * x` broadcasts `x` along the rows and multiplies elementwise, which is a different operation that also runs without error. The batched product multiplies each of the five $3 \times 4$ matrices by the same $4 \times 2$ one. The error message spells out the rule in its signature: the $k$ of the first operand must equal the $k$ of the second. What the product means, a linear map and three readings of $Ax = b$, is the [linear algebra](/notes/math/matrices-and-linear-systems#three-readings) of the Mathematics course; `np.linalg.solve(A, b)` solves the system and is what the [least-squares note](/notes/ml/least-squares#code) calls on $X^\top X$.
+
+## Random numbers
+
+**The rule.** Create one **generator** with a seed and draw everything from it: `rng = np.random.default_rng(seed)`. The same seed and the same NumPy version give the same numbers. The generator holds its state, the PCG64 bit generator by default, so successive calls continue the stream instead of repeating it.
+
+```text
+>>> rng = np.random.default_rng(42)
+>>> rng.random(3)
+array([0.77395605, 0.43887844, 0.85859792])
+>>> rng.integers(0, 10, size=5)
+array([0, 6, 2, 0, 5])
+>>> np.random.default_rng(42).random(3)
+array([0.77395605, 0.43887844, 0.85859792])
+```
+
+`rng.random(3)` draws three uniform numbers in $[0, 1)$; `rng.integers(0, 10, size=5)` five integers from 0 to 9; `rng.normal(mean, std, size)` Gaussian samples; `rng.permutation(n)` and `rng.choice` shuffle and sample. A second generator with seed 42 starts the same stream again. For independent parallel streams, `rng.spawn(k)` returns $k$ child generators whose streams do not overlap.
+
+The older interface, `np.random.seed(0)` followed by `np.random.rand(...)`, keeps one hidden global state that any library you call can advance, so the numbers your code gets depend on what ran before it. It still works and is kept for old code; new code passes a generator explicitly. NumPy fixes the bit stream for a seed but not the output of every distribution method across versions ([NEP 19](#references)), so exact numbers are reproducible for one version, which is why the Code sections of this site print their versions. Most Code sections of the Machine Learning course create such a generator in their first lines, `rng = np.random.default_rng(0)`, and draw every random number from it.
+
+<aside class="callout"><strong>Check yourself.</strong> (1) An array of shape `(2, 3, 4)` of `float32` in C order: what are its strides? (2) Which of these share memory with `a`, a C-ordered `(4, 6)` array: `a[1:3]`, `a[:, ::2]`, `a[[1, 2]]`, `a.T`, `a.T.reshape(24)`, `a.reshape(6, 4)`? (3) What does `np.array([200], dtype=np.uint8) + np.array([100], dtype=np.uint8)` give, and why? (4) What are the shapes of `np.ones((5, 1, 3)) + np.ones((4, 1))` and of `np.ones((2, 3)) + np.ones((3, 2))`? (5) A model returns `pred` of shape `(100, 1)` and the targets `y` have shape `(100,)`. What does `((pred - y) ** 2).mean()` compute? (6) Why is `for v in x: total += v * v` slower when `x` is a NumPy array than when it is a list?<details><summary>Answers</summary>(1) The item size is 4 bytes, so $s_2 = 4$, $s_1 = 4 \cdot 4 = 16$, $s_0 = 16 \cdot 3 = 48$: `(48, 16, 4)`. (2) `a[1:3]`, `a[:, ::2]`, `a.T` and `a.reshape(6, 4)` are views. `a[[1, 2]]` is fancy indexing, a copy. `a.T.reshape(24)` needs the elements in column order, which no single stride can walk, so it copies. (3) `array([44], dtype=uint8)`: $300$ does not fit in 8 bits and wraps to $300 - 256 = 44$, with no warning. (4) `(5, 4, 3)`: right-aligned, $(5,1,3)$ and $(1,4,1)$ are compatible on every axis. The second raises `ValueError`: $3$ against $2$ on the last axis. (5) Broadcasting turns `pred - y` into a $100 \times 100$ matrix of every prediction minus every target, so the result is the mean over all $10\,000$ pairs, not the mean squared error. (6) Each iteration converts one raw value into a new NumPy scalar object, and arithmetic on NumPy scalars costs more than on Python floats; the list already holds Python floats.</details></aside>
+
+## What changed
+
+| | List of floats (the baseline) | NumPy array |
+| --- | --- | --- |
+| Storage | an array of pointers to separate float objects | one block of raw values, all of one dtype |
+| Memory for 1000 doubles | 8 056 + 24 000 bytes | 8 000 bytes |
+| Slicing | copies | a view: new strides over the same block |
+| Integers | exact, unbounded | fixed width, wrap around silently |
+| Elementwise arithmetic | a Python loop, about 20 ns per element here | one ufunc call, under 1 ns per element on large arrays here |
+| Shapes | nested lists of any shape | rectangular, $d$ axes; broadcasting combines shapes |
+| Matrix product | written by hand | `@`, handed to BLAS |
+
+## Limitations
+
+- **Rectangular and homogeneous.** An array holds one dtype in a rectangular shape. Ragged data (sentences of different lengths) must be padded or kept in lists; mixed columns (names next to numbers) belong in a [pandas](/notes/python/pandas) table, whose columns are arrays of different dtypes.
+- **Temporaries cost memory.** Every intermediate of an expression is a full array. `((x - m) ** 2).sum()` on a 1 GB `x` allocates two more gigabytes. In-place forms (`x -= m`), `out=` arguments and fused functions (`x @ x`, `np.einsum`) avoid some of them.
+- **Sequential dependencies do not vectorize.** A recurrence where each step needs the previous result, such as a simulation or a running state, stays a loop. Libraries that compile Python loops (Numba) or array libraries with compilers (JAX, PyTorch) handle these; they are not covered here.
+- **One machine, one build.** The timings are from an Apple M1 with NumPy 2.5.4 and Accelerate as the BLAS. The memory model, the rules and the error messages are NumPy's and hold everywhere; the numbers do not.
+
+## What you should remember
+
+- An array is a block of memory plus a dtype, a shape and strides. The element $(i_0, \dots)$ is at $\text{start} + \sum_k i_k s_k$; C order makes the last axis contiguous.
+- Basic slicing, `.T` and most `reshape` calls return views that share memory; fancy and boolean indexing return copies. `np.shares_memory` tells you. Writing through a view changes the original.
+- NumPy integers have fixed width and wrap around silently. `float32` has about 7 significant digits; accumulate long sums in `float64`.
+- A ufunc runs one typed C loop over the whole array. It wins on large arrays and loses on a handful of elements; never loop over an array element by element in Python.
+- Broadcasting lines shapes up on the right; sizes must be equal or 1, and size 1 is stretched with stride 0. It is silent when shapes happen to fit, so check shapes.
+- Reductions with `axis=k` remove axis $k$; `keepdims=True` keeps it for broadcasting back. `@` is the matrix product, `*` is elementwise.
+- Draw random numbers from one seeded generator, `np.random.default_rng(seed)`.
+
+## Code
+
+The script checks the note's claims in order: the strides of C and Fortran order and the address formula; views and copies; integer wraparound and `float32` accumulation; broadcasting and its silent shape bug; indexing and reductions; the matrix product; seeded generators; and finally a timing of the list loop against the vectorized forms. Run it with `python -I arrays.py`; it needs NumPy and takes a few seconds. The timings differ on every machine and from run to run; the other lines are exact for NumPy 2.5.4.
+
+```python
+"""NumPy arrays: memory layout, views, dtypes, broadcasting and speed (Python 3.14, NumPy 2.x)."""
+import timeit
+
+import numpy as np
+
+print("numpy", np.__version__)
+
+# 1. An array is a block of memory + dtype + shape + strides
+a = np.arange(12).reshape(3, 4)
+f = np.asfortranarray(a)
+print(a.dtype, a.shape, a.strides, f.strides)
+i, j = 2, 1
+print("offset of a[2, 1]:", i * a.strides[0] + j * a.strides[1], "C;", i * f.strides[0] + j * f.strides[1], "F")
+
+# 2. Views share memory; fancy and boolean indexing copy
+views = {"a[:, 1]": a[:, 1], "a.T": a.T, "a.reshape(4, 3)": a.reshape(4, 3), "a.T.reshape(12)": a.T.reshape(12),
+         "a[[0, 2]]": a[[0, 2]], "a[a > 5]": a[a > 5]}
+print({name: np.shares_memory(a, v) for name, v in views.items()})
+b = a.copy()
+b[1][0] = 100                       # b[1] is a view, so this writes into b
+print(b[1])
+
+# 3. Fixed-width integers wrap; float32 loses digits in long sequential sums
+x8 = np.array([100, 120, 127], dtype=np.int8)
+print(x8 + 1, np.array([200], dtype=np.uint8) + np.array([100], dtype=np.uint8))
+v = np.full(10_000_000, 0.1, dtype=np.float32)
+print(v.sum(), np.cumsum(v)[-1], v.sum(dtype=np.float64))
+
+# 4. Broadcasting: (3, 1) with (4,) -> (3, 4); and the silent (n, 1) - (n,) bug
+col, row = np.array([[0], [10], [20]]), np.array([1, 2, 3, 4])
+print((col + row).shape, (col + row)[2].tolist(), np.broadcast_to(row, (3, 4)).strides)
+y = np.array([1.0, 2.0, 3.0])
+pred = y[:, None]                    # perfect predictions, but shape (3, 1)
+print("wrong mse", ((y - pred) ** 2).mean(), "right mse", ((y - pred[:, 0]) ** 2).mean())
+
+# 5. Reductions along an axis, and centering the columns of a matrix
+X = np.array([[1.0, 2.0], [3.0, 4.0], [5.0, 9.0]])
+print(X.mean(axis=0), (X - X.mean(axis=0)).mean(axis=0), X.sum(axis=1, keepdims=True).shape)
+
+# 6. The matrix product
+A = np.array([[1, 2], [3, 4]])
+print(A @ np.array([1, 1]), (np.ones((5, 3, 4)) @ np.ones((4, 2))).shape)
+
+# 7. A seeded generator gives the same stream every time
+print(np.random.default_rng(42).random(3).round(4), np.random.default_rng(42).random(3).round(4))
+
+# 8. A Python loop against vectorized code, sum of squares of n random floats
+def loop(xs):
+    total = 0.0
+    for t in xs:
+        total += t * t
+    return total
+
+rng = np.random.default_rng(0)
+for n in (10, 1_000, 1_000_000):
+    x = rng.random(n)
+    xs = x.tolist()
+    number = max(1, 100_000 // n)
+    for name, fn in [("list loop", lambda: loop(xs)), ("(x*x).sum()", lambda: (x * x).sum()), ("x @ x", lambda: x @ x)]:
+        best = min(timeit.repeat(fn, number=number, repeat=5)) / number
+        print(f"n={n:>9,} {name:12} {best * 1e6:10.2f} us  {best * 1e9 / n:7.2f} ns/element")
+
+# Output with CPython 3.14.7 and NumPy 2.5.4 on an Apple M1 (macOS); the timings vary between machines and runs:
+# numpy 2.5.4
+# int64 (3, 4) (32, 8) (8, 24)
+# offset of a[2, 1]: 72 C; 40 F
+# {'a[:, 1]': True, 'a.T': True, 'a.reshape(4, 3)': True, 'a.T.reshape(12)': False, 'a[[0, 2]]': False, 'a[a > 5]': False}
+# [100   5   6   7]
+# [ 101  121 -128] [44]
+# 1.0000001e+06 1.087937e+06 1000000.0149011612
+# (3, 4) [21, 22, 23, 24] (0, 8)
+# wrong mse 1.3333333333333333 right mse 0.0
+# [3. 5.] [0. 0.] (3, 1)
+# [3 7] (5, 3, 2)
+# [0.774  0.4389 0.8586] [0.774  0.4389 0.8586]
+# n=       10 list loop          0.25 us    25.00 ns/element
+# n=       10 (x*x).sum()        0.58 us    57.54 ns/element
+# n=       10 x @ x              0.50 us    50.14 ns/element
+# n=    1,000 list loop         18.51 us    18.51 ns/element
+# n=    1,000 (x*x).sum()        0.96 us     0.96 ns/element
+# n=    1,000 x @ x              0.67 us     0.67 ns/element
+# n=1,000,000 list loop      19735.83 us    19.74 ns/element
+# n=1,000,000 (x*x).sum()      420.50 us     0.42 ns/element
+# n=1,000,000 x @ x            177.75 us     0.18 ns/element
+```
+
+## Next
+
+An array holds numbers of one type, addressed by position. Real data come as tables: a column of city names next to a column of temperatures and a column of dates, rows that are identified by a key rather than by their position, and values that are missing. The [next note](/notes/python/pandas) builds such a table, the pandas `DataFrame`, as labeled columns over arrays like these, and shows how to filter, group, join and reshape it.
+
+## References
+
+- NumPy documentation (2.x): [The N-dimensional array](https://numpy.org/doc/stable/reference/arrays.ndarray.html) (memory layout and strides); [Copies and views](https://numpy.org/doc/stable/user/basics.copies.html); [Data types](https://numpy.org/doc/stable/user/basics.types.html) (overflow); [Universal functions](https://numpy.org/doc/stable/reference/ufuncs.html); [Broadcasting](https://numpy.org/doc/stable/user/basics.broadcasting.html); [Indexing on ndarrays](https://numpy.org/doc/stable/user/basics.indexing.html); [`numpy.matmul`](https://numpy.org/doc/stable/reference/generated/numpy.matmul.html); [Random sampling](https://numpy.org/doc/stable/reference/random/index.html); [CPU/SIMD optimizations](https://numpy.org/doc/stable/reference/simd/index.html).
+- S. Berg, M. Kühne, R. Gommers et al. [NEP 50 — Promotion rules for Python scalars](https://numpy.org/neps/nep-0050-scalar-promotion.html). NumPy 2.0, 2024.
+- R. Kern. [NEP 19 — Random number generator policy](https://numpy.org/neps/nep-0019-rng-policy.html). 2018.
+- C. R. Harris, K. J. Millman, S. J. van der Walt et al. [Array programming with NumPy](https://doi.org/10.1038/s41586-020-2649-2). *Nature* 585, 2020.
+- S. van der Walt, S. C. Colbert, G. Varoquaux. [The NumPy array: a structure for efficient numerical computation](https://doi.org/10.1109/MCSE.2011.37). *Computing in Science & Engineering* 13(2), 2011.
+- J. VanderPlas. *Python Data Science Handbook*, 2nd ed. O'Reilly, 2023. Ch. 2 (introduction to NumPy).
+- W. McKinney. *Python for Data Analysis*, 3rd ed. O'Reilly, 2022. Ch. 4 (NumPy basics).
+- L. Ramalho. *Fluent Python*, 2nd ed. O'Reilly, 2022.

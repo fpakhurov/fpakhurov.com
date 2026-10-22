@@ -1,0 +1,603 @@
+---
+title: Файлы и исключения
+description: "Как Python сообщает об ошибках и обрабатывает их и как читает и пишет файлы: raise, try, except, else и finally, иерархия исключений, EAFP против LBYL, группы исключений с except* и примечаниями, контекстные менеджеры и инструкция with, текстовые и двоичные файлы, кодировки, pathlib, CSV и JSON."
+course: python
+section: Структуры данных
+order: 8
+status: published
+tags: [python, exceptions, try-except, exception-hierarchy, eafp, exception-groups, context-managers, with, files, encodings, pathlib, csv, json]
+prerequisites: [Функции, Строки и текст, "Итерация, включения и генераторы"]
+---
+
+import ExcHierarchy from '../../../components/figures/files-and-exceptions/ExcHierarchy.astro';
+import WithProtocol from '../../../components/figures/files-and-exceptions/WithProtocol.astro';
+import IOStack from '../../../components/figures/files-and-exceptions/IOStack.astro';
+import FileMemory from '../../../components/figures/files-and-exceptions/FileMemory.astro';
+
+[Предыдущая заметка](/ru/notes/python/iteration-and-generators) получала свои данные внутри программы. Настоящие данные лежат в файлах, а чтение файла приносит две вещи, которые прежние заметки могли отложить. Операции не удаются по причинам, которые программа не контролирует: файла нет, диск заполнен, в строке стоит `1,5` там, где ожидалось число. А некоторые объекты держат ресурс — открытый файл, блокировку, сетевое соединение, — который нужно освободить, как бы ни закончился использующий его код. На первое Python отвечает **исключениями** (exceptions), на второе — **контекстными менеджерами** (context managers) и инструкцией `with`. Эта заметка разбирает и то и другое, а затем сами файлы: текст против байтов, кодировки, пути, чтение большого файла без загрузки целиком и два формата, которые встречаются в каждом проекте с данными, — CSV и JSON.
+
+## Отправная точка: коды ошибок \{#baseline-error-codes\}
+
+Функция может сообщать о неудаче через возвращаемое значение, как функции C возвращают $-1$. Так работает `str.find` в Python: он возвращает позицию подстроки или $-1$, если её нет. Ничто не заставляет вызывающий код это проверять:
+
+```text
+>>> s = 'abc'
+>>> s.find('z')
+-1
+>>> s[s.find('z')]
+'c'
+>>> s.index('z')
+Traceback (most recent call last):
+  ...
+ValueError: substring not found
+```
+
+$-1$ использовалось как индекс, а поскольку отрицательные индексы отсчитываются от конца, программа молча прочитала последний символ. После каждого вызова, который может не удаться, нужен `if`, и забытый `if` превращает ошибку в неверный ответ далеко от её причины. `str.index` выполняет тот же поиск, но вместо этого **возбуждает исключение**: программа не может продолжить так, будто поиск удался.
+
+## Возбуждение и обработка исключений \{#raising-and-handling-exceptions\}
+
+<aside class="callout"><strong>Ключевая идея.</strong> Исключение — объект, который описывает ошибку, и его возбуждение прерывает обычный ход выполнения: интерпретатор разматывает стек вызовов кадр за кадром, пока не найдёт инструкцию `try` с подходящей частью `except`, которая берёт управление на себя, или не дойдёт до верха и не напечатает трассировку. `finally` и инструкция `with` присоединяют код очистки, который выполняется при любом выходе из блока, обычном или нет, — так файлы закрываются, а блокировки освобождаются, даже когда что-то идёт не так. Сами файлы — многослойные объекты, которые превращают байты операционной системы в строки с помощью кодировки, и они являются итераторами по строкам, поэтому файл любого размера можно обрабатывать по одной строке.</aside>
+
+**Правило** ([справочник по языку Python, §8.4](#references)):
+
+```python
+try:
+    body
+except SomeError as err:     # любое число частей except, проверяются по порядку
+    handler
+else:                        # необязательно: выполняется, если тело ничего не возбудило
+    no_error
+finally:                     # необязательно: выполняется при любом выходе
+    cleanup
+```
+
+1. Выполняется тело. Если оно ничего не возбудило, выполняется `else`, затем `finally`.
+2. Если оно возбудило исключение `e`, части `except` проверяются по порядку, и первая, класс которой подходит, `isinstance(e, SomeError)`, выполняется с `err`, связанным с `e`. После обработчика выполняется `finally`, и выполнение продолжается после инструкции.
+3. Если ни одна часть не подошла, выполняется `finally`, и исключение уходит дальше к вызывающему коду.
+4. `finally` выполняется и тогда, когда тело или обработчик выходят через `return`, `break` или `continue`.
+
+Имя `err` удаляется в конце своей части `except`; чтобы сохранить объект, его нужно присвоить другому имени. Порядок блоков виден на маленьком разборщике:
+
+```text
+>>> def parse(text):
+...     try:
+...         value = int(text)
+...     except ValueError as err:
+...         print('except:', err)
+...         return None
+...     else:
+...         print('else: parsed', value)
+...         return value
+...     finally:
+...         print('finally')
+...
+>>> parse('42')
+else: parsed 42
+finally
+42
+>>> parse('4x2')
+except: invalid literal for int() with base 10: '4x2'
+finally
+```
+
+`finally` выполнился после того, как `return value` было вычислено, и до того, как функция действительно вернула управление; REPL напечатал 42 последним. Блок `else` оставляет в теле `try` только ту одну строку, которая может не удаться, чтобы неожиданный `ValueError` из кода в `else` не был принят за неверное число. Два изменения в Python 3.14: `except TimeoutError, ConnectionError:` теперь может перечислять несколько классов без скобок, если нет `as` ([PEP 758](#references)), а `return`, `break` или `continue`, которые выходят из блока `finally`, вызывают `SyntaxWarning`, потому что молча отбрасывают летящее исключение ([PEP 765](#references)).
+
+**Возбуждение.** `raise SomeError('message')` возбуждает новое исключение, а голый `raise` внутри обработчика повторно возбуждает обрабатываемое. Исключение, возбуждённое во время обработки другого, запоминает его, а `raise New(...) from err` записывает первое как явную причину; трассировка тогда показывает оба ([PEP 3134](#references)):
+
+```text
+>>> def load(cfg, key):
+...     try:
+...         return cfg[key]
+...     except KeyError as err:
+...         raise RuntimeError(f'missing setting {key!r}') from err
+...
+>>> load({}, 'lr')
+Traceback (most recent call last):
+  ...
+KeyError: 'lr'
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  ...
+RuntimeError: missing setting 'lr'
+```
+
+**Почему стек разматывается.** У каждого вызова функции есть кадр на стеке вызовов ([заметка о функциях](/ru/notes/python/functions#recursion-and-the-call-stack)). Когда возбуждается исключение, CPython ищет обработчик в текущем кадре по таблице, которую компилятор строит для каждой функции из её блоков `try`; если обработчика нет, кадр отбрасывается, и поиск продолжается в вызывающей функции. Трассировка — это список пройденных кадров, поэтому она читается от самого внешнего вызова вниз до строки, которая возбудила исключение ([заметка о запуске Python](/ru/notes/python/running-python#errors-and-how-to-read-a-traceback)). Начиная с Python 3.11 блок `try` ничего не стоит, если исключение не возбуждено: к таблице обработчиков обращаются, только когда оно возбуждено ([What's New in Python 3.11](#references)).
+
+## Иерархия исключений \{#the-exception-hierarchy\}
+
+**Правило.** Исключения — это классы в единой иерархии с корнем `BaseException`, и `except C` перехватывает экземпляры `C` и всех его подклассов. Программы перехватывают `Exception` и его потомков. Несколько классов наследуют прямо от `BaseException`, чтобы широкий `except Exception` их пропускал ([документация Python, иерархия исключений](#references)).
+
+<ExcHierarchy />
+
+```text
+>>> issubclass(KeyError, LookupError), issubclass(FileNotFoundError, OSError)
+(True, True)
+>>> issubclass(KeyboardInterrupt, Exception), issubclass(ExceptionGroup, Exception)
+(False, True)
+>>> try:
+...     open('no-such-file.txt')
+... except OSError as e:
+...     print(type(e).__name__, e.errno, e.strerror, e.filename)
+...
+FileNotFoundError 2 No such file or directory no-such-file.txt
+```
+
+`except OSError` перехватил `FileNotFoundError`, атрибуты которого несут номер ошибки и сообщение, которые операционная система вернула для неудавшегося системного вызова `open`, — `ENOENT` (2), как в [заметке о системных вызовах](/ru/notes/acos/system-calls). Категории, отмеченные жёлтым, удобно перехватывать целиком: `LookupError` — для любого неудавшегося `[]`, `OSError` — для любого сбоя операционной системы, `ValueError` — для значения правильного типа, но с неправильным содержимым.
+
+**Ошибки.** Голый `except:` или `except BaseException:` перехватывает и `KeyboardInterrupt`, так что программа игнорирует Ctrl-C; он перехватывает и `SystemExit` от `sys.exit()`. `except Exception:` вокруг большого блока прячет ошибки в коде — `NameError` из-за опечатки или `TypeError` из-за неверного аргумента — за обработкой, предназначенной для одного ожидаемого сбоя. Перехватывать нужно самый узкий класс, описывающий ожидаемый сбой, вокруг как можно меньшего числа строк, которые могут его возбудить. Библиотека определяет собственные исключения как подклассы `Exception`, `class ConfigError(Exception): pass`, чтобы вызывающий код мог перехватывать её ошибки, и только их.
+
+## EAFP против LBYL \{#eafp-against-lbyl\}
+
+Операцию, которая может не удаться, можно обработать двумя способами. **LBYL** (look before you leap, «посмотри, прежде чем прыгать») сначала проверяет: `if key in d: use(d[key])`. **EAFP** (easier to ask forgiveness than permission, «проще попросить прощения, чем разрешения») пробует и обрабатывает неудачу: `try: use(d[key])` с `except KeyError`. Стиль Python склоняется к EAFP ([глоссарий Python](#references)) по двум причинам.
+
+**Проверка может устареть.** Для всего, что находится вне программы, состояние может измениться между проверкой и использованием. `if path.exists(): open(path)` всё равно может не удаться: другой процесс может удалить файл в промежутке — это **гонка между проверкой и использованием** (time-of-check to time-of-use). Для файлов правилен только EAFP; `open` должен стоять внутри `try`, а проверка ничего не добавляет.
+
+**Стоимость зависит от того, как часто случается неудача.** Измерено на этой машине (CPython 3.14.7, Apple M1), на один вызов маленькой функции, которая ищет ключ в словаре из одного ключа:
+
+| | ключ есть | ключа нет |
+| --- | --- | --- |
+| LBYL: `if k in d: return d[k]` | 52 нс | 43 нс |
+| EAFP: `try: return d[k]` / `except KeyError` | 44 нс | 130 нс |
+| `d.get(k, 0)` | 50 нс | 49 нс |
+
+`try` бесплатен, когда ничего не возбуждается, как сказано в предыдущем разделе, поэтому EAFP выигрывает, когда неудачи редки. Возбуждение и перехват исключения стоят примерно на 90 нс больше, поэтому для поиска, который часто не удаётся, проверка или `dict.get` дешевле. Для словарей `get`, `setdefault` и `defaultdict` ([заметка о словарях](/ru/notes/python/dicts-and-sets#counting-and-grouping-counter-and-defaultdict)) обычно делают этот вопрос неактуальным.
+
+## Группы исключений и примечания \{#exception-groups-and-notes\}
+
+**Группы исключений.** Иногда одновременно происходит несколько не связанных между собой ошибок: три из десяти параллельных загрузок не удаются, или проверка находит в одной записи две проблемы. Если возбудить только первую, остальные потеряются. В Python 3.11 появились `ExceptionGroup` — **группа исключений** (exception group), исключение, которое несёт список исключений, — и `except*`, который обрабатывает члены группы по типу ([PEP 654](#references)):
+
+```text
+>>> def check(row):
+...     errors = []
+...     if row.get('age', 0) < 0:
+...         errors.append(ValueError('age must be non-negative'))
+...     if 'name' not in row:
+...         errors.append(KeyError('name'))
+...     if errors:
+...         raise ExceptionGroup('invalid row', errors)
+...
+>>> try:
+...     check({'age': -3})
+... except* ValueError as eg:
+...     print('values:', eg.exceptions)
+... except* KeyError as eg:
+...     print('keys:', eg.exceptions)
+...
+values: (ValueError('age must be non-negative'),)
+keys: (KeyError('name'),)
+```
+
+**Правило.** Каждая часть `except* C` получает подгруппу членов, подходящих под `C`, в виде группы исключений, и части выполняются одна за другой, так что на одно возбуждение может сработать несколько частей, в отличие от `except`. Члены, которые не подошли ни под одну часть, повторно возбуждаются вместе как группа. Необработанная группа печатается как дерево:
+
+```text
+>>> check({'age': -3})
+  + Exception Group Traceback (most recent call last):
+  |   ...
+  | ExceptionGroup: invalid row (2 sub-exceptions)
+  +-+---------------- 1 ----------------
+    | ValueError: age must be non-negative
+    +---------------- 2 ----------------
+    | KeyError: 'name'
+    +------------------------------------
+```
+
+`asyncio.TaskGroup`, который выполняет задачи конкурентно, возбуждает `ExceptionGroup` из задач, завершившихся с ошибкой ([заметка о конкурентности](/ru/notes/python/concurrency)).
+
+**Примечания.** Исключению, возбуждённому глубоко внутри библиотеки, часто не хватает контекста, который бы его объяснил: какой файл, какая строка, какая настройка. Начиная с 3.11 `err.add_note(text)` прикрепляет **примечание** (note) — строку, которую трассировка печатает после сообщения, не меняя тип исключения ([PEP 678](#references)):
+
+```text
+>>> try:
+...     float('1,5')
+... except ValueError as err:
+...     err.add_note('line 7 of prices.csv')
+...     raise
+...
+Traceback (most recent call last):
+  ...
+ValueError: could not convert string to float: '1,5'
+line 7 of prices.csv
+```
+
+Стандартная библиотека сама пользуется примечаниями: в Python 3.14 `json.dumps({'tags': {'a', 'b'}})` возбуждает `TypeError: Object of type set is not JSON serializable` с примечанием `when serializing dict item 'tags'`, которое указывает на виновника внутри большой структуры.
+
+## Контекстные менеджеры и `with` \{#context-managers-and-with\}
+
+Файл нужно закрыть, блокировку освободить, временный каталог удалить, и освобождение должно произойти, даже когда код между ними возбуждает исключение. Это может сделать `try`/`finally`, но тогда очистка становится обязанностью каждого вызывающего кода. **Контекстный менеджер** упаковывает подготовку и очистку в один объект, а инструкция `with` применяет его.
+
+**Правило.** `with expr as name: body` вычисляет `expr` в контекстный менеджер `m`, вызывает `m.__enter__()` и связывает его результат с `name`, выполняет тело и затем вызывает `m.__exit__(exc_type, exc, tb)`, как бы ни закончилось тело, — с типом, значением и трассировкой исключения или с тремя `None`. Если `__exit__` возвращает истинное значение, исключение из тела подавляется; иначе оно летит дальше ([PEP 343](#references); специальные методы ищутся в типе, как объясняет [заметка о модели данных](/ru/notes/python/the-data-model#context-managers-__enter__-and-__exit__)). Класс, который печатает свои вызовы, показывает порядок:
+
+```text
+>>> class Timer:
+...     def __enter__(self):
+...         print('enter')
+...         return self
+...     def __exit__(self, exc_type, exc, tb):
+...         print('exit, exception:', exc_type)
+...         return False
+...
+>>> with Timer() as t:
+...     print('body')
+...
+enter
+body
+exit, exception: None
+>>> with Timer():
+...     1 / 0
+...
+enter
+exit, exception: <class 'ZeroDivisionError'>
+Traceback (most recent call last):
+  ...
+ZeroDivisionError: division by zero
+```
+
+<WithProtocol />
+
+1. Вычисляется `Timer()`, и у его типа проверяется наличие `__enter__` и `__exit__`.
+2. Выполняется `__enter__` и возвращает сам объект, который связывается с `t`. `__enter__` файла тоже возвращает сам файл, поэтому работает `with open(p) as f`.
+3. Тело возбуждает `ZeroDivisionError`.
+4. Прежде чем исключение покинет блок, с ним вызывается `__exit__`.
+5. `__exit__` возвращает `False`, поэтому исключение распространяется дальше, и трассировка появляется после строки, напечатанной `__exit__`.
+
+**Контекстные менеджеры из генераторов.** `contextlib.contextmanager` превращает функцию-генератор с единственным `yield` в контекстный менеджер: код до `yield` — подготовка, выданное значение связывается через `as`, а `finally` вокруг `yield` — очистка. Это протокол [генератора](/ru/notes/python/iteration-and-generators#generator-functions-and-yield), использованный для другой цели:
+
+```text
+>>> from contextlib import contextmanager, suppress
+>>> @contextmanager
+... def tag(name):
+...     print(f'<{name}>')
+...     try:
+...         yield name
+...     finally:
+...         print(f'</{name}>')
+...
+>>> with tag('p') as n:
+...     print('inside', n)
+...
+<p>
+inside p
+</p>
+>>> with suppress(FileNotFoundError):
+...     open('missing.txt')
+...
+>>> print('carried on')
+carried on
+```
+
+`contextlib.suppress` — контекстный менеджер, чей `__exit__` возвращает истину для перечисленных исключений. Другие распространённые: открытые файлы `open`, `threading.Lock`, `tempfile.TemporaryDirectory`, `torch.no_grad()` в [PyTorch](/ru/notes/deep-learning/pytorch-and-autograd#how-pytorch-records-the-graph), который выключает запись градиентов внутри своего блока и снова включает в его конце.
+
+## Файлы: текст и байты \{#files-text-and-bytes\}
+
+**Правило.** `open(path, mode='r', encoding=None, newline=None)` возвращает файловый объект. Режим — комбинация из `r` (чтение, по умолчанию), `w` (запись, файл сначала обрезается), `a` (дозапись в конец), `x` (создание, неудача, если файл существует), `+` (чтение и запись) и `t` (текст, по умолчанию) или `b` (двоичный режим). **Текстовый** файл читает и пишет `str`, декодируя и кодируя по `encoding`; **двоичный** файл читает и пишет `bytes` без изменений ([документация Python, `open`](#references)).
+
+```text
+>>> from pathlib import Path
+>>> p = Path('notes.txt')
+>>> with open(p, 'w', encoding='utf-8') as f:
+...     f.write('naïve café\n')
+...     f.write('second line\n')
+...
+11
+12
+>>> p.read_bytes()
+b'na\xc3\xafve caf\xc3\xa9\nsecond line\n'
+>>> with open(p, encoding='utf-8') as f:
+...     for line in f:
+...         print(repr(line))
+...
+'naïve café\n'
+'second line\n'
+```
+
+`write` вернул число записанных **символов**, 11 для первой строки, но в файле лежат байты: `ï` и `é` занимают в UTF-8 по два байта, поэтому первая строка на диске занимает 13 байт. Чтение в текстовом режиме декодировало их обратно, а обход файла давал по одной строке, каждую со своим `\n`.
+
+**Кодировки.** Байты ничего не значат без кодировки, которая их произвела, как показала [заметка о строках](/ru/notes/python/strings-and-text#a-string-is-a-sequence-of-code-points). Прочитанный с неверной кодировкой, тот же файл либо искажается, либо не читается вовсе:
+
+```text
+>>> with open(p, encoding='latin-1') as f:
+...     print(f.read())
+...
+naÃ¯ve cafÃ©
+second line
+
+>>> with open(p, encoding='ascii') as f:
+...     f.read()
+...
+Traceback (most recent call last):
+  ...
+UnicodeDecodeError: 'ascii' codec can't decode byte 0xc3 in position 2: ordinal not in range(128)
+```
+
+**Ошибка** — не указать `encoding`. Тогда Python 3.14 использует кодировку локали, `locale.getencoding()`, которая в большинстве систем macOS и Linux — UTF-8, а в Windows часто устаревшая кодовая страница вроде cp1252, поэтому один и тот же скрипт читает один и тот же файл на двух машинах по-разному. Для текстовых файлов `encoding='utf-8'` нужно передавать всегда; `python -X warn_default_encoding` заставляет Python предупреждать везде, где кодировка не указана ([PEP 597](#references)). Python 3.15, вышедший в октябре 2026 года, делает UTF-8 кодировкой по умолчанию везде ([PEP 686](#references)). Двоичный режим — для файлов, которые не являются текстом: изображений, архивов, файлов `.npy` NumPy, весов моделей.
+
+**Концы строк.** В текстовом режиме `newline=None` (по умолчанию) при чтении превращает `\r\n` и `\r` в `\n`, а при записи пишет `\n` как конец строки, принятый на платформе. Модуль `csv` сам обрабатывает концы строк и просит `newline=''`.
+
+**Что такое открытый файл.** Текстовый файловый объект — это три объекта друг над другом, и каждый слой делает одну работу:
+
+<IOStack />
+
+```text
+>>> f = open('notes.txt', encoding='utf-8')
+>>> f
+<_io.TextIOWrapper name='notes.txt' mode='r' encoding='utf-8'>
+>>> type(f.buffer).__name__, type(f.buffer.raw).__name__, f.fileno()
+('BufferedReader', 'FileIO', 3)
+>>> import io
+>>> io.DEFAULT_BUFFER_SIZE
+131072
+>>> f.close()
+>>> f.read()
+Traceback (most recent call last):
+  ...
+ValueError: I/O operation on closed file.
+```
+
+`FileIO` внизу держит файловый дескриптор операционной системы, здесь 3, поскольку 0, 1 и 2 — стандартные потоки, и каждое его чтение — системный вызов `read`. `BufferedReader` над ним запрашивает большие блоки и раздаёт их маленькими кусками, чтобы построчное чтение файла не стоило одного системного вызова на строку: это буферизация из [заметки о файлах и вводе-выводе](/ru/notes/acos/files-and-io#buffering-fewer-and-larger-calls), сделанная за нас. Запись буферизуется так же, поэтому данные, записанные в файл, могут лежать в памяти, пока буфер не заполнится, не будет вызван `f.flush()` или файл не закроется. Это и есть практическая причина писать `with open(...)`: `__exit__` закрывает файл, что сбрасывает буфер и освобождает дескриптор, даже когда тело завершается ошибкой. Файл, который так и не закрыли, может потерять последние записи, а процесс, который открывает тысячи файлов, не закрывая их, исчерпывает дескрипторы.
+
+## Ленивое чтение больших файлов \{#reading-large-files-lazily\}
+
+**Правило.** `f.read()` возвращает весь файл одной строкой; `f.readlines()` возвращает список всех строк. Обход файла, `for line in f`, возвращает по одной строке и читает следующий блок, только когда буфер кончается: файловый объект — [итератор](/ru/notes/python/iteration-and-generators#the-iterator-protocol) по своим строкам.
+
+<FileMemory />
+
+`f.read()` для файла в 16 МБ дал пик в 32 МБ — прочитанные байты и декодированная строка, хранящиеся одновременно; построчный обход держался на 0.15 МБ, в основном буфер в 128 КиБ, при любом размере. Цикл по строкам обрабатывает файл больше памяти и может остановиться раньше, после заголовка или на первом совпадении, не читая остальное. Вместе с конвейерами генераторов из предыдущей заметки так очищают, фильтруют и разбивают на батчи большие журналы и корпуса.
+
+## Пути \{#paths\}
+
+`pathlib.Path` представляет путь как объект, а не как строку ([документация Python, `pathlib`](#references)). Оператор `/` соединяет части правильным для системы разделителем, а части имени доступны как атрибуты:
+
+```text
+>>> from pathlib import Path
+>>> p = Path('data') / 'train' / 'prices.csv'
+>>> p, p.name, p.stem, p.suffix, p.parent
+(PosixPath('data/train/prices.csv'), 'prices.csv', 'prices', '.csv', PosixPath('data/train'))
+>>> p.exists()
+False
+>>> Path('data/train').mkdir(parents=True, exist_ok=True)
+>>> p.write_text('day,price\nmon,9.5\ntue,10.25\n', encoding='utf-8')
+28
+>>> sorted(q.name for q in Path('data').rglob('*.csv'))
+['prices.csv']
+```
+
+`read_text` и `write_text` открывают файл, читают или пишут и закрывают его за один вызов; `glob` и `rglob` ищут файлы по шаблону, второй — во всех подкаталогах. Python 3.14 добавляет `Path.copy`, `Path.move` и их варианты с `_into` для копирования и перемещения файлов и целых деревьев каталогов. Относительные пути вроде `data/train` разрешаются относительно **текущего рабочего каталога** (current working directory) — каталога, из которого запущена программа, а не каталога скрипта; скрипт, которому нужно найти собственные файлы данных, строит пути от `Path(__file__).parent`.
+
+## CSV и JSON \{#csv-and-json\}
+
+**CSV.** Файл со значениями, разделёнными запятыми, — это текст с одной записью на строку. Разбиение строк по запятым ломается, как только поле содержит запятую внутри кавычек; модуль `csv` разбирает правила кавычек ([документация Python, `csv`](#references)). `csv.DictReader` возвращает по словарю на строку с ключами из заголовка:
+
+```text
+>>> import csv
+>>> with open('data/train/prices.csv', newline='', encoding='utf-8') as f:
+...     rows = list(csv.DictReader(f))
+...
+>>> rows
+[{'day': 'mon', 'price': '9.5'}, {'day': 'tue', 'price': '10.25'}]
+>>> sum(float(r['price']) for r in rows)
+19.75
+```
+
+Каждое поле возвращается строкой, `'9.5'`, и его нужно преобразовать; значение, которое не преобразуется, возбуждает `ValueError`, и здесь `add_note` с номером строки оказывается как нельзя кстати. Таблицы любого размера [заметка о pandas](/ru/notes/python/pandas) читает через `pd.read_csv`, который определяет типы сам.
+
+**JSON.** JSON — текстовый формат для вложенных данных с шестью видами значений, которые соответствуют типам Python: объекты — `dict`, массивы — `list`, строки — `str`, числа — `int` или `float`, `true` и `false` — `bool`, а `null` — `None` ([документация Python, `json`](#references)). `json.dumps` и `json.loads` преобразуют в строки и из строк, `json.dump` и `json.load` — в файлы и из файлов:
+
+```text
+>>> import json
+>>> config = {'lr': 0.001, 'layers': [64, 32], 'name': 'mlp', 'dropout': None}
+>>> text = json.dumps(config)
+>>> text
+'{"lr": 0.001, "layers": [64, 32], "name": "mlp", "dropout": null}'
+>>> json.loads(text) == config
+True
+>>> json.loads("{'a': 1}")
+Traceback (most recent call last):
+  ...
+json.decoder.JSONDecodeError: Expecting property name enclosed in double quotes: line 1 column 2 (char 1)
+```
+
+JSON — не синтаксис Python: строкам нужны двойные кавычки, а `None` — это `null`. Кортежи возвращаются списками, ключи — всегда строками, а множества, даты и массивы NumPy без преобразования не сериализуются. Конфигурации экспериментов, словари токенизаторов и метаданные контрольных точек моделей обычно хранят в JSON; сами веса идут в двоичные форматы.
+
+<aside class="callout"><strong>Проверьте себя.</strong> (1) В `try: return 1` / `finally: print('x')` печатается ли `'x'` и что возвращает функция? (2) Почему `except Exception:` не останавливает Ctrl-C и почему это правильное решение? (3) Скрипт проверяет `if os.path.exists(p):`, а затем открывает `p`. Назовите, как это может не сработать, и исправление. (4) `with open('out.txt', 'w') as f: f.write(data); 1 / 0` — окажутся ли данные после этого в файле? (5) CSV, открытый без `encoding`, правильно читается на Mac и показывает `Ã©` на машине коллеги с Windows. Что произошло и какой один аргумент это исправляет?<details><summary>Ответы</summary>(1) Да: `finally` выполняется после того, как вычислено возвращаемое значение, и до того, как функция вернёт управление; она возвращает 1. (2) `KeyboardInterrupt` наследует от `BaseException`, а не от `Exception`. Обработчик, написанный для ошибок программы, не должен мешать пользователю остановить программу. (3) Файл могут удалить или изменить его права доступа между проверкой и `open` (гонка между проверкой и использованием), и `open` всё равно возбудит исключение. Нужно поместить `open` в `try` и обработать `FileNotFoundError` или `OSError`. (4) Да: исключение покидает блок, `__exit__` закрывает файл, закрытие сбрасывает буфер, и только затем `ZeroDivisionError` распространяется дальше. (5) Файл в UTF-8, а Windows использовала кодировку своей локали, cp1252, которая декодирует два байта `é` как два символа. Нужно передать `encoding='utf-8'`.</details></aside>
+
+## Что изменилось \{#what-changed\}
+
+| | Коды ошибок и ручная очистка (отправная точка) | Исключения, `with` и файловые объекты |
+| --- | --- | --- |
+| Сообщение о неудаче | особое возвращаемое значение, которое легко проигнорировать | исключение, которое останавливает обычный ход выполнения |
+| Обработка | `if` после каждого вызова | один `try` на том уровне, который может решить, с `except` по классу |
+| Несколько неудач сразу | сообщается только о первой | `ExceptionGroup`, обрабатываемая через `except*` |
+| Освобождение ресурса | каждый вызывающий код должен помнить | `with` вызывает `__exit__` при любом выходе |
+| Чтение файла | байты, декодируемые вручную | текстовый режим декодирует с явной кодировкой, буферизация скрыта |
+| Файл больше памяти | ручное чтение кусками | `for line in f`, постоянная память |
+
+## Ограничения \{#limitations\}
+
+- **Исключения — для исключительных случаев.** Возбуждение и перехват стоят на этой машине примерно на 90 нс больше проверки; во внутреннем цикле, где неудача обычна, лучше сначала проверить или использовать `dict.get`.
+- **Буфер — не диск.** Закрытие файла передаёт его данные операционной системе, которая ещё может держать их в памяти; `os.fsync` принудительно записывает их на устройство, как объясняет [заметка о файлах и вводе-выводе](/ru/notes/acos/files-and-io#when-is-the-data-safe-the-page-cache-and-fsync). Запись нового файла и его переименование поверх старого — обычный способ не оставить после сбоя наполовину записанный файл.
+- **У CSV нет стандартных типов.** Каждое поле — текст, кавычки и разделители различаются у разных источников, а большим таблицам место в pandas или в двоичных форматах вроде Parquet.
+- **Что не рассмотрено.** `async with` и асинхронные файлы, `mmap` для файлов, отображённых в память, `shutil` для копирования деревьев, `pickle` (который может выполнять код при загрузке, и его никогда нельзя применять к недоверенным файлам) и журналирование (logging), которое разбирает [заметка об отладке](/ru/notes/python/debugging-and-profiling).
+
+## Что нужно запомнить \{#what-you-should-remember\}
+
+- `raise` останавливает обычный ход выполнения; стек разматывается до первого подходящего `except`. `else` выполняется, когда ничего не возбуждено, `finally` — при любом выходе.
+- `except C` перехватывает `C` и его подклассы. Перехватывать самый узкий класс вокруг как можно меньшего числа строк; никогда не писать голый `except:`, который глотает и Ctrl-C.
+- Для всего, что вне программы, и прежде всего для файлов, предпочитать EAFP: проверка может устареть. `try`, в котором ничего не возбуждается, начиная с 3.11 ничего не стоит.
+- `ExceptionGroup` и `except*` обрабатывают несколько ошибок сразу; `add_note` добавляет к ошибке контекст, не меняя её тип.
+- `with` вызывает `__enter__`, выполняет тело и затем `__exit__`, как бы тело ни закончилось; `contextlib.contextmanager` строит контекстный менеджер из генератора.
+- Текстовый файл — это `TextIOWrapper` поверх `BufferedReader` поверх `FileIO` поверх файлового дескриптора. Всегда передавать `encoding='utf-8'`; открывать через `with`; чтобы прочитать большой файл в постоянной памяти, обходить его по строкам.
+- Для путей — `pathlib`, для CSV — `csv` с `newline=''`, для вложенных данных — `json`; значения из CSV — строки.
+
+## Код \{#code\}
+
+Скрипт по порядку проверяет утверждения заметки: код возврата против исключения, какие блоки `try` выполняются, группу исключений, обработанную через `except*`, класс контекстного менеджера и менеджер, построенный из генератора, текст против байтов и неверную кодировку, отсутствующий файл и примечание к ошибке, CSV и JSON туда и обратно, а также пик памяти при чтении файла в 4 МБ целиком против построчного чтения. Все файлы пишутся во временный каталог, который сам является контекстным менеджером и в конце удаляется. Скрипту нужна только стандартная библиотека, и он выполняется меньше чем за секунду командой `python -I files.py`; числа байтов немного меняются от запуска к запуску и между платформами.
+
+```python
+"""Exceptions, context managers and files: text, bytes, CSV and JSON (Python 3.14)."""
+import csv
+import json
+import tempfile
+import tracemalloc
+from contextlib import contextmanager
+from pathlib import Path
+
+# 1. Отправная точка: код возврата можно использовать по ошибке; исключение нельзя проигнорировать
+s = "abc"
+print(s.find("z"), s[s.find("z")])          # -1 молча индексирует последний символ
+try:
+    s.index("z")
+except ValueError as err:
+    print("ValueError:", err)
+
+# 2. try / except / else / finally: какие блоки выполняются
+def parse(text, log):
+    try:
+        value = int(text)
+    except ValueError:
+        log.append("except")
+        return None
+    else:
+        log.append("else")
+        return value
+    finally:
+        log.append("finally")
+for text in ("42", "4x2"):
+    log = []
+    print(repr(text), parse(text, log), log)
+
+# 3. Группы исключений: несколько независимых ошибок сразу, обработка по типу через except*
+def check(row):
+    errors = []
+    if row.get("age", 0) < 0:
+        errors.append(ValueError("age must be non-negative"))
+    if "name" not in row:
+        errors.append(KeyError("name"))
+    if errors:
+        raise ExceptionGroup("invalid row", errors)
+try:
+    check({"age": -3})
+except* ValueError as eg:
+    print("ValueError group:", [str(e) for e in eg.exceptions])
+except* KeyError as eg:
+    print("KeyError group:", [str(e) for e in eg.exceptions])
+
+# 4. Контекстные менеджеры: __exit__ выполняется, как бы ни закончился блок
+events = []
+class Tracked:
+    def __enter__(self):
+        events.append("enter")
+        return self
+    def __exit__(self, exc_type, exc, tb):
+        events.append(f"exit {exc_type.__name__ if exc_type else None}")
+        return False                         # не подавлять
+try:
+    with Tracked():
+        1 / 0
+except ZeroDivisionError:
+    events.append("caught outside")
+@contextmanager
+def tag(name):
+    events.append(f"<{name}>")
+    try:
+        yield name
+    finally:
+        events.append(f"</{name}>")
+with tag("p"):
+    events.append("body")
+print(events)
+
+with tempfile.TemporaryDirectory() as tmp:  # тоже контекстный менеджер: каталог удаляется при выходе
+    root = Path(tmp)
+
+    # 5. Текст против байтов: кодировка превращает символы в байты и обратно
+    p = root / "notes.txt"
+    p.write_text("naïve café\n", encoding="utf-8")
+    raw = p.read_bytes()
+    print(raw, len(raw), "bytes for", len(p.read_text(encoding="utf-8")), "characters")
+    print(raw.decode("latin-1").rstrip())    # неверная кодировка: ошибки нет, текст неверный (mojibake)
+    try:
+        raw.decode("ascii")
+    except UnicodeDecodeError as err:
+        print("UnicodeDecodeError:", err.reason, "at byte", err.start)
+
+    # 6. EAFP с файлами и добавление контекста к ошибке
+    try:
+        (root / "missing.json").read_text(encoding="utf-8")
+    except FileNotFoundError as err:
+        print("FileNotFoundError:", err.errno, err.strerror)
+    try:
+        float("1,5")
+    except ValueError as err:
+        err.add_note("line 7 of prices.csv")
+        print(err, err.__notes__)
+
+    # 7. CSV и JSON
+    data = root / "prices.csv"
+    with open(data, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["day", "price"])
+        writer.writerows([["mon", 9.5], ["tue", 10.25]])
+    with open(data, newline="", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+    print(rows, sum(float(r["price"]) for r in rows))
+    config = {"lr": 0.001, "layers": [64, 32], "dropout": None}
+    (root / "config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
+    print(json.loads((root / "config.json").read_text(encoding="utf-8")) == config,
+          sorted(q.name for q in root.glob("*.*")))
+
+    # 8. Чтение большого файла целиком против построчного: пик памяти
+    big = root / "big.txt"
+    big.write_text(("x" * 99 + "\n") * 40_000, encoding="utf-8")   # 4 МБ
+    def peak(f):
+        tracemalloc.start()
+        f()
+        p = tracemalloc.get_traced_memory()[1]
+        tracemalloc.stop()
+        return p
+    def whole():
+        with open(big, encoding="utf-8") as f:
+            return len(f.read())
+    def by_line():
+        with open(big, encoding="utf-8") as f:
+            return sum(1 for _ in f)
+    print(f"read(): {peak(whole):,} bytes   for line in f: {peak(by_line):,} bytes")
+print("directory removed:", not root.exists())
+
+# Вывод в CPython 3.14.7 на Apple M1, macOS (arm64); числа байтов немного меняются:
+# -1 c
+# ValueError: substring not found
+# '42' 42 ['else', 'finally']
+# '4x2' None ['except', 'finally']
+# ValueError group: ['age must be non-negative']
+# KeyError group: ["'name'"]
+# ['enter', 'exit ZeroDivisionError', 'caught outside', '<p>', 'body', '</p>']
+# b'na\xc3\xafve caf\xc3\xa9\n' 13 bytes for 11 characters
+# naÃ¯ve cafÃ©
+# UnicodeDecodeError: ordinal not in range(128) at byte 2
+# FileNotFoundError: 2 No such file or directory
+# could not convert string to float: '1,5' ['line 7 of prices.csv']
+# [{'day': 'mon', 'price': '9.5'}, {'day': 'tue', 'price': '10.25'}] 19.75
+# True ['config.json', 'notes.txt', 'prices.csv']
+# read(): 8,132,354 bytes   for line in f: 149,400 bytes
+# directory removed: True
+```
+
+## Дальше \{#next\}
+
+На этом раздел о структурах данных заканчивается: программа теперь может хранить данные в списках, кортежах, словарях и множествах, лениво выдавать их генераторами, читать и записывать их в файлы, не теряя ни ошибок, ни ресурсов. По дороге несколько объектов вели себя как встроенные, потому что реализовывали протокол: итераторы — через `__iter__` и `__next__`, контекстные менеджеры — через `__enter__` и `__exit__`, ключи — через `__hash__` и `__eq__`. Следующий раздел пишет такие объекты сам. [Следующая заметка](/ru/notes/python/classes-and-objects) вводит классы: как определить собственный тип, где живут его атрибуты и как один класс строится на другом.
+
+## Литература \{#references\}
+
+- Документация Python (3.14): The Python Language Reference, [§8.4 the `try` statement](https://docs.python.org/3.14/reference/compound_stmts.html#the-try-statement), [§8.5 the `with` statement](https://docs.python.org/3.14/reference/compound_stmts.html#the-with-statement) и [§7.8 the `raise` statement](https://docs.python.org/3.14/reference/simple_stmts.html#the-raise-statement); [Built-in exceptions](https://docs.python.org/3.14/library/exceptions.html) (иерархия исключений); раздел учебника [Errors and exceptions](https://docs.python.org/3.14/tutorial/errors.html); статьи глоссария [EAFP](https://docs.python.org/3.14/glossary.html#term-EAFP) и [LBYL](https://docs.python.org/3.14/glossary.html#term-LBYL); [`contextlib`](https://docs.python.org/3.14/library/contextlib.html); [`open`](https://docs.python.org/3.14/library/functions.html#open) и [`io`](https://docs.python.org/3.14/library/io.html); [`pathlib`](https://docs.python.org/3.14/library/pathlib.html); [`csv`](https://docs.python.org/3.14/library/csv.html); [`json`](https://docs.python.org/3.14/library/json.html); [What's New in Python 3.11](https://docs.python.org/3.14/whatsnew/3.11.html) (исключения с нулевой стоимостью, группы исключений, примечания) и [What's New in Python 3.14](https://docs.python.org/3.14/whatsnew/3.14.html) (PEP 758, PEP 765, копирование в `pathlib`, примечания к ошибкам JSON).
+- K.-P. Yee. [PEP 3134 — Exception Chaining and Embedded Tracebacks](https://peps.python.org/pep-3134/). 2005.
+- G. van Rossum, A. Coghlan. [PEP 343 — The "with" Statement](https://peps.python.org/pep-0343/). 2005.
+- I. Katriel, Y. Selivanov, G. van Rossum. [PEP 654 — Exception Groups and except*](https://peps.python.org/pep-0654/). 2021.
+- Z. Hatfield-Dodds. [PEP 678 — Enriching Exceptions with Notes](https://peps.python.org/pep-0678/). 2022.
+- I. Naoki. [PEP 597 — Add optional EncodingWarning](https://peps.python.org/pep-0597/). 2021.
+- I. Naoki. [PEP 686 — Make UTF-8 mode default](https://peps.python.org/pep-0686/). Python 3.15.
+- P. Galindo Salgado, B. Cannon. [PEP 758 — Allow except and except* expressions without parentheses](https://peps.python.org/pep-0758/). Python 3.14.
+- I. Katriel, A. Coghlan. [PEP 765 — Disallow return/break/continue that exit a finally block](https://peps.python.org/pep-0765/). Python 3.14.
+- L. Ramalho. *Fluent Python*, 2nd ed. O'Reilly, 2022. Гл. 18 (блоки with, match и else).
+- B. Slatkin. *Effective Python*, 3rd ed. Addison-Wesley, 2024. Разделы о `try`/`except`/`else`/`finally`, о `contextlib` и `with`.
+- D. Beazley, B. K. Jones. *Python Cookbook*, 3rd ed. O'Reilly, 2013. Гл. 5 (файлы и ввод-вывод) и гл. 6 (кодирование и обработка данных: CSV и JSON).

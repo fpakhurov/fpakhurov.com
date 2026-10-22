@@ -37,8 +37,8 @@ const background: Record<string, PrerequisiteTarget> = {
   'Метрики классификации': { note: 'ml/classification-metrics' },
   'Backpropagation': { note: 'ml/backpropagation' },
   'Обратное распространение ошибки': { note: 'ml/backpropagation' },
-  'Python basics': { href: 'https://docs.python.org/3/tutorial/' },
-  'Основы Python': { href: 'https://docs.python.org/3/tutorial/' },
+  'Python basics': { note: 'python/running-python' },
+  'Основы Python': { note: 'python/running-python' },
   // Sections of the course notes.
   'Entropy': { note: 'generative-models/entropy-and-divergences', anchor: 'entropy-expected-surprise' },
   'Энтропия': { note: 'generative-models/entropy-and-divergences', anchor: 'entropy-expected-surprise' },

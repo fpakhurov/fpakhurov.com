@@ -1,0 +1,483 @@
+---
+title: Debugging and profiling
+description: "How to find out why a program is wrong or slow: reading chained tracebacks, stopping a program with breakpoint() and pdb, logging instead of print, timing with perf_counter and timeit, profiling with cProfile and pstats, and measuring memory with tracemalloc."
+course: python
+section: Reliable Code
+order: 15
+status: published
+tags: [python, debugging, pdb, breakpoint, traceback, logging, profiling, cprofile, timeit, tracemalloc]
+prerequisites: [Functions, Files and exceptions, Testing]
+---
+
+import PdbFrames from '../../../components/figures/debugging-and-profiling/PdbFrames.astro';
+
+The [testing note](/notes/python/testing) ended with a failing test: it says that a result is wrong and where the check was made, but not why. The cause is often several calls away from the symptom, or appears only on one row out of ten thousand. This note is about finding causes without guessing: reading the error report closely, stopping a running program to look at its variables, recording what a long run does, and, for the other kind of problem, a correct program that is too slow or uses too much memory, measuring where the time and the memory go.
+
+**Setup.** CPython 3.14.7 on an Apple M1 (4 performance and 4 efficiency cores, 8 GB) under macOS, with other programs running; every timing below is from this setup, and timings on another machine will differ. Folders in paths are shortened to `...`.
+
+## Baseline: print and guess
+
+The first debugging tool everyone uses is `print`: add `print(total)` in the middle of a function, run, read, move the `print`, run again. It works for small problems and fails in three ways on larger ones. Every question costs an edit and a rerun, which is slow when reaching the bug takes a minute of computation. The prints show only what you decided to print, before you knew what was wrong. And they stay behind: they clutter the output of the program, and a stray `print` in a library pollutes every program that imports it.
+
+The rest of the note replaces each use of `print` with a tool built for it: the traceback for "where did it fail", the debugger for "what were the values", logging for "what happened during a long run", and profilers for "where did the time go".
+
+## Reading a traceback closely
+
+The [first note](/notes/python/running-python#errors-and-how-to-read-a-traceback) gave the rule: read the last line for what went wrong, the frame above it for where, then walk up the frames to find where the bad value came from. Two more patterns are common in real programs.
+
+**Chained exceptions.** When an exception is raised while another is being handled, Python prints both, oldest first, joined by one of two sentences ([Python documentation, exception context](#references)):
+
+```text
+$ python chain.py
+Traceback (most recent call last):
+  File ".../chain.py", line 3, in parse_port
+    return int(text)
+ValueError: invalid literal for int() with base 10: '80a'
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File ".../chain.py", line 8, in <module>
+    parse_port("80a")
+    ~~~~~~~~~~^^^^^^^
+  File ".../chain.py", line 5, in parse_port
+    raise RuntimeError(f"bad port in config: {text!r}") from err
+RuntimeError: bad port in config: '80a'
+```
+
+"The above exception was the direct cause" means the code chose to translate one error into another with `raise ... from err`: the second report is the meaningful one, and the first gives the detail. The other sentence, "During handling of the above exception, another exception occurred", means a second error happened by accident inside an `except` block, for example a misspelled name in the handler. Then the first report is the original problem and the second is a bug in the error handling, and both need fixing. In either case the last line of the whole output is the exception that ended the program, not necessarily the first thing that went wrong.
+
+**The bug that does not raise.** The worst bugs produce a wrong value quietly. Take a weighted mean whose inputs have different lengths:
+
+```python
+def weighted_mean(scores, weights):
+    total = 0
+    for s, w in zip(scores, weights):
+        total += s * w
+    return total / sum(weights)
+
+def report(student):
+    return weighted_mean(student["scores"], student["weights"])
+
+print(report({"scores": [80, 90, 70], "weights": [0.5, 0.5]}))   # prints 85.0
+```
+
+`zip` stops at the shorter of its arguments, so the third score is silently dropped and the program prints 85.0 instead of failing. Since Python 3.10, `zip(scores, weights, strict=True)` raises instead ([PEP 618](#references)), and the program fails where the problem is:
+
+```text
+ValueError: zip() argument 2 is shorter than argument 1
+```
+
+The rule this illustrates is to make wrong states fail loudly and early: validate inputs at the boundary of a function, use `strict=True`, and prefer an exception to a default value that hides a problem. A traceback near the cause is worth more than any debugger session far from it.
+
+## Stopping the program: `breakpoint()` and pdb
+
+<aside class="callout"><strong>Key idea.</strong> A debugger pauses the program at a chosen line and lets you inspect the whole **frame stack**: every active function call, each with its own local variables and current line. You can print any expression in any frame, step one line at a time, and continue. It answers "what were the values when it went wrong" without editing the program for every question.</aside>
+
+`breakpoint()`, a built-in function since Python 3.7 ([PEP 553](#references)), pauses the program at the line where it is called and starts **pdb**, the debugger of the standard library. Precisely: it calls `sys.breakpointhook()`, which by default calls `pdb.set_trace()`. The environment variable `PYTHONBREAKPOINT` changes the hook: `PYTHONBREAKPOINT=0` turns every `breakpoint()` call into a no-op, which is a safety net for one forgotten in the code, and a value such as `PYTHONBREAKPOINT=ipdb.set_trace` selects another debugger.
+
+The commands you need first ([Python documentation, `pdb`](#references)):
+
+| Command | Does |
+| --- | --- |
+| `p expr`, `pp expr` | print (pretty-print) the value of an expression in the current frame |
+| `l`, `ll` | list the source around the current line; the whole current function |
+| `n` | next: run the current line, stepping over calls |
+| `s` | step: run the current line, stepping into a call |
+| `r` | return: run until the current function returns |
+| `c` | continue until the next breakpoint or the end |
+| `w` | where: print the frame stack, oldest first, with `>` at the current frame |
+| `u`, `d` | move the current frame up (to the caller) or down |
+| `b file:line`, `b func` | set a breakpoint |
+| `q` | quit, which stops the program |
+
+Any line that is not a command is executed as Python in the current frame, so `total * 2` or `len(scores)` work directly. A one-letter variable that collides with a command, such as `n` or `c`, needs `p n`.
+
+Put `breakpoint()` before the `return` of `weighted_mean` and run the script. The output below is a real session; pdb read the commands from its input, and they are shown after each `(Pdb)` prompt as they would appear when typed:
+
+```text
+$ python grades.py
+> .../grades.py(5)weighted_mean()
+-> breakpoint()
+(Pdb) p total
+85.0
+(Pdb) p scores, weights
+([80, 90, 70], [0.5, 0.5])
+(Pdb) w
+  .../grades.py(13)<module>()
+-> print(report({"scores": [80, 90, 70], "weights": [0.5, 0.5]}))
+  .../grades.py(10)report()
+-> return weighted_mean(student["scores"], student["weights"])
+> .../grades.py(5)weighted_mean()
+-> breakpoint()
+(Pdb) up
+> .../grades.py(10)report()
+-> return weighted_mean(student["scores"], student["weights"])
+(Pdb) p student
+{'scores': [80, 90, 70], 'weights': [0.5, 0.5]}
+(Pdb) down
+> .../grades.py(5)weighted_mean()
+-> breakpoint()
+(Pdb) n
+> .../grades.py(6)weighted_mean()
+-> return total / sum(weights)
+(Pdb) n
+--Return--
+> .../grades.py(6)weighted_mean()->85.0
+-> return total / sum(weights)
+(Pdb) c
+85.0
+```
+
+<PdbFrames />
+
+1. `breakpoint()` stops the program at line 5 of `weighted_mean`. The line `->` shows the next line to run; the current frame is the newest one.
+2. `p` evaluates expressions in that frame. Three scores and two weights: the bug is visible at once.
+3. `w` prints the stack in the order of a traceback, oldest first, and marks the current frame with `>`.
+4. `up` moves to the frame of the caller, `report`, where `student` is a local variable; the data was already inconsistent when it was passed in.
+5. `down` returns to `weighted_mean`, `n` runs one line at a time (the second `n` shows `--Return--` and the value being returned), and `c` lets the program finish.
+
+**Why this works: frames are objects.** Each call of a Python function creates a **frame** that holds the function's local variables, its current instruction and a reference to the caller's frame. The frames form the chain that `w` prints and that a traceback lists. The debugger is ordinary Python code: CPython calls a hook that it registers (through `sys.settrace`, or `sys.monitoring` since 3.12) on each new line and each call, and the hook stops and reads the frame's variables. The [How CPython runs code](/notes/python/how-cpython-runs-code) note shows frames from the interpreter's side.
+
+**Post-mortem debugging.** You often learn about a bug from a traceback, after the fact. `python -m pdb -c continue script.py` runs the script under pdb and, when an uncaught exception ends it, stops in the frame that raised, with all variables intact:
+
+```text
+$ python -m pdb -c continue strict.py
+Traceback (most recent call last):
+  ...
+ValueError: zip() argument 2 is shorter than argument 1
+Uncaught exception. Entering post mortem debugging
+Running 'cont' or 'step' will restart the program
+> .../strict.py(3)weighted_mean()
+-> for s, w in zip(scores, weights, strict=True):
+(Pdb) p s, w, total
+(90, 0.5, 85.0)
+(Pdb) up
+> .../strict.py(9)report()
+-> return weighted_mean(student["scores"], student["weights"])
+(Pdb) p student["weights"]
+[0.5, 0.5]
+```
+
+In a REPL or notebook, `import pdb; pdb.pm()` does the same for the last exception, and Jupyter's `%debug` magic is the same idea. Since Python 3.14, `python -m pdb -p PID` attaches pdb to a Python process that is already running, through a safe hook in the interpreter ([PEP 768](#references); [What's New in Python 3.14](#references)); a process blocked in a system call is reached at its next bytecode instruction. IDE debuggers (VS Code, PyCharm) offer the same operations with a mouse and use the same interpreter hooks.
+
+**The common mistake** is to commit a `breakpoint()`. A program that stops and waits for input in production, or in a test run, hangs. Search for it before committing, or run the test suite with `PYTHONBREAKPOINT=0` in continuous integration.
+
+## Logging instead of `print`
+
+For a program that runs for hours, or on a server, nobody is there to stop it in a debugger. The program has to record what it does, and the standard tool is the module `logging` ([Python documentation, Logging HOWTO](#references)). Its model has three parts:
+
+- A **logger** is a named channel, created once per module with `logging.getLogger(__name__)`. Code calls `logger.debug`, `.info`, `.warning`, `.error` or `.exception`, each a **level** of importance: DEBUG 10, INFO 20, WARNING 30, ERROR 40, CRITICAL 50.
+- A **handler** decides where records go (standard error, a file, a remote service) and a **formatter** how they look.
+- Configuration happens once, at the program's entry point. `logging.basicConfig(level=..., format=...)` attaches a handler that writes to standard error. A record below the configured level is dropped before it is formatted.
+
+```python
+import logging
+
+logger = logging.getLogger("loader")
+
+def load(path):
+    logger.debug("opening %s", path)
+    try:
+        with open(path) as f:
+            return f.read()
+    except FileNotFoundError:
+        logger.exception("could not load %s", path)
+        return ""
+
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logger.info("starting")
+load("missing.csv")
+logger.warning("loaded %d rows", 0)
+```
+
+```text
+$ python logdemo.py
+2026-10-22 13:53:15,041 INFO loader: starting
+2026-10-22 13:53:15,041 ERROR loader: could not load missing.csv
+Traceback (most recent call last):
+  File ".../logdemo.py", line 9, in load
+    with open(path) as f:
+         ~~~~^^^^^^
+FileNotFoundError: [Errno 2] No such file or directory: 'missing.csv'
+2026-10-22 13:53:15,041 WARNING loader: loaded 0 rows
+```
+
+Line by line: the DEBUG record `opening missing.csv` is not printed, because the level is INFO; set `level=logging.DEBUG` and it appears, with no change to the code that logs. Every record carries a time, a level and the logger's name, so the output of a long run can be searched and filtered. `logger.exception` logs at ERROR level and appends the traceback of the exception being handled, so the program records the error and keeps going. All of it goes to standard error: `python logdemo.py 2>/dev/null` prints nothing, which keeps logs apart from the program's real output.
+
+The rules that follow from the model:
+
+- **`print` for output, `logging` for diagnostics.** What the program is asked to produce goes to standard output; what it says about itself goes to the log.
+- **Pass arguments, do not pre-format.** `logger.debug("opening %s", path)` formats the message only if the record is emitted. `logger.debug(f"opening {path}")` builds the string on every call, even when DEBUG is off, which matters in a hot loop.
+- **Libraries never configure logging.** A library creates its loggers and logs; only the application calls `basicConfig`. A library that calls it overrides the choices of every program that imports it.
+
+The machine-learning courses meet logging constantly: training loops log the loss every few hundred steps, and libraries such as PyTorch and Hugging Face Transformers log their warnings through this module, which is how their verbosity can be turned down from the application.
+
+## Measuring time properly
+
+A program that is correct but slow raises a different question: where does the time go? The first step is to measure, and to measure in a way that can be trusted ([the ACOS note on measuring programs](/notes/acos/performance-optimization#how-to-measure-a-program) covers the same rules from the machine's side).
+
+**Which clock.** `time.perf_counter()` is a monotonic clock with the highest available resolution: the difference between two readings is elapsed wall time. `time.process_time()` counts the CPU time of the process. `time.time()` is the calendar clock, which can jump when the system time is adjusted, and is the wrong tool for intervals. On the setup above, around `time.sleep(0.2)` the first reported 0.201 s and the second 0.0 s: waiting costs wall time and no CPU time.
+
+**Repeat, and report the minimum and the median.** Five runs of the same function on the same 100,000 words (`unique_words`, from the profiling example below) took 1.561, 1.631, 2.180, 2.010 and 1.805 s on the setup above, with other programs competing for the processor. One timing can be off by 40 % from the next. The minimum estimates what the code costs when nothing interferes; the median what a user typically sees. A difference smaller than the spread between runs is not a difference.
+
+**`timeit` for small pieces.** One operation that takes nanoseconds cannot be timed with two clock readings around it. The module `timeit` runs a statement in a loop many times and divides ([Python documentation, `timeit`](#references)):
+
+```text
+$ python -m timeit -s "seen = [f'w{i}' for i in range(3000)]" "'w2999' in seen"
+10000 loops, best of 5: 22.2 usec per loop
+$ python -m timeit -s "seen = {f'w{i}' for i in range(3000)}" "'w2999' in seen"
+20000000 loops, best of 5: 12.6 nsec per loop
+```
+
+`-s` is setup code, run once and not timed. timeit picks the number of loops so that one batch takes at least 0.2 s, repeats the batch five times and reports the best. It also turns off the cyclic garbage collector while timing, so that a collection does not land in one batch and not in another. In code, `timeit.Timer(stmt, setup).autorange()` and `.repeat(...)` do the same. Searching a list of 3,000 strings for the last one costs about 1,800 times as much as searching a set; the [performance note](/notes/python/performance) explains why and plots it.
+
+**Warm up.** The first run of a function is slower than later ones: modules are imported, caches fill, and since 3.11 the interpreter rewrites instructions into specialized forms after a short warm-up. Discard the first run, or report it separately when start-up time is what matters.
+
+## Profiling: where the time goes
+
+A timer says how long the whole program takes. A **profiler** says how that time divides between functions. The standard library's `cProfile` is a **deterministic** profiler: it records every function call and return, with a timestamp, and sums the time per function ([Python documentation, The Python profilers](#references)). The program below counts the distinct words in 100,000 random words drawn from a vocabulary of 3,000:
+
+```python
+import random
+
+def make_text(n_words, vocab, seed=1):
+    rng = random.Random(seed)
+    return " ".join(f"w{rng.randrange(vocab)}" for _ in range(n_words))
+
+def tokenize(text):
+    return [w.strip(".,").lower() for w in text.split()]
+
+def unique_words(words):
+    seen = []
+    for w in words:
+        if w not in seen:
+            seen.append(w)
+    return seen
+```
+
+`python -m cProfile -s tottime words.py` runs the program under the profiler and prints a table sorted by the chosen column (the first rows):
+
+```text
+$ python -m cProfile -s tottime words.py
+100000 3000
+         740384 function calls (740361 primitive calls) in 1.670 seconds
+
+   Ordered by: internal time
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+        1    1.533    1.533    1.533    1.533 words.py:14(unique_words)
+   100000    0.030    0.000    0.048    0.000 random.py:245(_randbelow_with_getrandbits)
+   100000    0.026    0.000    0.080    0.000 random.py:294(randrange)
+        1    0.020    0.020    0.101    0.101 words.py:4(make_text)
+        1    0.019    0.019    0.034    0.034 words.py:10(tokenize)
+   136605    0.011    0.000    0.011    0.000 {method 'getrandbits' of '_random.Random' objects}
+   100000    0.007    0.000    0.007    0.000 {method 'bit_length' of 'int' objects}
+```
+
+The columns: `ncalls` is the number of calls; `tottime` the time spent in the function itself, excluding the functions it called; `cumtime` the time including them; the two `percall` columns divide each by `ncalls`. Sort by `tottime` to find the function that does the work, by `cumtime` to find the high-level step that contains it. Here one call of `unique_words` takes 1.53 s of 1.67 s, 92 %; generating the random words, with 100,000 calls of `randrange`, costs 0.10 s in total (`cumtime` of `make_text`). Only `unique_words` is worth optimizing: a 10× speed-up of `tokenize` would save 0.03 s.
+
+**What cProfile cannot see.** It counts function calls, not lines and not operators. The `w not in seen` test inside `unique_words` scans a list of up to 3,000 strings, and that is where the 1.53 s goes, but `in` on a list is not a Python function call, so it appears only as the `tottime` of `unique_words`. When the hot function is long, split it into smaller functions to profile, or time its parts. Replacing the list with a set takes `unique_words` from about 1.6 s to about 3 ms on the same words; the [performance note](/notes/python/performance) explains why.
+
+**Overhead.** Recording every call costs time per call, so a program made of many tiny functions looks slower under cProfile than it is, and the parts that make many calls are inflated relative to the others. Timed with `perf_counter` and no profiler, in the same session, the three steps took 0.022 s (`make_text`), 0.007 s (`tokenize`) and 1.482 s (`unique_words`). The profile inflated the first two about fivefold, because they make 100,000 calls each, and `unique_words`, which makes few, by 3 %. The ranking is still right, but the share of the hot function is 98 %, not 92 %. In code, `cProfile.Profile()` with `.enable()` and `.disable()` profiles one section, and `pstats.Stats(profiler).strip_dirs().sort_stats("cumulative").print_stats(10)` prints the top ten; the Code section does this. For a visual view, the third-party tool SnakeViz draws a saved profile (`python -m cProfile -o out.prof script.py`) as nested boxes.
+
+**Sampling profilers.** A **sampling** profiler does not hook every call. It interrupts the program many times a second, records the current stack, and estimates each function's share of the time from how often it appears in the samples. The overhead is small and does not depend on the number of calls, and it can see lines. **py-spy**, a third-party tool, samples a running Python process from outside, reading its memory, without changing or restarting it. Python 3.15, released in October 2026 after the version this course uses, adds a sampling profiler to the standard library as `profiling.sampling`, alongside `profiling.tracing`, the new name for cProfile ([PEP 799](#references); [What's New in Python 3.15](#references)); its documentation lists modes for wall time, CPU time and time holding the GIL, and attaching to a running process. Neither tool was run for this note.
+
+## Memory: `tracemalloc`
+
+When a program runs out of memory, or a long run grows steadily, the question is which lines allocate. The module `tracemalloc` hooks Python's memory allocator and records, for each block, the traceback of the line that allocated it ([Python documentation, `tracemalloc`](#references)). It counts memory allocated through Python's allocator (all Python objects, and NumPy's array buffers, which it reports to tracemalloc); memory taken by other C libraries directly is not counted.
+
+```python
+import tracemalloc
+
+def load_rows(n):
+    return [{"id": i, "score": i * 0.5} for i in range(n)]
+
+def total_list(n):
+    squares = [i * i for i in range(n)]
+    return sum(squares)
+
+def total_gen(n):
+    return sum(i * i for i in range(n))
+
+tracemalloc.start()
+rows = load_rows(100_000)
+snapshot = tracemalloc.take_snapshot()
+for stat in snapshot.statistics("lineno")[:3]:
+    print(stat)
+current, peak = tracemalloc.get_traced_memory()
+print(f"current {current / 2**20:.1f} MiB, peak {peak / 2**20:.1f} MiB")
+del rows
+
+for f in (total_list, total_gen):
+    tracemalloc.reset_peak()
+    base, _ = tracemalloc.get_traced_memory()
+    f(1_000_000)
+    _, peak = tracemalloc.get_traced_memory()
+    print(f"{f.__name__}: peak {(peak - base) / 2**10:,.1f} KiB above the start")
+tracemalloc.stop()
+```
+
+```text
+.../mem.py:5: size=23.6 MiB, count=399711, average=62 B
+current 23.6 MiB, peak 23.6 MiB
+total_list: peak 39,497.2 KiB above the start
+total_gen: peak 0.4 KiB above the start
+```
+
+All 23.6 MiB come from line 5: 100,000 small dictionaries cost about 4 blocks and 247 bytes each, against 16 bytes for two numbers stored as raw floats. `total_list` builds a list of a million integers before summing it, a peak of 38.6 MiB (8 bytes per list slot plus 32 bytes per integer object); `total_gen` produces the squares one at a time and never holds more than a few, a peak of 0.4 KiB for the same answer. Comparing two snapshots, `snapshot2.compare_to(snapshot1, "lineno")`, lists the lines whose allocations grew between them, which is how a leak is found. tracemalloc slows allocation down noticeably, so it is turned on for an investigation, not left running.
+
+<aside class="callout"><strong>Check yourself.</strong> (1) A traceback ends with two reports joined by "During handling of the above exception, another exception occurred". Which one do you fix first? (2) In pdb you type `n` to print a variable called `n`, and the program moves to the next line. Why, and what should you type? (3) `cProfile` shows a function with large `cumtime` and small `tottime`. Where is the time? (4) A function takes 1.2 s in one run and 1.5 s in the next. Is the second version of your code slower?<details><summary>Answers</summary>(1) Usually both, but start with the first: it is the original failure, and the second is a bug in the `except` block that handled it. (2) `n` is the pdb command "next"; use `p n` (or `pp n`). (3) In the functions it calls; sort by `tottime`, or print its callees with `Stats.print_callees`. (4) Not from two runs: the difference is within the run-to-run spread seen above. Repeat both versions several times and compare minimums and medians.</details></aside>
+
+## What changed
+
+| Question | Baseline | Tool |
+| --- | --- | --- |
+| Where did it fail? | `print` until the crash is found | the traceback, read from the bottom; chained reports in order |
+| What were the values? | add `print`, rerun | `breakpoint()`, pdb's `p`, `w`, `u`/`d`, `n`; post-mortem `pdb -c continue` |
+| What happened in a long run? | prints mixed into the output | `logging`: levels, logger names, times, to standard error |
+| How long does it take? | one run, `time.time()` | `perf_counter`, repeated; minimum and median; `timeit` for small statements |
+| Which function is slow? | guess | `cProfile` and `pstats`, sorted by `tottime` or `cumtime` |
+| Which line allocates? | guess | `tracemalloc` snapshots and peaks |
+
+## Limitations
+
+- **One machine, one moment.** Every timing here was taken once on one laptop with other programs running; the spread quoted is the evidence that such numbers move by tens of percent.
+- **cProfile distorts and is blind to lines.** Its per-call overhead inflates programs made of small functions, and its unit is the function. Sampling profilers avoid both problems; py-spy and Python 3.15's `profiling.sampling` were not run here.
+- **tracemalloc sees Python's allocator only.** Memory that C extensions allocate on their own, and memory the operating system attributes to the process for other reasons (shared libraries, fragmentation), does not appear. The process's resident size, from `resource.getrusage` or the operating system, is the other half of the picture.
+- **Debuggers change timing.** A program paused in pdb lets other threads and timers run on, so bugs that depend on timing between threads may vanish under the debugger; logging with thread names is often the better tool there. The [concurrency note](/notes/python/concurrency) shows such bugs.
+
+## What you should remember
+
+- Read the last line of a traceback first, then the frames upwards. "Direct cause" means a deliberate translation of one error into another; "During handling" means a second bug inside an `except` block.
+- Make wrong states fail early: `zip(..., strict=True)`, input checks, exceptions rather than silent defaults.
+- `breakpoint()` stops in pdb. `p`, `w`, `u`/`d`, `n`, `s`, `c` cover most sessions. `python -m pdb -c continue` debugs a crash after the fact. `PYTHONBREAKPOINT=0` disables stray breakpoints.
+- Log with `logging.getLogger(__name__)`, configure once at the entry point, pass arguments instead of f-strings, use `logger.exception` in handlers.
+- Time with `perf_counter`, repeat, report the minimum and the median, and use `timeit` for small statements. Discard the warm-up run.
+- `cProfile`: `tottime` finds the function doing the work, `cumtime` the step containing it. Operators and lines are invisible to it.
+- `tracemalloc` finds the lines that allocate and the peak of a computation.
+
+## Code
+
+The script runs the whole workflow on one problem, counting distinct words: it logs its progress, profiles the slow version with cProfile and pstats, times both versions with repeated `perf_counter` readings and `timeit`, and measures memory with tracemalloc. It needs only the standard library and runs in about 8 seconds on the setup above; run it with `python -I find_slow.py`.
+
+```python
+"""Find where a program spends its time and memory (Python 3.14, standard library)."""
+import cProfile
+import io
+import logging
+import pstats
+import random
+import statistics
+import time
+import timeit
+import tracemalloc
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+log = logging.getLogger("words")
+
+
+def make_words(n_words, vocab, seed=1):
+    rng = random.Random(seed)
+    return [f"w{rng.randrange(vocab)}" for _ in range(n_words)]
+
+
+def unique_list(words):          # membership test in a list: a scan
+    seen = []
+    for w in words:
+        if w not in seen:
+            seen.append(w)
+    return seen
+
+
+def unique_set(words):           # membership test in a set: a hash lookup
+    seen, order = set(), []
+    for w in words:
+        if w not in seen:
+            seen.add(w)
+            order.append(w)
+    return order
+
+
+words = make_words(50_000, 2_000)
+log.info("made %d words", len(words))
+
+# 1. Profile: which function takes the time?
+profiler = cProfile.Profile()
+profiler.enable()
+result = unique_list(words)
+profiler.disable()
+out = io.StringIO()
+pstats.Stats(profiler, stream=out).strip_dirs().sort_stats("tottime").print_stats(3)
+lines = [line for line in out.getvalue().splitlines() if line.strip()]
+print("\n".join(lines[:2] + lines[-4:]))
+
+# 2. Time both versions, five runs each, and report the minimum and the median.
+for f in (unique_list, unique_set):
+    runs = []
+    for _ in range(5):
+        t0 = time.perf_counter()
+        f(words)
+        runs.append(time.perf_counter() - t0)
+    print(f"{f.__name__:12} min {min(runs) * 1e3:8.2f} ms   median {statistics.median(runs) * 1e3:8.2f} ms")
+assert unique_list(words) == unique_set(words)
+log.info("both versions agree on %d unique words", len(result))
+
+# 3. timeit for one small operation: it picks the number of loops itself.
+for kind in ("list", "set"):
+    setup = f"seen = {kind}(f'w{{i}}' for i in range(2000))"
+    timer = timeit.Timer("'w1999' in seen", setup=setup)
+    number, _ = timer.autorange()
+    best = min(timer.repeat(repeat=5, number=number)) / number
+    print(f"'w1999' in a {kind} of 2000: {best * 1e9:9.1f} ns")
+
+# 4. Memory: tracemalloc counts the bytes Python allocates, by source line.
+tracemalloc.start()
+squares = [i * i for i in range(200_000)]
+current, peak = tracemalloc.get_traced_memory()
+top = tracemalloc.take_snapshot().statistics("lineno")[0]
+print(f"list of 200,000 squares: current {current / 2**20:.1f} MiB, peak {peak / 2**20:.1f} MiB")
+print(f"largest line: {top.traceback[0].lineno}, {top.size / 2**20:.1f} MiB in {top.count} blocks")
+del squares
+tracemalloc.reset_peak()
+total = sum(i * i for i in range(200_000))
+print(f"generator instead: peak {tracemalloc.get_traced_memory()[1] / 2**10:.1f} KiB")
+tracemalloc.stop()
+
+# Output in a terminal with CPython 3.14.7 on an Apple M1 (macOS); the log lines go to
+# standard error, and every time varies from run to run and across machines:
+# INFO words: made 50000 words
+#          2002 function calls in 0.512 seconds
+#    Ordered by: internal time
+#    ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+#         1    0.511    0.511    0.512    0.512 find_slow.py:21(unique_list)
+#      2000    0.000    0.000    0.000    0.000 {method 'append' of 'list' objects}
+#         1    0.000    0.000    0.000    0.000 {method 'disable' of '_lsprof.Profiler' objects}
+# unique_list  min   508.06 ms   median   510.56 ms
+# unique_set   min     1.48 ms   median     1.53 ms
+# INFO words: both versions agree on 2000 unique words
+# 'w1999' in a list of 2000:   14438.8 ns
+# 'w1999' in a set of 2000:      12.7 ns
+# list of 200,000 squares: current 7.6 MiB, peak 7.6 MiB
+# largest line: 72, 7.6 MiB in 199891 blocks
+# generator instead: peak 5.4 KiB
+```
+
+The profile shows 2,002 calls: one of `unique_list`, 2,000 appends (one per distinct word), and one of `disable`. The 50,000 membership tests do not appear, which is the blind spot described above. Line 72 is the list comprehension; its 199,891 blocks are almost all integer objects, one per square.
+
+## Next
+
+The profiler found the slow function, and the fix, a set instead of a list, was a change of data structure. To go further, to know why a list scan costs 7 nanoseconds per element, why a function call costs more than an addition, and what "the interpreter specializes each instruction" means, we need to look at what CPython does with a function. The [next note](/notes/python/how-cpython-runs-code) follows source code through the compiler to bytecode, runs it on the interpreter's value stack, and explains reference counting and the garbage collector.
+
+## References
+
+- Python documentation (3.14): [`pdb`](https://docs.python.org/3.14/library/pdb.html); [`breakpoint`](https://docs.python.org/3.14/library/functions.html#breakpoint) and [`sys.breakpointhook`](https://docs.python.org/3.14/library/sys.html#sys.breakpointhook); [Exception context](https://docs.python.org/3.14/library/exceptions.html#exception-context); [Logging HOWTO](https://docs.python.org/3.14/howto/logging.html) and [`logging`](https://docs.python.org/3.14/library/logging.html); [`time.perf_counter`](https://docs.python.org/3.14/library/time.html#time.perf_counter); [`timeit`](https://docs.python.org/3.14/library/timeit.html); [The Python profilers](https://docs.python.org/3.14/library/profile.html); [`tracemalloc`](https://docs.python.org/3.14/library/tracemalloc.html).
+- [What's New in Python 3.14](https://docs.python.org/3.14/whatsnew/3.14.html) (remote attaching with `pdb -p`) and [What's New in Python 3.15](https://docs.python.org/3.15/whatsnew/3.15.html) (the `profiling` package).
+- B. Warsaw. [PEP 553 — Built-in breakpoint()](https://peps.python.org/pep-0553/). 2017.
+- B. Bucher. [PEP 618 — Add Optional Length-Checking To zip](https://peps.python.org/pep-0618/). 2020.
+- P. Galindo Salgado, M. Wozniski, I. Stojanovic. [PEP 768 — Safe external debugger interface for CPython](https://peps.python.org/pep-0768/). 2024.
+- P. Galindo Salgado, L. Kiss Kollár. [PEP 799 — A dedicated profiling package for organizing Python profiling tools](https://peps.python.org/pep-0799/). 2025.
+- B. Frederickson. [py-spy: sampling profiler for Python programs](https://github.com/benfred/py-spy).
+- B. Slatkin. *Effective Python*, 3rd ed. Addison-Wesley, 2024. The chapters on testing and debugging, and on performance.
+- M. Gorelick, I. Ozsvald. *High Performance Python*, 2nd ed. O'Reilly, 2020. Ch. 2, profiling.

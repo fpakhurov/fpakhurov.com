@@ -1,0 +1,483 @@
+---
+title: Отладка и профилирование
+description: "Как выяснить, почему программа работает неправильно или медленно: чтение цепочек трассировок, остановка программы через breakpoint() и pdb, журналирование вместо print, замер времени через perf_counter и timeit, профилирование через cProfile и pstats и измерение памяти через tracemalloc."
+course: python
+section: Надёжный код
+order: 15
+status: published
+tags: [python, debugging, pdb, breakpoint, traceback, logging, profiling, cprofile, timeit, tracemalloc]
+prerequisites: [Функции, Файлы и исключения, Тестирование]
+---
+
+import PdbFrames from '../../../components/figures/debugging-and-profiling/PdbFrames.astro';
+
+[Заметка о тестировании](/ru/notes/python/testing) закончилась упавшим тестом: он говорит, что результат неверен и где была проверка, но не говорит почему. Причина часто находится на несколько вызовов дальше от симптома или проявляется только на одной строке данных из десяти тысяч. Эта заметка о том, как находить причины, не угадывая: внимательно читать сообщение об ошибке, останавливать работающую программу и смотреть на её переменные, записывать, что делает долгий запуск, а для проблемы другого рода — правильной программы, которая слишком медленна или занимает слишком много памяти, — измерять, куда уходят время и память.
+
+**Условия.** CPython 3.14.7 на Apple M1 (4 производительных и 4 энергоэффективных ядра, 8 ГБ) под macOS, с другими работающими программами; все замеры времени ниже сделаны в этих условиях, на другой машине они будут другими. Папки в путях сокращены до `...`.
+
+## Отправная точка: print и догадки \{#baseline-print-and-guess\}
+
+Первый инструмент отладки, которым пользуются все, — `print`: вставить `print(total)` в середину функции, запустить, прочитать, передвинуть `print`, запустить снова. Для маленьких задач это работает, а на больших отказывает трижды. Каждый вопрос стоит правки и перезапуска, а это медленно, когда до ошибки программа считает минуту. Вызовы `print` показывают только то, что решили напечатать до того, как стало известно, что не так. И они остаются в коде: засоряют вывод программы, а забытый `print` в библиотеке засоряет вывод каждой программы, которая её импортирует.
+
+Остальная часть заметки заменяет каждое применение `print` инструментом, сделанным для этой цели: трассировку — для вопроса «где упало», отладчик — для «какими были значения», журналирование — для «что происходило во время долгого запуска» и профилировщики — для «куда ушло время».
+
+## Внимательное чтение трассировки \{#reading-a-traceback-closely\}
+
+[Первая заметка](/ru/notes/python/running-python#errors-and-how-to-read-a-traceback) дала правило: последняя строка трассировки (traceback) говорит, что пошло не так, кадр над ней — где, а дальше нужно идти вверх по кадрам, чтобы найти, откуда взялось плохое значение. В настоящих программах часто встречаются ещё два случая.
+
+**Цепочки исключений.** Когда исключение возбуждается во время обработки другого, Python печатает оба, начиная с более старого, и соединяет их одной из двух фраз ([документация Python, exception context](#references)):
+
+```text
+$ python chain.py
+Traceback (most recent call last):
+  File ".../chain.py", line 3, in parse_port
+    return int(text)
+ValueError: invalid literal for int() with base 10: '80a'
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File ".../chain.py", line 8, in <module>
+    parse_port("80a")
+    ~~~~~~~~~~^^^^^^^
+  File ".../chain.py", line 5, in parse_port
+    raise RuntimeError(f"bad port in config: {text!r}") from err
+RuntimeError: bad port in config: '80a'
+```
+
+Фраза «The above exception was the direct cause of the following exception» («исключение выше — непосредственная причина следующего») означает, что код сознательно превратил одну ошибку в другую с помощью `raise ... from err`: осмыслен второй отчёт, а первый даёт подробности. Другая фраза, «During handling of the above exception, another exception occurred» («во время обработки исключения выше возникло другое исключение»), означает, что вторая ошибка случайно произошла внутри блока `except`, например из-за опечатки в имени в обработчике. Тогда первый отчёт — исходная проблема, а второй — ошибка в обработке ошибок, и исправлять нужно обе. В любом случае последняя строка всего вывода — исключение, которое завершило программу, а не обязательно первое, что пошло не так.
+
+**Ошибка, которая ничего не возбуждает.** Худшие ошибки тихо дают неверное значение. Возьмём взвешенное среднее, у входов которого разная длина:
+
+```python
+def weighted_mean(scores, weights):
+    total = 0
+    for s, w in zip(scores, weights):
+        total += s * w
+    return total / sum(weights)
+
+def report(student):
+    return weighted_mean(student["scores"], student["weights"])
+
+print(report({"scores": [80, 90, 70], "weights": [0.5, 0.5]}))   # печатает 85.0
+```
+
+`zip` останавливается на более коротком аргументе, поэтому третья оценка молча отбрасывается, и программа печатает 85.0 вместо того, чтобы упасть. Начиная с Python 3.10, `zip(scores, weights, strict=True)` в такой ситуации возбуждает исключение ([PEP 618](#references)), и программа падает там, где проблема:
+
+```text
+ValueError: zip() argument 2 is shorter than argument 1
+```
+
+Правило, которое иллюстрирует пример: неверные состояния должны проявляться громко и рано. Входные данные проверяют на границе функции, используют `strict=True` и предпочитают исключение значению по умолчанию, которое прячет проблему. Трассировка рядом с причиной стоит больше любого сеанса отладчика вдали от неё.
+
+## Остановка программы: `breakpoint()` и pdb \{#stopping-the-program-breakpoint-and-pdb\}
+
+<aside class="callout"><strong>Ключевая идея.</strong> Отладчик (debugger) приостанавливает программу на выбранной строке и позволяет осмотреть весь **стек кадров** (frame stack): каждый активный вызов функции с его собственными локальными переменными и текущей строкой. Можно напечатать любое выражение в любом кадре, выполнять программу по одной строке и продолжить её. Отладчик отвечает на вопрос «какими были значения, когда всё пошло не так», не требуя править программу ради каждого вопроса.</aside>
+
+`breakpoint()`, встроенная функция начиная с Python 3.7 ([PEP 553](#references)), ставит **точку останова** (breakpoint): приостанавливает программу на строке, где её вызвали, и запускает **pdb**, отладчик стандартной библиотеки. Точнее, она вызывает `sys.breakpointhook()`, который по умолчанию вызывает `pdb.set_trace()`. Переменная окружения `PYTHONBREAKPOINT` меняет этот хук: `PYTHONBREAKPOINT=0` превращает каждый вызов `breakpoint()` в пустую операцию, что страхует от забытого в коде вызова, а значение вроде `PYTHONBREAKPOINT=ipdb.set_trace` выбирает другой отладчик.
+
+Команды, которые нужны в первую очередь ([документация Python, `pdb`](#references)):
+
+| Команда | Что делает |
+| --- | --- |
+| `p expr`, `pp expr` | печатает (красиво печатает) значение выражения в текущем кадре |
+| `l`, `ll` | показывает исходный код вокруг текущей строки; всю текущую функцию |
+| `n` | next: выполняет текущую строку, не заходя в вызовы |
+| `s` | step: выполняет текущую строку, заходя в вызов |
+| `r` | return: выполняет до возврата из текущей функции |
+| `c` | continue: продолжает до следующей точки останова или до конца |
+| `w` | where: печатает стек кадров, старые сверху, с `>` у текущего кадра |
+| `u`, `d` | перемещает текущий кадр вверх (к вызывающей функции) или вниз |
+| `b file:line`, `b func` | ставит точку останова |
+| `q` | quit: выход, который останавливает программу |
+
+Любая строка, которая не является командой, выполняется как код на Python в текущем кадре, поэтому `total * 2` или `len(scores)` работают напрямую. Однобуквенной переменной, имя которой совпадает с командой, например `n` или `c`, нужен `p n`.
+
+Поставим `breakpoint()` перед `return` в `weighted_mean` и запустим скрипт. Ниже — настоящий сеанс; pdb читал команды из своего входа, и они показаны после каждого приглашения `(Pdb)` так, как выглядели бы при наборе:
+
+```text
+$ python grades.py
+> .../grades.py(5)weighted_mean()
+-> breakpoint()
+(Pdb) p total
+85.0
+(Pdb) p scores, weights
+([80, 90, 70], [0.5, 0.5])
+(Pdb) w
+  .../grades.py(13)<module>()
+-> print(report({"scores": [80, 90, 70], "weights": [0.5, 0.5]}))
+  .../grades.py(10)report()
+-> return weighted_mean(student["scores"], student["weights"])
+> .../grades.py(5)weighted_mean()
+-> breakpoint()
+(Pdb) up
+> .../grades.py(10)report()
+-> return weighted_mean(student["scores"], student["weights"])
+(Pdb) p student
+{'scores': [80, 90, 70], 'weights': [0.5, 0.5]}
+(Pdb) down
+> .../grades.py(5)weighted_mean()
+-> breakpoint()
+(Pdb) n
+> .../grades.py(6)weighted_mean()
+-> return total / sum(weights)
+(Pdb) n
+--Return--
+> .../grades.py(6)weighted_mean()->85.0
+-> return total / sum(weights)
+(Pdb) c
+85.0
+```
+
+<PdbFrames />
+
+1. `breakpoint()` останавливает программу на строке 5 функции `weighted_mean`. Строка `->` показывает следующую строку, которая будет выполнена; текущий кадр — самый новый.
+2. `p` вычисляет выражения в этом кадре. Три оценки и два веса: ошибка видна сразу.
+3. `w` печатает стек в порядке трассировки, старые кадры первыми, и отмечает текущий кадр знаком `>`.
+4. `up` переходит в кадр вызывающей функции, `report`, где `student` — локальная переменная; данные были несогласованными уже тогда, когда их передали.
+5. `down` возвращается в `weighted_mean`, `n` выполняет по одной строке (второе `n` показывает `--Return--` и возвращаемое значение), а `c` даёт программе закончить работу.
+
+**Почему это работает: кадры — объекты.** Каждый вызов функции на Python создаёт **кадр** (frame), в котором хранятся локальные переменные функции, её текущая команда байт-кода и ссылка на кадр вызывающей функции. Кадры образуют цепочку, которую печатает `w` и перечисляет трассировка. Отладчик — обычный код на Python: CPython вызывает зарегистрированный им хук (через `sys.settrace`, а начиная с 3.12 — через `sys.monitoring`) на каждой новой строке и при каждом вызове, и хук останавливается и читает переменные кадра. Заметка [«Как CPython выполняет код»](/ru/notes/python/how-cpython-runs-code) показывает кадры со стороны интерпретатора.
+
+**Посмертная отладка.** Об ошибке часто узнают из трассировки, уже после того, как она произошла. `python -m pdb -c continue script.py` запускает скрипт под pdb и, когда необработанное исключение его завершает, останавливается в кадре, который возбудил исключение, со всеми переменными на месте:
+
+```text
+$ python -m pdb -c continue strict.py
+Traceback (most recent call last):
+  ...
+ValueError: zip() argument 2 is shorter than argument 1
+Uncaught exception. Entering post mortem debugging
+Running 'cont' or 'step' will restart the program
+> .../strict.py(3)weighted_mean()
+-> for s, w in zip(scores, weights, strict=True):
+(Pdb) p s, w, total
+(90, 0.5, 85.0)
+(Pdb) up
+> .../strict.py(9)report()
+-> return weighted_mean(student["scores"], student["weights"])
+(Pdb) p student["weights"]
+[0.5, 0.5]
+```
+
+В REPL или ноутбуке `import pdb; pdb.pm()` делает то же самое для последнего исключения, а магическая команда `%debug` в Jupyter устроена так же. Начиная с Python 3.14, `python -m pdb -p PID` подключает pdb к уже работающему процессу Python через безопасный хук в интерпретаторе ([PEP 768](#references); [What's New in Python 3.14](#references)); до процесса, заблокированного в системном вызове, отладчик доберётся на его следующей команде байт-кода. Отладчики IDE (VS Code, PyCharm) предлагают те же операции с мышью и используют те же хуки интерпретатора.
+
+**Типичная ошибка** — закоммитить `breakpoint()`. Программа, которая в рабочем окружении или в прогоне тестов останавливается и ждёт ввода, зависает. Перед коммитом вызов стоит поискать, а в непрерывной интеграции запускать тесты с `PYTHONBREAKPOINT=0`.
+
+## Журналирование вместо `print` \{#logging-instead-of-print\}
+
+Программу, которая работает часами или на сервере, некому остановить в отладчике. Она должна сама записывать, что делает, и стандартный инструмент для этого — **журналирование** (logging), модуль `logging` ([документация Python, Logging HOWTO](#references)). Его модель состоит из трёх частей:
+
+- **Логгер** (logger) — именованный канал, который создаётся один раз в каждом модуле вызовом `logging.getLogger(__name__)`. Код вызывает `logger.debug`, `.info`, `.warning`, `.error` или `.exception`, и каждый из этих методов соответствует **уровню** (level) важности: DEBUG 10, INFO 20, WARNING 30, ERROR 40, CRITICAL 50.
+- **Обработчик** (handler) решает, куда идут записи (стандартный поток ошибок, файл, удалённый сервис), а **форматировщик** (formatter) — как они выглядят.
+- Настройка делается один раз, в точке входа программы. `logging.basicConfig(level=..., format=...)` подключает обработчик, который пишет в стандартный поток ошибок. Запись ниже настроенного уровня отбрасывается ещё до форматирования.
+
+```python
+import logging
+
+logger = logging.getLogger("loader")
+
+def load(path):
+    logger.debug("opening %s", path)
+    try:
+        with open(path) as f:
+            return f.read()
+    except FileNotFoundError:
+        logger.exception("could not load %s", path)
+        return ""
+
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logger.info("starting")
+load("missing.csv")
+logger.warning("loaded %d rows", 0)
+```
+
+```text
+$ python logdemo.py
+2026-10-22 13:53:15,041 INFO loader: starting
+2026-10-22 13:53:15,041 ERROR loader: could not load missing.csv
+Traceback (most recent call last):
+  File ".../logdemo.py", line 9, in load
+    with open(path) as f:
+         ~~~~^^^^^^
+FileNotFoundError: [Errno 2] No such file or directory: 'missing.csv'
+2026-10-22 13:53:15,041 WARNING loader: loaded 0 rows
+```
+
+Разберём построчно. Запись уровня DEBUG `opening missing.csv` не напечатана, потому что уровень — INFO; если задать `level=logging.DEBUG`, она появится без всяких изменений в коде, который пишет в журнал. Каждая запись несёт время, уровень и имя логгера, поэтому вывод долгого запуска можно искать и фильтровать. `logger.exception` пишет запись уровня ERROR и добавляет трассировку обрабатываемого исключения, так что программа фиксирует ошибку и продолжает работу. Всё это идёт в стандартный поток ошибок: `python logdemo.py 2>/dev/null` не печатает ничего, и журнал не смешивается с настоящим выводом программы.
+
+Правила, которые следуют из модели:
+
+- **`print` — для вывода, `logging` — для диагностики.** То, что программу просят выдать, идёт в стандартный вывод; то, что она сообщает о себе, идёт в журнал.
+- **Аргументы передают отдельно, а не готовой строкой.** `logger.debug("opening %s", path)` форматирует сообщение, только если запись действительно выводится. `logger.debug(f"opening {path}")` строит строку при каждом вызове, даже когда DEBUG выключен, а в горячем цикле это заметно.
+- **Библиотеки никогда не настраивают журналирование.** Библиотека создаёт свои логгеры и пишет в них; `basicConfig` вызывает только приложение. Библиотека, которая вызывает его сама, отменяет решения каждой программы, которая её импортирует.
+
+Курсы по машинному обучению встречаются с журналированием постоянно: циклы обучения записывают функцию потерь каждые несколько сотен шагов, а библиотеки вроде PyTorch и Hugging Face Transformers выводят свои предупреждения через этот модуль, поэтому их подробность можно уменьшить из приложения.
+
+## Как правильно измерять время \{#measuring-time-properly\}
+
+Программа, которая правильна, но медленна, ставит другой вопрос: куда уходит время? Первый шаг — измерить, причём так, чтобы измерению можно было доверять ([заметка курса ACOS об измерении программ](/ru/notes/acos/performance-optimization#how-to-measure-a-program) излагает те же правила со стороны машины).
+
+**Какие часы.** `time.perf_counter()` — монотонные часы с наибольшим доступным разрешением: разность двух показаний равна прошедшему реальному времени (wall time). `time.process_time()` считает процессорное время процесса. `time.time()` — календарные часы, которые могут прыгнуть при подстройке системного времени, и для интервалов это неподходящий инструмент. В описанных условиях вокруг `time.sleep(0.2)` первые часы показали 0.201 с, а вторые — 0.0 с: ожидание стоит реального времени, но не процессорного.
+
+**Повторяйте и указывайте минимум и медиану.** Пять запусков одной и той же функции на одних и тех же 100 000 слов (`unique_words` из примера с профилированием ниже) заняли в описанных условиях 1.561, 1.631, 2.180, 2.010 и 1.805 с, пока за процессор боролись другие программы. Один замер может отличаться от следующего на 40%. Минимум оценивает стоимость кода, когда ничто не мешает, медиана — то, что обычно видит пользователь. Разница меньше разброса между запусками — не разница.
+
+**`timeit` для маленьких фрагментов.** Одну операцию длиной в наносекунды нельзя измерить двумя показаниями часов вокруг неё. Модуль `timeit` выполняет инструкцию в цикле много раз и делит ([документация Python, `timeit`](#references)):
+
+```text
+$ python -m timeit -s "seen = [f'w{i}' for i in range(3000)]" "'w2999' in seen"
+10000 loops, best of 5: 22.2 usec per loop
+$ python -m timeit -s "seen = {f'w{i}' for i in range(3000)}" "'w2999' in seen"
+20000000 loops, best of 5: 12.6 nsec per loop
+```
+
+`-s` — код подготовки, который выполняется один раз и не измеряется. timeit подбирает число повторений так, чтобы одна серия занимала не меньше 0.2 с, повторяет серию пять раз и сообщает лучший результат. Кроме того, на время замера он отключает циклический сборщик мусора, чтобы сборка не попала в одну серию и не попала в другую. В коде то же самое делают `timeit.Timer(stmt, setup).autorange()` и `.repeat(...)`. Поиск последней строки в списке из 3000 строк стоит примерно в 1800 раз дороже, чем во множестве; [заметка о производительности](/ru/notes/python/performance) объясняет почему и строит график.
+
+**Разогрев.** Первый запуск функции медленнее следующих: импортируются модули, заполняются кэши, а начиная с 3.11 интерпретатор после короткого разогрева переписывает команды байт-кода в специализированные формы. Первый запуск нужно отбрасывать или указывать отдельно, если важно именно время старта.
+
+## Профилирование: куда уходит время \{#profiling-where-the-time-goes\}
+
+Таймер говорит, сколько длится вся программа. **Профилировщик** (profiler) говорит, как это время делится между функциями. `cProfile` из стандартной библиотеки — **детерминированный** профилировщик: он фиксирует каждый вызов функции и каждый возврат с отметкой времени и суммирует время по функциям ([документация Python, The Python profilers](#references)). Программа ниже считает различные слова среди 100 000 случайных слов из словаря в 3000 слов:
+
+```python
+import random
+
+def make_text(n_words, vocab, seed=1):
+    rng = random.Random(seed)
+    return " ".join(f"w{rng.randrange(vocab)}" for _ in range(n_words))
+
+def tokenize(text):
+    return [w.strip(".,").lower() for w in text.split()]
+
+def unique_words(words):
+    seen = []
+    for w in words:
+        if w not in seen:
+            seen.append(w)
+    return seen
+```
+
+`python -m cProfile -s tottime words.py` запускает программу под профилировщиком и печатает таблицу, отсортированную по выбранному столбцу (первые строки):
+
+```text
+$ python -m cProfile -s tottime words.py
+100000 3000
+         740384 function calls (740361 primitive calls) in 1.670 seconds
+
+   Ordered by: internal time
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+        1    1.533    1.533    1.533    1.533 words.py:14(unique_words)
+   100000    0.030    0.000    0.048    0.000 random.py:245(_randbelow_with_getrandbits)
+   100000    0.026    0.000    0.080    0.000 random.py:294(randrange)
+        1    0.020    0.020    0.101    0.101 words.py:4(make_text)
+        1    0.019    0.019    0.034    0.034 words.py:10(tokenize)
+   136605    0.011    0.000    0.011    0.000 {method 'getrandbits' of '_random.Random' objects}
+   100000    0.007    0.000    0.007    0.000 {method 'bit_length' of 'int' objects}
+```
+
+Столбцы: `ncalls` — число вызовов; `tottime` — время, проведённое в самой функции, без вызванных ею функций; `cumtime` — время вместе с ними; два столбца `percall` делят каждое из них на `ncalls`. Сортировка по `tottime` находит функцию, которая выполняет работу, сортировка по `cumtime` — шаг верхнего уровня, который её содержит. Здесь один вызов `unique_words` занимает 1.53 с из 1.67 с, 92%; порождение случайных слов со 100 000 вызовов `randrange` стоит в сумме 0.10 с (`cumtime` у `make_text`). Оптимизировать стоит только `unique_words`: ускорение `tokenize` в 10 раз сэкономило бы 0.03 с.
+
+**Чего cProfile не видит.** Он считает вызовы функций, а не строки и не операторы. Проверка `w not in seen` внутри `unique_words` просматривает список длиной до 3000 строк, и именно туда уходят 1.53 с, но `in` для списка — не вызов функции на Python, поэтому эта работа видна только как `tottime` функции `unique_words`. Если горячая функция длинная, её стоит разбить на функции поменьше для профилирования или измерить время её частей. Замена списка на множество сокращает время `unique_words` на тех же словах примерно с 1.6 с до примерно 3 мс; [заметка о производительности](/ru/notes/python/performance) объясняет почему.
+
+**Накладные расходы.** Запись каждого вызова стоит времени на каждый вызов, поэтому программа из множества крошечных функций под cProfile выглядит медленнее, чем есть, а части, которые делают много вызовов, раздуваются относительно остальных. При замере через `perf_counter` без профилировщика в том же сеансе три шага заняли 0.022 с (`make_text`), 0.007 с (`tokenize`) и 1.482 с (`unique_words`). Профиль раздул первые два примерно впятеро, потому что каждый делает 100 000 вызовов, а `unique_words`, который делает мало вызовов, — на 3%. Порядок всё равно верный, но доля горячей функции — 98%, а не 92%. В коде `cProfile.Profile()` с `.enable()` и `.disable()` профилирует один участок, а `pstats.Stats(profiler).strip_dirs().sort_stats("cumulative").print_stats(10)` печатает первые десять строк; так делает раздел «Код». Для наглядного представления сторонний инструмент SnakeViz рисует сохранённый профиль (`python -m cProfile -o out.prof script.py`) в виде вложенных прямоугольников.
+
+**Сэмплирующие профилировщики.** **Сэмплирующий** профилировщик (sampling profiler) не перехватывает каждый вызов. Он много раз в секунду прерывает программу, записывает текущий стек и оценивает долю времени каждой функции по тому, как часто она встречается в выборках. Накладные расходы малы и не зависят от числа вызовов, и такой профилировщик видит строки. **py-spy**, сторонний инструмент, снимает выборки с работающего процесса Python снаружи, читая его память, не меняя и не перезапуская процесс. Python 3.15, вышедший в октябре 2026 года, уже после версии, на которой построен курс, добавляет в стандартную библиотеку сэмплирующий профилировщик `profiling.sampling` рядом с `profiling.tracing` — новым именем cProfile ([PEP 799](#references); [What's New in Python 3.15](#references)); его документация перечисляет режимы для реального времени, процессорного времени и времени удержания GIL, а также подключение к работающему процессу. Ни один из этих инструментов для заметки не запускался.
+
+## Память: `tracemalloc` \{#memory-tracemalloc\}
+
+Когда программе не хватает памяти или долгий запуск постоянно растёт, вопрос в том, какие строки выделяют память. Модуль `tracemalloc` перехватывает распределитель памяти Python и записывает для каждого блока трассировку строки, которая его выделила ([документация Python, `tracemalloc`](#references)). Он учитывает память, выделенную через распределитель Python (все объекты Python и буферы массивов NumPy, о которых NumPy сообщает tracemalloc); память, которую другие библиотеки на C берут напрямую, не учитывается.
+
+```python
+import tracemalloc
+
+def load_rows(n):
+    return [{"id": i, "score": i * 0.5} for i in range(n)]
+
+def total_list(n):
+    squares = [i * i for i in range(n)]
+    return sum(squares)
+
+def total_gen(n):
+    return sum(i * i for i in range(n))
+
+tracemalloc.start()
+rows = load_rows(100_000)
+snapshot = tracemalloc.take_snapshot()
+for stat in snapshot.statistics("lineno")[:3]:
+    print(stat)
+current, peak = tracemalloc.get_traced_memory()
+print(f"current {current / 2**20:.1f} MiB, peak {peak / 2**20:.1f} MiB")
+del rows
+
+for f in (total_list, total_gen):
+    tracemalloc.reset_peak()
+    base, _ = tracemalloc.get_traced_memory()
+    f(1_000_000)
+    _, peak = tracemalloc.get_traced_memory()
+    print(f"{f.__name__}: peak {(peak - base) / 2**10:,.1f} KiB above the start")
+tracemalloc.stop()
+```
+
+```text
+.../mem.py:5: size=23.6 MiB, count=399711, average=62 B
+current 23.6 MiB, peak 23.6 MiB
+total_list: peak 39,497.2 KiB above the start
+total_gen: peak 0.4 KiB above the start
+```
+
+Все 23.6 МиБ выделены в строке 5: 100 000 маленьких словарей стоят примерно 4 блока и 247 байт каждый, против 16 байт для двух чисел, хранимых как «сырые» float. `total_list` строит список из миллиона целых, прежде чем просуммировать его, — пик в 38.6 МиБ (8 байт на ячейку списка плюс 32 байта на объект целого числа); `total_gen` порождает квадраты по одному и никогда не держит больше нескольких — пик в 0.4 КиБ при том же ответе. Сравнение двух снимков, `snapshot2.compare_to(snapshot1, "lineno")`, перечисляет строки, выделения в которых выросли между снимками, и так находят утечку. tracemalloc заметно замедляет выделение памяти, поэтому его включают на время расследования, а не оставляют работать постоянно.
+
+<aside class="callout"><strong>Проверьте себя.</strong> (1) Трассировка заканчивается двумя отчётами, соединёнными фразой «During handling of the above exception, another exception occurred». Какой из них исправлять первым? (2) В pdb набирают `n`, чтобы напечатать переменную с именем `n`, а программа переходит на следующую строку. Почему и что нужно набрать? (3) `cProfile` показывает функцию с большим `cumtime` и маленьким `tottime`. Где время? (4) Функция заняла 1.2 с в одном запуске и 1.5 с в следующем. Стала ли вторая версия кода медленнее?<details><summary>Ответы</summary>(1) Обычно оба, но начинать стоит с первого: это исходный сбой, а второй — ошибка в блоке `except`, который его обрабатывал. (2) `n` — команда pdb «next»; нужно `p n` (или `pp n`). (3) В вызываемых ею функциях; нужно отсортировать по `tottime` или напечатать вызываемые функции через `Stats.print_callees`. (4) По двум запускам этого не сказать: разница лежит в пределах разброса между запусками, показанного выше. Нужно повторить обе версии несколько раз и сравнить минимумы и медианы.</details></aside>
+
+## Что изменилось \{#what-changed\}
+
+| Вопрос | Отправная точка | Инструмент |
+| --- | --- | --- |
+| Где упало? | `print`, пока не найдётся место падения | трассировка, читаемая снизу; отчёты цепочки по порядку |
+| Какими были значения? | добавить `print`, перезапустить | `breakpoint()`, команды pdb `p`, `w`, `u`/`d`, `n`; посмертная отладка `pdb -c continue` |
+| Что происходило в долгом запуске? | вывод `print`, смешанный с выводом программы | `logging`: уровни, имена логгеров, время, в стандартный поток ошибок |
+| Сколько это длится? | один запуск, `time.time()` | `perf_counter` с повторами; минимум и медиана; `timeit` для маленьких инструкций |
+| Какая функция медленная? | догадка | `cProfile` и `pstats` с сортировкой по `tottime` или `cumtime` |
+| Какая строка выделяет память? | догадка | снимки и пики `tracemalloc` |
+
+## Ограничения \{#limitations\}
+
+- **Одна машина, один момент.** Каждый замер времени здесь сделан один раз на одном ноутбуке с другими работающими программами; приведённый разброс и есть свидетельство того, что такие числа гуляют на десятки процентов.
+- **cProfile искажает и не видит строк.** Его накладные расходы на каждый вызов раздувают программы из маленьких функций, а единица его учёта — функция. Сэмплирующие профилировщики избегают обеих проблем; py-spy и `profiling.sampling` из Python 3.15 здесь не запускались.
+- **tracemalloc видит только распределитель Python.** Память, которую расширения на C выделяют сами, и память, которую операционная система приписывает процессу по другим причинам (разделяемые библиотеки, фрагментация), в нём не видна. Резидентный размер процесса, полученный через `resource.getrusage` или от операционной системы, — вторая половина картины.
+- **Отладчики меняют тайминги.** Пока программа стоит в pdb, другие потоки и таймеры продолжают работать, поэтому ошибки, зависящие от взаимного расположения потоков во времени, под отладчиком могут исчезнуть; там часто лучше подходит журналирование с именами потоков. [Заметка о конкурентности](/ru/notes/python/concurrency) показывает такие ошибки.
+
+## Что нужно запомнить \{#what-you-should-remember\}
+
+- Сначала читают последнюю строку трассировки, затем кадры вверх. «Direct cause» означает сознательное превращение одной ошибки в другую; «During handling» — вторую ошибку внутри блока `except`.
+- Неверные состояния должны проявляться рано: `zip(..., strict=True)`, проверки входных данных, исключения вместо молчаливых значений по умолчанию.
+- `breakpoint()` останавливает программу в pdb. Команды `p`, `w`, `u`/`d`, `n`, `s`, `c` покрывают большинство сеансов. `python -m pdb -c continue` отлаживает падение после того, как оно произошло. `PYTHONBREAKPOINT=0` отключает забытые точки останова.
+- Журнал пишут через `logging.getLogger(__name__)`, настраивают один раз в точке входа, передают аргументы вместо f-строк и используют `logger.exception` в обработчиках.
+- Время измеряют через `perf_counter` с повторами, указывают минимум и медиану, а для маленьких инструкций используют `timeit`. Запуск-разогрев отбрасывают.
+- `cProfile`: `tottime` находит функцию, которая выполняет работу, `cumtime` — шаг, который её содержит. Операторов и строк он не видит.
+- `tracemalloc` находит строки, которые выделяют память, и пик вычисления.
+
+## Код \{#code\}
+
+Скрипт проходит весь процесс на одной задаче — подсчёте различных слов: он пишет журнал своего хода, профилирует медленную версию через cProfile и pstats, измеряет время обеих версий повторными показаниями `perf_counter` и через `timeit` и измеряет память через tracemalloc. Ему нужна только стандартная библиотека, в описанных условиях он работает около 8 секунд; запуск — `python -I find_slow.py`.
+
+```python
+"""Find where a program spends its time and memory (Python 3.14, standard library)."""
+import cProfile
+import io
+import logging
+import pstats
+import random
+import statistics
+import time
+import timeit
+import tracemalloc
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+log = logging.getLogger("words")
+
+
+def make_words(n_words, vocab, seed=1):
+    rng = random.Random(seed)
+    return [f"w{rng.randrange(vocab)}" for _ in range(n_words)]
+
+
+def unique_list(words):          # проверка вхождения в список: просмотр
+    seen = []
+    for w in words:
+        if w not in seen:
+            seen.append(w)
+    return seen
+
+
+def unique_set(words):           # проверка вхождения во множество: поиск по хешу
+    seen, order = set(), []
+    for w in words:
+        if w not in seen:
+            seen.add(w)
+            order.append(w)
+    return order
+
+
+words = make_words(50_000, 2_000)
+log.info("made %d words", len(words))
+
+# 1. Профиль: какая функция занимает время?
+profiler = cProfile.Profile()
+profiler.enable()
+result = unique_list(words)
+profiler.disable()
+out = io.StringIO()
+pstats.Stats(profiler, stream=out).strip_dirs().sort_stats("tottime").print_stats(3)
+lines = [line for line in out.getvalue().splitlines() if line.strip()]
+print("\n".join(lines[:2] + lines[-4:]))
+
+# 2. Замер обеих версий, по пять запусков, с минимумом и медианой.
+for f in (unique_list, unique_set):
+    runs = []
+    for _ in range(5):
+        t0 = time.perf_counter()
+        f(words)
+        runs.append(time.perf_counter() - t0)
+    print(f"{f.__name__:12} min {min(runs) * 1e3:8.2f} ms   median {statistics.median(runs) * 1e3:8.2f} ms")
+assert unique_list(words) == unique_set(words)
+log.info("both versions agree on %d unique words", len(result))
+
+# 3. timeit для одной маленькой операции: число повторений он подбирает сам.
+for kind in ("list", "set"):
+    setup = f"seen = {kind}(f'w{{i}}' for i in range(2000))"
+    timer = timeit.Timer("'w1999' in seen", setup=setup)
+    number, _ = timer.autorange()
+    best = min(timer.repeat(repeat=5, number=number)) / number
+    print(f"'w1999' in a {kind} of 2000: {best * 1e9:9.1f} ns")
+
+# 4. Память: tracemalloc считает байты, которые выделяет Python, по строкам исходного кода.
+tracemalloc.start()
+squares = [i * i for i in range(200_000)]
+current, peak = tracemalloc.get_traced_memory()
+top = tracemalloc.take_snapshot().statistics("lineno")[0]
+print(f"list of 200,000 squares: current {current / 2**20:.1f} MiB, peak {peak / 2**20:.1f} MiB")
+print(f"largest line: {top.traceback[0].lineno}, {top.size / 2**20:.1f} MiB in {top.count} blocks")
+del squares
+tracemalloc.reset_peak()
+total = sum(i * i for i in range(200_000))
+print(f"generator instead: peak {tracemalloc.get_traced_memory()[1] / 2**10:.1f} KiB")
+tracemalloc.stop()
+
+# Вывод в терминале на CPython 3.14.7 на Apple M1 (macOS); строки журнала идут в стандартный
+# поток ошибок, и каждое время меняется от запуска к запуску и от машины к машине:
+# INFO words: made 50000 words
+#          2002 function calls in 0.512 seconds
+#    Ordered by: internal time
+#    ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+#         1    0.511    0.511    0.512    0.512 find_slow.py:21(unique_list)
+#      2000    0.000    0.000    0.000    0.000 {method 'append' of 'list' objects}
+#         1    0.000    0.000    0.000    0.000 {method 'disable' of '_lsprof.Profiler' objects}
+# unique_list  min   508.06 ms   median   510.56 ms
+# unique_set   min     1.48 ms   median     1.53 ms
+# INFO words: both versions agree on 2000 unique words
+# 'w1999' in a list of 2000:   14438.8 ns
+# 'w1999' in a set of 2000:      12.7 ns
+# list of 200,000 squares: current 7.6 MiB, peak 7.6 MiB
+# largest line: 72, 7.6 MiB in 199891 blocks
+# generator instead: peak 5.4 KiB
+```
+
+Профиль показывает 2002 вызова: один вызов `unique_list`, 2000 вызовов `append` (по одному на каждое различное слово) и один вызов `disable`. 50 000 проверок вхождения в нём не видны — это и есть слепое пятно, описанное выше. Строка 72 — включение списка (list comprehension); её 199 891 блок — почти сплошь объекты целых чисел, по одному на квадрат.
+
+## Дальше \{#next\}
+
+Профилировщик нашёл медленную функцию, а исправление — множество вместо списка — оказалось сменой структуры данных. Чтобы пойти дальше и понять, почему просмотр списка стоит 7 наносекунд на элемент, почему вызов функции дороже сложения и что значит «интерпретатор специализирует каждую команду», нужно посмотреть, что CPython делает с функцией. [Следующая заметка](/ru/notes/python/how-cpython-runs-code) проводит исходный код через компилятор до байт-кода, выполняет его на стеке значений интерпретатора и объясняет подсчёт ссылок и сборщик мусора.
+
+## Литература \{#references\}
+
+- Документация Python (3.14): [`pdb`](https://docs.python.org/3.14/library/pdb.html); [`breakpoint`](https://docs.python.org/3.14/library/functions.html#breakpoint) и [`sys.breakpointhook`](https://docs.python.org/3.14/library/sys.html#sys.breakpointhook); [Exception context](https://docs.python.org/3.14/library/exceptions.html#exception-context); [Logging HOWTO](https://docs.python.org/3.14/howto/logging.html) и [`logging`](https://docs.python.org/3.14/library/logging.html); [`time.perf_counter`](https://docs.python.org/3.14/library/time.html#time.perf_counter); [`timeit`](https://docs.python.org/3.14/library/timeit.html); [The Python profilers](https://docs.python.org/3.14/library/profile.html); [`tracemalloc`](https://docs.python.org/3.14/library/tracemalloc.html).
+- [What's New in Python 3.14](https://docs.python.org/3.14/whatsnew/3.14.html) (удалённое подключение через `pdb -p`) и [What's New in Python 3.15](https://docs.python.org/3.15/whatsnew/3.15.html) (пакет `profiling`).
+- B. Warsaw. [PEP 553 — Built-in breakpoint()](https://peps.python.org/pep-0553/). 2017.
+- B. Bucher. [PEP 618 — Add Optional Length-Checking To zip](https://peps.python.org/pep-0618/). 2020.
+- P. Galindo Salgado, M. Wozniski, I. Stojanovic. [PEP 768 — Safe external debugger interface for CPython](https://peps.python.org/pep-0768/). 2024.
+- P. Galindo Salgado, L. Kiss Kollár. [PEP 799 — A dedicated profiling package for organizing Python profiling tools](https://peps.python.org/pep-0799/). 2025.
+- B. Frederickson. [py-spy: sampling profiler for Python programs](https://github.com/benfred/py-spy).
+- B. Slatkin. *Effective Python*, 3rd ed. Addison-Wesley, 2024. Главы о тестировании и отладке и о производительности.
+- M. Gorelick, I. Ozsvald. *High Performance Python*, 2nd ed. O'Reilly, 2020. Гл. 2, профилирование.
