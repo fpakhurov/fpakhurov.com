@@ -1,0 +1,317 @@
+---
+title: Chain of thought and reasoning
+description: "How writing intermediate steps before answering helps a language model: few-shot and zero-shot chain of thought, the serial computation extra tokens add, self-consistency as a vote over reasoning paths with its exact accuracy, search over thoughts, and how faithful the written reasoning is."
+course: agents
+section: Language Models as Agents
+order: 9
+status: published
+tags: [chain-of-thought, reasoning, self-consistency, majority-vote, least-to-most, tree-of-thoughts, faithfulness, test-time-compute]
+prerequisites: [The language model as a policy, Search and planning, Discrete distributions]
+---
+
+import SelfConsistency from '../../../components/figures/chain-of-thought/SelfConsistency.astro';
+import MajorityVote from '../../../components/figures/chain-of-thought/MajorityVote.astro';
+
+The policy of the [previous note](/notes/agents/language-model-as-a-policy) reads its context and writes an action in a few tokens. Each of those tokens is computed by a fixed stack of layers. When the right action depends on several steps of computation, say the arithmetic of a word problem or a chain of three facts, the model has only those few forward passes to do all of it before it commits to the first token of the answer. The simplest fix is also the most consequential one in the history of language-model agents: let the model write the intermediate steps first. This note covers chain-of-thought prompting, explains why the written steps add computation and not just words, treats sampling several chains and voting as a way to marginalize over reasoning paths, computes exactly how much the vote helps, places decomposition and tree search on the same line, and summarizes what is known about whether the written chain is the reasoning the model actually did.
+
+**Notation.** A question $x$, a reasoning path $r$ (a sequence of tokens) and an answer $y$ read off its end; the model defines $p_\theta(r, y \mid x)$. For one question, $p$ is the probability that one sampled path ends in the correct answer. With $n$ sampled paths, $K$ is the number that end correctly and $\hat y_n$ the most frequent answer; $A_n(p) = P(\hat y_n \text{ is correct})$. A transformer has $L$ layers.
+
+## Baseline: answer directly
+
+The standard prompt of the [GPT note](/notes/nlp/gpt#from-gpt-1-to-gpt-3) shows a few solved examples as question–answer pairs and then the new question. The model must produce the answer immediately. On GSM8K, a benchmark of grade-school word problems that each take two to eight arithmetic steps ([Cobbe et al., 2021](#references)), PaLM 540B prompted this way with eight examples solved 17.9 % of the test problems ([Wei et al., 2022](#references)). The model had the facts and the arithmetic; what it lacked was a place to do several dependent steps one after another.
+
+<aside class="callout"><strong>Key idea.</strong> Let the model generate its intermediate steps as text before the answer. Every generated token is fed back as input to all later positions, so the computation available before the answer grows with the number of tokens written, and each step can use the results of the steps before it. Then treat the reasoning as a hidden variable: sample several paths and keep the answer that most of them reach.</aside>
+
+## Chain-of-thought prompting
+
+**Few-shot chain of thought** ([Wei et al., 2022](#references)) changes only the examples in the prompt. Each answer is preceded by the steps that lead to it, in plain words:
+
+```
+Q: A shop has 17 pens. It receives 6 boxes of 4 pens and sells 9 pens. How many pens does it have now?
+A: The boxes hold 6 × 4 = 24 pens. 17 + 24 = 41 pens. After selling 9, 41 − 9 = 32. The answer is 32.
+```
+
+Shown eight such examples, the model writes its own steps for the new question and ends with *The answer is …*, which a regular expression extracts. On GSM8K, with eight examples in each condition ([Wei et al., 2022](#references), section 3):
+
+| model | standard prompting | chain-of-thought prompting |
+| --- | --- | --- |
+| LaMDA 137B | 6.5 % | 14.3 % |
+| GPT-3 175B (text-davinci-002) | 15.6 % | 46.9 % |
+| PaLM 540B | 17.9 % | 56.9 % |
+
+The gain grew with scale. Below roughly 100 B parameters the models of the paper wrote fluent but wrong chains, and chain of thought did not help or hurt; the authors described it as an ability that emerges with scale. The paper also separated the ingredients, on GSM8K with LaMDA 137B. Writing only the equation before the answer gave 5.4 %. Writing a row of dots as long as the reasoning, extra tokens with no content, gave 6.4 %. Writing the reasoning after the answer gave 6.1 %. All three stayed near the 6.5 % of standard prompting, against 14.3 % for real reasoning before the answer. The steps help when they are written in words, and when they come before the answer.
+
+**Zero-shot chain of thought** ([Kojima et al., 2022](#references)) needs no examples. The prompt is the question followed by *Let's think step by step.*; the model writes a chain, and a second prompt appends *Therefore, the answer (arabic numerals) is* to extract the number. With text-davinci-002, accuracy rose from 10.4 % to 40.7 % on GSM8K and from 17.7 % to 78.7 % on MultiArith, against 48.7 % for eight-example chain of thought on GSM8K with the same model. One sentence recovered most of the effect of hand-written examples. Instruction-tuned models now produce such chains for many questions without being asked, because the demonstrations they were tuned on contain them.
+
+## Why intermediate tokens add serial computation
+
+A transformer computes the distribution of token $j$ from the tokens before it with $L$ layers applied one after another. All positions are processed in parallel, and information moves only forward, from earlier positions to later ones, through attention. Without intermediate tokens, the first token of the answer is therefore a function of the question computed by a circuit of depth $L$: however wide the model, at most $L$ dependent steps fit in it.
+
+A generated token changes this. It is the output of a full pass of $L$ layers at its position, and it re-enters the network at the bottom as an input to every later position. A later token can then build on the result of that whole computation:
+
+$$
+\boxed{\;\text{serial depth before the answer} \approx L \quad \text{(direct)}, \qquad \approx L\,(T + 1) \quad \text{(after } T \text{ reasoning tokens)}.\;}
+$$
+
+**Worked example.** A 12-layer model answering directly has 12 layers of sequential computation between the question and the first token of the answer. After 60 tokens of reasoning, the token that starts the answer depends on a chain of $12 \times 61 = 732$ layer applications. The reasoning tokens act as a scratchpad whose every entry is the result of a full forward pass.
+
+Theory makes the difference precise. Li et al. ([2024](#references)) show that transformers of constant depth with constant-bit precision, answering directly, can only solve problems in the circuit class $\mathrm{AC}^0$, which excludes even computing the parity of a bit string; with $T$ steps of chain of thought, the same kind of transformer, with embeddings of size $O(\log n)$, can solve any problem that boolean circuits of size $T$ solve. Problems in which each step needs the result of the previous one, such as following a value through a long sequence of operations, are exactly the ones that need the extra steps.
+
+Extra tokens are necessary, not sufficient. In the ablation above, dots of the same length did not help a prompted model. Pfau, Merrill and Bowman ([2024](#references)) found that transformers can learn to use meaningless filler tokens for extra computation on two algorithmic tasks, but only with specific, dense supervision; prompted models do not do it on their own. The content of the steps matters too: written-out results are what later tokens can read.
+
+## Self-consistency: vote over reasoning paths
+
+A reasoning path is not part of the answer; it is a means to it. The probability of an answer is a sum over all paths that reach it,
+
+$$
+P(y \mid x) = \sum_{r} p_\theta(r, y \mid x),
+$$
+
+and the answer we want is the most probable one, $\arg\max_y P(y \mid x)$. Greedy decoding does something else: it follows, token by token, the most likely continuation, which approximates the single most probable path. When the correct answer can be reached by many different paths and a wrong one by a single popular path, the two disagree.
+
+**Self-consistency** ([Wang et al., 2023](#references)) estimates the marginal by sampling. Draw $n$ paths at a temperature above zero, $(r_i, y_i) \sim p_\theta(\cdot \mid x)$, parse each answer, and return the most frequent:
+
+$$
+\boxed{\;\hat y_n = \arg\max_{y} \sum_{i=1}^{n} \mathbb 1[y_i = y].\;}
+$$
+
+The relative frequency of each answer is an average of independent indicators, so by the [law of large numbers](/notes/probability/law-of-large-numbers) it converges to $P(y \mid x)$, and $\hat y_n$ converges to the mode of the answer distribution.
+
+**Worked example.** Take the question *17 + 6 × 4 − 9* in a stand-in model, the one of the Code section. It solves the problem by one of three correct plans that begin differently (`6 * 4 = 24`, `17 - 9 = 8`, `4 * 6 = 24`) or, with probability $q$, by a misconception that computes from left to right, `17 + 6 = 23`, and ends at 83. With $q = 0.35$, each correct plan has probability $0.65 / 3 = 0.217$ and the misconception $0.35$. Greedy decoding takes the most likely first step, the misconception, and answers 83. Yet $P(32 \mid x) = 0.65$ and $P(83 \mid x) = 0.35$: the vote of many samples answers 32.
+
+<SelfConsistency />
+
+1. **Prompt.** The question goes into the context, with chain-of-thought examples or an instruction to reason step by step.
+2. **Sample.** The model writes $n$ reasoning paths independently, at a temperature such as $0.7$; here $n = 5$.
+3. **Parse.** A regular expression reads the final answer of each path: 32, 83, 32, 34, 32. The fourth path slipped in one addition.
+4. **Vote.** The most frequent answer, 32 with three votes, is returned. The paths themselves are discarded.
+
+On GSM8K with PaLM 540B, sampling 40 paths at temperature 0.7 with top-$k$ = 40 and voting raised accuracy from 56.5 % for greedy chain of thought to 74.4 %; with code-davinci-002, from 60.1 % to 78.0 % ([Wang et al., 2023](#references), Table 2). Weighting each vote by the normalized probability of its path gave 74.1 %, no better than the plain count (Table 1). The cost is $n$ times the tokens of one chain.
+
+### How much the vote helps
+
+When every wrong answer is the same, or when only "correct" and "wrong" matter, the vote is a majority vote between two outcomes. If, given the question, the $n$ samples are independent and each is correct with probability $p$, the number of correct samples is binomial ([Discrete distributions](/notes/probability/discrete-distributions#binomial)). The majority is correct when more than half the samples are, and a tie, possible when $n$ is even, is broken by a fair coin:
+
+$$
+\begin{aligned}
+K &\sim \mathrm{Bin}(n, p), \qquad P(K = k) = \binom{n}{k} p^{k} (1 - p)^{n - k} && \text{(independent samples)} \\
+A_n(p) &= P\big(K > \tfrac n2\big) + \tfrac12\, P\big(K = \tfrac n2\big) && \text{(majority wins, ties by a coin)} \\
+&= \boxed{\;\sum_{k > n/2} \binom{n}{k} p^{k}(1-p)^{n-k} \;+\; \tfrac12 \binom{n}{n/2} \big(p(1-p)\big)^{n/2} \,\mathbb 1[n \text{ even}].\;}
+\end{aligned}
+$$
+
+**Worked example.** With $p = 0.6$ and $n = 5$:
+
+$$
+A_5(0.6) = \underbrace{10 \cdot 0.6^{3}\, 0.4^{2}}_{k = 3:\; 0.3456} + \underbrace{5 \cdot 0.6^{4}\, 0.4}_{k = 4:\; 0.2592} + \underbrace{0.6^{5}}_{k = 5:\; 0.0778} = 0.683 .
+$$
+
+Three properties follow from the formula.
+
+- **The vote amplifies whichever side is ahead.** For $p = 0.6$, $A_n$ rises from $0.6$ to $0.648$, $0.683$, $0.753$ and $0.903$ at $n = 1, 3, 5, 11, 41$. For $p = 0.4$ it falls symmetrically: $0.4$, $0.352$, $0.317$, $0.247$, $0.097$. Voting does not create accuracy; it sharpens the model's own tendency.
+- **The error falls exponentially.** For $p > 1/2$, [Hoeffding's inequality](/notes/probability/inequalities-and-concentration#hoeffdings-inequality) bounds the error by $1 - A_n(p) \le \exp\big(-2n(p - \tfrac12)^2\big)$. At $n = 41$ and $p = 0.6$ the bound is $0.440$ against the exact $0.097$: loose, but it shows the rate.
+- **An even number of samples adds nothing.** Going from $2m - 1$ samples to $2m$, a correct majority of exactly $m$ becomes a tie when the new sample is wrong, and a wrong majority with $m - 1$ correct becomes a tie when the new sample is right. The two events have probabilities $\binom{2m-1}{m} p^m (1-p)^m$ and $\binom{2m-1}{m-1} p^m (1-p)^m$, which are equal, and each tie is won half the time, so $A_{2m} = A_{2m - 1}$.
+
+Real wrong answers are not all the same. A slip in one step produces a different wrong number on each path, while a shared misconception produces the same wrong number every time. With several answers, the vote is a plurality, and the correct answer wins in the limit exactly when it is the most frequent one, **even if $p < 1/2$**. With the correct answer at $p = 0.4$ and three wrong answers at $0.3$, $0.2$ and $0.1$, the exact plurality accuracy, computed by summing the multinomial probabilities of all vote counts, is $0.4$, $0.440$, $0.490$, $0.581$ and $0.763$ at $n = 1, 3, 5, 11, 41$, and it tends to 1. With the same $p = 0.4$ and a single wrong answer at $0.6$, it tends to 0.
+
+<MajorityVote />
+
+Over a dataset, the questions differ. Accuracy at $n$ samples is the average of the per-question curves, and as $n$ grows it approaches the fraction of questions whose correct answer is the mode of the model's answer distribution. Questions where the model is confidently wrong stay wrong however many paths are sampled, so the curve rises and then flattens. In the stand-in model of the Code section, with 200 questions whose misconception and slip rates vary, one sampled path is correct 53.6 % of the time and greedy decoding 36 %; voting over 5, 10, 20 and 40 paths gives 69.3 %, 73.9 %, 76.4 % and 77.7 %, approaching the 78 % of questions whose correct answer is the mode.
+
+## Decomposition and search over thoughts
+
+Chain of thought and self-consistency produce paths independently and from left to right. Two refinements change the shape of the computation.
+
+**Least-to-most prompting** ([Zhou et al., 2023](#references)) splits the work into two stages. A first prompt, with examples of decompositions, asks the model to break the problem into simpler subquestions. Then the model answers the subquestions in order, each prompt containing the answers found so far, and the original question last. The order matters when a problem is harder than any example in the prompt. On the length split of SCAN, where the test commands translate into longer action sequences than any training command, code-davinci-002 reached 99.7 % with least-to-most prompting, against 16.2 % with chain of thought and 16.7 % with standard prompting. On last-letter concatenation of 12-word lists it reached 74.0 % against 31.8 %. On GSM8K the two were close, 62.4 % and 60.9 %.
+
+**Tree of Thoughts** ([Yao et al., 2023b](#references)) turns reasoning into the search of [Search and planning](/notes/agents/search-and-planning#why-this-matters-for-language-model-planners). A node is a partial solution, a sequence of thoughts. The model proposes several next thoughts, which are the successors of the node, and also rates how promising each partial solution is, which plays the part of the heuristic. Breadth-first or depth-first search keeps the best nodes and backtracks from dead ends, which a single left-to-right chain cannot do. The search note gives its result on the Game of 24; [Planning with language models](/notes/agents/planning-with-language-models) develops search with a model as successor function and heuristic.
+
+| method | shape of the computation | what is chosen | model calls |
+| --- | --- | --- | --- |
+| chain of thought | one path, left to right | the path's answer | 1 |
+| self-consistency | $n$ independent paths | the most frequent answer | $n$ |
+| least-to-most | a list of subquestions, answered in order | the last answer, built on the earlier ones | 1 + number of subquestions |
+| Tree of Thoughts | a tree of partial solutions, searched with backtracking | the best leaf by the model's own rating | proposals plus evaluations per node |
+
+## Is the chain of thought faithful?
+
+A written chain is easy to read, and it is tempting to treat it as an explanation of how the model reached its answer. It is a generated text like any other, and several lines of evidence show that it can differ from the computation that produced the answer.
+
+- **Biased contexts.** Turpin et al. ([2023](#references)) reordered the options of few-shot examples so that the correct answer was always (A). GPT-3.5 and Claude 1.0 then chose (A) more often for new questions, with accuracy falling by up to 36 % on 13 BIG-Bench Hard tasks, and their chains of thought justified the choice without mentioning the bias. In a test of social bias, the explanations rationalized stereotyped answers in the same way.
+- **Interventions on the chain.** Lanham et al. ([2023](#references)) truncated chains, inserted mistakes and paraphrased them, and measured how often the answer changed. The dependence on the chain varied widely between tasks: on some the answer followed the chain, on others the model largely ignored it. On most tasks they studied, larger and more capable models produced *less* faithful reasoning.
+- **Hints in reasoning models.** Chen et al. ([2025](#references)) placed hints to the answer in prompts and checked whether models that used a hint said so. Averaged over their hint types, Claude 3.7 Sonnet mentioned the hint 25 % of the time and DeepSeek-R1 39 %. Outcome-based reinforcement learning first made the chains more faithful, then stopped improving them.
+- **Hidden computation.** The filler-token result above shows that a transformer can, in principle, compute with tokens whose text says nothing about what is computed.
+
+For agents the consequence is practical. A trace of thoughts is evidence about what the agent is doing, often good evidence, and the main tool people have for debugging agents and monitoring them. It is not a proof. A safety argument that relies on reading the chain needs the chain to be necessary for the task, so that the model cannot reach the answer without writing its real reasoning down; [Alignment and oversight of agents](/notes/agents/alignment-and-oversight) returns to monitoring.
+
+## From prompted reasoning to reasoning models
+
+Everything in this note is done by prompting a fixed model. From 2024, models have been trained with reinforcement learning to write long chains before they answer: OpenAI's o1 (September 2024) and DeepSeek-R1 (January 2025) are the first widely known examples. Accuracy then grows with the length of the reasoning and the number of samples spent at inference, which turns the serial-depth argument and the voting arithmetic of this note into a budget to be allocated. [Reasoning models and test-time compute](/notes/agents/reasoning-models) covers how such models are trained and how to spend computation at inference time.
+
+<aside class="callout"><strong>Check yourself.</strong> (1) Each sampled path is correct with probability 0.7, and there is only one wrong answer. What is the accuracy of a majority vote over 3 paths? Over 4? (2) A model reaches the answer 18 by one path of probability 0.3 and the answer 26 by three paths of probability 0.2 each; the remaining 0.1 scatters over many answers. What does greedy decoding answer, and what does self-consistency answer as $n$ grows? (3) Why did a row of dots as long as the reasoning not help the prompted model, although it adds forward passes?<details><summary>Answers</summary>(1) $A_3 = 3 \cdot 0.7^2 \cdot 0.3 + 0.7^3 = 0.441 + 0.343 = 0.784$, and $A_4 = A_3 = 0.784$. (2) Greedy follows the single most likely path and answers 18. The marginal probabilities are $P(18) = 0.3$ and $P(26) = 0.6$, so the vote converges to 26. (3) The extra positions give more computation only if the model has learned to use them; a prompted model treats the dots as text, and nothing it computes at those positions is written down for later tokens to read. Filler tokens help only after training that teaches the model to use them.</details></aside>
+
+## What changed
+
+| | answer directly | chain of thought | self-consistency |
+| --- | --- | --- | --- |
+| tokens before the answer | none | one written chain | $n$ chains |
+| serial computation | $L$ layers | about $L(T + 1)$ | the same per chain |
+| what is returned | the first answer | the chain's answer | the most frequent answer |
+| decoding | greedy or sampled | usually greedy | sampled, temperature above zero |
+| cost | 1 | the length of the chain | $n$ times that |
+| what fixes errors | nothing | nothing | the vote, if the correct answer is the mode |
+
+## Limitations
+
+- **Cost.** A chain of hundreds of tokens per answer, and $n$ chains for self-consistency, multiply the latency and the price of every step of an agent.
+- **Errors propagate along the chain.** A slip in step two is copied into everything after it, and the model rarely notices; [Reflection and self-correction](/notes/agents/reflection-and-self-correction) is about checking.
+- **Not always helpful.** Liu et al. ([2024](#references)) found tasks, taken from studies where deliberating makes people worse, on which chain of thought lowered accuracy: on three of six such tasks, by up to 36.3 points of absolute accuracy (OpenAI o1-preview compared with GPT-4o).
+- **Voting needs a canonical answer.** Numbers and multiple-choice letters can be counted; free text, code and plans need a comparison or a checker instead.
+- **Samples are not independent across questions or prompts.** The binomial formula holds for one question given the prompt. Errors shared by every sample, such as a misconception, are untouched by the vote.
+- **Faithfulness is not guaranteed.** The chain can omit what drove the answer.
+
+## What you should remember
+
+- Chain of thought: show or ask for intermediate steps before the answer. Few-shot (examples with steps) or zero-shot (*Let's think step by step*). On GSM8K with PaLM 540B and eight examples: 17.9 % to 56.9 %.
+- Generated tokens are fed back as inputs, so the serial depth before the answer grows from about $L$ to about $L(T + 1)$; dots of the same length do not help a prompted model, so the written content matters too.
+- Self-consistency samples $n$ paths and returns the most frequent answer: a Monte Carlo estimate of $\arg\max_y \sum_r p(r, y \mid x)$, which greedy decoding does not compute.
+- Majority accuracy with two outcomes is a binomial tail, $A_n(p) = P(K > n/2) + \frac12 P(K = n/2)$. It tends to 1 if $p > 1/2$ and to 0 if $p < 1/2$; even $n$ adds nothing over $n - 1$. With scattered wrong answers, the correct answer wins whenever it is the mode. Over a dataset the curve flattens at the share of questions whose mode is correct.
+- Least-to-most prompting decomposes the problem and answers subquestions in order; Tree of Thoughts searches over partial solutions with the model as successor function and heuristic.
+- The written chain is evidence, not proof: models can be steered by things their chains do not mention.
+
+## Code
+
+A scripted stand-in for a model that reasons in text about *a + b × c − d*: three correct plans, one misconception and random slips, each path written as text and its answer read by a regular expression. The script runs self-consistency on 200 questions, computes the exact answer distribution of each question by enumeration to find where the vote converges, and checks the exact binomial and plurality formulas. With a real model, `sample_path` becomes a call to the model at a temperature above zero, and `answer_distribution` is unknown: only the samples are available. Seeds are fixed; exact numbers can differ slightly across platforms and library versions. The script runs in about five seconds.
+
+```python
+import re
+from collections import Counter
+from itertools import product
+from math import comb, exp, factorial
+import numpy as np
+
+# 1. a scripted stand-in for a model that reasons in text about  a + b * c - d
+#    three correct plans that start differently, one misconception (left to right); any step can slip
+SLIPS = (-10, -2, -1, 1, 2, 10)
+def plans(a, b, c, d):        # each step: (left operand, operator, right operand); 'r0', 'r1' are earlier results
+    return [[(a, '+', b), ('r0', '*', c), ('r1', '-', d)],      # the misconception: (a + b) * c - d
+            [(b, '*', c), (a, '+', 'r0'), ('r1', '-', d)],      # three correct orders
+            [(a, '-', d), (b, '*', c), ('r0', '+', 'r1')],
+            [(c, '*', b), ('r0', '-', d), (a, '+', 'r1')]]
+
+def run_plan(plan, slips):
+    res, text = [], []
+    for (x, sym, y), s in zip(plan, slips):
+        x, y = [res[int(v[1])] if isinstance(v, str) else v for v in (x, y)]
+        r = {'+': x + y, '-': x - y, '*': x * y}[sym] + s
+        res.append(r); text.append(f'{x} {sym} {y} = {r}.')
+    return ' '.join(text) + f' The answer is {res[-1]}.'
+
+def sample_path(a, b, c, d, q, eps, rng):
+    k = 0 if rng.random() < q else 1 + rng.integers(3)
+    slips = [int(rng.choice(SLIPS)) if rng.random() < eps else 0 for _ in range(3)]
+    return run_plan(plans(a, b, c, d)[k], slips)
+
+def answer_distribution(a, b, c, d, q, eps):      # exact, by enumerating every plan and every slip
+    dist = Counter()
+    outcomes = [(0, 1 - eps)] + [(s, eps / len(SLIPS)) for s in SLIPS]
+    for k, plan in enumerate(plans(a, b, c, d)):
+        for steps in product(outcomes, repeat=3):
+            pr = (q if k == 0 else (1 - q) / 3) * np.prod([w for _, w in steps])
+            dist[extract(run_plan(plan, [s for s, _ in steps]))] += pr
+    return dist
+
+def extract(path):                                                # the answer parser
+    m = re.search(r'The answer is (-?\d+)\.', path)
+    return int(m.group(1)) if m else None
+
+def vote(answers, rng):                                           # plurality vote, ties broken at random
+    counts = Counter(answers)
+    top = max(counts.values())
+    return rng.choice(sorted(a for a, k in counts.items() if k == top))
+
+# 2. a dataset of 200 questions; each has its own misconception rate q and slip rate eps
+rng = np.random.default_rng(0)
+qs = [(*rng.integers(2, 20, size=4), rng.uniform(0, 0.6), rng.uniform(0, 0.15)) for _ in range(200)]
+for k in range(4): print(run_plan(plans(17, 6, 4, 9)[k], [0, 0, 0]))
+# 17 + 6 = 23. 23 * 4 = 92. 92 - 9 = 83. The answer is 83.
+# 6 * 4 = 24. 17 + 24 = 41. 41 - 9 = 32. The answer is 32.
+# 17 - 9 = 8. 6 * 4 = 24. 8 + 24 = 32. The answer is 32.
+# 4 * 6 = 24. 24 - 9 = 15. 17 + 15 = 32. The answer is 32.
+
+ns, trials = (1, 5, 10, 20, 40), 50
+acc = {n: 0.0 for n in ns}
+greedy = mode_ok = p_single = 0
+for a, b, c, d, q, eps in qs:
+    truth = a + b * c - d
+    greedy += (1 - q) / 3 > q                    # greedy follows the likeliest first step: one correct plan, or the misconception
+    dist = answer_distribution(a, b, c, d, q, eps)
+    mode_ok += dist[truth] > max(v for k, v in dist.items() if k != truth)   # is the correct answer the mode?
+    p_single += dist[truth]
+    for _ in range(trials):
+        answers = [extract(sample_path(a, b, c, d, q, eps, rng)) for _ in range(max(ns))]
+        for n in ns:
+            acc[n] += vote(answers[:n], rng) == truth
+print('one sample', round(p_single / len(qs), 3), 'greedy', greedy / len(qs), 'mode correct', mode_ok / len(qs))
+print({n: round(float(acc[n]) / (len(qs) * trials), 3) for n in ns})
+# one sample 0.536 greedy 0.36 mode correct 0.78
+# {1: 0.526, 5: 0.693, 10: 0.739, 20: 0.764, 40: 0.777}
+
+# 3. the exact majority vote: n independent samples, each correct with probability p, two possible answers
+def majority(n, p):
+    win = sum(comb(n, k) * p**k * (1 - p)**(n - k) for k in range(n // 2 + 1, n + 1))
+    tie = comb(n, n // 2) * (p * (1 - p))**(n // 2) if n % 2 == 0 else 0.0
+    return win + tie / 2                                          # a tie is broken by a fair coin
+
+for p in (0.6, 0.4):
+    print(p, [round(majority(n, p), 4) for n in (1, 3, 5, 11, 41)])
+print(all(abs(majority(2 * m, 0.6) - majority(2 * m - 1, 0.6)) < 1e-12 for m in range(1, 30)))  # even n adds nothing
+print(round(1 - majority(41, 0.6), 4), round(exp(-2 * 41 * 0.1**2), 4))                       # error and Hoeffding bound
+# 0.6 [0.6, 0.648, 0.6826, 0.7535, 0.9035]
+# 0.4 [0.4, 0.352, 0.3174, 0.2465, 0.0965]
+# True
+# 0.0965 0.4404
+
+# 4. the exact plurality vote with several wrong answers: the correct one wins if it is the mode
+def plurality(n, probs):
+    total = 0.0
+    for ks in product(range(n + 1), repeat=len(probs) - 1):
+        k0 = n - sum(ks)
+        if k0 < 0: continue
+        counts = (k0, *ks)
+        pr = factorial(n) * np.prod([pi**k / factorial(k) for pi, k in zip(probs, counts)])
+        top = max(counts)
+        if k0 == top: total += pr / counts.count(top)
+    return total
+
+print([round(float(plurality(n, (0.4, 0.3, 0.2, 0.1))), 4) for n in (1, 3, 5, 11, 41)])
+# [0.4, 0.44, 0.4902, 0.5815, 0.7631]
+
+# 5. a simulation of the binary vote agrees with the formula
+sim = np.mean([(rng.random(5) < 0.6).sum() >= 3 for _ in range(100_000)])
+print(round(float(sim), 4), round(majority(5, 0.6), 4))
+# 0.6836 0.6826
+```
+
+The run reports 0.526 for one sampled path, a Monte Carlo estimate of the exact 0.536. Greedy decoding is worse than a single sample here, as in the worked example: on every question with $q > 0.25$ it follows the misconception.
+
+## Next
+
+The model can now think before it answers, but everything it thinks with is in its weights and its context. It cannot look up a fact it does not know, compute reliably beyond what its chain gets right, or change anything in the world. The [next note](/notes/agents/tool-use-and-function-calling) gives it actuators: functions described by JSON schemas, the round trip through which the runtime executes a call and returns the result, constrained decoding that makes every call valid by construction, and what happens when a call fails.
+
+## References
+
+- J. Wei, X. Wang, D. Schuurmans, M. Bosma, B. Ichter, F. Xia, E. Chi, Q. Le, D. Zhou. [Chain-of-thought prompting elicits reasoning in large language models](https://arxiv.org/abs/2201.11903). NeurIPS, 2022. Section 3 (arithmetic reasoning) and its ablation, section 3.3.
+- K. Cobbe et al. [Training verifiers to solve math word problems](https://arxiv.org/abs/2110.14168). arXiv, 2021. The GSM8K benchmark.
+- T. Kojima, S. S. Gu, M. Reid, Y. Matsuo, Y. Iwasawa. [Large language models are zero-shot reasoners](https://arxiv.org/abs/2205.11916). NeurIPS, 2022.
+- X. Wang, J. Wei, D. Schuurmans, Q. Le, E. Chi, S. Narang, A. Chowdhery, D. Zhou. [Self-consistency improves chain of thought reasoning in language models](https://arxiv.org/abs/2203.11171). ICLR, 2023. Tables 1 and 2.
+- D. Zhou et al. [Least-to-most prompting enables complex reasoning in large language models](https://arxiv.org/abs/2205.10625). ICLR, 2023.
+- S. Yao, D. Yu, J. Zhao, I. Shafran, T. L. Griffiths, Y. Cao, K. Narasimhan. [Tree of thoughts: deliberate problem solving with large language models](https://arxiv.org/abs/2305.10601). NeurIPS, 2023 (cited as Yao et al., 2023b).
+- Z. Li, H. Liu, D. Zhou, T. Ma. [Chain of thought empowers transformers to solve inherently serial problems](https://arxiv.org/abs/2402.12875). ICLR, 2024.
+- J. Pfau, W. Merrill, S. R. Bowman. [Let's think dot by dot: hidden computation in transformer language models](https://arxiv.org/abs/2404.15758). arXiv, 2024.
+- M. Turpin, J. Michael, E. Perez, S. R. Bowman. [Language models don't always say what they think: unfaithful explanations in chain-of-thought prompting](https://arxiv.org/abs/2305.04388). NeurIPS, 2023.
+- T. Lanham et al. [Measuring faithfulness in chain-of-thought reasoning](https://arxiv.org/abs/2307.13702). arXiv, 2023.
+- Y. Chen et al. [Reasoning models don't always say what they think](https://arxiv.org/abs/2505.05410). arXiv, May 2025.
+- R. Liu, J. Geng, A. J. Wu, I. Sucholutsky, T. Lombrozo, T. L. Griffiths. [Mind your step (by step): chain-of-thought can reduce performance on tasks where thinking makes humans worse](https://arxiv.org/abs/2410.21333). arXiv, 2024.
+- DeepSeek-AI. [DeepSeek-R1: incentivizing reasoning capability in LLMs via reinforcement learning](https://arxiv.org/abs/2501.12948). arXiv, January 2025.
+- OpenAI. [Learning to reason with LLMs](https://openai.com/index/learning-to-reason-with-llms/). September 2024. The o1 models.

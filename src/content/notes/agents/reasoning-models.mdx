@@ -1,0 +1,307 @@
+---
+title: Reasoning models and test-time compute
+description: "How models trained with verifiable rewards learned to think at length: OpenAI o1 and DeepSeek-R1, best-of-n and voting computed exactly, sequential revision, compute-optimal allocation, process versus outcome reward models, distillation into small models, and the cost of overthinking."
+course: agents
+section: Training Agents
+order: 21
+status: published
+tags: [reasoning-models, test-time-compute, o1, deepseek-r1, best-of-n, majority-vote, process-reward-model, distillation, overthinking]
+prerequisites: [Reinforcement learning for language models, Chain of thought and reasoning, Reflection and self-correction, Discrete distributions]
+---
+
+import R1Pipeline from '../../../components/figures/reasoning-models/R1Pipeline.astro';
+import TestTimeScaling from '../../../components/figures/reasoning-models/TestTimeScaling.astro';
+import PrmVsOrm from '../../../components/figures/reasoning-models/PrmVsOrm.astro';
+
+[Chain of thought](/notes/agents/chain-of-thought) asked a fixed model to write its steps before answering, and [the previous note](/notes/agents/rl-for-language-models) trained a model with rewards that a program checks. Put the two together, let the chain grow as long as the model wants, and reward only the final answer: the model learns on its own to write chains thousands of tokens long, in which it tries an approach, checks it, notices a mistake and starts again. Models trained this way, from OpenAI's o1 in September 2024 and DeepSeek-R1 in January 2025, are called **reasoning models**. Their accuracy grows with the number of tokens they spend before answering, which makes computation at inference time a resource to be allocated, next to the computation spent on training. This note describes what is known about how such models are trained, computes exactly what the main ways of spending inference compute buy (more samples, voting, a verifier that picks the best, a verifier that checks every step), shows how to split a budget across questions of different difficulty, and covers distillation into small models and the cost of thinking too long.
+
+**Notation.** A question $x$; a reasoning chain $z$ and a final answer $y$ read off its end. For one question, $p$ is the probability that a sampled answer is correct, and $n$ the number of samples. **pass@$n$** is the probability that at least one of $n$ samples is correct, **cons@$n$** (or maj@$n$) the accuracy of a majority vote over $n$ samples, and **pass@1** the accuracy of one sample, usually estimated by averaging over several. A verifier gives an answer a score $S$; $\Phi$ is the standard normal CDF. In the process-supervision toy, a solution has $T$ steps, each right with probability $q$, and a verifier accepts a right object with probability $a$ and a wrong one with probability $b$, as in [Reflection and self-correction](/notes/agents/reflection-and-self-correction#generate-and-verify).
+
+## Baseline: a fixed model prompted to think
+
+The chain-of-thought note prompted a fixed model to reason, and spent more computation by sampling several chains and voting. Both have a ceiling. A prompted chain is as long as the demonstrations it imitates, usually a few hundred tokens, and the model has no reason to continue once it has written an answer, even a wrong one. Voting adds accuracy only while the correct answer is the most frequent one, and stops at the share of questions where it is. On AIME 2024, the 30 problems of the 2024 American Invitational Mathematics competition (AIME), each with an integer answer, GPT-4o (the May 2024 version) solved 9.3 % of the problems with one sample and 13.4 % with a vote over 64 samples, in the evaluation of DeepSeek-AI ([2025](#references), table 5). Its accuracy did not scale with the compute spent at inference, because nothing in its training rewarded using that compute well.
+
+<aside class="callout"><strong>Key idea.</strong> Train the policy with reinforcement learning on problems whose answers can be checked, rewarding only the final answer and letting the chain be as long as it needs. Whatever behaviour raises the chance of a correct answer, such as checking a step, trying another approach or continuing after a wrong first attempt, is reinforced if the model ever does it. The model learns to turn tokens at inference time into accuracy, and test-time compute becomes a second axis of scaling next to training compute.</aside>
+
+## From prompted chains to trained reasoning
+
+**OpenAI o1** was announced on 12 September 2024, with o1-preview and o1-mini released that day ([OpenAI, 2024](#references)). OpenAI disclosed that the model was trained with large-scale reinforcement learning to think productively with a chain of thought, and that its performance improved smoothly with both train-time compute (more RL) and test-time compute (more time thinking), in plots against the logarithm of each. On the two 2024 AIME papers, scored out of 15 problems each, GPT-4o solved on average 12 % (1.8 of 15); o1 solved 74 % (11.1 of 15) with one sample per problem, 83 % (12.5) with a consensus of 64 samples, and 93 % (13.9) when 1,000 samples were re-ranked by a learned scoring function. The raw chains of thought are hidden from users, who see a summary. The algorithm, the rewards, the data and the size of the model were not disclosed.
+
+**DeepSeek-R1-Zero** showed in January 2025 that the recipe can be reproduced openly ([DeepSeek-AI, 2025](#references), section 2.2). The starting point was DeepSeek-V3-Base, a mixture-of-experts model with 671 B parameters of which 37 B are active per token, with no supervised fine-tuning. Training used GRPO, the algorithm of the [previous note](/notes/agents/rl-for-language-models#grpo-the-group-as-the-baseline), with two rule-based rewards: an accuracy reward (the final answer checked against the reference, or code checked by tests) and a format reward for putting the reasoning between `<think>` and `</think>` tags. The prompt template only asked for reasoning followed by an answer, without examples or instructions on how to reason. Over training:
+
+- **Accuracy.** Pass@1 on AIME 2024, averaged over 16 samples per question, rose from 15.6 % to 71.0 %; with a vote over 64 samples it reached 86.7 %.
+- **Length.** The average length of responses on the training problems grew steadily, from hundreds to thousands of tokens; no reward asked for length.
+- **Behaviour.** Reflection on earlier steps and the exploration of alternative approaches appeared in the chains. In one intermediate checkpoint the model interrupted its own algebra with "Wait, wait. Wait. That's an aha moment I can flag here" and re-derived the step, which the authors presented as an "aha moment".
+- **Problems.** The chains were hard to read and mixed languages.
+
+**DeepSeek-R1** keeps the reinforcement learning and adds stages around it to fix those problems:
+
+<R1Pipeline />
+
+1. **Cold start.** DeepSeek-V3-Base is fine-tuned on thousands of long chain-of-thought examples in a readable format, so that RL does not start from an unstable base.
+2. **Reasoning RL.** GRPO with the rule-based rewards on maths, code, science and logic, plus a language-consistency reward, the share of target-language words in the chain. The extra reward lowered accuracy slightly in ablations and was kept for readability.
+3. **Rejection sampling.** The RL checkpoint generates several responses per prompt and only correct ones are kept, with chains that mix languages or are hard to read filtered out: about 600,000 reasoning samples. About 200,000 samples of writing, factual questions and translation from DeepSeek-V3's own SFT data are added.
+4. **SFT.** DeepSeek-V3-Base is fine-tuned for two epochs on these 800,000 samples.
+5. **RL for all scenarios.** A second RL stage combines the rule-based rewards for reasoning with reward models for helpfulness, judged on the final summary only, and harmlessness, judged on the whole response.
+6. **Distillation.** The same 800,000 samples fine-tune smaller Qwen2.5 and Llama 3 models, from 1.5 B to 70 B parameters, with SFT only.
+
+In DeepSeek's evaluation, with responses of up to 32,768 tokens, temperature 0.6, top-$p$ 0.95 and pass@1 averaged over 4 to 64 samples per question, DeepSeek-R1 reached 79.8 % on AIME 2024 and 97.3 % on MATH-500, against 79.2 % and 96.4 % for OpenAI-o1-1217 as reported in the same table (table 4). Those o1 numbers are OpenAI's, from its own setup; the comparison is close, not exact.
+
+**How much "emerged".** Three lines of later work qualify the story.
+
+- **The base model already reflects.** Liu et al. ([2025](#references)) sampled DeepSeek-V3-Base on 500 MATH questions with the R1 template and found self-reflection, including the words "aha" and "wait", before any RL. In R1-Zero's responses self-reflection was more frequent, but it was not positively correlated with accuracy. RL amplified a behaviour that pretraining had put in the model rather than creating it.
+- **RL sharpens more than it expands.** Yue et al. ([2025](#references)) compared base and RLVR-trained models across several model families, six RL algorithms and maths, code and visual reasoning, with pass@$k$ at large $k$. The trained models were better at small $k$, but the base models reached a higher pass@$k$ when $k$ was large. Their reading is that current RLVR makes the model sample the solutions it could already find more often, while distillation from a stronger teacher can add reasoning patterns the student did not have. DeepSeekMath had reported the same for GRPO: Maj@K improved, Pass@K did not.
+- **Some length is an artefact.** The previous note showed that GRPO's division by the response length penalizes long wrong answers less per token; part of the growth in length may come from the objective rather than from useful thinking ([Liu et al., 2025](#references)).
+
+Why does a longer chain help at all? The chain-of-thought note gave the architectural reason: every generated token adds a full pass of serial computation. Reinforcement learning adds a reason to use it. A chain that can check an intermediate result and try again is a sequential search inside a single sample; if each attempt succeeds with probability $p$ and the model recognizes a failed attempt, $k$ attempts succeed with probability $1 - (1 - p)^k$, and the reward of the previous note pays for exactly that. The parallel methods of the next section do the same search across samples instead of inside one.
+
+## Spending compute at inference
+
+Given a model, there are two ways to spend more computation on one question. **Parallel** methods draw $n$ independent samples and select one answer. **Sequential** methods condition each new attempt on the previous ones. Their limits are set by three quantities: coverage, the selection rule and the verifier.
+
+**Coverage** is pass@$n = 1 - (1 - p)^n$, the probability that some sample is right. It is the ceiling of every parallel method, and it is the success rate when a verifier recognizes correct answers perfectly, as unit tests or a proof checker can. The [reflection note](/notes/agents/reflection-and-self-correction#generate-and-verify) computed what an imperfect accept-or-reject verifier does to it: the curve flattens at the verifier's precision. Two other selection rules are common.
+
+**Majority vote** returns the most frequent answer; it needs no verifier, only answers that can be compared, and the [chain-of-thought note](/notes/agents/chain-of-thought#how-much-the-vote-helps) computed its exact accuracy. It converges to the correct answer exactly when that answer is the mode of the model's answer distribution.
+
+**Best-of-$n$ with a scoring verifier** returns the sample with the highest score, given by a learned reward model, often called an outcome reward model (ORM). Its accuracy follows from the distribution of the scores. Let correct answers have score density $f_c$, and let $F(s) = P(S \le s)$ be the CDF of the score of one sample, mixed over correct and wrong ones. The kept sample is correct when some sample $i$ is correct and every other sample scores below it:
+
+$$
+\begin{aligned}
+P(\text{best-of-}n \text{ correct}) &= \sum_{i=1}^{n} P\big(\text{sample } i \text{ correct}, \ S_j < S_i \text{ for all } j \ne i\big) && \text{disjoint events, continuous scores} \\
+&= n \int P(\text{correct})\, f_c(s)\, P(S_j < s)^{\,n - 1}\, ds && \text{samples independent and alike} \\
+&= \boxed{\; n\, p \int f_c(s)\, F(s)^{\,n-1}\, ds . \;}
+\end{aligned}
+$$
+
+At $n = 1$ the integral is $\int f_c = 1$ and the formula gives $p$. As $n$ grows, $F(s)^{n-1}$ is close to 0 except for the highest scores, so the answer is decided by which kind of answer dominates the top tail of the score distribution, not by how often each kind is sampled.
+
+**Worked example.** One question, three kinds of sampled answers. The correct answer has probability $p = 0.35$. A shared misconception, the same wrong number every time, has $0.25$. Slips, each a different wrong number, have $0.40$. The verifier scores correct answers $\mathcal N(1, 1)$, slips $\mathcal N(0, 1)$, and the misconception $\mathcal N(1.4, 1)$: it finds the confident wrong derivation more convincing than the right one, a systematic error rather than noise. The Code section computes the three selection rules exactly:
+
+| $n$ | 1 | 4 | 8 | 32 | 256 |
+| --- | --- | --- | --- | --- | --- |
+| coverage, pass@$n$ | 0.350 | 0.821 | 0.968 | 1.000 | 1.000 |
+| best-of-$n$ by the verifier's score | 0.350 | 0.424 | 0.420 | 0.383 | 0.320 |
+| majority vote | 0.350 | 0.478 | 0.630 | 0.768 | 0.981 |
+
+<TestTimeScaling />
+
+Best-of-$n$ first gains, because the verifier ranks slips below everything else, and then loses, because among many samples the highest score more and more often belongs to the misconception it overrates. It is the overoptimization curve of the previous note at inference time: selecting harder against a proxy finds its errors. The vote is untouched by the verifier's bias and climbs to 0.981, because the correct answer is the most frequent single answer. The verifier is not useless; it is used wrongly. Weighting each vote by its score, or voting among the top-scored samples, combines the two, and o1's 93 % came from re-ranking 1,000 samples with a scoring function good enough for that.
+
+**Sequential revision.** A model can also be asked to revise: each new attempt sees the earlier ones. Snell et al. ([2024](#references)) fine-tuned PaLM 2-S* to revise its own wrong answers on MATH and found that, at the same number of generated answers, sequential revisions narrowly outperformed parallel samples, with either a verifier or a vote selecting the final answer. A reasoning model revises inside its chain, and the length of the chain can be controlled from outside. s1 ([Muennighoff et al., 2025](#references)) fine-tuned Qwen2.5-32B-Instruct on 1,000 questions with reasoning traces and then applied **budget forcing**: when the model tried to stop thinking, the word "Wait" was appended to its chain, and when a budget was exhausted, the end of thinking was forced. Extending the thinking this way raised its AIME 2024 accuracy from 50 % to 57 %.
+
+## Compute-optimal allocation
+
+Snell et al. ([2024](#references)) asked how a fixed inference budget should be spent, with PaLM 2-S* fine-tuned as a reviser and as a process verifier on MATH. The answer depends on the question. They binned questions into five difficulty levels by the base model's pass@1, estimated from 2,048 samples per question (or, without the reference answers, from the verifier's scores on those samples), and chose the best strategy for each bin. On easy questions, sequential revision paid most; on hard ones, a mix of revision and parallel sampling or search; on the hardest, nothing helped much. Choosing per bin matched the accuracy of a best-of-$N$ baseline with about four times less test-time compute, for revisions and for search alike. In a comparison at equal FLOPs, test-time compute on the smaller model beat a model with about 14 times more parameters on easy and intermediate questions when inference was a small share of the total compute, while on the hardest questions, or when the model serves many more tokens than it was trained on, more pretraining was the better use of the compute.
+
+The same logic, in its simplest form: questions differ in $p$, and a sample is worth most where it most raises the chance of a solve. **Worked example.** 100 questions with $p_i = ((i + 0.5)/100)^3$, mostly hard (mean 0.25); a perfect verifier, so a question is solved if any of its samples is correct; 800 samples in total. The expected number solved is $\sum_i (1 - (1 - p_i)^{n_i})$, and one more sample on question $i$ adds $p_i (1 - p_i)^{n_i}$, which shrinks as $n_i$ grows. Because every question's gain is diminishing, giving each next sample to the question with the largest gain is optimal.
+
+| allocation of 800 samples | expected questions solved |
+| --- | --- |
+| uniform, 8 per question | 56.5 |
+| by the true difficulty | 63.2 |
+| by difficulty estimated from 4 pilot samples per question | 60.9 |
+
+The optimal allocation gives 26 questions no sample at all, because their $p$ is so small that any sample is better spent elsewhere, and up to 22 samples to one question. The estimated allocation recovers most of the gain at the cost of the pilots. The lesson is Snell et al.'s at toy scale: compute at inference is worth most on questions of intermediate difficulty, and the hardest need a better model rather than more samples.
+
+## Process and outcome reward models
+
+An outcome reward model scores a finished solution. A **process reward model** (PRM) scores every step, so that a search can prune a wrong partial solution as soon as it goes wrong instead of after it is complete. **"Let's verify step by step"** ([Lightman et al., 2023](#references)) compared the two for a GPT-4-based generator on MATH. Labellers marked each step of model-written solutions as positive, negative or neutral, up to the first mistake, which gives a PRM no more information than an ORM on correct solutions and only the location of the error on wrong ones. The released dataset, **PRM800K**, has 800,000 step labels on 75,000 solutions to 12,000 problems; choosing which solutions to label by active learning made labelling about 2.6 times more data-efficient. The PRM's score of a solution is the product of its per-step probabilities of being correct. Selecting the best of 1,860 samples on 500 MATH test problems, the PRM solved 78.2 %, the ORM 72.4 % and a majority vote 69.6 %, the numbers the reflection note used to compare verifiers. Human step labels are expensive, and they do not transfer well across models: Snell et al. found a PRM trained on PRM800K easy to exploit with best-of-$N$ on PaLM 2's samples, and instead trained their PRM on per-step correctness estimated by Monte Carlo rollouts from each step, following Math-Shepherd ([Wang et al., 2024](#references)).
+
+Why checking steps helps is easiest to see with exact numbers. Take solutions of $T = 8$ steps, each right with probability $q = 0.8$, where one wrong step spoils the answer, so a whole solution is right with probability $q^8 = 0.168$. Give both methods the same verifier quality, $a = 0.9$ and $b = 0.1$, and the same budget of $8n$ generated steps:
+
+- **ORM, best of $n$ solutions.** Draw $n$ complete solutions and return the first one the verifier accepts. With $p = 0.168$, the formula of the reflection note gives a ceiling of $\frac{pa}{pa + (1 - p)b} = 0.645$.
+- **PRM, step-level search.** At each step draw $n$ candidate next steps and keep the first one the verifier accepts. Each step now succeeds with the same formula at $p = q = 0.8$, whose ceiling is $0.973$, and the solution succeeds if all 8 steps do: at most $0.973^8 = 0.803$.
+
+<PrmVsOrm />
+
+With 4 candidates per step the step-level search reaches 0.783, against 0.431 for the best of 4 complete solutions, and its curve is near its ceiling of 0.803 while best-of-$n$ is still climbing towards 0.645. Verification is easier where the object is likely to be right: an accepted step is right with probability 0.973, an accepted solution with only 0.645, because wrong solutions are the majority and a 10 % false-positive rate lets many of them through. The comparison assumes that judging a step is as reliable as judging a solution, and it charges the PRM one verifier call per candidate step, $8n$ calls against $n$; both are favourable to the PRM, and real comparisons have to measure them.
+
+DeepSeek-R1 lists PRMs among its unsuccessful attempts ([DeepSeek-AI, 2025](#references), section 4.2): a "step" is hard to define in general reasoning, judging an intermediate step is hard to automate and expensive to label, and a model-based PRM used as a reward in large-scale RL invites reward hacking. The authors found PRMs useful for re-ranking and guided search at inference, but not worth their cost as a training signal; Monte Carlo tree search over steps, the other method they tried, did not scale either, because the space of token sequences is far larger than a game's and the value model that guides the search was hard to train.
+
+## Distilling reasoning into small models
+
+Reinforcement learning on a small model is expensive and, by DeepSeek's measurement, not the best use of the compute. Distillation is plain SFT on the reasoning traces of a stronger model, here the 800,000 samples of stage 3, with no RL ([DeepSeek-AI, 2025](#references), sections 2.4, 3.2 and 4.1). In DeepSeek's evaluation (the setup above):
+
+| model | AIME 2024 pass@1 | MATH-500 pass@1 |
+| --- | --- | --- |
+| GPT-4o-0513 | 9.3 % | 74.6 % |
+| DeepSeek-R1-Distill-Qwen-1.5B | 28.9 % | 83.9 % |
+| DeepSeek-R1-Distill-Qwen-7B | 55.5 % | 92.8 % |
+| DeepSeek-R1-Distill-Qwen-32B | 72.6 % | 94.3 % |
+| DeepSeek-R1-Zero-Qwen-32B (RL on Qwen2.5-32B, over 10,000 steps) | 47.0 % | 91.6 % |
+| DeepSeek-R1 | 79.8 % | 97.3 % |
+
+The comparison in the fifth row is the informative one: the same 32 B base model reached 47.0 % on AIME with large-scale RL of its own and 72.6 % by imitating R1. The authors conclude that distilling a stronger model is far cheaper than discovering its behaviour by RL in a smaller one, while going beyond the strongest model still needs a stronger base and more RL. Distillation needs few examples when the student is strong: s1's 1,000 traces were enough to turn Qwen2.5-32B-Instruct into a model that reasons at length. It is also the mechanism by which reasoning behaviour spreads from one model to many, since any model's published traces can serve as SFT data.
+
+## Overthinking and the cost of length
+
+A long chain costs time and money on every question, including the easy ones. Chen et al. ([2024](#references)) asked o1-like models "what is the answer of 2 plus 3?". QwQ-32B-Preview wrote 901 tokens with 13 separate solutions, the first of them correct after 39 tokens; on that question, o1-like models used on average 1,953 % more tokens than conventional models to reach the same answer. On their maths benchmarks, among the responses that contained a correct answer, the first solution in the chain was already correct in more than 92 % of cases, and later rounds added little accuracy and little diversity. Longer is not even always more accurate. Gema et al. ([2025](#references)) built tasks, such as counting with distracting information and regression with spurious features, on which the accuracy of several reasoning models fell as they were allowed to reason longer; with longer reasoning, one model also expressed more self-preservation on an AI-risk evaluation.
+
+The costs add up in a simple way. A chain is generated token by token, so its latency is its length divided by the decoding speed: 10,000 tokens at 50 tokens per second take 200 seconds before the first word of the answer. Price is linear in the tokens, and an agent pays it at every step of its loop ([ReAct and the agent loop](/notes/agents/react-and-the-agent-loop#the-cost-and-latency-of-a-loop)). Providers therefore expose a thinking budget or an effort setting, and training adds pressure towards brevity, such as length penalties or rewards for reaching the answer earlier. The right length is a property of the question, which is the compute-optimal argument of the previous section applied inside one chain.
+
+## Dated numbers
+
+Every number below is from the source named, on that source's setup; numbers from different setups are listed, not ranked.
+
+| date | model | benchmark | result | setup |
+| --- | --- | --- | --- | --- |
+| May 2023 | GPT-4-based generator, PRM | MATH, 500 test problems | 78.2 % | best of 1,860 samples by a PRM trained on PRM800K ([Lightman et al.](#references)) |
+| Sept 2024 | o1 | AIME 2024 | 74 % / 83 % / 93 % | one sample / consensus of 64 / re-ranking 1,000 with a learned scorer ([OpenAI](#references)) |
+| Jan 2025 | DeepSeek-R1-Zero | AIME 2024 | 71.0 % pass@1, 86.7 % cons@64 | 16 samples per question for pass@1 ([DeepSeek-AI](#references), table 2) |
+| Jan 2025 | DeepSeek-R1 | AIME 2024, MATH-500 | 79.8 %, 97.3 % | up to 32,768 tokens, temperature 0.6, pass@1 over 4–64 samples (table 4) |
+| Jan 2025 | s1-32B | AIME 2024 | 50 % to 57 % | budget forcing, extending the thinking ([Muennighoff et al.](#references)) |
+
+AIME 2024 has 30 problems over its two papers, and every model since 2024 may have seen them, or discussions of them, in its training data. Later evaluations moved to newer competitions for that reason, and any number on a public benchmark should be read with its date.
+
+<aside class="callout"><strong>Check yourself.</strong> (1) A question has $p = 0.2$ and a perfect verifier. How many samples give a 90 % chance of solving it? (2) In the worked example of best-of-$n$, what would happen at large $n$ if the verifier scored the misconception $\mathcal N(0.6, 1)$ instead of $\mathcal N(1.4, 1)$? (3) Why does a vote over 64 samples raise R1-Zero's AIME score from 71.0 % to 86.7 % while pass@64 would be higher still? (4) With $q = 0.9$ per step instead of 0.8, what is the ceiling of the step-level search with $a = 0.9$, $b = 0.1$ over 8 steps?<details><summary>Answers</summary>(1) $1 - 0.8^n \ge 0.9$ needs $n \ge \ln 0.1/\ln 0.8 = 10.3$, so 11 samples. (2) Correct answers would now dominate the top tail, since their mean score of 1 is the highest, and best-of-$n$ would rise towards 1 instead of falling. (3) A vote returns the correct answer only on questions where it is the most frequent one; pass@64 counts every question where any sample is correct, and it needs a perfect verifier to be realized. (4) Per step $0.81/(0.81 + 0.01) = 0.988$, and $0.988^8 = 0.906$.</details></aside>
+
+## What changed
+
+| | prompted chain of thought | reasoning model |
+| --- | --- | --- |
+| how the chain is obtained | demonstrations or "think step by step" | RL with verifiable rewards on the final answer |
+| length of the chain | hundreds of tokens, fixed by the prompt | thousands, chosen by the model; can be budgeted |
+| self-checking | rare, and unreliable without feedback | reinforced when it raises accuracy |
+| how more compute is spent | more samples, a vote | longer chains, plus samples, votes and verifiers |
+| AIME 2024, one sample | GPT-4o: 9.3 % (DeepSeek's evaluation) | DeepSeek-R1: 79.8 % (same evaluation) |
+| small models | weak at long reasoning | distilled from a reasoning model's traces |
+
+## Limitations
+
+- **Little is disclosed about the leading models.** o1's training was described in a few sentences; open reproductions rely on DeepSeek's report and on later analyses that disagree in places.
+- **Verifiable domains only.** The recipe needs a checker; maths and code have one, most other tasks do not, and the gains outside them are smaller and harder to measure.
+- **Sharpening, not discovery.** At large numbers of samples, base models can solve as many problems as their RL-trained versions; RL makes success more likely on what was already reachable.
+- **Verifiers are proxies.** Selection by a learned scorer has the overoptimization curve of the previous note; PRMs trained on one model's solutions are exploited by another's.
+- **Length is expensive and sometimes harmful.** Long chains add latency and cost on easy questions, and on some tasks accuracy falls with length.
+- **Benchmarks age.** Competition problems leak into training data, and the numbers on them are dated by construction.
+- **Faithfulness.** Long chains are still not guaranteed to show what drove the answer, as the [chain-of-thought note](/notes/agents/chain-of-thought#is-the-chain-of-thought-faithful) discussed.
+
+## What you should remember
+
+- Reasoning models are trained with RL on checkable problems, rewarding the final answer; long chains, self-checking and retries are reinforced because they raise the reward. o1 (September 2024) showed it, DeepSeek-R1-Zero (January 2025) reproduced it openly with GRPO and rule-based rewards on a base model: 15.6 % to 71.0 % pass@1 on AIME 2024.
+- R1 adds a cold-start SFT, a language-consistency reward, rejection sampling into 800,000 SFT samples, and a final RL stage with reward models; the same samples distil reasoning into models from 1.5 B to 70 B.
+- Later analyses: base models already show self-reflection; RLVR improves pass@1 and voting more than pass@$k$ at large $k$; some length growth comes from the objective.
+- Parallel compute is bounded by coverage, $1 - (1 - p)^n$. Best-of-$n$ by a score is $n p \int f_c F^{n-1}$: decided by the top tail of the scores, so a biased verifier makes it fall with $n$. A vote converges to the mode.
+- Compute-optimal allocation depends on difficulty: put samples where the marginal gain is largest; revisions for easy questions, search for medium ones, and a better model for the hardest. Snell et al. matched best-of-$N$ with about four times less compute.
+- Process reward models check steps, where the object is more often right and errors are caught early; PRM800K's PRM beat an ORM and a vote (78.2 %, 72.4 %, 69.6 %), but PRMs are costly to label and hackable as RL rewards.
+- Distillation by SFT on a stronger model's traces beats RL on the small model itself (72.6 % against 47.0 % for Qwen2.5-32B on AIME 2024).
+- Overthinking costs tokens on easy questions; latency is length divided by decoding speed.
+
+## Code
+
+Three exact computations and their simulations, in NumPy: coverage, best-of-$n$ by a biased verifier's score and a plurality vote with three kinds of answers; outcome against process verification with the first-accepted rule; and the allocation of a sample budget over questions of different difficulty, with the true and with an estimated difficulty. With a real model, `p`, the score distributions and the per-step accuracy are unknown and are estimated from samples on held-out questions; the formulas and the greedy allocation are used as written. Seeds are fixed; exact numbers can differ slightly across platforms and library versions. The script runs in about two seconds.
+
+```python
+import numpy as np
+from math import erf, exp, lgamma, log, sqrt, pi as PI
+
+# 1. one question, three kinds of sampled answers: correct (p = 0.35), one shared misconception (0.25),
+#    and scattered slips (0.40), each slip a different wrong number. A learned verifier scores every answer:
+#    N(1, 1) if correct, N(1.4, 1) for the misconception, which it overrates, N(0, 1) for a slip.
+p, qm = 0.35, 0.25; qs = 1 - p - qm
+MU = {'correct': 1.0, 'misconception': 1.4, 'slip': 0.0}
+Phi = np.vectorize(lambda x: 0.5 * (1 + erf(x / sqrt(2))))
+s = np.linspace(-8, 10, 18001); ds = s[1] - s[0]
+f_correct = np.exp(-0.5 * (s - MU['correct']) ** 2) / sqrt(2 * PI)
+F = p * Phi(s - MU['correct']) + qm * Phi(s - MU['misconception']) + qs * Phi(s - MU['slip'])
+
+def coverage(n): return 1 - (1 - p) ** n                   # pass@n: some sample is correct (a perfect verifier)
+def best_of(n):                                            # the top-scored sample is correct
+    return float((n * p * f_correct * F ** (n - 1)).sum() * ds)
+def vote(n):                                               # plurality vote, ties broken uniformly at random
+    total = 0.0
+    for kc in range(1, n + 1):
+        for km in range(n - kc + 1):
+            ks = n - kc - km
+            top = max(kc, km, 1 if ks else 0)
+            if kc < top: continue
+            ties = 1 + (km == top) + (ks if top == 1 else 0)   # every slip is its own answer with one vote
+            lp = (lgamma(n + 1) - lgamma(kc + 1) - lgamma(km + 1) - lgamma(ks + 1)
+                  + kc * log(p) + km * log(qm) + ks * log(qs))
+            total += exp(lp) / ties
+    return total
+for n in (1, 2, 4, 8, 16, 32, 64, 128, 256):
+    print(f'n {n:3d}  coverage {coverage(n):.3f}  best-of-n {best_of(n):.3f}  vote {vote(n):.3f}')
+# n   1  coverage 0.350  best-of-n 0.350  vote 0.350
+# n   2  coverage 0.577  best-of-n 0.403  vote 0.350
+# n   4  coverage 0.821  best-of-n 0.424  vote 0.478
+# n   8  coverage 0.968  best-of-n 0.420  vote 0.630
+# n  16  coverage 0.999  best-of-n 0.404  vote 0.697
+# n  32  coverage 1.000  best-of-n 0.383  vote 0.768
+# n  64  coverage 1.000  best-of-n 0.361  vote 0.850
+# n 128  coverage 1.000  best-of-n 0.340  vote 0.929
+# n 256  coverage 1.000  best-of-n 0.320  vote 0.981
+
+rng = np.random.default_rng(0)                              # a simulation agrees with the exact numbers at n = 8
+kinds = rng.choice(3, size=(100_000, 8), p=[p, qm, qs])
+scores = rng.normal(np.array([1.0, 1.4, 0.0])[kinds], 1.0)
+print(round(float(np.mean(kinds[np.arange(100_000), scores.argmax(1)] == 0)), 3))
+# 0.42
+
+# 2. outcome versus process verification, exactly. A solution has T = 8 steps; each step is right with probability
+#    q = 0.8 and one wrong step spoils the answer. A verifier accepts a right object with probability a = 0.9 and a
+#    wrong one with b = 0.1. ORM: best of N whole solutions. PRM: at every step draw k candidates and keep the first
+#    one the verifier accepts. Both return the first accepted candidate, or the first one if none is accepted.
+def first_accepted(p, a, b, n):                             # the formula of the reflection note
+    q1, q0 = p * a, (1 - p) * b; r = 1 - q1 - q0
+    return q1 / (q1 + q0) * (1 - r ** n) + p * (1 - a) * r ** (n - 1)
+T, q, a, b = 8, 0.8, 0.9, 0.1
+for n in (1, 2, 4, 8, 16, 64):                              # n solutions, or n candidates per step: n * T steps each
+    print(n, round(first_accepted(q ** T, a, b, n), 3), round(first_accepted(q, a, b, n) ** T, 3))
+# 1 0.168 0.168
+# 2 0.279 0.55
+# 4 0.431 0.783
+# 8 0.571 0.803
+# 16 0.636 0.803
+# 64 0.645 0.803
+
+def prm_search(k, rng):                                     # the same search, simulated step by step
+    for _ in range(T):
+        cands = rng.random(k) < q
+        accepted = np.where(cands, rng.random(k) < a, rng.random(k) < b)
+        pick = cands[np.argmax(accepted)] if accepted.any() else cands[0]
+        if not pick: return False
+    return True
+print(round(np.mean([prm_search(4, rng) for _ in range(50_000)]), 3))
+# 0.785
+
+# 3. compute-optimal allocation: 100 questions of graded difficulty, a perfect verifier (unit tests),
+#    800 samples in total. Uniform: 8 per question. Adaptive: each next sample goes where it raises the
+#    expected number of solved questions most, using the true difficulty or one estimated from 4 pilot samples.
+P = ((np.arange(100) + 0.5) / 100) ** 3                    # most questions are hard: the mean of P is 0.25
+def solved(n): return float(np.sum(1 - (1 - P) ** n))
+def allocate(p_hat, budget, n0):
+    n = n0.copy()
+    for _ in range(budget):
+        gain = p_hat * (1 - p_hat) ** n                     # the gain of one more sample on each question
+        n[np.argmax(gain)] += 1
+    return n
+uniform = np.full(100, 8)
+oracle = allocate(P, 800, np.zeros(100, int))
+pilot = rng.binomial(4, P)                                  # 4 samples per question first, then 400 by the estimate
+est = allocate((pilot + 0.5) / 5, 400, np.full(100, 4))
+solved_est = float(np.mean([np.sum((pilot > 0) | (rng.random(100) > (1 - P) ** (est - 4))) for _ in range(20_000)]))
+print(round(solved(uniform), 1), round(solved(oracle), 1), round(solved_est, 1), int((oracle == 0).sum()), int(oracle.max()))
+# 56.5 63.2 60.9 26 22
+```
+
+## Next
+
+Everything in this section so far trains a model to write one response: a chain of thought and an answer, judged when it is complete. An agent's episode is longer and of a different kind. Between the model's turns come tool outputs, written by the environment rather than the model; the reward arrives after dozens of actions; and the environment can be changed by what the agent does, including the tests that grade it. The [next note](/notes/agents/agentic-rl) extends the methods of the last two notes to whole multi-turn episodes: which tokens to train on, how to assign credit across turns, which environments exist, why rejection sampling is still a strong baseline, and how agents learn to hack the reward.
+
+## References
+
+- OpenAI. [Learning to reason with LLMs](https://openai.com/index/learning-to-reason-with-llms/). 12 September 2024. The o1 models; AIME 2024 results; train-time and test-time compute.
+- DeepSeek-AI. [DeepSeek-R1: incentivizing reasoning capability in LLMs via reinforcement learning](https://arxiv.org/abs/2501.12948). arXiv, January 2025. Section 2.2 (R1-Zero: GRPO, rule-based rewards, the template, table 2, the "aha moment" of table 3), section 2.3 (the R1 pipeline), section 2.4 and table 5 (distillation), table 4 (evaluation), section 4 (distillation against RL; unsuccessful attempts with PRMs and MCTS).
+- Z. Liu, C. Chen, W. Li, P. Qi, T. Pang, C. Du, W. S. Lee, M. Lin. [Understanding R1-Zero-like training: a critical perspective](https://arxiv.org/abs/2503.20783). COLM, 2025. Section 2.3: self-reflection in DeepSeek-V3-Base.
+- Y. Yue, Z. Chen, R. Lu, A. Zhao, Z. Wang, S. Song, G. Huang. [Does reinforcement learning really incentivize reasoning capacity in LLMs beyond the base model?](https://arxiv.org/abs/2504.13837) arXiv, April 2025.
+- Z. Shao et al. [DeepSeekMath: pushing the limits of mathematical reasoning in open language models](https://arxiv.org/abs/2402.03300). arXiv, 2024. Section 5.2.2: Maj@K and Pass@K.
+- C. Snell, J. Lee, K. Xu, A. Kumar. [Scaling LLM test-time compute optimally can be more effective than scaling model parameters](https://arxiv.org/abs/2408.03314). arXiv, August 2024. Sections 4–7: difficulty bins, PRM search, revisions, the compute-optimal strategy and the FLOPs-matched comparison.
+- H. Lightman, V. Kosaraju, Y. Burda, H. Edwards, B. Baker, T. Lee, J. Leike, J. Schulman, I. Sutskever, K. Cobbe. [Let's verify step by step](https://arxiv.org/abs/2305.20050). arXiv, May 2023 (ICLR 2024). PRM800K; process against outcome supervision; active learning.
+- P. Wang et al. [Math-Shepherd: verify and reinforce LLMs step-by-step without human annotations](https://arxiv.org/abs/2312.08935). ACL, 2024. Step labels from Monte Carlo rollouts.
+- N. Muennighoff, Z. Yang, W. Shi, X. L. Li, L. Fei-Fei, H. Hajishirzi, L. Zettlemoyer, P. Liang, E. Candès, T. Hashimoto. [s1: simple test-time scaling](https://arxiv.org/abs/2501.19393). arXiv, January 2025. s1K and budget forcing.
+- X. Chen et al. [Do NOT think that much for 2+3=? On the overthinking of o1-like LLMs](https://arxiv.org/abs/2412.21187). arXiv, December 2024.
+- A. P. Gema et al. [Inverse scaling in test-time compute](https://arxiv.org/abs/2507.14417). *Transactions on Machine Learning Research*, 2025.
+- X. Wang et al. [Self-consistency improves chain of thought reasoning in language models](https://arxiv.org/abs/2203.11171). ICLR, 2023.
+- B. Brown, J. Juravsky, R. Ehrlich, R. Clark, Q. V. Le, C. Ré, A. Mirhoseini. [Large language monkeys: scaling inference compute with repeated sampling](https://arxiv.org/abs/2407.21787). arXiv, 2024.
+- Berkeley RDI. [Advanced Large Language Model Agents](https://rdi.berkeley.edu/adv-llm-agents/sp25). MOOC, Spring 2025. Lectures on inference-time techniques and reasoning.

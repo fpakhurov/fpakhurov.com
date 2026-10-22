@@ -1,0 +1,322 @@
+---
+title: Model-based reinforcement learning
+description: "Learning a model of the environment and planning with it: Dyna, learned dynamics with model-predictive control and the cross-entropy method, why model errors compound over a horizon, world models and learning in imagination with Dreamer, MuZero, and world models for language-model agents."
+course: agents
+section: Reinforcement Learning
+order: 7
+status: published
+tags: [reinforcement-learning, model-based-rl, dyna, model-predictive-control, cross-entropy-method, compounding-error, world-models, dreamer, muzero, sample-efficiency]
+prerequisites: [Q-learning and temporal-difference learning, Policy gradients and actor-critic, Games and Monte Carlo tree search]
+---
+
+import DynaLoop from '../../../components/figures/model-based-rl/DynaLoop.astro';
+import DynaMaze from '../../../components/figures/model-based-rl/DynaMaze.astro';
+import CompoundingError from '../../../components/figures/model-based-rl/CompoundingError.astro';
+
+*Optional depth: an extension of the reinforcement-learning section, from Dyna to Dreamer. The rest of the course does not depend on it; the language-model notes use only the idea of a world model, which the last section summarizes.*
+
+The methods of the last three notes are **model-free**: Q-learning, DQN and PPO learn values or policies directly from real transitions, and never ask what would happen after an action they did not take. That makes them general and expensive. DQN trained on 50 million frames per Atari game, and PPO's control results used a million steps per task, far more experience than a person needs and far more than a robot can collect without wearing out. The [MDP note](/notes/agents/markov-decision-processes) and the [games note](/notes/agents/games-and-tree-search) showed the alternative: with a model of the environment, an agent can plan, evaluating actions in its head before taking them. This note learns that model from experience. It starts with Dyna, which plans with a remembered table; moves to learned dynamics models and planning by model-predictive control; shows why errors in a model compound over a long horizon; and ends with world models that learn compact latent dynamics, Dreamer, which trains its actor and critic entirely in imagination, and MuZero, and with what all of this means for agents built on language models.
+
+**Notation.** As in the previous notes. A **model** is a learned approximation $\hat P_\psi(s' \mid s, a)$ of the transitions and $\hat r_\psi(s, a)$ of the rewards, with parameters $\psi$; a deterministic model is written $s' = f_\psi(s, a)$. $H$ is a planning **horizon**, $a_{t:t+H-1}$ a sequence of actions, and $n$ the number of planning updates per real step. For a model with latent states, $z_t$ is the latent state at step $t$ and $o_t$ the observation.
+
+## Baseline: learning only from real experience
+
+A model-free agent uses each real transition for one update, or a few with replay, and then the transition has done its job. Everything else the transition says about the world, that from this state this action leads there, is thrown away. Two costs follow. The agent needs many transitions, because values spread backwards one update at a time, as the [TD note](/notes/agents/temporal-difference-learning) showed. And nothing learned transfers to a new task in the same world: change the reward, and a model-free agent starts again, although the physics has not changed.
+
+A model is a way to keep that information. Once the agent has a model, it can generate as many simulated transitions as it likes, at the price of computation instead of interaction, and a model of the dynamics can serve any reward. The questions are how to use the model, how to learn it, and what happens when it is wrong.
+
+## Dyna: learning, planning and acting in one loop
+
+The simplest way to use a model is to treat simulated transitions exactly like real ones. In **Dyna** ([Sutton, 1990](#references); [Sutton, 1991](#references)) every real step is used three times: for a direct update of the values, to update the model, and then as the seed of $n$ planning updates in which the model replays transitions the agent has already seen.
+
+<aside class="callout"><strong>Key idea.</strong> Learning and planning are the same operation applied to different data. A value update does not care whether its transition came from the world or from a model of it, so a learned model turns cheap computation into extra experience. How much this helps depends on how good the model is.</aside>
+
+<DynaLoop />
+
+1. **Act.** The agent chooses $A$ ε-greedily from its action values and observes $R$ and $S'$.
+2. **Direct RL.** One Q-learning update with the real transition, as in the TD note.
+3. **Model learning.** In a deterministic world, the model is a table that records the outcome: $\text{Model}(S, A) \leftarrow (R, S')$.
+4. **Planning.** $n$ times: pick a state–action pair seen before, look up its outcome in the model, and apply the same Q-learning update to it.
+5. **Continue** from $S'$ with the updated values.
+
+The test is the **maze** of [Sutton and Barto (2018)](#references), example 8.1: a $6 \times 9$ grid with a few walls, reward 1 at the goal and 0 elsewhere, $\gamma = 0.95$.
+
+<DynaMaze />
+
+The first episode is the same with or without planning: until the goal is found, every value is zero and the model has nothing useful to replay. After it, the difference is large. Without planning, one episode moves the value of the goal back by one state, so the path is learned over dozens of episodes; in the second episode the agent still needs more than 550 steps, and it gets near the asymptote only after about 50 episodes. With $n = 50$ planning updates per step, the goal's value spreads back along the whole remembered path during the second episode, and from the fifth episode on the agent walks about 17 steps, the 14 of the shortest path plus ε-greedy detours. The model cost nothing in interaction; it traded computation for experience.
+
+The table model has two weaknesses that every later method inherits in some form. It is only as good as the data: in a stochastic world it must store frequencies, and a state never visited has no entry. And it can be wrong in a way the agent does not notice: Sutton and Barto's "blocking maze" opens a shortcut after the agent has learned the long way round, and a Dyna agent that plans only with its old model keeps believing the shortcut is a wall unless something makes it go back and look ([Sutton and Barto, 2018](#references), section 8.3).
+
+## Learned dynamics and planning with them: MPC and CEM
+
+In a continuous world the model is a function, $s_{t+1} \approx f_\psi(s_t, a_t)$, and learning it is supervised regression: collect transitions, minimize $\sum \lVert f_\psi(s_t, a_t) - s_{t+1} \rVert^2$ by least squares or gradient descent, often predicting the change $s_{t+1} - s_t$ rather than the next state itself. The data come from the agent's own experience, so the model is accurate where the agent has been.
+
+The model can then be used without any value function, by **model-predictive control** (MPC). At every step:
+
+1. **Plan.** Find an action sequence $a_{t:t+H-1}$ that maximizes the predicted return over the horizon, $\sum_{k=0}^{H-1} \hat r(\hat s_{t+k}, a_{t+k})$, where $\hat s_t = s_t$ and $\hat s_{t+k+1} = f_\psi(\hat s_{t+k}, a_{t+k})$.
+2. **Act.** Execute only the first action $a_t$.
+3. **Replan** from the real next state, which corrects the drift of the model's predictions at every step.
+
+The optimization in step 1 does not need gradients. **Random shooting** samples many action sequences and keeps the best ([Nagabandi et al., 2018](#references)). The **cross-entropy method** (CEM, [Rubinstein, 1999](#references); [de Boer et al., 2005](#references)) refines the sampling distribution:
+
+$$
+\boxed{\;
+\begin{aligned}
+&\text{sample } a^{(i)}_{t:t+H-1} \sim \mathcal N(\mu, \operatorname{diag} \sigma^2), \quad i = 1, \dots, N; \\
+&\text{score each by its predicted return under the model;} \\
+&\mu, \sigma \leftarrow \text{mean and standard deviation of the } K \text{ best (the elites); repeat.}
+\end{aligned}
+\;}
+$$
+
+**Worked example: swinging up a pendulum.** The pendulum of the Code section starts hanging down, its motor is too weak to lift it directly, and the cost penalizes the angle from upright, the speed and the torque at every step, over 200 steps of 0.05 seconds. The planner is given one of three models: the true dynamics for reference, and two models fitted by least squares to the same 1275 transitions on a grid of angles, speeds and torques, one that predicts the change of the angle and the new speed from the features $(\sin\theta, \omega, u, 1)$ and a plain linear model of $(\theta, \omega, u, 1)$. MPC with CEM plans 30 steps ahead with 200 samples, 20 elites and 5 iterations per step:
+
+| planner's model | return over 200 steps | final angle from upright |
+| --- | --- | --- |
+| the true dynamics | −358.8 | 0.03 rad |
+| fitted with the feature $\sin\theta$ | −363.7 | 0.02 rad |
+| fitted linear model | −1512.5 | 2.95 rad |
+| no planning: random torques | −1708.9 | — |
+
+With the feature model, planning almost matches planning with the truth: the planner swings the pendulum back and forth to build up energy and then holds it upright. With the linear model, it never swings up and ends hanging down, 2.95 radians from upright. The linear model is not far off on any single step, as the next section shows. But a planner searches for the action sequence that the model *predicts* to be best, and when the model is wrong, the sequences it likes best are often those that exploit its errors.
+
+**PETS** ([Chua, Calandra, McAllister and Levine, 2018](#references)) made this approach competitive on harder control tasks by learning an *ensemble* of probabilistic neural-network models and planning with CEM through samples from the ensemble, so that actions are judged under the model's uncertainty as well as its mean. It matched the asymptotic performance of model-free methods on several benchmark tasks, and on the half-cheetah task it needed about 8 times fewer samples than soft actor–critic and about 125 times fewer than PPO.
+
+## Compounding model error
+
+A model with a small one-step error can be useless over a long horizon, because each prediction is fed back as the input of the next. If the true dynamics are $s_{t+1} = f(s_t)$ and the model $\hat f$ has one-step error at most $\epsilon$, and if $\hat f$ is Lipschitz with constant $L$, then the error $e_k = \lVert \hat s_k - s_k \rVert$ of a $k$-step prediction satisfies
+
+$$
+\begin{aligned}
+e_{k+1} &= \lVert \hat f(\hat s_k) - f(s_k) \rVert \le \lVert \hat f(\hat s_k) - \hat f(s_k) \rVert + \lVert \hat f(s_k) - f(s_k) \rVert && \text{triangle inequality} \\
+&\le L\, e_k + \epsilon, && \text{Lipschitz; one-step error}
+\end{aligned}
+$$
+
+so that, with $e_0 = 0$,
+
+$$
+e_H \le \epsilon \,(1 + L + L^2 + \dots + L^{H-1}) = \epsilon\, \frac{L^H - 1}{L - 1} .
+$$
+
+When $L > 1$, as in any system where nearby states drift apart, the bound grows geometrically with the horizon, not linearly. On the pendulum:
+
+<CompoundingError />
+
+The linear model's one-step error is 0.018 radians. After 10 steps it is 0.95 radians, more than five times the 0.18 that adding up ten one-step errors would give, and after 20 steps the prediction is no better than a random angle. The feature model is about nine times more accurate on the same rollouts and stays useful for longer, but its error grows too, to 0.73 radians after 40 steps.
+
+The consequences shape every practical method:
+
+- **Plan over short horizons and replan.** MPC uses the model only for $H$ steps and corrects from the real state at every step.
+- **Use model rollouts that start from real states.** MBPO ([Janner, Fu, Zhang and Levine, 2019](#references)) trains a model-free actor–critic on short model rollouts branched from states in the replay buffer, a few steps each, and bounds how the gap between the model's and the true return grows with the rollout length and the model error.
+- **Know where the model is uncertain.** Ensembles, as in PETS, disagree where data are scarce, which is where the planner is most tempted to go.
+- **Do not let the planner exploit the model.** A planner that is allowed to optimize hard against an imperfect model will find its errors, the same phenomenon as reward hacking against a learned reward model.
+
+## World models: learning in imagination
+
+From pixels, predicting the next state means predicting the next image, which is both hard and mostly irrelevant: the leaves in the background of a driving game do not matter for steering. **World models** therefore learn a compact latent state and the dynamics in that space.
+
+[Ha and Schmidhuber (2018)](#references) split the agent into three parts: a variational autoencoder that compresses each frame into a latent vector $z_t$; a recurrent network that predicts the distribution of $z_{t+1}$ from $z_t$, the action and its own hidden state; and a small linear controller that acts on the latent and hidden states. The controller was trained by an evolution strategy, and in a VizDoom task it was trained entirely inside the "dream" generated by the recurrent model and then transferred to the real game.
+
+**PlaNet** ([Hafner et al., 2019](#references)) introduced the recurrent state-space model (RSSM) that later systems use: a latent state with a deterministic recurrent part, which carries information over many steps, and a stochastic part, which represents what the model cannot predict. It is trained on sequences as a sequential [VAE](/notes/generative-models/vae): reconstruct each observation and predict each reward from the latent state, while keeping the posterior latent, inferred with the observation, close to the prior latent, predicted without it. PlaNet planned with CEM in the latent space.
+
+**Dreamer** ([Hafner, Lillicrap, Ba and Norouzi, 2020](#references)) replaced the planner with an actor and a critic trained by **latent imagination**:
+
+1. **Learn the world model** from sequences of real experience: encoder, RSSM dynamics, reward predictor, and a decoder for the reconstruction loss.
+2. **Imagine.** From latent states of real sequences, roll the dynamics forward for $H = 15$ steps with actions chosen by the actor, never decoding an image.
+3. **Train the critic** on the imagined trajectories, with λ-returns as targets, the same mixture of n-step returns as in the TD and policy-gradient notes.
+4. **Train the actor** to maximize the λ-returns of its imagined trajectories. Because the dynamics are a network, the gradient of the return can flow back through the imagined states into the actor; later versions use policy gradients for discrete actions.
+5. **Act** in the real environment with the actor, add the experience to the dataset, and repeat.
+
+On 20 visual control tasks of the DeepMind Control Suite, Dreamer exceeded the existing approaches in data efficiency, computation time and final performance (2019). **DreamerV2** ([Hafner, Lillicrap, Norouzi and Ba, 2021](#references)) used discrete latent variables and became the first agent to reach human-level performance on the 55-game Atari benchmark by learning behaviours inside a separately trained world model. **DreamerV3** ([Hafner, Pasukonis, Ba and Lillicrap, 2025](#references)) added normalization and balancing techniques so that one configuration works across more than 150 tasks, from Atari and control to Minecraft, where it was, as far as its authors know, the first algorithm to collect diamonds from scratch, without human data or curricula (preprint 2023, *Nature* April 2025).
+
+## MuZero: a model for planning, not for prediction
+
+The [games note](/notes/agents/games-and-tree-search#what-the-network-replaces-alphago-alphazero-and-muzero) described how MuZero ([Schrittwieser et al., 2020](#references)) runs Monte Carlo tree search inside a learned model: a representation function encodes the observations, a dynamics function maps a hidden state and an action to a reward and the next hidden state, and a prediction function gives a policy and a value. Seen from this note, MuZero is model-based reinforcement learning with one decisive design choice: the model is trained to predict only what the planner needs, the rewards, values and policies over a few unrolled steps, and never the observation itself.
+
+This is the **value-equivalence** principle ([Grimm, Barreto, Singh and Silver, 2020](#references)): two models are equally good for planning if they give the same values, however different their predictions of the screen. It explains why MuZero's model can be small and still plan well, and it is the opposite end from Dreamer, whose model reconstructs observations and so learns about everything, relevant or not. MuZero matched AlphaZero in Go, chess and shogi without being given the rules, and set a new state of the art on 57 Atari games (2019). **EfficientZero** ([Ye et al., 2021](#references)) added a self-supervised consistency loss to the latent dynamics and reached a median of 109% of human performance on the Atari 100k benchmark, which allows two hours of game time per game (2021).
+
+| | what the model predicts | how it is used | example |
+| --- | --- | --- | --- |
+| Dyna | the next state and reward, exactly (a table) | replayed for extra value updates | Dyna-Q |
+| learned dynamics | the next state, in state space | MPC with CEM or shooting | PETS, the pendulum above |
+| latent world model | observations, rewards, latent dynamics | imagined rollouts train actor and critic | PlaNet, Dreamer |
+| value-equivalent model | rewards, values, policies only | tree search in the latent space | MuZero, EfficientZero |
+
+## Why world models matter for language-model agents
+
+A language-model agent faces the problem of this note in a sharper form. Its actions are often irreversible: a deleted file, a sent message, a payment. Its environment cannot be reset for search. And every real step is slow and costly. Three uses of world models follow.
+
+**The language model as a world model.** A model trained on text has absorbed a great deal about what actions do, and it can be asked to predict the outcome of an action before taking it: what a web page will look like after a click, what a shell command will print, how a user will answer. Planning then looks like MPC: imagine the outcomes of a few candidate actions, score them, take the best, observe the real result, and replan. [Planning with language models](/notes/agents/planning-with-language-models#world-models-for-planning) describes RAP and WebDreamer, which do exactly this. The lessons of this note apply unchanged. Imagined outcomes compound errors, so they are useful for one or two steps of lookahead, not for long plans. A planner optimizing against an imperfect model will find its errors. And the real environment remains the final verifier.
+
+**World models as training environments.** Reinforcement learning needs many episodes, and real environments for agents are slow, costly or dangerous. A learned simulator can stand in for them. Benchmarks for tool-using agents already simulate one side of the interaction with a language model: in τ-bench the user is played by a model instructed with a hidden goal ([Yao et al., 2024](#references)). At the other end, Genie 3 generates interactive 3D worlds in real time, at 24 frames per second and 720p, that stay consistent for a few minutes, and DeepMind has used it to give its SIMA agent goals in generated worlds (August 2025); V-JEPA 2 learns a video world model from more than a million hours of internet video and, after post-training on less than 62 hours of unlabeled robot video, plans pick-and-place actions on robot arms in new labs from image goals ([Assran et al., 2025](#references)). The compounding-error problem becomes the problem of the **sim-to-real gap**: an agent trained in a simulator learns the simulator, including its mistakes.
+
+**What a model knows.** Whether large models trained on sequences contain usable world models is an open question with evidence on both sides. A transformer trained only on legal Othello move sequences develops an internal representation of the board that probes can read and interventions can change ([Li et al., 2023](#references)). Models trained on taxi routes in New York predict valid next turns almost perfectly, yet the street maps implied by their predictions are incoherent and break down under detours ([Vafa et al., 2024](#references)). For an agent, the practical test is the one of this note: not whether the model's predictions look right one step ahead, but whether planning with them over the horizon that matters produces good actions.
+
+<aside class="callout"><strong>Check yourself.</strong> (1) In Dyna-Q in a deterministic maze, why does planning help nothing during the first episode? (2) A model has one-step error $\epsilon = 0.01$ and Lipschitz constant $L = 1.2$. What does the bound give for $H = 10$, and how does it compare with $10\epsilon$? (3) Why can MuZero's model be good for planning even if it would draw the next frame badly?<details><summary>Answers</summary>(1) The reward is 0 everywhere except at the goal, so until the goal has been reached every Q-value and every remembered reward is 0; replaying zero-valued transitions changes nothing. (2) $0.01 \cdot (1.2^{10} - 1)/0.2 = 0.01 \cdot 25.96 = 0.26$, against $0.1$ for simple addition. (3) It is trained to predict rewards, values and policies, the only quantities the search uses; what it would predict about the rest of the frame does not enter the search at all.</details></aside>
+
+## What changed
+
+| | model-free RL | model-based RL |
+| --- | --- | --- |
+| what is learned | values or a policy | also a model of transitions and rewards |
+| use of a real transition | one update, or a few with replay | an update, model training, and many simulated updates |
+| cost | interaction with the environment | computation: planning or imagined rollouts |
+| new task, same world | start again | reuse the dynamics model |
+| main risk | sample inefficiency | model errors that compound and that the planner exploits |
+| results | DQN, PPO | Dyna, PETS, Dreamer, MuZero |
+
+## Limitations
+
+- **Model bias.** The agent optimizes the model, not the world. Where the model is wrong, the planner is drawn to its errors, and the final performance of model-based methods has often trailed that of model-free ones on tasks where data are cheap.
+- **Long horizons.** Errors compound, so models are used for short rollouts or with replanning; long-horizon credit assignment still needs value functions.
+- **What to model.** Predicting observations wastes capacity on irrelevant detail; predicting only values ties the model to one task. Choosing what the latent state must capture is an open design problem.
+- **Computation.** Planning at every step, as in MPC or MuZero's search, is expensive at decision time, and training world models from pixels is expensive too.
+- **Stochastic and partially observed worlds** need models of distributions and beliefs, not just of the next state, which makes both learning and planning harder.
+
+## What you should remember
+
+- A model turns computation into experience. Dyna applies the same value update to real and to simulated transitions; with 50 planning updates per step, the maze is solved in a few episodes instead of dozens.
+- Learned dynamics can be used directly by model-predictive control: optimize an action sequence under the model, for example with the cross-entropy method, execute the first action, and replan.
+- Model errors compound: with one-step error $\epsilon$ and Lipschitz constant $L$, the $H$-step error is bounded by $\epsilon (L^H - 1)/(L - 1)$, and a planner exploits wherever the model is wrong. Short horizons, replanning, ensembles and rollouts from real states are the remedies.
+- World models learn latent dynamics. Dreamer trains its actor and critic on imagined latent trajectories; MuZero's model predicts only rewards, values and policies, which is all its tree search needs.
+- For language-model agents, world models are used as one-step lookahead before irreversible actions and as simulated environments for training, with the same compounding-error caveat.
+
+## Code
+
+Dyna-Q on the maze for $n = 0$, $5$ and $50$; the pendulum with two models fitted by least squares; the compounding error of their free-swinging rollouts, which the figure computes identically at build time; and model-predictive control with the cross-entropy method, using the true dynamics, each fitted model, or random torques. NumPy only, seeds fixed; the maze figure uses a different random generator and averages more runs, so its curves agree with these numbers in shape, not to the step. The script runs in about 10 seconds.
+
+```python
+import numpy as np
+
+# 1. Dyna-Q on the 6 x 9 maze: one real step, one Q-learning update, a table model, n planning updates
+ROWS, COLS, START, GOAL = 6, 9, 2 * 9 + 0, 0 * 9 + 8
+WALLS = {(1, 2), (2, 2), (3, 2), (4, 5), (0, 7), (1, 7), (2, 7)}
+MOVES = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+def maze_step(s, a):
+    r, c = divmod(s, COLS)
+    r2, c2 = min(ROWS - 1, max(0, r + MOVES[a][0])), min(COLS - 1, max(0, c + MOVES[a][1]))
+    if (r2, c2) in WALLS:
+        r2, c2 = r, c
+    s2 = r2 * COLS + c2
+    return s2, float(s2 == GOAL)
+
+def dyna_q(n, runs=30, episodes=50, gamma=0.95, alpha=0.1, eps=0.1, seed=0):
+    rng, steps = np.random.default_rng(seed), np.zeros(episodes)
+    for _ in range(runs):
+        Q, model = np.zeros((ROWS * COLS, 4)), {}                  # model: (s, a) -> (r, s'), deterministic world
+        for ep in range(episodes):
+            s, t = START, 0
+            while s != GOAL:
+                a = int(rng.integers(4)) if rng.random() < eps else int(rng.choice(np.flatnonzero(Q[s] == Q[s].max())))
+                s2, r = maze_step(s, a)
+                Q[s, a] += alpha * (r + (0 if s2 == GOAL else gamma * Q[s2].max()) - Q[s, a])   # direct RL
+                model[(s, a)] = (r, s2)                                                         # model learning
+                keys = list(model)
+                for i in rng.integers(len(keys), size=n):                                      # planning
+                    (ps, pa), (pr, ps2) = keys[i], model[keys[i]]
+                    Q[ps, pa] += alpha * (pr + (0 if ps2 == GOAL else gamma * Q[ps2].max()) - Q[ps, pa])
+                s, t = s2, t + 1
+            steps[ep] += t / runs
+    return steps
+for n in (0, 5, 50):
+    st = dyna_q(n)
+    print(f'n = {n:2d}: steps in episodes 2, 5, 10, 20, 50:', ' '.join(f'{st[i]:6.1f}' for i in (1, 4, 9, 19, 49)))
+# n =  0: steps in episodes 2, 5, 10, 20, 50:  573.0  295.9  109.0   45.8   17.4
+# n =  5: steps in episodes 2, 5, 10, 20, 50:  138.0   22.5   16.4   16.6   17.1
+# n = 50: steps in episodes 2, 5, 10, 20, 50:   42.6   17.3   17.1   16.7   17.4
+
+# 2. the pendulum (Gym's Pendulum-v1: theta = 0 upright) and two models fitted by least squares on a grid
+def pendulum(th, om, u):
+    u = np.clip(u, -2, 2)
+    om2 = np.clip(om + (15 * np.sin(th) + 3 * u) * 0.05, -8, 8)   # 3g/(2l) = 15, 3/(m l^2) = 3, dt = 0.05
+    return th + om2 * 0.05, om2
+wrap = lambda x: (x + np.pi) % (2 * np.pi) - np.pi
+TH, OM, U = (a.ravel() for a in np.meshgrid(np.linspace(-np.pi, np.pi, 25), np.linspace(-8, 8, 17), [-2.0, 0.0, 2.0], indexing='ij'))
+TH2, OM2 = pendulum(TH, OM, U)
+ones = np.ones_like(TH)
+W_lin = np.linalg.lstsq(np.stack([TH, OM, U, ones], 1), np.stack([TH2, OM2], 1), rcond=None)[0]
+W_feat = np.linalg.lstsq(np.stack([np.sin(TH), OM, U, ones], 1), np.stack([TH2 - TH, OM2], 1), rcond=None)[0]
+def linear(th, om, u):                                          # (theta', omega') = W [theta, omega, u, 1]
+    th, om = np.broadcast_arrays(th, om); u = np.broadcast_to(np.clip(u, -2, 2), th.shape)
+    x = np.stack([th, om, u, np.ones_like(th)], -1) @ W_lin
+    return x[..., 0], x[..., 1]
+def features(th, om, u):                                        # (theta' - theta, omega') = W [sin theta, omega, u, 1]
+    th, om = np.broadcast_arrays(th, om); u = np.broadcast_to(np.clip(u, -2, 2), th.shape)
+    x = np.stack([np.sin(th), om, u, np.ones_like(th)], -1) @ W_feat
+    return th + x[..., 0], x[..., 1]
+
+# 3. compounding error: free-swinging rollouts from 12 start angles, angle error against the horizon
+starts = np.linspace(-np.pi, np.pi, 13)[:-1] + 0.1
+for name, model in (('linear', linear), ('features', features)):
+    one = np.sqrt(np.mean((model(TH, OM, U)[0] - TH2) ** 2))
+    a, b, c, d, err = starts, np.zeros(12), starts, np.zeros(12), []
+    for h in range(40):
+        (a, b), (c, d) = pendulum(a, b, 0.0), model(c, d, 0.0)
+        err.append(np.sqrt(np.mean(wrap(a - c) ** 2)))
+    print(f'{name:8s} one-step error {one:.4f}; rollout error after 1, 5, 10, 20, 40 steps:', ' '.join(f'{err[h - 1]:.3f}' for h in (1, 5, 10, 20, 40)))
+# linear   one-step error 0.0179; rollout error after 1, 5, 10, 20, 40 steps: 0.017 0.260 0.949 1.936 1.855
+# features one-step error 0.0063; rollout error after 1, 5, 10, 20, 40 steps: 0.002 0.028 0.106 0.204 0.725
+
+# 4. model-predictive control with the cross-entropy method: plan 30 steps, act once, replan
+cost = lambda th, om, u: wrap(th) ** 2 + 0.1 * om ** 2 + 0.001 * u ** 2
+def cem(model, th, om, mu, rng, H=30, N=200, K=20, iters=5):
+    sd = np.full(H, 1.5)
+    for _ in range(iters):
+        U_ = np.clip(mu + sd * rng.normal(size=(N, H)), -2, 2)      # N candidate action sequences
+        t_, o_, total = np.full(N, th), np.full(N, om), np.zeros(N)
+        for k in range(H):                                          # imagined rollouts in the model
+            total += cost(t_, o_, U_[:, k]); t_, o_ = model(t_, o_, U_[:, k])
+        elite = U_[np.argsort(total)[:K]]                           # keep the K best, refit the Gaussian
+        mu, sd = elite.mean(0), elite.std(0) + 1e-3
+    return mu
+def episode(model, seed, T=200):
+    rng, th, om, ret, mu = np.random.default_rng(seed), np.pi, 0.0, 0.0, np.zeros(30)
+    for _ in range(T):
+        mu = cem(model, th, om, mu, rng)
+        ret -= cost(th, om, mu[0]); th, om = pendulum(th, om, mu[0])
+        mu = np.append(mu[1:], 0.0)                                  # warm start: shift the plan by one step
+    return ret, abs(wrap(th))
+for name, model in (('true dynamics', pendulum), ('feature model', features), ('linear model', linear)):
+    res = [episode(model, s) for s in (0, 1)]
+    print(f'{name:13s}: return {np.mean([r for r, _ in res]):7.1f}, final |angle from upright| {np.mean([e for _, e in res]):.2f}')
+rng, th, om, ret = np.random.default_rng(0), np.pi, 0.0, 0.0
+for _ in range(200):
+    u = rng.uniform(-2, 2); ret -= cost(th, om, u); th, om = pendulum(th, om, u)
+print(f'random torques: return {ret:7.1f}')
+# true dynamics: return  -358.8, final |angle from upright| 0.03
+# feature model: return  -363.7, final |angle from upright| 0.02
+# linear model : return -1512.5, final |angle from upright| 2.95
+# random torques: return -1708.9
+```
+
+With a neural network in place of the least-squares fits, and an ensemble of them, the same planner becomes PETS; with a learned latent state instead of the true angle and speed, and an actor and critic instead of the planner, it becomes Dreamer.
+
+## Next
+
+This note ends the reinforcement-learning section. Its agents learned from rewards in worlds described by small state vectors or by pixels, with policies and values trained from scratch. The next section changes the agent itself. A language model pretrained on text already knows a great deal about the world and can act through text: [The language model as a policy](/notes/agents/language-model-as-a-policy) writes it in the vocabulary of this section, with states, actions, a policy and rewards, so that the methods developed here, policy gradients above all, can later be applied to it.
+
+## References
+
+- R. S. Sutton. [Integrated architectures for learning, planning, and reacting based on approximating dynamic programming](https://doi.org/10.1016/B978-1-55860-141-3.50030-4). ICML, 1990.
+- R. S. Sutton. [Dyna, an integrated architecture for learning, planning, and reacting](https://doi.org/10.1145/122344.122377). *ACM SIGART Bulletin*, 2(4):160–163, 1991.
+- R. S. Sutton, A. G. Barto. [*Reinforcement Learning: An Introduction*](http://incompleteideas.net/book/the-book-2nd.html), 2nd ed. MIT Press, 2018. Chapter 8 (planning and learning with tabular methods; example 8.1, the Dyna maze; section 8.3, when the model is wrong).
+- A. Nagabandi, G. Kahn, R. S. Fearing, S. Levine. [Neural network dynamics for model-based deep reinforcement learning with model-free fine-tuning](https://arxiv.org/abs/1708.02596). ICRA, 2018.
+- R. Y. Rubinstein. [The cross-entropy method for combinatorial and continuous optimization](https://doi.org/10.1023/A:1010091220143). *Methodology and Computing in Applied Probability*, 1(2):127–190, 1999.
+- P.-T. de Boer, D. P. Kroese, S. Mannor, R. Y. Rubinstein. [A tutorial on the cross-entropy method](https://doi.org/10.1007/s10479-005-5724-z). *Annals of Operations Research*, 134:19–67, 2005.
+- K. Chua, R. Calandra, R. McAllister, S. Levine. [Deep reinforcement learning in a handful of trials using probabilistic dynamics models](https://arxiv.org/abs/1805.12114). NeurIPS, 2018.
+- M. Janner, J. Fu, M. Zhang, S. Levine. [When to trust your model: model-based policy optimization](https://arxiv.org/abs/1906.08253). NeurIPS, 2019.
+- D. Ha, J. Schmidhuber. [Recurrent world models facilitate policy evolution](https://arxiv.org/abs/1803.10122). NeurIPS, 2018.
+- D. Hafner, T. Lillicrap, I. Fischer, R. Villegas, D. Ha, H. Lee, J. Davidson. [Learning latent dynamics for planning from pixels](https://arxiv.org/abs/1811.04551). ICML, 2019.
+- D. Hafner, T. Lillicrap, J. Ba, M. Norouzi. [Dream to control: learning behaviors by latent imagination](https://arxiv.org/abs/1912.01603). ICLR, 2020.
+- D. Hafner, T. Lillicrap, M. Norouzi, J. Ba. [Mastering Atari with discrete world models](https://arxiv.org/abs/2010.02193). ICLR, 2021.
+- D. Hafner, J. Pasukonis, J. Ba, T. Lillicrap. [Mastering diverse control tasks through world models](https://doi.org/10.1038/s41586-025-08744-2). *Nature*, 640:647–653, 2025. Preprint: [arXiv:2301.04104](https://arxiv.org/abs/2301.04104), 2023.
+- J. Schrittwieser, I. Antonoglou, T. Hubert, K. Simonyan, L. Sifre, S. Schmitt, A. Guez, E. Lockhart, D. Hassabis, T. Graepel, T. Lillicrap, D. Silver. [Mastering Atari, Go, chess and shogi by planning with a learned model](https://doi.org/10.1038/s41586-020-03051-4). *Nature*, 588:604–609, 2020.
+- C. Grimm, A. Barreto, S. Singh, D. Silver. [The value equivalence principle for model-based reinforcement learning](https://arxiv.org/abs/2011.03506). NeurIPS, 2020.
+- W. Ye, S. Liu, T. Kurutach, P. Abbeel, Y. Gao. [Mastering Atari games with limited data](https://arxiv.org/abs/2111.00210). NeurIPS, 2021.
+- S. Yao, N. Shinn, P. Razavi, K. Narasimhan. [τ-bench: a benchmark for tool-agent-user interaction in real-world domains](https://arxiv.org/abs/2406.12045). arXiv:2406.12045, 2024.
+- Google DeepMind. [Genie 3: a new frontier for world models](https://deepmind.google/discover/blog/genie-3-a-new-frontier-for-world-models/). Blog post, 5 August 2025.
+- M. Assran et al. [V-JEPA 2: self-supervised video models enable understanding, prediction and planning](https://arxiv.org/abs/2506.09985). arXiv:2506.09985, 2025.
+- K. Li, A. K. Hopkins, D. Bau, F. Viégas, H. Pfister, M. Wattenberg. [Emergent world representations: exploring a sequence model trained on a synthetic task](https://arxiv.org/abs/2210.13382). ICLR, 2023.
+- K. Vafa, J. Y. Chen, A. Rambachan, J. Kleinberg, S. Mullainathan. [Evaluating the world model implicit in a generative model](https://arxiv.org/abs/2406.03689). NeurIPS, 2024.
+- S. Levine. [CS285: Deep Reinforcement Learning](https://rail.eecs.berkeley.edu/deeprlcourse/). University of California, Berkeley. Lectures on model-based RL and model-based policy learning.

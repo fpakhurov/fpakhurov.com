@@ -1,0 +1,295 @@
+---
+title: Planning with language models
+description: "How a language-model agent plans a task before or while acting: task decomposition, plan-and-execute against interleaved planning, the evidence that models plan poorly alone, translation to PDDL for a classical planner, tree search over model proposals with value estimates, and world models."
+course: agents
+section: Memory, Planning and Reflection
+order: 13
+status: published
+tags: [planning, task-decomposition, plan-and-execute, planbench, llm-plus-p, pddl, tree-of-thoughts, rap, lats, mcts, world-models]
+prerequisites: [Search and planning, Games and Monte Carlo tree search, ReAct and the agent loop]
+---
+
+import GreedyVsSearch from '../../../components/figures/planning-with-language-models/GreedyVsSearch.astro';
+import ProposeVerifySearch from '../../../components/figures/planning-with-language-models/ProposeVerifySearch.astro';
+
+The [previous note](/notes/agents/context-and-memory) gave the agent a memory, so that a long task no longer breaks at the edge of the context window. Memory does not decide what to do next. The loop of [ReAct and the agent loop](/notes/agents/react-and-the-agent-loop) decides one action at a time, from the model's sense of what looks right now, and on tasks where an early move can make a later goal unreachable that is not enough. The first section of the course solved such tasks by search: [Search and planning](/notes/agents/search-and-planning) formulated them as state spaces and found plans with A\* and PDDL planners, and [Games and Monte Carlo tree search](/notes/agents/games-and-tree-search) searched by sampling. This note asks how well language models plan, and how they plan better when the old machinery is put back around them: a decomposition into steps, a classical planner that receives the model's formulation, a tree search over the model's proposals, and a model of the world to search in.
+
+**Notation.** A state $s$, an action $a$, a goal $G$, and a plan $(a_1, \dots, a_n)$. The language model is a **proposal distribution** $p_\theta(a \mid s, G)$ over next actions; a **value estimate** $V(s)$ rates how promising a state is; a **transition model** $s' = f(s, a)$ gives the next state, and the **verifier** checks that an action is applicable and that a state satisfies $G$. In the search, $k$ proposals are taken per state and $b$ states are kept per depth.
+
+## Baseline: decide one step at a time
+
+An agent that plans nothing follows its proposal distribution: at every state it takes the most likely action, $a_t = \arg\max_a p_\theta(a \mid s_t, G)$. In the terms of the search note this is greedy best-first search with the model as the heuristic, a frontier of size one and no backtracking. It works when the locally attractive move is also globally right, and fails exactly where planning is needed.
+
+**Worked example: the Sussman anomaly again.** The blocks problem of the search note: C sits on A, B is on the table, and the goal is A on B on C. A scripted stand-in for the model (in the Code section) proposes the moves that make a goal fact true and avoids moves that undo one, with some noise:
+
+<GreedyVsSearch />
+
+From the start, "put B on C" makes the goal fact on(B, C) true, so the model proposes it. It is a trap: A is now buried under C and B, and the only legal move is to take B off again, which undoes a goal fact. Back at the start, "B on C" looks as good as ever. In one of the ten runs of the Code section this cycle repeats six times before the noise breaks the tie, and the run needs 15 moves for a 3-move plan; over the ten runs the plans have 3 to 15 moves, 6.8 on average. A\* with an admissible heuristic (the number of blocks not yet in their final place) expands 4 states and returns the optimal plan. The greedy agent is not stupid; it has no way to notice that a goal fact achieved now must be undone later, which is what the goal interaction of the Sussman anomaly means.
+
+<aside class="callout"><strong>Key idea.</strong> A language model is a good source of candidate steps and a poor guarantor of plans. Plan with it the way the first section planned with heuristics: let the model propose, let something sound check, and search over the proposals with a goal test, backtracking and a budget. Where the problem can be written in a planning language, let the model write it and a classical planner solve it.</aside>
+
+## Decomposition: plan first, or plan as you go
+
+The simplest form of planning is **task decomposition**: break the goal into subgoals, in natural language, before acting. "Fix the failing test" becomes "reproduce the failure, find the function that produces the wrong value, change it, rerun the test suite". Two architectures differ in when this happens.
+
+- **Plan-and-execute.** The model writes the whole plan once, and an executor carries out the steps; the model is called again only to compose the answer or when a step fails. ReWOO, with its evidence placeholders and tool calls made without the model, is the example in [ReAct and the agent loop](/notes/agents/react-and-the-agent-loop#plan-first-then-execute), with its measured token savings.
+- **Interleaved planning.** ReAct decides each step after seeing the previous observation. It adapts to surprises, at the price of a model call per step over a context that grows.
+
+The token arithmetic of the [previous note](/notes/agents/context-and-memory#baseline-append-everything) makes the difference concrete for planning. With a prefix of $s$ tokens, $T$ tool steps and $d$ tokens per step, an interleaved agent makes $T + 1$ model calls that read $\sum_{t=1}^{T+1} \big(s + (t - 1)d\big)$ tokens, quadratic in $T$. A plan-and-execute agent makes two calls, the planner reading $s$ and the solver about $s + T d$: linear in $T$. For $s = 2{,}000$, $d = 500$ and $T = 5$, that is $6 \cdot 2{,}000 + 500 \cdot 15 = 19{,}500$ tokens against $2{,}000 + 4{,}500 = 6{,}500$. The tool calls of a fixed plan can also run in parallel.
+
+| | plan-and-execute | interleaved (ReAct) |
+| --- | --- | --- |
+| model calls | about two, plus replanning | one per step |
+| input tokens | linear in the number of steps | quadratic, without compaction |
+| reacts to an observation | only by replanning | at every step |
+| fails when | the plan is wrong and nobody notices | the agent drifts, loops or forgets the goal |
+| fits | steps knowable in advance | exploration, debugging |
+
+Practical agents combine the two: a short plan written first and kept at the end of the context (the to-do list of the previous note), executed step by step, and revised when an observation contradicts it. A plan in prose has no goal test and no preconditions, so nothing checks it until the world does.
+
+## How well do language models plan on their own?
+
+PlanBench ([Valmeekam et al., 2023](#references)) tests plan generation on domains from the International Planning Competition, with instances generated from PDDL and checked by the plan validator VAL. On 600 Blocksworld problems of three to five blocks, with the domain described in natural language and one example, GPT-4 produced a valid plan for 206, or 34.3%, in 2023 ([Valmeekam et al., 2023b](#references)). Of 50 people given the same description, 39 (78%) wrote a valid plan. The informative variant is **Mystery Blocksworld**: the same problems with the actions and predicates renamed to unrelated words ("attack", "feast"), which changes nothing for a planner. GPT-4's success fell to 26 of 600, 4.3%, and with random strings as names to 12 of 600, 2%. A model that planned would not care what the actions are called; one that recalls plans for familiar-sounding problems does.
+
+The reasoning models of 2024 moved these numbers a long way ([Valmeekam, Stechly and Kambhampati, 2024](#references)). OpenAI's o1-preview, zero-shot, solved 587 of the 600 Blocksworld problems (97.8%) and 317 of 600 Mystery Blocksworld problems (52.8%), where earlier models had been near zero. On 110 larger problems, 6 to 20 blocks with optimal plans of 20 to 40 steps, it solved 23.6%. The classical planner Fast Downward solved all of them, in 0.265 seconds on average against 40 to 111 seconds per problem for o1-preview, and with a guarantee that every plan it returns is valid. As of 2026, reasoning models are better again, and the numbers above are best read as a dated snapshot of one benchmark. Two conclusions have held across model generations: success falls as plans get longer, and a plan from a model needs a check before anyone acts on it. When a sound verifier exists, it should be used. When GPT-4's plans were checked by VAL and the errors fed back ("the precondition clear(C) of step 3 does not hold"), it found a valid plan for 41 of 50 Blocksworld problems it had failed, within 15 rounds; [Reflection and self-correction](/notes/agents/reflection-and-self-correction) takes up why external checks work where self-checks do not.
+
+## LLM+P: the model formulates, a planner searches
+
+LLM+P ([Liu et al., 2023](#references)) divides the work along the line drawn in the [search note](/notes/agents/search-and-planning#why-this-matters-for-language-model-planners). The protocol has four steps:
+
+1. A person supplies the **domain** in PDDL once: the predicates and the action schemas with their preconditions and effects, as in the [STRIPS section of the search note](/notes/agents/search-and-planning#classical-planning-strips-and-pddl).
+2. Given a problem in natural language ("the red block is on the blue one; stack them in the order…") and one example pair of a problem description and its PDDL problem file, the model writes a PDDL **problem file**: the objects, the initial state and the goal.
+3. A classical planner (Fast Downward in the paper) searches for a plan, optimal if its optimal configuration finishes in time.
+4. The model translates the plan back into natural language.
+
+With GPT-4 on seven planning domains, 20 problems each (2023), the model planning directly produced an optimal plan for 15% of the Blocksworld problems and a valid one for 30%; LLM+P produced optimal plans for 90%. Across the domains it reached 95% on Grippers and 85% on Storage, where the model alone produced optimal plans for 35% and 0%. Two results bound the method. Without the example problem file in the prompt, LLM+P solved nothing in any domain: the model's translation, not the planner, is the weak link, and it needs to see the target format. And on Floortile both failed, because the model could not translate the problems correctly.
+
+The division is sound where it applies. Whatever the planner returns is a valid plan for the problem file it received, so every remaining error is an error of formulation, which can be checked separately: the file must parse, mention only declared objects, and have an initial state that matches the description. The cost is the domain file, which a person writes, and the assumption that the world fits STRIPS: deterministic, fully observable, with discrete actions. Later work asks the model to draft the domain file too, with a person or a validator correcting it, which moves the hard part rather than removing it.
+
+## Search over model proposals
+
+Where no planning language fits, the search of the first section can run over the model's own proposals:
+
+<ProposeVerifySearch />
+
+1. **Select** states from the frontier: the $b$ kept at the current depth, or the leaf chosen by a tree policy.
+2. **Propose**: the model samples $k$ candidate actions or partial solutions from $p_\theta(\cdot \mid s, G)$.
+3. **Verify**: whatever can be checked mechanically is checked, and inapplicable or malformed proposals are dropped.
+4. **Transition**: each surviving action gives a next state, from the real environment, a simulator, or a model of the world.
+5. **Evaluate and keep**: a value estimate $V(s')$ rates the new states and the search keeps the best; a state that satisfies the goal test ends the search with a plan.
+
+Greedy proposal-following is the special case $k = b = 1$ without a verifier. The methods below differ in the search algorithm and in where $V$ and $f$ come from.
+
+**Tree of Thoughts** ([Yao et al., 2023](#references)) runs breadth-first search with a beam or depth-first search with backtracking over "thoughts", partial solutions in text; the model proposes them and also rates them, playing both $p_\theta$ and $V$. Its result on the Game of 24 is in the [search note](/notes/agents/search-and-planning#why-this-matters-for-language-model-planners).
+
+**RAP**, Reasoning via Planning ([Hao et al., 2023](#references)), adds the transition model. The same model is prompted twice for different roles: as the agent it proposes an action, and as a **world model** it predicts the state that results, in text ("the orange block is in the hand, the red block is clear…"). A reward combines the model's confidence in the action with task-specific signals, and Monte Carlo tree search with the UCT rule of the [games note](/notes/agents/games-and-tree-search#selection-as-a-bandit-problem-ucb1-and-uct) chooses where to expand. On Blocksworld problems needing 2, 4 and 6 steps, LLaMA-33B with RAP and 20 iterations solved 100%, 88% and 42%, against 17%, 2% and 0% for the same model with chain of thought and 50%, 63% and 40% for GPT-4 with chain of thought (2023).
+
+**LATS**, Language Agent Tree Search ([Zhou et al., 2024](#references)), runs MCTS over whole ReAct trajectories in a real environment. Its value estimate mixes the model's own rating with agreement among samples,
+
+$$
+V(s) = \lambda\, \text{LM}(s) + (1 - \lambda)\, \text{SC}(s),
+$$
+
+where $\text{LM}(s)$ is the score the model gives the trajectory so far, $\text{SC}(s)$ a self-consistency score (how often the same action is proposed among the samples) and $\lambda$ a weight. When a trajectory fails, the model writes a reflection on why, which is added to the context of later attempts, the mechanism of the next note. On HumanEval, with GPT-4 generating 5 candidates per expansion for up to 8 iterations and checking them against unit tests that it wrote itself, LATS reached a pass@1 of 92.7%, against 80.1% for GPT-4 alone (2024).
+
+**Worked example: what the search buys.** The Code section runs the three planners on 200 random blocks problems for each size, with the scripted proposer, $k = 3$ proposals and $b = 3$ states kept per depth for the search over proposals, and a budget of 20 moves for the greedy agent:
+
+| blocks | greedy, no verifier | greedy with verifier | search over proposals | A\* |
+| --- | --- | --- | --- | --- |
+| 3 | 41.0% | 95.0% | 100% | 100% |
+| 4 | 16.5% | 77.0% | 95.5% | 100% |
+| 5 | 3.5% | 65.0% | 94.5% | 100% |
+| 6 | 2.0% | 60.5% | 84.5% | 100% |
+
+Without a verifier, one illegal move in ten proposals is enough to sink most episodes; with one, greedy following still fails on 40% of the six-block problems, and its successful plans are 2.7 moves longer than optimal. The search over the same proposals, with a value estimate that is right only on average, solves 84.5% with plans 0.7 moves too long, at 13.6 model calls per problem. A\*, with a heuristic that is admissible by construction, always finds an optimal plan, expanding 8.3 states on average, where breadth-first search reaches 2,179. The gap between the last two columns is the gap between a heuristic that guesses and one that is guaranteed never to overestimate, which no language model provides.
+
+The cost side is real. Every expansion is a model call, and every evaluation may be another; a search that is cheap with an exact simulator is expensive when the transition model is the language model itself. And search needs to undo: backtracking from a state is free in a simulator and impossible on a live website after a purchase or a sent message.
+
+## World models for planning
+
+Searching in the real environment requires an environment that can be reset. When it cannot, the agent needs a **model of the world**: a function that predicts the outcome of an action without taking it, the idea that [Model-based reinforcement learning](/notes/agents/model-based-rl) develops with learned dynamics. A language model can serve as one in text, as in RAP. WebDreamer ([Gu et al., 2024](#references)) applies this to web agents: for each candidate action on a page, the model describes what the page would look like after it, a value estimate scores the imagined outcomes, and only the best action is executed for real. On VisualWebArena it was competitive with tree search in the real environment while being four to five times more efficient, and it worked on live websites, where tree search is not available because actions cannot be undone; a 7-billion-parameter model trained as the world model performed comparably to GPT-4o in that role (2024–2025).
+
+Imagined outcomes inherit the model's errors, and the errors compound with depth: a rollout of ten imagined steps is ten predictions conditioned on each other. World models are therefore used for short lookahead, one or two steps, to rank actions before an irreversible one; the real environment remains the final verifier.
+
+<aside class="callout"><strong>Check yourself.</strong> (1) An interleaved agent with $s = 3{,}000$ and $d = 1{,}000$ uses $T = 8$ tool steps. How many input tokens do its model calls read, and how many does a plan-and-execute agent read, with the solver reading $s + T d$? (2) Why does the drop from 34.3% to 4.3% on Mystery Blocksworld say more about planning than the 34.3% itself? (3) In LLM+P, the planner reports that the problem file has no solution. Who is at fault, and what should the agent do?<details><summary>Answers</summary>(1) Nine calls read $9 \cdot 3{,}000 + 1{,}000 \cdot (0 + 1 + \dots + 8) = 27{,}000 + 36{,}000 = 63{,}000$ tokens; the plan-and-execute agent reads $3{,}000 + 11{,}000 = 14{,}000$. (2) The renaming leaves the planning problem identical, so a planner's success cannot change; a large drop shows that the success depended on recognizing the familiar domain rather than on search. (3) A sound planner is not wrong about the file it received (if it finished its search), so the formulation is: the model mistranslated the initial state or the goal, or the task really is impossible. The agent should check the file against the description, regenerate it with the planner's report as feedback, and ask the user if the task still has no solution.</details></aside>
+
+## What changed
+
+| | one step at a time | plan with search and checks |
+| --- | --- | --- |
+| who chooses the action | the model's first proposal | a search over the model's proposals, or a planner |
+| backtracking | none: loops and dead ends persist | built into the search |
+| what checks a step | the world, after acting | a verifier and a goal test, before acting |
+| where the model is strong | everywhere it is used | proposing, formulating, describing outcomes |
+| guarantees | none | valid plans from a sound planner or verifier |
+| cost | one call per step | many calls per step, or a planner run |
+
+## Limitations
+
+- **Formulation remains the bottleneck.** LLM+P is only as good as the problem file, and someone must write the domain. Problems with time, resources, uncertainty or partial observability do not fit classical STRIPS.
+- **Model value estimates are not admissible.** Search over proposals recovers from many mistakes, but it inherits the bias of the evaluator: if the model rates a dead end highly, the search explores it.
+- **Search multiplies cost and latency.** Each expansion is a model call; tree search over trajectories can cost tens of times more than a single attempt, which is justified only when an attempt is cheap to check and expensive to get wrong.
+- **Real environments rarely rewind.** Backtracking needs a simulator, a sandbox or a world model, and imagined outcomes drift from reality over a few steps.
+- **Benchmarks move fast.** Results on PlanBench, HumanEval and similar sets are snapshots of particular models and prompts; reasoning models changed them within a year, and results from different setups cannot be ranked.
+
+## What you should remember
+
+- Following the model's first proposal is greedy search without backtracking; it fails where goals interact, as in the Sussman anomaly, and loops where an attractive move must be undone.
+- Plan-and-execute writes a plan once (two model calls, linear tokens); interleaved planning decides each step after an observation (one call per step, quadratic tokens). Hybrids keep a short plan and revise it.
+- On PlanBench, GPT-4 solved 34.3% of Blocksworld problems in 2023 and 4.3% once the names were obfuscated; o1-preview solved 97.8% and 52.8% in 2024, and 23.6% of larger problems, while a classical planner solved all of them with guarantees.
+- LLM+P lets the model write the PDDL problem file and a planner find the plan; the translation is the weak link, and an example of the target format is essential.
+- Search over model proposals (Tree of Thoughts, RAP with a world model and MCTS, LATS over ReAct trajectories) uses the model as proposal distribution and value estimate, and a verifier and goal test supply what the model cannot. World models allow lookahead where actions cannot be undone.
+
+## Code
+
+The blocks world as a STRIPS-style environment with a precondition check (the verifier), a scripted stand-in for the model that ranks next moves by whether they make or undo a goal fact (with noise and occasional illegal proposals), and three planners: greedy proposal-following, a beam search over the model's proposals with a noisy value estimate, and A\* with an admissible heuristic. With a real model, `propose` would parse the moves from the model's text and `value` would ask it to rate a state; the verifier, the search and the comparison stay as they are. NumPy and the standard library only; seeds are fixed, the script runs in about eight seconds, and exact numbers can differ across platforms and library versions.
+
+```python
+import heapq, itertools
+from collections import deque
+import numpy as np
+
+# 1. the blocks world: a state is a set of stacks, each a tuple from bottom to top
+def canon(stacks): return tuple(sorted(tuple(s) for s in stacks if s))
+def on_map(state):                                               # block -> what it sits on ('T' is the table)
+    return {b: (s[i - 1] if i else 'T') for s in state for i, b in enumerate(s)}
+def valid(state, move):                                          # the verifier: STRIPS preconditions
+    x, dest = move
+    tops = {s[-1] for s in state}
+    return x in tops and x != dest and (dest == 'T' or dest in tops) and not (dest == 'T' and on_map(state)[x] == 'T')
+def apply(state, move):                                          # the transition model
+    x, dest = move
+    stacks = [list(s) for s in state]
+    src = next(s for s in stacks if s and s[-1] == x); src.pop()
+    if dest == 'T': stacks.append([x])
+    else: next(s for s in stacks if s and s[-1] == dest).append(x)
+    return canon(stacks)
+def moves(state):
+    blocks = [b for s in state for b in s]
+    return [(x, d) for x in blocks for d in blocks + ['T'] if valid(state, (x, d))]
+
+# 2. a scripted stand-in for a language model that proposes the next move: it likes moves that make a goal
+#    fact true, dislikes moves that undo one, sometimes names a buried block, and is noisy
+class ScriptedProposer:
+    def __init__(self, goal, rng, noise=0.6, slip=0.1):
+        self.g, self.rng, self.noise, self.slip = on_map(goal), rng, noise, slip
+    def propose(self, state):                                    # a ranked list of moves, best first
+        on = on_map(state)
+        cands = [(x, d) for x in on for d in list(on) + ['T'] if d != x]
+        def score(m):
+            x, d = m
+            s = 2.0 * (self.g[x] == d) - 1.5 * (self.g[x] == on[x]) + self.noise * self.rng.normal()
+            if not valid(state, m): s = s + 3.0 if self.rng.random() < self.slip else s - 10.0   # an occasional slip
+            return s
+        return sorted(cands, key=score, reverse=True)
+
+def greedy(start, goal, rng, verifier=True, budget=20):          # follow the model's first (valid) proposal
+    model, state, plan = ScriptedProposer(goal, rng), start, []
+    for _ in range(budget):
+        if state == goal: return plan
+        props = model.propose(state)
+        m = next(m for m in props if valid(state, m)) if verifier else props[0]
+        if not valid(state, m): return None                      # without a verifier an invalid move ends the episode
+        state = apply(state, m); plan.append(m)
+    return plan if state == goal else None
+
+# 3. search over the model's proposals: keep the b best states per depth by a noisy value estimate (Tree of Thoughts style)
+def value(state, goal, rng, noise=0.6):                          # the model rates a state: goal facts already true
+    g, on = on_map(goal), on_map(state)
+    return sum(on[x] == g[x] for x in on) + noise * rng.normal()
+def beam(start, goal, rng, k=3, b=3, depth=20):
+    model, level, seen, calls = ScriptedProposer(goal, rng), [start], {start}, 0
+    for dpt in range(depth):
+        children = []
+        for s in level:
+            if s == goal: return dpt, calls
+            calls += 1                                           # one proposal call per expanded state
+            for m in [m for m in model.propose(s) if valid(s, m)][:k]:
+                t = apply(s, m)
+                if t not in seen: seen.add(t); children.append(t)
+        if not children: return None, calls
+        level = sorted(children, key=lambda t: value(t, goal, rng), reverse=True)[:b]
+    return None, calls
+
+# 4. search with guarantees: A* with h = the number of blocks not yet in their final place (each needs at least one move)
+def h_misplaced(state, goal):
+    good = {b for s in goal for i, b in enumerate(s) for t in state if t[:i + 1] == s[:i + 1]}
+    return sum(len(s) for s in state) - len(good)
+def astar(start, goal, h=h_misplaced):
+    tie, frontier, g, parent, closed = itertools.count(), [(h(start, goal), 0, 0, start)], {start: 0}, {start: None}, set()
+    while frontier:
+        _, _, _, s = heapq.heappop(frontier)
+        if s in closed: continue
+        closed.add(s)
+        if s == goal:
+            plan = []
+            while parent[s]: s, m = parent[s]; plan.append(m)
+            return plan[::-1], len(closed)
+        for m in moves(s):
+            t = apply(s, m)
+            if g[s] + 1 < g.get(t, 1e9):
+                g[t], parent[t] = g[s] + 1, (s, m)
+                heapq.heappush(frontier, (g[t] + h(t, goal), -g[t], next(tie), t))
+    return None, len(closed)
+
+# 5. the Sussman anomaly: C on A, A and B on the table; goal A on B on C
+start, goal = canon([['A', 'C'], ['B']]), canon([['C', 'B', 'A']])
+print(astar(start, goal))                                        # ([('C', 'T'), ('B', 'C'), ('A', 'B')], 4)
+rng = np.random.default_rng(0)
+runs = [greedy(start, goal, rng) for _ in range(10)]
+print([len(p) for p in runs])                                    # [3, 3, 15, 5, 15, 3, 5, 3, 7, 9]
+print(runs[2][:4])                                               # [('B', 'C'), ('B', 'T'), ('B', 'C'), ('B', 'T')]
+
+# 6. random problems with n blocks: greedy proposal-following, search over proposals, and A*
+def random_state(blocks, rng):
+    order, stacks = list(rng.permutation(blocks)), []
+    for x in order:
+        if stacks and rng.random() < 0.6: stacks[rng.integers(len(stacks))].append(x)
+        else: stacks.append([x])
+    return canon(stacks)
+def bfs_count(start, goal):                                      # uninformed search, for the node count
+    seen, q = {start}, deque([start])
+    while q:
+        s = q.popleft()
+        if s == goal: return len(seen)
+        for m in moves(s):
+            t = apply(s, m)
+            if t not in seen: seen.add(t); q.append(t)
+
+rng = np.random.default_rng(1)
+for n in (3, 4, 5, 6):
+    ok = dict(free=0, greedy=0, beam=0, astar=0); extra = dict(greedy=[], beam=[]); calls, exp_a, exp_b = [], [], []
+    for _ in range(200):
+        s0, g0 = random_state(list('ABCDEF'[:n]), rng), random_state(list('ABCDEF'[:n]), rng)
+        p, e = astar(s0, g0); ok['astar'] += 1; exp_a.append(e); exp_b.append(bfs_count(s0, g0))
+        ok['free'] += greedy(s0, g0, rng, verifier=False) is not None
+        q = greedy(s0, g0, rng)
+        if q is not None: ok['greedy'] += 1; extra['greedy'].append(len(q) - len(p))
+        dpt, c = beam(s0, g0, rng)
+        if dpt is not None: ok['beam'] += 1; extra['beam'].append(dpt - len(p)); calls.append(c)
+    print(n, {k: v / 2 for k, v in ok.items()}, round(np.mean(extra['greedy']), 2), round(np.mean(extra['beam']), 2),
+          round(np.mean(calls), 1), round(np.mean(exp_a), 1), round(np.mean(exp_b), 1))
+# 3 {'free': 41.0, 'greedy': 95.0, 'beam': 100.0, 'astar': 100.0} 1.09 0.0 3.3 3.1 8.5
+# 4 {'free': 16.5, 'greedy': 77.0, 'beam': 95.5, 'astar': 100.0} 1.79 0.16 7.2 4.5 49.1
+# 5 {'free': 3.5, 'greedy': 65.0, 'beam': 94.5, 'astar': 100.0} 1.87 0.7 11.9 6.4 301.8
+# 6 {'free': 2.0, 'greedy': 60.5, 'beam': 84.5, 'astar': 100.0} 2.72 0.7 13.6 8.3 2179.4
+#   (blocks; % solved: greedy without and with the verifier, beam over proposals, A*; extra moves over the optimum for
+#    greedy and beam; model calls of the beam; states expanded by A* and reached by breadth-first search)
+```
+
+## Next
+
+Search over proposals already used two kinds of feedback: a verifier that rejected illegal moves, and LATS's reflections on failed attempts. Both are ways for an agent to correct itself. The [next note](/notes/agents/reflection-and-self-correction) studies self-correction directly: when a model's critique of its own work helps, why it often does not without an external signal, and how much a verifier of known accuracy adds when the agent samples many attempts and keeps the one that passes.
+
+## References
+
+- K. Valmeekam, M. Marquez, A. Olmo, S. Sreedharan, S. Kambhampati. [PlanBench: an extensible benchmark for evaluating large language models on planning and reasoning about change](https://arxiv.org/abs/2206.10498). NeurIPS Datasets and Benchmarks, 2023.
+- K. Valmeekam, M. Marquez, S. Sreedharan, S. Kambhampati. [On the planning abilities of large language models: a critical investigation](https://arxiv.org/abs/2305.15771). NeurIPS, 2023 (cited as 2023b). Table 1 (plan generation), section 4 (human baseline), table 4 (back-prompting with VAL).
+- K. Valmeekam, K. Stechly, S. Kambhampati. [LLMs still can't plan; can LRMs? A preliminary evaluation of OpenAI's o1 on PlanBench](https://arxiv.org/abs/2409.13373). arXiv:2409.13373, 2024. Table 2 and the section on larger problems.
+- B. Liu, Y. Jiang, X. Zhang, Q. Liu, S. Zhang, J. Biswas, P. Stone. [LLM+P: empowering large language models with optimal planning proficiency](https://arxiv.org/abs/2304.11477). arXiv:2304.11477, 2023. Table I.
+- S. Yao, D. Yu, J. Zhao, I. Shafran, T. L. Griffiths, Y. Cao, K. Narasimhan. [Tree of Thoughts: deliberate problem solving with large language models](https://arxiv.org/abs/2305.10601). NeurIPS, 2023.
+- S. Hao, Y. Gu, H. Ma, J. J. Hong, Z. Wang, D. Z. Wang, Z. Hu. [Reasoning with language model is planning with world model](https://arxiv.org/abs/2305.14992). EMNLP, 2023. Table 1 (Blocksworld).
+- A. Zhou, K. Yan, M. Shlapentokh-Rothman, H. Wang, Y.-X. Wang. [Language agent tree search unifies reasoning, acting, and planning in language models](https://arxiv.org/abs/2310.04406). ICML, 2024. Equation 2 (value function), table 4 (HumanEval).
+- Y. Gu, K. Zhang, Y. Ning, B. Zheng, B. Gou, T. Xue, C. Chang, S. Srivastava, Y. Xie, P. Qi, H. Sun, Y. Su. [Is your LLM secretly a world model of the internet? Model-based planning for web agents](https://arxiv.org/abs/2411.06559). arXiv:2411.06559, 2024 (revised 2025).
+- S. Kambhampati, K. Valmeekam, L. Guan, M. Verma, K. Stechly, S. Bhambri, L. Saldyt, A. Murthy. [LLMs can't plan, but can help planning in LLM-modulo frameworks](https://arxiv.org/abs/2402.01817). ICML, 2024.
+- S. Russell, P. Norvig. [*Artificial Intelligence: A Modern Approach*](https://aima.cs.berkeley.edu/), 4th ed. Pearson, 2021. Chapter 11 (automated planning).

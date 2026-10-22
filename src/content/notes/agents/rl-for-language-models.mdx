@@ -1,0 +1,443 @@
+---
+title: Reinforcement learning for language models
+description: "How policy gradients train a language model: the KL-regularized objective and its closed-form optimum, PPO with a value head and per-token penalties, GRPO's group-relative advantages without a critic, rewards checked by programs, and why optimizing a learned reward too hard backfires."
+course: agents
+section: Training Agents
+order: 20
+status: published
+tags: [rlhf, kl-regularization, ppo, grpo, rlvr, verifiable-rewards, reward-model, overoptimization, value-head, dpo]
+prerequisites: [Policy gradients and actor-critic, The language model as a policy, Instruction tuning and alignment, KL divergence]
+---
+
+import PpoVsGrpo from '../../../components/figures/rl-for-language-models/PpoVsGrpo.astro';
+import GrpoCurves from '../../../components/figures/rl-for-language-models/GrpoCurves.astro';
+import Overoptimization from '../../../components/figures/rl-for-language-models/Overoptimization.astro';
+
+The agents of the previous section, up to the teams of [Multi-agent systems](/notes/agents/multi-agent-systems), were built around a model whose weights never changed: everything they learned lived in prompts, tools, memory and structure. This section changes the weights. The tool is the policy gradient of the second section, and the policy is the language model of [The language model as a policy](/notes/agents/language-model-as-a-policy#tokens-turns-and-actions), read at the token level: the state is the prompt and the tokens written so far, the action is the next token, and a reward arrives when the response is complete. This note derives the objective that RLHF optimizes and its exact optimum, shows how PPO is adapted to it with a value head and a penalty at every token, replaces the critic by a group of samples as GRPO does, swaps the learned reward for a program that checks the answer, and measures what happens when a learned reward is optimized too hard. The NLP course's [instruction-tuning note](/notes/nlp/instruction-tuning#preference-optimization) introduced reward models, RLHF and DPO; this note does not repeat them and works out what that note took as given.
+
+**Notation.** A prompt $x$ is drawn from a dataset $\mathcal D$; a response $y = (y_1, \dots, y_T)$ is a sequence of tokens, and $s_t = (x, y_{<t})$ is the state before token $t$. The policy is the language model, $\pi_\theta(y \mid x) = \prod_{t=1}^{T} \pi_\theta(y_t \mid s_t)$; $\pi_{\text{ref}}$ is a frozen copy of the model training starts from, usually the SFT model. A reward $r(x, y)$ scores a whole response: a learned reward model $r_\phi$ or a verifier $v(x, y) \in \{0, 1\}$. $\beta > 0$ is the KL coefficient and $D_{\mathrm{KL}}(\pi \,\|\, \pi_{\text{ref}})(x) = \sum_y \pi(y \mid x) \log \frac{\pi(y \mid x)}{\pi_{\text{ref}}(y \mid x)}$. As in [Policy gradients and actor-critic](/notes/agents/policy-gradients), $\pi_{\text{old}}$ is the policy that sampled the data and $\hat A$ an advantage estimate; the probability ratio, written $r_t$ there, is $\rho_t(\theta) = \pi_\theta(y_t \mid s_t)/\pi_{\text{old}}(y_t \mid s_t)$ here, because $r$ is the reward. $V_\psi$ is a value head, $G$ the number of responses sampled per prompt.
+
+## Baseline: maximize the reward alone
+
+The obvious objective is the expected reward, $\max_\pi \mathbb E_{y \sim \pi(\cdot \mid x)}[r(x, y)]$. It is linear in $\pi$, so its maximum puts all probability on the best-scored response. **Worked example.** A prompt has four candidate answers. The reference model gives them probabilities $\pi_{\text{ref}} = (0.50, 0.30, 0.15, 0.05)$, and a reward model scores them $r = (0, 0.5, 1.0, 1.2)$. Answer 4 is the kind of response reward models are known to overrate: confident, long, agreeable, and wrong in a way the reward model did not learn to see. The expected reward of the reference is $0.36$. The optimum of the plain objective is answer 4 with probability 1.
+
+Three things go wrong at once. The reward model is accurate only near the responses it was trained on ([instruction-tuning note](/notes/nlp/instruction-tuning#with-a-reward-model-rlhf)), and the optimum lands on the response it knows least about. The policy loses all diversity, which the methods of this section need, because their signal comes from differences between samples. And nothing in the objective asks the model to keep what pretraining and instruction tuning gave it: fluency, knowledge, the format of an answer. The policy gradient of this objective, followed long enough, finds the same corner.
+
+<aside class="callout"><strong>Key idea.</strong> Maximize the reward minus $\beta$ times the KL divergence from the reference model. The optimum of this objective is not a jump to the best-scored answer but a tilt of the reference: every response keeps its reference probability, multiplied by $\exp(r/\beta)$. PPO and GRPO are ways to approach that tilted distribution by sampling, because its normalizing constant sums over every possible response and cannot be computed.</aside>
+
+## The KL-regularized objective and its optimum
+
+The objective of RLHF ([Ziegler et al., 2019](#references); [Ouyang et al., 2022](#references)) and of most later methods is
+
+$$
+J_\beta(\pi) = \mathbb E_{x \sim \mathcal D}\Big[\, \mathbb E_{y \sim \pi(\cdot \mid x)}\big[r(x, y)\big] - \beta\, D_{\mathrm{KL}}\big(\pi(\cdot \mid x) \,\|\, \pi_{\text{ref}}(\cdot \mid x)\big) \Big].
+$$
+
+The prompts are independent, so it is enough to maximize the bracket for one $x$; we drop $x$ from the notation. **Step 1: collect both terms under one sum.** Write the expected reward and the KL divergence as sums over responses, and take out $-\beta$:
+
+$$
+\begin{aligned}
+\mathbb E_\pi[r] - \beta D_{\mathrm{KL}}(\pi \,\|\, \pi_{\text{ref}})
+&= \sum_y \pi(y)\, r(y) - \beta \sum_y \pi(y) \log \frac{\pi(y)}{\pi_{\text{ref}}(y)} \\
+&= -\beta \sum_y \pi(y) \Big( \log \frac{\pi(y)}{\pi_{\text{ref}}(y)} - \frac{r(y)}{\beta} \Big) && \text{linearity} \\
+&= -\beta \sum_y \pi(y) \log \frac{\pi(y)}{\pi_{\text{ref}}(y)\, e^{r(y)/\beta}} && \tfrac{r}{\beta} = \log e^{r/\beta} .
+\end{aligned}
+$$
+
+**Step 2: normalize the denominator.** $\pi_{\text{ref}}(y) e^{r(y)/\beta}$ is positive but does not sum to 1. Divide it by $Z = \sum_y \pi_{\text{ref}}(y) e^{r(y)/\beta}$ and call the result $\pi^\star(y)$; then $\pi_{\text{ref}}(y) e^{r(y)/\beta} = Z\, \pi^\star(y)$, and
+
+$$
+\begin{aligned}
+-\beta \sum_y \pi(y) \log \frac{\pi(y)}{Z\, \pi^\star(y)}
+&= -\beta \sum_y \pi(y) \log \frac{\pi(y)}{\pi^\star(y)} + \beta \log Z \sum_y \pi(y) && \log \tfrac{a}{Zb} = \log \tfrac{a}{b} - \log Z \\
+&= -\beta\, D_{\mathrm{KL}}(\pi \,\|\, \pi^\star) + \beta \log Z . && \textstyle\sum_y \pi(y) = 1
+\end{aligned}
+$$
+
+**Step 3: use that a KL divergence is non-negative.** $\beta \log Z$ does not depend on $\pi$, and $D_{\mathrm{KL}}(\pi \,\|\, \pi^\star) \ge 0$ with equality only at $\pi = \pi^\star$ ([Kullback–Leibler divergence](/notes/generative-models/entropy-and-divergences#kullbackleibler-divergence)). The objective is therefore largest at $\pi^\star$, where it equals $\beta \log Z$:
+
+$$
+\boxed{\; \pi^\star(y \mid x) = \frac{1}{Z(x)}\, \pi_{\text{ref}}(y \mid x)\, \exp\!\Big(\frac{r(x, y)}{\beta}\Big), \qquad Z(x) = \sum_y \pi_{\text{ref}}(y \mid x)\, e^{r(x, y)/\beta}, \qquad \max_\pi J_\beta = \mathbb E_x\big[\beta \log Z(x)\big] . \;}
+$$
+
+The derivation needs $\beta > 0$ and a bounded reward, so that $Z$ is finite; responses with $\pi_{\text{ref}}(y) = 0$ keep probability 0, since any mass on them would make the KL divergence infinite. The same result is old in reinforcement learning: relative entropy policy search derives this exponential reweighting of a reference policy ([Peters, Mülling and Altun, 2010](#references)), and Korbak, Perez and Buckley ([2022](#references)) read it as Bayesian inference, with $\pi_{\text{ref}}$ as the prior and $e^{r/\beta}$ as the likelihood of "being a good response".
+
+**Worked example.** The four answers of the baseline, for three values of $\beta$:
+
+| $\beta$ | $\pi^\star$ | $\mathbb E_{\pi^\star}[r]$ | $D_{\mathrm{KL}}(\pi^\star \,\|\, \pi_{\text{ref}})$ | $\beta \log Z$ |
+| --- | --- | --- | --- | --- |
+| 2.0 | (0.409, 0.315, 0.202, 0.074) | 0.449 | 0.023 | 0.4036 |
+| 0.5 | (0.168, 0.274, 0.373, 0.185) | 0.732 | 0.374 | 0.5451 |
+| 0.1 | (0.000, 0.004, 0.288, 0.708) | 1.140 | 2.048 | 0.9349 |
+
+Large $\beta$ keeps the reference almost unchanged; small $\beta$ approaches the plain maximization of the baseline. The last column equals $\mathbb E[r] - \beta D_{\mathrm{KL}}$, as the boxed formula says, and no other distribution over the four answers scores higher (the Code section checks 10,000 random ones). At $\beta = 0.5$ answer 3 is the most likely, although answer 4 scores higher: its reference probability $0.05$ costs more KL than its extra reward is worth.
+
+**Where DPO comes from.** Solve the boxed formula for the reward: $r(x, y) = \beta \log \frac{\pi^\star(y \mid x)}{\pi_{\text{ref}}(y \mid x)} + \beta \log Z(x)$. In the Bradley–Terry likelihood of a preference pair, only the difference $r(x, y_w) - r(x, y_l)$ appears, and $\beta \log Z(x)$ cancels because both responses answer the same prompt. What remains is a loss on the policy alone, the DPO loss of the [instruction-tuning note](/notes/nlp/instruction-tuning#without-a-reward-model-dpo) ([Rafailov et al., 2023](#references)). DPO and the methods below aim at the same $\pi^\star$; DPO fits it offline on a fixed set of pairs, while PPO and GRPO approach it online with samples from the current policy.
+
+**Why not compute $\pi^\star$ directly.** $Z(x)$ sums over every response, $|V|^T$ of them for responses of $T$ tokens. What can be done is to sample responses, score them and move $\pi_\theta$ towards $\pi^\star$, which is reinforcement learning. One identity makes the KL term easy to handle during sampling. The log-ratio of a response is the sum of the log-ratios of its tokens,
+
+$$
+\log \frac{\pi_\theta(y \mid x)}{\pi_{\text{ref}}(y \mid x)} = \sum_{t=1}^{T} \log \frac{\pi_\theta(y_t \mid s_t)}{\pi_{\text{ref}}(y_t \mid s_t)},
+$$
+
+because both probabilities are products over the same tokens. Its expectation under $\pi_\theta$ is the KL divergence, so the KL penalty can be charged token by token.
+
+## PPO for language models: rewards at every token
+
+PPO needs rewards at steps and a critic. For a language model both are built from the pieces above ([Ziegler et al., 2019](#references); [Stiennon et al., 2020](#references); [Ouyang et al., 2022](#references)). The episode is one response; the action at step $t$ is token $y_t$; the transitions are deterministic. The reward of token $t$ is the KL penalty of that token, plus the reward model's score at the last token:
+
+$$
+\boxed{\; r_t = -\beta \log \frac{\pi_\theta(y_t \mid s_t)}{\pi_{\text{ref}}(y_t \mid s_t)} + \mathbb 1[t = T]\; r_\phi(x, y) \;}
+$$
+
+This is equation (2) of DeepSeekMath ([Shao et al., 2024](#references)), which calls it the standard approach. Summed over the response, with the discount $\gamma = 1$ that is usual here, $\sum_t r_t = r_\phi(x, y) - \beta \log \frac{\pi_\theta(y \mid x)}{\pi_{\text{ref}}(y \mid x)}$, and its expectation under $\pi_\theta$ is exactly the bracket of $J_\beta$. PPO on these rewards therefore maximizes the KL-regularized objective.
+
+The critic is a **value head** $V_\psi(s_t)$: a linear layer on top of a transformer, often initialized from the reward model, that reads the prefix and predicts the return still to come. Its TD errors $\delta_t = r_t + V_\psi(s_{t+1}) - V_\psi(s_t)$ feed [generalized advantage estimation](/notes/agents/policy-gradients#generalized-advantage-estimation), and the advantages feed the [clipped objective](/notes/agents/policy-gradients#ppo-a-clipped-objective), summed over tokens.
+
+**Worked example.** A response of four tokens has log-ratios $(0.2, -0.1, 0.5, 0.0)$ against the reference; $\beta = 0.1$; the reward model scores it $1.0$; the value head predicts $(0.6, 0.5, 0.7, 0.9)$ before each token and 0 after the end; $\gamma = 1$, $\lambda = 0.95$.
+
+| token $t$ | 1 | 2 | 3 | 4 |
+| --- | --- | --- | --- | --- |
+| reward $r_t$ | $-0.02$ | $0.01$ | $-0.05$ | $0 + 1.0 = 1.0$ |
+| TD error $\delta_t$ | $-0.02 + 0.5 - 0.6 = -0.12$ | $0.21$ | $0.15$ | $1.0 + 0 - 0.9 = 0.10$ |
+| advantage $\hat A_t = \delta_t + 0.95\, \hat A_{t+1}$ | $0.3006$ | $0.4428$ | $0.245$ | $0.10$ |
+
+The reward model said one number about the whole response. The four different advantages come from the value head, which decides how much of that number each token earned, and from the small per-token penalties. This is the step that is hard to get right for language models: only the last token carries reward, and the value head has to learn the worth of every prefix from that signal alone ([Shao et al., 2024](#references), section 4.1.1). It is also expensive. The value head is usually a model of the size of the policy, so PPO for RLHF keeps four large models in memory: policy, reference, reward model and critic.
+
+## GRPO: the group as the baseline
+
+**Group relative policy optimization** ([Shao et al., 2024](#references)) removes the critic. For each prompt it samples a group of $G$ responses from $\pi_{\text{old}}$, scores them, and uses the group itself as the baseline. With outcome rewards $r_1, \dots, r_G$, every token of response $i$ receives the same advantage, its reward standardized within the group:
+
+$$
+\hat A_{i,t} = \frac{r_i - \operatorname{mean}(r_1, \dots, r_G)}{\operatorname{std}(r_1, \dots, r_G)} .
+$$
+
+The KL penalty moves from the reward into the loss, which keeps the advantages free of it. The objective, maximized by gradient ascent, is
+
+$$
+\boxed{\; J_{\text{GRPO}}(\theta) = \mathbb E_{x,\, \{y_i\} \sim \pi_{\text{old}}}\Bigg[ \frac{1}{G} \sum_{i=1}^{G} \frac{1}{|y_i|} \sum_{t=1}^{|y_i|} \Big( \min\big( \rho_{i,t}\, \hat A_{i,t},\ \operatorname{clip}(\rho_{i,t}, 1 - \varepsilon, 1 + \varepsilon)\, \hat A_{i,t} \big) - \beta\, \hat D_{i,t} \Big) \Bigg] \;}
+$$
+
+with the token ratio $\rho_{i,t} = \pi_\theta(y_{i,t} \mid s_{i,t}) / \pi_{\text{old}}(y_{i,t} \mid s_{i,t})$ and the KL estimate
+
+$$
+\hat D_{i,t} = \frac{\pi_{\text{ref}}(y_{i,t} \mid s_{i,t})}{\pi_\theta(y_{i,t} \mid s_{i,t})} - \log \frac{\pi_{\text{ref}}(y_{i,t} \mid s_{i,t})}{\pi_\theta(y_{i,t} \mid s_{i,t})} - 1 ,
+$$
+
+an estimator of $D_{\mathrm{KL}}(\pi_\theta \,\|\, \pi_{\text{ref}})$ at that token that is unbiased and never negative ([Schulman, 2020](#references)): writing $u = \pi_{\text{ref}}/\pi_\theta$, its mean under $\pi_\theta$ is $\mathbb E[u] - \mathbb E[\log u] - 1 = 1 + D_{\mathrm{KL}} - 1$, and $u - \log u - 1 \ge 0$ for every $u > 0$. For process rewards, one score per reasoning step, DeepSeekMath standardizes the step scores the same way and gives each token the sum of the standardized scores of the steps that end at or after it.
+
+**Worked example.** Six responses to a maths question, checked against the reference answer: $r = (1, 0, 0, 1, 0, 0)$. The mean is $1/3$ and the standard deviation $\sqrt{\tfrac13 \cdot \tfrac23} = 0.471$, so the two correct responses get $\hat A = (1 - \tfrac13)/0.471 = 1.414$ at every token and the four wrong ones $-0.707$. The advantages sum to zero: the group pushes up what beat its own average and pushes down the rest. A group in which all six responses are right, or all six wrong, has standard deviation 0; its advantages are set to 0, and that prompt contributes nothing to the step except through the KL term.
+
+<PpoVsGrpo />
+
+1. **Sample.** The policy writes responses to the prompt: one for PPO, a group of $G$ for GRPO.
+2. **Score.** PPO's reward model scores the response once, and the reference model gives the log-ratio of every token; GRPO scores each response of the group, with a reward model or a verifier.
+3. **Per-token rewards.** PPO turns these into rewards at every token: $-\beta$ times the log-ratio, plus the score at the end.
+4. **Value head.** PPO's critic predicts the value of every prefix.
+5. **Advantages.** PPO computes GAE along the response. GRPO standardizes the rewards within the group and gives every token of a response the same advantage.
+6. **Update.** Both take clipped policy-gradient steps; GRPO adds the KL estimate to the loss instead of the reward.
+
+DeepSeekMath trained DeepSeekMath-Instruct 7B with GRPO on about 144,000 chain-of-thought questions from GSM8K and MATH, with rewards from a learned reward model, a learning rate of $10^{-6}$, $\beta = 0.04$, $G = 64$ responses per question, responses of at most 1,024 tokens, batches of 1,024, and one policy update per batch of samples, so that $\rho = 1$ and the clipping never acted ([Shao et al., 2024](#references), section 4.2). With chain-of-thought prompting and one answer per question, accuracy rose from 82.9 % to 88.2 % on GSM8K and from 46.8 % to 51.7 % on MATH (table 5). The authors also measured Maj@K, the accuracy of a majority vote over $K$ samples, and Pass@K, the share of questions solved by at least one of $K$ samples, at temperature 0.7: RL raised Maj@K but not Pass@K (figure 7). The training made correct answers more likely among those the model could already produce; it did not make new questions solvable. The same paper writes SFT, rejection-sampling fine-tuning, DPO, PPO and GRPO in one form, a sum of $\nabla \log \pi_\theta$ over tokens weighted by a **gradient coefficient**: the methods differ in where the data comes from, what scores it and how the score becomes that weight.
+
+### What the group baseline does in expectation
+
+*Optional depth: an exact formula for GRPO's expected update with right-or-wrong rewards, and the two biases that follow from it. The rest of the note does not depend on it.*
+
+Take one prompt, a reward $r \in \{0, 1\}$, and let $p = \pi_\theta(\text{correct})$ be the probability that a sampled response is right; $\nabla$ is the gradient with respect to $\theta$. Consider one on-policy step, so $\rho = 1$, and leave out the KL term and the $1/|y_i|$ factor. The step is $\frac1G \sum_i \hat A_i \nabla \log \pi_\theta(y_i)$. Let $K$ be the number of correct responses in the group and $m = K/G$.
+
+1. **Condition on $K = k$.** Given $k$, the correct responses are independent draws from $\pi_\theta$ restricted to the correct set $C$, and the wrong ones from its complement.
+2. **The mean score of a correct response.** $\mathbb E[\nabla \log \pi_\theta(y) \mid y \in C] = \sum_{y \in C} \frac{\pi_\theta(y)}{p} \nabla \log \pi_\theta(y) = \frac1p \sum_{y \in C} \nabla \pi_\theta(y) = \frac{\nabla p}{p}$, and in the same way $-\frac{\nabla p}{1 - p}$ for a wrong one.
+3. **The advantages.** The group's mean is $m$ and its standard deviation $\sqrt{m(1 - m)}$, so a correct response gets $(1 - m)/\sqrt{m(1 - m)}$ and a wrong one $-m/\sqrt{m(1 - m)}$.
+4. **Add up.** With $k = Gm$ correct and $G - k = G(1 - m)$ wrong responses,
+
+$$
+\begin{aligned}
+\mathbb E\Big[ \tfrac1G \textstyle\sum_i \hat A_i \nabla \log \pi_\theta(y_i) \,\Big|\, K = k \Big]
+&= \frac{1}{\sqrt{m(1 - m)}} \Big( m (1 - m) \frac{\nabla p}{p} + (1 - m)\, m\, \frac{\nabla p}{1 - p} \Big) \\
+&= \sqrt{m(1 - m)}\; \frac{\nabla p}{p (1 - p)} . && \tfrac1p + \tfrac{1}{1-p} = \tfrac{1}{p(1-p)}
+\end{aligned}
+$$
+
+5. **Average over $K \sim \mathrm{Bin}(G, p)$.** Groups with $k = 0$ or $k = G$ give 0, as the worked example said.
+
+$$
+\boxed{\; \mathbb E\Big[ \tfrac1G \textstyle\sum_i \hat A_i \nabla \log \pi_\theta(y_i) \Big] = c_G(p)\, \nabla p, \qquad c_G(p) = \frac{\mathbb E\big[ \sqrt{m (1 - m)} \big]}{p (1 - p)} . \;}
+$$
+
+In expectation, GRPO climbs the gradient of the success probability, scaled by a factor that depends on how hard the prompt is. Without the division by the standard deviation, the factor is $\mathbb E[m(1 - m)]/(p(1 - p)) = 1 - 1/G$, since $\mathbb E[m(1 - m)] = p(1 - p)(1 - 1/G)$ for a binomial share: the group mean is an ordinary baseline, slightly biased because each response is part of its own baseline. The leave-one-out mean of RLOO removes even that ([Ahmadian et al., 2024](#references)). With the division, for large groups $\sqrt{m(1 - m)} \to \sqrt{p(1 - p)}$ and $c_G(p) \to 1/\sqrt{p(1 - p)}$: prompts that the model nearly always solves, or nearly never, get the largest weight. With $G = 8$, $c_8 = 1.856$ at $p = 0.5$ (the limit is 2), $2.328$ at $p = 0.1$ (limit 3.333) and $2.609$ at $p = 0.01$ (limit 10.05): small groups rarely contain a success on a hard prompt, so the extra weight seldom arrives. Liu et al. ([2025](#references)) call this a **difficulty bias** of the per-question standard deviation, and point to a second one in the factor $1/|y_i|$: a wrong response spreads its negative advantage over more tokens when it is longer, so each of its tokens is pushed down less, and long wrong answers are penalized least. Their Dr. GRPO drops both normalizations.
+
+The KL estimate has a subtlety of its own. Its value is unbiased, but GRPO differentiates it as a loss on sampled tokens. Holding the prefix fixed, the gradient of $u - \log u - 1$ with $u = \pi_{\text{ref}}/\pi_\theta$ is $(1 - u) \nabla \log \pi_\theta(y_t \mid s_t)$, and its mean under $\pi_\theta$ is
+
+$$
+\sum_{w} \pi_\theta(w) \Big( 1 - \frac{\pi_{\text{ref}}(w)}{\pi_\theta(w)} \Big) \nabla \log \pi_\theta(w) = -\sum_w \pi_{\text{ref}}(w)\, \nabla \log \pi_\theta(w) = \nabla D_{\mathrm{KL}}\big(\pi_{\text{ref}} \,\|\, \pi_\theta\big),
+$$
+
+using $\sum_w \pi_\theta(w) \nabla \log \pi_\theta(w) = \nabla \sum_w \pi_\theta(w) = 0$. The term pulls the policy towards the reference, but along the gradient of $D_{\mathrm{KL}}(\pi_{\text{ref}} \,\|\, \pi_\theta)$, the divergence with its arguments swapped, and it ignores how the change of earlier tokens moves the distribution of later prefixes ([Tang and Munos, 2025](#references)). The Code section checks $c_G$ against a simulation and uses this expected KL gradient for the curves below.
+
+## Rewards that a program checks
+
+A learned reward model is the weakest part of RLHF: it can be wrong, and optimization finds where. For tasks with a checkable answer, the reward can instead be computed by a program. Tülu 3 named this **reinforcement learning with verifiable rewards** (RLVR) and trained with it after DPO, using PPO with the KL-regularized objective and a reward of 10 for a verified answer ([Lambert et al., 2024](#references), section 6). DeepSeek-R1-Zero used rule-based rewards alone, an accuracy reward and a format reward, because its authors found that neural reward models were hacked in large-scale RL ([DeepSeek-AI, 2025](#references), section 2.2.2). The protocols are simple:
+
+- **Maths.** The prompt asks for the final answer in a fixed place, for example `\boxed{...}`. The verifier takes the last boxed expression of the response, normalizes it (spaces, `\frac{a}{b}` against `a/b`, a leading `x =`), and compares it with the reference answer, numerically within a tolerance or symbolically. The reward is 1 if they match and 0 otherwise.
+- **Code.** The program runs against unit tests in a sandbox with limits on time and memory ([Coding agents](/notes/agents/coding-agents#sandboxing)). The reward is 1 if every test passes, sometimes the fraction of tests passed, and 0 if the program does not compile or times out.
+- **Format and constraints.** A response must put its reasoning between tags, or follow an instruction that a rule can check, such as "answer in exactly three bullet points".
+
+**Worked example.** The question is the positive root of $x^2 = 9$. The response "… so the answer is $\boxed{3}$" gets 1. The response "… $\boxed{x = 3}$" gets 1 if the normalizer strips `x =` and 0 otherwise, a false negative that adds noise to the reward. The response "… $\boxed{\pm 3}$" gets 0. A false negative only weakens the signal. A false positive is worse, because it is optimized: if the normalizer accepted any boxed expression containing a 3, the policy would learn to write expressions full of threes.
+
+The Code section shows this on a toy. A verifier that checks only the last token of a three-token answer lets 25 of the 125 possible responses pass. After the same training as with the exact verifier, the lenient verifier reports a pass rate of 0.959, while the exact accuracy of the same policy is 0.606, against 0.839 for the policy trained with the exact verifier. The agentic version of this failure, a coding agent that edits the tests instead of the code, is the subject of [Training agents with reinforcement learning](/notes/agents/agentic-rl).
+
+## GRPO on a toy, with its KL
+
+The Code section trains a tiny policy over token sequences. There are 8 questions; each is answered by 3 tokens from a vocabulary of 5, and a verifier accepts only the right answer. The policy is a table of logits for every prefix, the tabular version of a language model, and it starts at a reference policy that finds some answers much likelier than others: the reference solves the 8 questions with probabilities from 0.536 down to 0.0019, 0.191 on average. GRPO samples $G = 8$ responses per question, takes one step per batch with a learning rate of 0.5, and runs for 300 iterations at three values of $\beta$.
+
+<GrpoCurves />
+
+The curves are the expected trajectories, computed with the formula of the previous section instead of sampling; the sampled runs of the Code section follow them closely (0.839, 0.795 and 0.414 at the end, against 0.842, 0.795 and 0.417). Three things are visible:
+
+- **Reward is bought with KL.** Without a penalty, mean accuracy rises from 0.191 to 0.842 while the policy moves 1.81 nats from the reference. With $\beta = 0.1$ it reaches 0.795 at 1.55 nats; with $\beta = 1$ it stops at 0.417 and 0.22 nats. The right panel is the trade-off itself, accuracy against KL, the quantity that the KL-regularized objective prices.
+- **Easy questions are learned first.** Without a penalty, the six easiest questions end between 0.968 and 0.980. The seventh, which the reference solves with probability 0.005, climbs only in the last third of the run, to 0.874, and the mean accuracy steps up when it does.
+- **No success, no signal.** The hardest question starts at $p = 0.0019$. A group of 8 contains at least one success, and so a non-zero advantage, with probability $1 - (1 - p)^8 = 0.015$. After 300 iterations its accuracy is 0.007 without a penalty. Reinforcement learning with outcome rewards can only reinforce what the policy already does sometimes, which is why it is run after pretraining and SFT, and why the choice of training questions, hard but not hopeless, matters as much as the algorithm.
+
+## Overoptimization: when the proxy keeps rising
+
+A learned reward model is a proxy for what people want. Optimizing a proxy too hard makes the true objective worse, an instance of Goodhart's law. Gao, Schulman and Hilton ([2023](#references)) measured this without human labellers: a 6 B-parameter reward model from InstructGPT played the role of the "gold" reward, labelled comparisons, and proxy reward models from 3 M to 3 B parameters were trained on those labels. A policy, initialized from an SFT model, was optimized against a proxy by best-of-$n$ sampling or by PPO, and its gold score was tracked against $d = \sqrt{D_{\mathrm{KL}}(\pi \,\|\, \pi_{\text{init}})}$. The gold score first rose, then fell, while the proxy kept rising, and the curves fitted two forms:
+
+$$
+R_{\text{bon}}(d) = d\, (\alpha_{\text{bon}} - \beta_{\text{bon}}\, d), \qquad R_{\text{RL}}(d) = d\, (\alpha_{\text{RL}} - \beta_{\text{RL}} \log d),
+$$
+
+with coefficients that changed smoothly with the size of the proxy model: larger proxies peak later and higher. Measured by KL, RL optimized and overoptimized more slowly than best-of-$n$. In their PPO runs, a KL penalty raised the proxy score reached at a given KL but did not improve the gold score at a given KL; the authors note that this may depend on hyperparameters.
+
+**The KL of best-of-$n$.** Best-of-$n$ draws $n$ responses and keeps the one with the highest proxy score. If the scores have a continuous distribution with CDF $F$ under $\pi$, the kept response has density $n F(s)^{n-1}$ times that of $\pi$: the chosen one has score $s$ and the other $n - 1$ score less. Its KL divergence from $\pi$ is the mean log of that ratio, $\mathbb E[\log n + (n - 1) \log F(S)]$, where $S$ is the kept score. $F(S)$ is distributed as the largest of $n$ uniform variables, with density $n u^{n-1}$ on $[0, 1]$, so $\mathbb E[\log F(S)] = \int_0^1 n u^{n-1} \log u \, du = -1/n$, and
+
+$$
+D_{\mathrm{KL}}(\pi_{\text{bon}} \,\|\, \pi) = \log n - \frac{n - 1}{n},
+$$
+
+the formula Gao et al. use. Best-of-16 is $1.835$ nats from the policy it samples from; best-of-64, $3.17$.
+
+**On a toy, exactly.** Let 98 % of responses have a gold quality $g \sim \mathcal N(0, 1)$ and a proxy score $g + \mathcal N(0, 0.5^2)$, a good but noisy reward model. The other 2 % are exploits: their gold quality is $-1$, and their proxy scores are spread as $\mathcal N(0, 2^2)$, because the proxy cannot tell them apart from good responses. With a mean proxy score of 0 they rarely win among a few samples; among many, the widest-spread scores win the top place. The Code section computes the gold and proxy scores of best-of-$n$ exactly, by integrating over the kept score:
+
+<Overoptimization />
+
+The gold score rises from $-0.02$ to a peak of $1.747$ near $n = 96$, where the KL is 3.57 nats, and falls to $-0.835$ at $n = 16{,}384$, while the proxy rises the whole time, to $5.82$. Nothing is wrong with the reward model on typical responses. Optimization reaches the rare responses on which it is wrong, and the harder it optimizes, the more of what it selects comes from there.
+
+The practical defences follow: limit the optimization by $\beta$ or by early stopping, chosen on an evaluation that does not use the proxy; retrain the reward model on samples of the current policy, as iterative GRPO does, with 10 % of old data replayed ([Shao et al., 2024](#references), section 4.1.4); and replace the learned reward by a verifier wherever an answer can be checked.
+
+<aside class="callout"><strong>Check yourself.</strong> (1) With $\pi_{\text{ref}} = (0.5, 0.5)$ and rewards $(0, 1)$, what is $\pi^\star$ at $\beta = 1$? (2) A group of four has rewards $(1, 1, 1, 0)$. What are GRPO's advantages? (3) Why does a prompt that the policy always solves contribute no policy gradient in GRPO, and why is that not a problem? (4) How far, in nats, is best-of-4 from the policy it samples from?<details><summary>Answers</summary>(1) The weights are $0.5$ and $0.5e$, so $\pi^\star = (1/(1 + e), e/(1 + e)) = (0.269, 0.731)$. (2) Mean $0.75$, standard deviation $\sqrt{0.75 \cdot 0.25} = 0.433$: $+0.577$ for the three correct responses and $-1.732$ for the wrong one. (3) All rewards are equal, so the standard deviation is 0 and every advantage is 0. The expected gradient is $c_G(p)\nabla p$, and at $p = 1$ there is nothing left to gain: the prompt is solved. The cost is computational: its samples were generated for nothing, which is why such prompts are often filtered out. (4) $\log 4 - 3/4 = 0.636$.</details></aside>
+
+## What changed
+
+| | SFT | RLHF with PPO | GRPO with verifiable rewards |
+| --- | --- | --- | --- |
+| signal | demonstrations | a learned reward model | a program that checks the answer |
+| data | fixed | sampled from the current policy | sampled, $G$ responses per prompt |
+| baseline | none | a value head, as large as the policy | the group's mean reward |
+| credit per token | every target token alike | GAE along the response | the same advantage for every token |
+| KL to the reference | implicit, by starting there | a penalty in every token's reward | an estimate in the loss |
+| models in memory | 1 | 4 | 2 (or 3 with a reward model) |
+| what limits it | the demonstrations | reward hacking of $r_\phi$ | tasks must be checkable |
+
+## Limitations
+
+- **The reward is the objective.** Whatever the reward model or the verifier gets wrong, the policy learns. A learned reward is overoptimized; a verifier is exploited through its false positives.
+- **Outcome rewards are sparse.** One number per response, however long, and none at all from a group that is all right or all wrong; hard prompts teach nothing until the policy succeeds on them by chance.
+- **RL sharpens more than it expands.** In DeepSeekMath, RL improved majority voting but not the share of questions solved by some sample; later studies make the same point for RLVR at large numbers of samples, discussed in the [next note](/notes/agents/reasoning-models).
+- **Many choices are heuristics.** The per-question standard deviation, the $1/|y_i|$ factor and the KL estimator each bias the update in measurable ways.
+- **The KL coefficient is a guess.** Neither the theory nor the measurements give a $\beta$; it is set by watching an evaluation that the optimization does not see.
+- **Not every task has a checker.** Writing, advice and most conversations still need learned rewards or preferences, with their failure modes.
+
+## What you should remember
+
+- RLHF maximizes $\mathbb E[r] - \beta D_{\mathrm{KL}}(\pi \,\|\, \pi_{\text{ref}})$. Its optimum is $\pi^\star \propto \pi_{\text{ref}} \exp(r/\beta)$, worth $\beta \log Z$: a tilt of the reference, derived by rewriting the objective as $-\beta D_{\mathrm{KL}}(\pi \,\|\, \pi^\star) + \beta \log Z$. Solving it for $r$ and substituting into Bradley–Terry gives DPO.
+- The sequence log-ratio is a sum of token log-ratios, so PPO charges $-\beta \log(\pi_\theta/\pi_{\text{ref}})$ at every token and adds the reward model's score at the last; a value head turns this into per-token advantages with GAE.
+- GRPO samples $G$ responses per prompt, standardizes their rewards within the group and gives every token that advantage; the KL estimate $u - \log u - 1$ goes into the loss. No critic is needed.
+- In expectation, GRPO with right-or-wrong rewards follows $c_G(p) \nabla p$; the standard deviation reweights prompts by difficulty, and groups with no success give no signal.
+- Verifiable rewards replace a learned reward by a check of the answer: an extracted maths answer, unit tests, a format rule. Their false positives are optimized like any other reward.
+- Optimizing a learned proxy raises the true score and then lowers it; best-of-$n$ moves $\log n - (n - 1)/n$ nats from the policy. Limit the optimization with an evaluation the proxy does not see.
+
+## Code
+
+Seven parts in NumPy: the KL-regularized optimum checked against random policies; PPO's per-token rewards and GAE on the worked example; GRPO's advantages and the factor $c_G(p)$ checked by simulation; GRPO on a tabular policy over token sequences with a verifier and the KL estimate as a loss, at three values of $\beta$; the same training in expectation, which gives the curves of the figure; a lenient verifier; and the exact overoptimization curve of best-of-$n$. With a real model, the table of logits becomes a transformer, the verifier parses generated text, and every sum over the 125 responses becomes an average over samples; the advantages, the loss and the KL estimate are computed as written. Seeds are fixed; exact numbers can differ slightly across platforms and library versions. The script runs in about twelve seconds.
+
+```python
+import numpy as np
+from itertools import product
+from math import comb, erf, log, sqrt, pi as PI
+
+# 1. the KL-regularized optimum: pi* = pi_ref exp(r / beta) / Z, worth beta log Z
+pi_ref = np.array([0.50, 0.30, 0.15, 0.05])
+r = np.array([0.0, 0.5, 1.0, 1.2])                          # answer 4 is the one the reward model overrates
+def J(pi, beta): return pi @ r - beta * (pi @ np.log(pi / pi_ref))
+others = np.random.default_rng(0).dirichlet(np.ones(4), 10_000)
+for beta in (2.0, 0.5, 0.1):
+    w = pi_ref * np.exp(r / beta); star = w / w.sum()
+    print(beta, star.round(3), round(J(star, beta), 4), round(beta * log(w.sum()), 4),
+          all(J(q, beta) < J(star, beta) for q in others))
+# 2.0 [0.409 0.315 0.202 0.074] 0.4036 0.4036 True
+# 0.5 [0.168 0.274 0.373 0.185] 0.5451 0.5451 True
+# 0.1 [0.    0.004 0.288 0.708] 0.9349 0.9349 True
+
+# 2. PPO's token rewards: -beta * log-ratio at every token, plus the reward model's score at the last one; then GAE
+log_ratio = np.array([0.2, -0.1, 0.5, 0.0]); beta, score = 0.1, 1.0
+rewards = -beta * log_ratio; rewards[-1] += score
+V = np.array([0.6, 0.5, 0.7, 0.9, 0.0])                     # the value head at each prefix; 0 after the end
+delta = rewards + V[1:] - V[:-1]                            # gamma = 1
+adv, g = np.zeros(4), 0.0
+for t in (3, 2, 1, 0): g = delta[t] + 0.95 * g; adv[t] = g   # lambda = 0.95
+print(rewards.round(3), delta.round(3), adv.round(4))
+# [-0.02  0.01 -0.05  1.  ] [-0.12  0.21  0.15  0.1 ] [0.3006 0.4428 0.245  0.1   ]
+
+# 3. GRPO's group-relative advantages, and what they do in expectation for 0/1 rewards
+def group_adv(rw):
+    s = rw.std()                                            # the population standard deviation of the group
+    return np.zeros_like(rw) if s == 0 else (rw - rw.mean()) / s
+print(group_adv(np.array([1., 0, 0, 1, 0, 0])).round(3), group_adv(np.zeros(6)))
+# [ 1.414 -0.707 -0.707  1.414 -0.707 -0.707] [0. 0. 0. 0. 0. 0.]
+def c_G(p, G):                                              # E[(1/G) sum_i A_i grad log pi(y_i)] = c_G(p) grad p
+    return sum(comb(G, k) * p**k * (1 - p)**(G - k) * sqrt(k / G * (1 - k / G)) for k in range(1, G)) / (p * (1 - p))
+rng = np.random.default_rng(1)
+for p in (0.5, 0.1, 0.01):
+    # a two-outcome softmax: the score of a correct sample is (1 - p), of a wrong one -p, and dp/dlogit = p (1 - p)
+    est = np.mean([group_adv(y) @ (y - p) / 8 for y in (1.0 * (rng.random((200_000, 8)) < p))])
+    print(p, round(c_G(p, 8), 3), round(est / (p * (1 - p)), 3), round(1 / sqrt(p * (1 - p)), 3))
+# 0.5 1.856 1.856 2.0
+# 0.1 2.328 2.327 3.333
+# 0.01 2.609 2.616 10.05
+
+# 4. a tiny policy over token sequences: 8 questions, each answered by 3 tokens from a vocabulary of 5;
+#    the verifier accepts exactly the right answer; the reference policy finds some answers far likelier than others
+VOC, L, NQ, G = 5, 3, 8, 8
+NODES = [h for l in range(L) for h in product(range(VOC), repeat=l)]   # every prefix is a state of the token MDP
+NI = {h: i for i, h in enumerate(NODES)}
+SEQS = list(product(range(VOC), repeat=L))
+ANS = [((3 * q + 1) % VOC, (q + 2) % VOC, (2 * q + 3) % VOC) for q in range(NQ)]
+BONUS = [3.0, 2.5, 2.0, 1.6, 1.2, 0.8, 0.4, 0.0]                       # how strongly the reference prefers the answer
+def softmax(z):
+    e = np.exp(z - z.max(-1, keepdims=True)); return e / e.sum(-1, keepdims=True)
+def reference(q):
+    z = np.array([[0.8 * np.sin(1.3 * i + 2.1 * v + 0.7 * q) for v in range(VOC)] for i in range(len(NODES))])
+    for t in range(L): z[NI[ANS[q][:t]], ANS[q][t]] += BONUS[q]
+    return z
+REF = [reference(q) for q in range(NQ)]
+def seq_prob(pi, y): return np.prod([pi[NI[y[:t]], y[t]] for t in range(L)])
+def stats(z, q):                                   # exact accuracy and exact KL(pi || pi_ref) over all 125 responses
+    pi, pr = softmax(z), softmax(REF[q])
+    P = np.array([seq_prob(pi, y) for y in SEQS]); R = np.array([seq_prob(pr, y) for y in SEQS])
+    return float(P[SEQS.index(ANS[q])]), float(P @ np.log(P / R))
+print([round(stats(REF[q], q)[0], 4) for q in range(NQ)])
+# [0.5355, 0.5112, 0.221, 0.1531, 0.081, 0.0215, 0.0051, 0.0019]
+
+def sample(pi, rng):
+    y = ()
+    for t in range(L): y += (int(rng.choice(VOC, p=pi[NI[y]])),)
+    return y
+def grpo(beta, verifier, iters=300, lr=0.5, seed=0):
+    rng, Z, log = np.random.default_rng(seed), [r.copy() for r in REF], []
+    for it in range(iters + 1):
+        if it % 50 == 0:
+            s = [stats(Z[q], q) for q in range(NQ)]
+            log.append((it, round(float(np.mean([a for a, _ in s])), 3), round(float(np.mean([k for _, k in s])), 2)))
+        for q in range(NQ):
+            pi, pr = softmax(Z[q]), softmax(REF[q])
+            ys = [sample(pi, rng) for _ in range(G)]
+            A = group_adv(np.array([1.0 * verifier(y, q) for y in ys]))   # the verifier, then the group baseline
+            grad = np.zeros_like(Z[q])
+            for y, a in zip(ys, A):
+                for t in range(L):
+                    i = NI[y[:t]]
+                    score = -pi[i].copy(); score[y[t]] += 1                 # d log pi(y_t | prefix) / d logits
+                    rho = pr[i, y[t]] / pi[i, y[t]]                        # k3 = rho - log rho - 1, used as a loss
+                    grad[i] += (a - beta * (1 - rho)) * score / (G * L)     # 1/G over the group, 1/|o| over tokens
+            Z[q] += lr * grad                                              # one step per batch, so the ratio is 1
+    return log, Z
+exact = lambda y, q: y == ANS[q]
+for beta in (0.0, 0.1, 1.0):
+    print(beta, grpo(beta, exact)[0])
+# 0.0 [(0, 0.191, 0.0), (50, 0.471, 0.35), (100, 0.602, 0.73), (150, 0.692, 1.07), (200, 0.728, 1.24), (250, 0.797, 1.56), (300, 0.839, 1.79)]
+# 0.1 [(0, 0.191, 0.0), (50, 0.456, 0.32), (100, 0.577, 0.64), (150, 0.661, 0.94), (200, 0.696, 1.08), (250, 0.741, 1.28), (300, 0.795, 1.55)]
+# 1.0 [(0, 0.191, 0.0), (50, 0.348, 0.11), (100, 0.388, 0.17), (150, 0.396, 0.18), (200, 0.41, 0.21), (250, 0.413, 0.22), (300, 0.414, 0.22)]
+#     (iteration, mean accuracy over the 8 questions, mean KL to the reference in nats)
+
+# 5. the same training in expectation, without sampling: the curves of the figure
+def visits(pi):                                    # probability that a response passes through each prefix
+    return np.array([np.prod([pi[NI[h[:t]], h[t]] for t in range(len(h))]) for h in NODES])
+def grpo_expected(beta, iters=300, lr=0.5):
+    Z, log = [r.copy() for r in REF], []
+    for it in range(iters + 1):
+        s = [stats(Z[q], q) for q in range(NQ)]
+        log.append((float(np.mean([a for a, _ in s])), float(np.mean([k for _, k in s])), [a for a, _ in s]))
+        for q in range(NQ):
+            pi, pr, p = softmax(Z[q]), softmax(REF[q]), s[q][0]
+            grad = -beta / L * visits(pi)[:, None] * (pi - pr)            # the expected gradient of the k3 term
+            for t in range(L):                                            # c_G(p) grad p / L, on the answer's path
+                i = NI[ANS[q][:t]]; e = np.zeros(VOC); e[ANS[q][t]] = 1
+                grad[i] += c_G(p, G) * p * (e - pi[i]) / L
+            Z[q] += lr * grad
+    return log
+for beta in (0.0, 0.1, 1.0):
+    lg = grpo_expected(beta)
+    print(beta, [(it, round(lg[it][0], 3), round(lg[it][1], 2)) for it in (0, 100, 200, 300)], np.round(lg[-1][2], 3))
+# 0.0 [(0, 0.191, 0.0), (100, 0.641, 0.87), (200, 0.731, 1.25), (300, 0.842, 1.81)] [0.98  0.979 0.978 0.977 0.975 0.968 0.874 0.007]
+# 0.1 [(0, 0.191, 0.0), (100, 0.61, 0.75), (200, 0.699, 1.1), (300, 0.795, 1.55)] [0.967 0.965 0.946 0.937 0.925 0.9   0.716 0.005]
+# 1.0 [(0, 0.191, 0.0), (100, 0.392, 0.17), (200, 0.413, 0.21), (300, 0.417, 0.22)] [0.82  0.802 0.575 0.493 0.386 0.231 0.027 0.003]
+
+# 6. a lenient verifier that checks only the last token: 25 of the 125 responses pass
+lenient = lambda y, q: y[-1] == ANS[q][-1]
+_, Z = grpo(0.0, lenient)
+pis = [softmax(z) for z in Z]
+print(round(np.mean([sum(seq_prob(pis[q], y) for y in SEQS if lenient(y, q)) for q in range(NQ)]), 3),
+      round(np.mean([seq_prob(pis[q], ANS[q]) for q in range(NQ)]), 3))
+# 0.959 0.606      (what the lenient verifier reports; the accuracy an exact check would report)
+
+# 7. overoptimization under best-of-n, computed exactly: 98% of responses have gold quality g ~ N(0, 1) and a proxy
+#    score g + N(0, 0.5^2); 2% are exploits with gold -1 and a proxy score ~ N(0, 2^2) that the proxy cannot tell apart
+Phi = np.vectorize(lambda x: 0.5 * (1 + erf(x / sqrt(2))))
+def normal(x, m, s): return np.exp(-0.5 * ((x - m) / s) ** 2) / (s * sqrt(2 * PI))
+s = np.linspace(-10, 14, 24001); ds = s[1] - s[0]
+h, sn = 0.02, sqrt(1 + 0.5 ** 2)
+fN, fE = normal(s, 0, sn), normal(s, 0, 2.0)
+F = (1 - h) * Phi(s / sn) + h * Phi(s / 2.0)       # the CDF of the proxy score of one response
+def best_of(n):                                    # the selected score has density n f(s) F(s)^(n-1)
+    w = n * F ** (n - 1) * ds
+    gold = ((1 - h) * fN * s / sn**2 - h * fE) @ w  # E[g | proxy s] = s / 1.25 for an honest response
+    proxy = ((1 - h) * fN + h * fE) * s @ w
+    return log(n) - (n - 1) / n, gold, proxy        # KL(best-of-n || pi) = log n - (n - 1)/n
+for n in (1, 4, 16, 64, 96, 256, 1024, 4096, 16384):
+    kl, gold, proxy = best_of(n)
+    print(f'n {n:5d}  KL {kl:4.2f}  gold {gold:6.3f}  proxy {proxy:5.3f}')
+# n     1  KL 0.00  gold -0.020  proxy 0.000
+# n     4  KL 0.64  gold  0.869  proxy 1.172
+# n    16  KL 1.84  gold  1.441  proxy 2.027
+# n    64  KL 3.17  gold  1.730  proxy 2.736
+# n    96  KL 3.57  gold  1.747  proxy 2.932
+# n   256  KL 4.55  gold  1.619  proxy 3.406
+# n  1024  KL 5.93  gold  0.930  proxy 4.128
+# n  4096  KL 7.32  gold -0.149  proxy 4.951
+# n 16384  KL 8.70  gold -0.835  proxy 5.820
+```
+
+## Next
+
+Everything here trains a model to produce better single responses: a maths answer, a program, a reply. The most visible result of this machinery came when the response was allowed to grow. Trained with verifiable rewards on hard problems, models learned to write chains of thought thousands of tokens long, to check and revise themselves inside them, and to get better the longer they think. The [next note](/notes/agents/reasoning-models) follows that line, from OpenAI's o1 and DeepSeek-R1 to the ways of spending computation at inference time: best-of-$n$, voting, sequential revision, process reward models and their compute-optimal mix.
+
+## References
+
+- D. M. Ziegler, N. Stiennon, J. Wu, T. B. Brown, A. Radford, D. Amodei, P. Christiano, G. Irving. [Fine-tuning language models from human preferences](https://arxiv.org/abs/1909.08593). arXiv, 2019. The KL penalty in the reward.
+- N. Stiennon et al. [Learning to summarize from human feedback](https://arxiv.org/abs/2009.01325). NeurIPS, 2020.
+- L. Ouyang et al. [Training language models to follow instructions with human feedback](https://arxiv.org/abs/2203.02155). NeurIPS, 2022.
+- J. Schulman, F. Wolski, P. Dhariwal, A. Radford, O. Klimov. [Proximal policy optimization algorithms](https://arxiv.org/abs/1707.06347). arXiv, 2017.
+- J. Schulman, P. Moritz, S. Levine, M. Jordan, P. Abbeel. [High-dimensional continuous control using generalized advantage estimation](https://arxiv.org/abs/1506.02438). ICLR, 2016.
+- J. Peters, K. Mülling, Y. Altun. [Relative entropy policy search](https://ojs.aaai.org/index.php/AAAI/article/view/7727). AAAI, 2010.
+- T. Korbak, E. Perez, C. L. Buckley. [RL with KL penalties is better viewed as Bayesian inference](https://arxiv.org/abs/2205.11275). Findings of EMNLP, 2022.
+- R. Rafailov, A. Sharma, E. Mitchell, S. Ermon, C. D. Manning, C. Finn. [Direct preference optimization: your language model is secretly a reward model](https://arxiv.org/abs/2305.18290). NeurIPS, 2023.
+- Z. Shao et al. [DeepSeekMath: pushing the limits of mathematical reasoning in open language models](https://arxiv.org/abs/2402.03300). arXiv, February 2024. Section 4.1 (PPO's per-token KL, equation 2; GRPO, equations 3 and 4; outcome and process supervision; iterative RL), section 4.2 and table 5 (setup and results), section 5.2 (the unified paradigm; Maj@K and Pass@K, figure 7).
+- J. Schulman. [Approximating KL divergence](http://joschu.net/blog/kl-approx.html). Blog post, 2020. The estimator $u - \log u - 1$.
+- A. Ahmadian et al. [Back to basics: revisiting REINFORCE style optimization for learning from human feedback in LLMs](https://arxiv.org/abs/2402.14740). ACL, 2024. RLOO, the leave-one-out baseline.
+- Z. Liu, C. Chen, W. Li, P. Qi, T. Pang, C. Du, W. S. Lee, M. Lin. [Understanding R1-Zero-like training: a critical perspective](https://arxiv.org/abs/2503.20783). COLM, 2025. The length and difficulty biases of GRPO; Dr. GRPO.
+- Y. Tang, R. Munos. [On a few pitfalls in KL divergence gradient estimation for RL](https://arxiv.org/abs/2506.09477). arXiv, June 2025.
+- N. Lambert et al. [Tülu 3: pushing frontiers in open language model post-training](https://arxiv.org/abs/2411.15124). arXiv, November 2024. Section 6, reinforcement learning with verifiable rewards.
+- DeepSeek-AI. [DeepSeek-R1: incentivizing reasoning capability in LLMs via reinforcement learning](https://arxiv.org/abs/2501.12948). arXiv, January 2025. Section 2.2.2, rule-based rewards.
+- L. Gao, J. Schulman, J. Hilton. [Scaling laws for reward model overoptimization](https://arxiv.org/abs/2210.10760). ICML, 2023. Section 2 (the synthetic setup; the KL of best-of-$n$), the functional forms and their coefficients.
+- R. S. Sutton, A. G. Barto. [*Reinforcement Learning: An Introduction*](http://incompleteideas.net/book/the-book-2nd.html), 2nd ed. MIT Press, 2018. Chapter 13.
+- S. Levine. [CS285: Deep Reinforcement Learning](https://rail.eecs.berkeley.edu/deeprlcourse/). University of California, Berkeley. Lectures on policy gradients and on RL for language models.

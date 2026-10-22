@@ -1,0 +1,468 @@
+---
+title: Policy gradients and actor-critic
+description: "Optimizing a stochastic policy directly: the policy gradient theorem derived with the log-derivative trick, REINFORCE and why baselines keep it unbiased, advantages, actor-critic and GAE, trust regions, TRPO and PPO's clipped objective, and the entropy bonus."
+course: agents
+section: Reinforcement Learning
+order: 6
+status: published
+tags: [reinforcement-learning, policy-gradient, reinforce, baseline, actor-critic, advantage, gae, trpo, ppo, entropy-bonus]
+prerequisites: [Q-learning and temporal-difference learning, Deep Q-networks, Gradient descent]
+---
+
+import ShortCorridor from '../../../components/figures/policy-gradients/ShortCorridor.astro';
+import ActorCriticLoop from '../../../components/figures/policy-gradients/ActorCriticLoop.astro';
+import PpoClip from '../../../components/figures/policy-gradients/PpoClip.astro';
+
+[Deep Q-networks](/notes/agents/deep-q-networks) learn values and act by taking the action with the largest one. That works for 18 joystick positions. It does not work for the torques of a robot arm, where the maximum over a continuous action is itself an optimization problem, and it does not work for a language model, whose output at every step is a probability distribution over a vocabulary of tens of thousands of tokens, and whose distribution, not some value table behind it, is the thing to train. This note drops the detour through values and adjusts the parameters of a stochastic policy directly, in the direction that increases the expected return. It derives that direction, the policy gradient, step by step; reduces its variance with baselines and a learned critic; and makes the steps safe with trust regions, ending with PPO, the algorithm that also trains language models from human feedback.
+
+**Notation.** As in the previous notes. $\pi_\theta(a \mid s)$ is a stochastic policy with parameters $\theta$, for example a softmax over the outputs of a network. A **trajectory** $\tau = (s_0, a_0, r_1, s_1, a_1, r_2, \dots, s_T)$ is one episode; $p_\theta(\tau)$ is its probability under $\pi_\theta$ and the environment, and $\rho_0$ is the distribution of $s_0$. We write $r_{t+1}$ for the reward after $a_t$, $R(\tau) = \sum_{t=0}^{T-1} \gamma^t r_{t+1}$ for the return of the episode and $G_t = \sum_{k=t}^{T-1} \gamma^{k-t} r_{k+1}$ for the **reward-to-go** from step $t$. The objective is $J(\theta) = \mathbb E_{\tau \sim p_\theta}[R(\tau)]$. $A^\pi(s, a) = Q^\pi(s, a) - V^\pi(s)$ is the **advantage**, $b(s)$ a baseline, $V_w$ a learned critic with parameters $w$, and $\nabla$ without a subscript is the gradient with respect to $\theta$.
+
+## Baseline: acting greedily on learned values
+
+A value-based agent acts by $\arg\max_a Q(s, a)$. Three things go wrong with that.
+
+- **Continuous actions.** The maximum over a real-valued action needs an inner optimization at every step and in every target.
+- **Discontinuity.** A tiny change in two nearly equal Q-values flips the greedy action, so the policy jumps while the values move smoothly. Small learning steps do not mean small changes in behaviour.
+- **Deterministic policies can be wrong.** When the agent cannot tell states apart, the best policy may have to be random, and a greedy policy can only be randomized by an exploration rule that knows nothing about the task.
+
+The last point has a clean small example, the **short corridor** of [Sutton and Barto (2018)](#references), example 13.1. Three states in a row lead to a goal on the right, each step costs $-1$, and in the middle state the actions are swapped: "right" moves left and "left" moves right. Moving left from the first state stays in place. The agent's features are the same in all three states, so whatever it does, it does everywhere: its policy is one number, $p = \Pr(\text{right})$.
+
+With $V_0, V_1, V_2$ the values of the three states, the Bellman expectation equations are
+
+$$
+V_0 = -1 + p V_1 + (1 - p) V_0, \qquad V_1 = -1 + p V_0 + (1 - p) V_2, \qquad V_2 = -1 + (1 - p) V_1 .
+$$
+
+The first gives $V_0 = V_1 - 1/p$. Substituting it and the third into the second, $V_1 = -1 + p V_1 - 1 - (1 - p) + (1 - p)^2 V_1$, so $p(1 - p) V_1 = p - 3$, and
+
+$$
+J(p) = V_0 = \frac{p - 3}{p(1 - p)} - \frac1p = -\frac{2(2 - p)}{p (1 - p)} .
+$$
+
+Setting the derivative to zero gives $p^2 - 4p + 2 = 0$, so $p^\star = 2 - \sqrt 2 \approx 0.586$ and $J(p^\star) = -(6 + 4\sqrt 2) \approx -11.66$. The deterministic policies, $p = 0$ and $p = 1$, never reach the goal. An ε-greedy agent with $\varepsilon = 0.1$ can only choose $p = 0.05$ or $p = 0.95$, worth $-82.1$ and $-44.2$. A parametrized stochastic policy can represent $p^\star$, and gradient ascent on $J$ can find it.
+
+## The policy gradient theorem
+
+The objective is an expectation over trajectories whose distribution depends on $\theta$. Differentiating it looks hopeless at first: changing $\theta$ changes which states are visited, through dynamics that the agent does not know. The **log-derivative trick** removes that difficulty. For any probability $p_\theta(x) > 0$,
+
+$$
+\nabla p_\theta(x) = p_\theta(x)\, \frac{\nabla p_\theta(x)}{p_\theta(x)} = p_\theta(x)\, \nabla \log p_\theta(x),
+$$
+
+by the chain rule for the logarithm. Applied to the objective, with a sum over trajectories (an integral works the same way when exchanging derivative and integral is allowed):
+
+$$
+\begin{aligned}
+\nabla J(\theta) &= \nabla \sum_\tau p_\theta(\tau)\, R(\tau) = \sum_\tau \nabla p_\theta(\tau)\, R(\tau) && R(\tau) \text{ does not depend on } \theta \\
+&= \sum_\tau p_\theta(\tau)\, \nabla \log p_\theta(\tau)\, R(\tau) && \text{log-derivative trick} \\
+&= \mathbb E_{\tau \sim p_\theta}\big[ \nabla \log p_\theta(\tau)\, R(\tau) \big]. && \text{definition of the expectation}
+\end{aligned}
+$$
+
+The gradient of an expectation has become an expectation of something we can sample: run the policy, record the trajectory, and average. What remains is $\nabla \log p_\theta(\tau)$. The probability of a trajectory is a product, so its logarithm is a sum:
+
+$$
+\begin{aligned}
+\log p_\theta(\tau) &= \log \rho_0(s_0) + \sum_{t=0}^{T-1} \Big( \log \pi_\theta(a_t \mid s_t) + \log P(s_{t+1} \mid s_t, a_t) \Big), \\
+\nabla \log p_\theta(\tau) &= \sum_{t=0}^{T-1} \nabla \log \pi_\theta(a_t \mid s_t) . && \rho_0 \text{ and } P \text{ do not depend on } \theta
+\end{aligned}
+$$
+
+The unknown dynamics drop out: their probabilities multiply the trajectory's probability, but they do not depend on $\theta$, so their logarithms have zero gradient. Only the policy's own log-probabilities, which the agent can compute, remain.
+
+One more step removes useless noise. The term $\nabla \log \pi_\theta(a_t \mid s_t)$ is multiplied by the whole return, including rewards received *before* $a_t$, which $a_t$ cannot have caused. Their contribution is zero on average. Conditioned on everything up to $s_t$, the earlier reward $r_{k+1}$, $k < t$, is fixed, and the remaining factor has expectation
+
+$$
+\mathbb E_{a_t \sim \pi_\theta(\cdot \mid s_t)}\big[ \nabla \log \pi_\theta(a_t \mid s_t) \big] = \sum_a \pi_\theta(a \mid s_t)\, \frac{\nabla \pi_\theta(a \mid s_t)}{\pi_\theta(a \mid s_t)} = \nabla \sum_a \pi_\theta(a \mid s_t) = \nabla 1 = 0 .
+$$
+
+The **score** $\nabla \log \pi_\theta$ has mean zero, so each action needs only the rewards that come after it: $\sum_{k \ge t} \gamma^k r_{k+1} = \gamma^t G_t$. The result is the policy gradient in the form used by every algorithm below:
+
+$$
+\boxed{\; \nabla J(\theta) = \mathbb E_{\tau \sim p_\theta}\Big[ \sum_{t=0}^{T-1} \gamma^t\, G_t\, \nabla \log \pi_\theta(a_t \mid s_t) \Big] \;}
+$$
+
+Since $\mathbb E[G_t \mid s_t, a_t] = Q^{\pi_\theta}(s_t, a_t)$ by the law of total expectation, $G_t$ can be replaced by $Q^{\pi_\theta}(s_t, a_t)$ without changing the expectation. Grouping the terms by state gives the **policy gradient theorem** of [Sutton, McAllester, Singh and Mansour (2000)](#references):
+
+$$
+\nabla J(\theta) = \sum_s d^{\pi}(s) \sum_a \pi_\theta(a \mid s)\, Q^{\pi}(s, a)\, \nabla \log \pi_\theta(a \mid s), \qquad d^\pi(s) = \sum_{t \ge 0} \gamma^t \Pr(s_t = s),
+$$
+
+with $d^\pi$ the discounted visitation of states. Its message: the gradient does not involve the derivative of the state distribution, even though the state distribution depends on $\theta$. Implementations usually drop the factor $\gamma^t$ and weight all steps equally; the result is then not exactly the gradient of $J$ ([Thomas, 2014](#references); [Nota and Thomas, 2020](#references)), though it works well in practice.
+
+<aside class="callout"><strong>Key idea.</strong> To increase the expected return, make the actions that were followed by high returns more probable and those followed by low returns less probable, in proportion to how much better or worse they did. The log-derivative trick turns this into an unbiased gradient estimate that needs only the policy's own log-probabilities, not the dynamics of the environment.</aside>
+
+**Worked example.** A one-step problem with two actions: action 1 pays $1$, action 2 pays $0$, and the policy is $\pi(1) = \sigma(h)$ for one logit $h$. Then $\partial_h \log \pi(1) = 1 - \sigma(h)$ and $\partial_h \log \pi(2) = -\sigma(h)$. At $h = 0$ both actions have probability $0.5$, and the exact gradient is $\partial_h J = \partial_h \sigma(h) = \sigma(1 - \sigma) = 0.25$. A sample of action 1 gives the estimate $1 \cdot (1 - 0.5) = 0.5$; a sample of action 2 gives $0 \cdot (-0.5) = 0$. Their average is $0.25$: the estimate is unbiased, and its variance is $0.0625$.
+
+## REINFORCE
+
+Sampling the boxed formula gives **REINFORCE** ([Williams, 1992](#references)):
+
+1. Run $\pi_\theta$ for one or more episodes.
+2. For each step compute the reward-to-go $G_t$.
+3. Update $\theta \leftarrow \theta + \alpha \sum_t \gamma^t G_t \nabla \log \pi_\theta(a_t \mid s_t)$, and repeat with the new policy.
+
+It is on-policy: the expectation is over trajectories of the current $\pi_\theta$, so each batch is used for one step and thrown away. It is also, as stated, very noisy. The estimate multiplies a sum of random rewards by a sum of random scores, and its variance grows with the length of the episodes and with the size of the rewards.
+
+## Baselines keep the gradient unbiased and cut its variance
+
+Subtract from $G_t$ any function of the state, $b(s_t)$, that does not depend on the action. The expected gradient does not change, by the same zero-mean property of the score:
+
+$$
+\mathbb E_{a_t \sim \pi_\theta(\cdot \mid s_t)}\big[ b(s_t)\, \nabla \log \pi_\theta(a_t \mid s_t) \big] = b(s_t)\, \mathbb E_{a_t}\big[ \nabla \log \pi_\theta(a_t \mid s_t) \big] = b(s_t) \cdot 0 = 0 .
+$$
+
+So
+
+$$
+\nabla J(\theta) = \mathbb E\Big[ \sum_t \gamma^t \big( G_t - b(s_t) \big) \nabla \log \pi_\theta(a_t \mid s_t) \Big]
+$$
+
+for every **baseline** $b$. The baseline must not depend on $a_t$: then it would not factor out of the expectation over $a_t$, and the estimate would be biased. A good baseline makes $G_t - b(s_t)$ small on average, so that the estimate no longer pushes all actions up when all returns are positive, or all down when they are negative. The usual choice is an estimate of $V^\pi(s_t)$: then $G_t - b(s_t)$ says whether this action did better or worse than the policy does on average from this state.
+
+**Worked example.** In the one-step problem above, take $b = 0.5$, the value of the state. Action 1 now gives $(1 - 0.5)(1 - 0.5) = 0.25$ and action 2 gives $(0 - 0.5)(-0.5) = 0.25$: the mean is still $0.25$ and the variance is now 0. Add 10 to both rewards and drop the baseline: the estimates become $11 \cdot 0.5 = 5.5$ and $10 \cdot (-0.5) = -5$, still with mean $0.25$, but with a standard deviation of $5.25$. A constant shift of the rewards, which changes nothing about which action is better, made the estimate 21 times noisier than its mean. The baseline $10.5$ removes the shift again.
+
+The short corridor shows the same thing during learning. Add a reward of $+100$ at the goal; every policy that reaches the goal gets the same bonus, so the optimal policy does not change. At $p = 0.3$ the Code section measures the standard deviation of the per-episode gradient estimate: 39 without a baseline and 24 with one, and with the bonus 156 without a baseline and still 25 with one, while the mean stays at about 8.
+
+<ShortCorridor />
+
+With the bonus and a step size of $2^{-9}$, REINFORCE without a baseline keeps jittering around the optimum at about 19 steps per episode; a four times smaller step jitters less but learns slowly, and is still at about 14 steps after 1000 episodes. With a baseline that tracks the average return, the same large step reaches $11.7$ steps, next to the optimum of $11.66$.
+
+## Advantages, actors and critics
+
+The best baseline is close to $V^\pi(s_t)$, and $Q^\pi(s_t, a_t) - V^\pi(s_t) = A^\pi(s_t, a_t)$ is the **advantage**: how much better action $a_t$ is than the policy's average action in $s_t$. With it, the policy gradient reads
+
+$$
+\nabla J(\theta) = \mathbb E\Big[ \sum_t \gamma^t A^{\pi}(s_t, a_t)\, \nabla \log \pi_\theta(a_t \mid s_t) \Big].
+$$
+
+The advantage is unknown, but the TD error of the true value function is an unbiased sample of it. By the law of total expectation and the definition of $Q^\pi$,
+
+$$
+\mathbb E\big[ r_{t+1} + \gamma V^\pi(s_{t+1}) - V^\pi(s_t) \,\big|\, s_t, a_t \big] = Q^\pi(s_t, a_t) - V^\pi(s_t) = A^\pi(s_t, a_t).
+$$
+
+This suggests two learners. An **actor**, the policy $\pi_\theta$, takes gradient steps along $\delta_t \nabla \log \pi_\theta(a_t \mid s_t)$. A **critic**, a value function $V_w$ trained by TD learning as in the [TD note](/notes/agents/temporal-difference-learning#td0-learning-a-guess-from-a-guess), supplies $\delta_t = r_{t+1} + \gamma V_w(s_{t+1}) - V_w(s_t)$. This is **actor–critic** ([Konda and Tsitsiklis, 2000](#references); [Sutton and Barto, 2018](#references), chapter 13). With $V_w$ in place of $V^\pi$, the estimate is biased by the critic's errors, in exchange for a variance that depends on one step instead of the whole episode: the trade-off between TD and Monte Carlo targets of the TD note, now inside a gradient. A2C and its asynchronous parallel version A3C ([Mnih et al., 2016](#references)) run many copies of the environment to collect batches for one shared actor and critic.
+
+## Generalized advantage estimation
+
+Between the one-step TD error and the full return lie the n-step advantages, and **generalized advantage estimation** (GAE) averages them with weights $\lambda^{n-1}$, exactly as the λ-return does ([Schulman, Moritz, Levine, Jordan and Abbeel, 2016](#references)):
+
+$$
+\boxed{\; \hat A_t^{\text{GAE}(\gamma, \lambda)} = \sum_{l=0}^{T - t - 1} (\gamma \lambda)^l\, \delta_{t+l}, \qquad \delta_t = r_{t+1} + \gamma V_w(s_{t+1}) - V_w(s_t) \;}
+$$
+
+computed backwards as $\hat A_t = \delta_t + \gamma \lambda \hat A_{t+1}$. With $\lambda = 0$ it is the TD error: low variance, biased by the critic. With $\lambda = 1$ it is $\sum_l \gamma^l \delta_{t+l} = G_t - V_w(s_t)$, by the telescoping identity of the TD note: unbiased for any critic, which then only serves as a baseline, and as noisy as the return. Values of $\lambda$ around $0.95$ are the common compromise.
+
+<ActorCriticLoop />
+
+1. **Act.** The actor samples actions from $\pi_\theta$ in the environment.
+2. **Batch.** The trajectories are stored with their rewards and with the log-probabilities of the policy that collected them. In the example, three steps with rewards $0, 0, 1$, then the end.
+3. **Critic.** $V_w$ gives the states the values $0.5, 0.6, 0.8$, and the end has value 0. With $\gamma = 0.9$ the TD errors are $\delta = 0 + 0.9 \cdot 0.6 - 0.5 = 0.04$, then $0 + 0.9 \cdot 0.8 - 0.6 = 0.12$, then $1 - 0.8 = 0.2$.
+4. **GAE.** From right to left with $\gamma\lambda = 0.45$: $\hat A_2 = 0.2$, $\hat A_1 = 0.12 + 0.45 \cdot 0.2 = 0.21$, $\hat A_0 = 0.04 + 0.45 \cdot 0.21 = 0.1345$. With $\lambda = 1$ the first advantage would be $G_0 - V(s_0) = 0.81 - 0.5 = 0.31$; with $\lambda = 0$ it would be $0.04$.
+5. **Actor.** The policy takes gradient steps that make actions with positive $\hat A_t$ more likely, here all three, the second the most.
+6. **Critic.** $V_w$ is regressed towards the returns $\hat A_t + V_w(s_t)$, and the next iteration starts with the new policy.
+
+## Trust regions: how far one step may go
+
+A policy gradient is a local direction, and the step along it is a problem that supervised learning does not have. A step that is too large can make the policy much worse, and the next batch is then collected *by* the worse policy, which may never visit the states where it could recover. A step size that is safe in one state can be reckless in another, because a small change of $\theta$ can move some action probabilities a lot.
+
+The fix is to limit the change in behaviour, not in parameters. Data collected by the old policy $\pi_{\text{old}}$ can evaluate a candidate $\pi_\theta$ through the **probability ratio** $r_t(\theta) = \pi_\theta(a_t \mid s_t)/\pi_{\text{old}}(a_t \mid s_t)$ and the **surrogate objective**
+
+$$
+L(\theta) = \mathbb E_{s_t, a_t \sim \pi_{\text{old}}}\big[ r_t(\theta)\, \hat A_t \big].
+$$
+
+At $\theta = \theta_{\text{old}}$ its gradient is the policy gradient, because $\nabla r_t(\theta) = \nabla \pi_\theta(a_t \mid s_t)/\pi_{\text{old}}(a_t \mid s_t) = \nabla \log \pi_\theta(a_t \mid s_t)$ there. Away from $\theta_{\text{old}}$ it ignores that the states would be visited differently, so it is trustworthy only nearby. [Kakade and Langford (2002)](#references) and [Schulman et al. (2015)](#references) bound the error: the true improvement is at least the surrogate improvement minus a constant times the largest KL divergence between the old and the new policy over states. **TRPO** ([Schulman, Levine, Abbeel, Jordan and Moritz, 2015](#references)) therefore maximizes $L(\theta)$ subject to an average KL divergence $\mathbb E_s[D_{\mathrm{KL}}(\pi_{\text{old}}(\cdot \mid s) \,\|\, \pi_\theta(\cdot \mid s))] \le \delta$, with $\delta = 0.01$ typically. To second order the constraint is a quadratic form in the Fisher information matrix, so the step is a **natural gradient** ([Kakade, 2001](#references)), computed with conjugate gradients and a line search. It works, but it is complicated, and it fits poorly with architectures that share parameters between the policy and the critic.
+
+## PPO: a clipped objective
+
+**Proximal policy optimization** ([Schulman, Wolski, Dhariwal, Radford and Klimov, 2017](#references)) gets a similar effect with first-order steps. It replaces the constraint by a clipped objective:
+
+$$
+\boxed{\; L^{\text{CLIP}}(\theta) = \mathbb E_t\Big[ \min\Big( r_t(\theta)\, \hat A_t,\ \operatorname{clip}\big(r_t(\theta), 1 - \varepsilon, 1 + \varepsilon\big)\, \hat A_t \Big) \Big] \;}
+$$
+
+with $\varepsilon = 0.2$ in the paper. What the clipping does is easiest to see on numbers. Take one sample with $\varepsilon = 0.2$:
+
+| $r_t$ | 0.6 | 0.9 | 1.0 | 1.1 | 1.4 |
+| --- | --- | --- | --- | --- | --- |
+| $\hat A_t = +2$: objective | 1.2 | 1.8 | 2.0 | 2.2 | 2.4 |
+| $\hat A_t = +2$: slope in $r_t$ | 2 | 2 | 2 | 2 | **0** |
+| $\hat A_t = -2$: objective | −1.6 | −1.8 | −2.0 | −2.2 | −2.8 |
+| $\hat A_t = -2$: slope in $r_t$ | **0** | −2 | −2 | −2 | −2 |
+
+For a good action ($\hat A_t > 0$) the objective rewards making it more probable only until its probability has grown by 20%; at $r_t = 1.4$ the clipped term $1.2 \cdot 2 = 2.4$ is the smaller one, and its gradient is zero, so this sample stops pulling. For a bad action the same happens below $r_t = 0.8$. In the other direction nothing is clipped: if an update made a good action *less* likely ($r_t = 0.6$, $\hat A_t = +2$), the unclipped term $1.2$ is the minimum and the gradient keeps pushing back. The minimum makes $L^{\text{CLIP}}$ a pessimistic lower bound of the unclipped surrogate.
+
+<PpoClip />
+
+Because the incentive to move far is removed sample by sample, PPO can take several epochs of minibatch steps on each batch, which REINFORCE cannot. The full algorithm alternates: collect $T$ steps with $\pi_{\text{old}}$ (the paper's continuous-control setting used $T = 2048$); compute GAE advantages ($\gamma = 0.99$, $\lambda = 0.95$); run $K = 10$ epochs of Adam on minibatches of 64 to maximize
+
+$$
+L^{\text{CLIP}}(\theta) - c_1 \, \mathbb E_t\big[ (V_w(s_t) - \hat V_t)^2 \big] + c_2 \, \mathbb E_t\big[ H(\pi_\theta(\cdot \mid s_t)) \big],
+$$
+
+where the second term trains the critic towards the targets $\hat V_t = \hat A_t + V_w(s_t)$ and the third is the entropy bonus of the next section; then set $\theta_{\text{old}} \leftarrow \theta$. On seven MuJoCo control tasks with one million steps each, the paper's ablation scored the clipped objective with $\varepsilon = 0.2$ at $0.82$ on a scale where a random policy is 0 and the best run on each task 1, against $0.76$ and $0.70$ for $\varepsilon = 0.1$ and $0.3$, $0.68$ to $0.74$ for an adaptive KL penalty, and $-0.39$ for the same multi-epoch surrogate without clipping or penalty, which made one task worse than random ([Schulman et al., 2017](#references), table 1, averages over 21 runs).
+
+Much of PPO's practical success depends on details that the paper mentions briefly or not at all: advantage normalization, value-function clipping, learning-rate annealing, observation and reward normalization. [Engstrom et al. (2020)](#references) found that such code-level choices account for much of PPO's advantage over TRPO, and [Huang et al. (2022)](#references) list 37 of them.
+
+**On CartPole.** The Code section trains a linear softmax policy on CartPole three ways, three seeds each, 40 iterations of 2048 steps: REINFORCE with a fitted value baseline, one gradient step per batch; ten epochs of the unclipped surrogate; and PPO.
+
+| method | learning rate | mean episode length, iterations 31–40 | KL per iteration: median, largest |
+| --- | --- | --- | --- |
+| REINFORCE with baseline | 0.1 | 31 | 0.0000, 0.000 |
+| unclipped surrogate, 10 epochs | 0.1 | 415 | 0.034, 0.29 |
+| PPO, 10 epochs | 0.1 | 252 | 0.005, 0.024 |
+| REINFORCE with baseline | 0.3 | 63 | 0.0001, 0.000 |
+| unclipped surrogate, 10 epochs | 0.3 | 329 | 0.131, 2.34 |
+| PPO, 10 epochs | 0.3 | 241 | 0.006, 0.018 |
+
+One step per batch wastes most of the data. Ten epochs learn far faster, and on this small, forgiving problem the unclipped version is the fastest on average. But its step size is set by the learning rate: tripling the rate makes its typical update four times larger and its largest update move the policy by 2.3 nats, and its average falls. PPO's updates stay near the same size at both rates, because the clipping, not the learning rate, decides how far the policy moves. That robustness, not speed on an easy task, is what PPO buys, and it matters most for large networks, where one bad step can destroy a policy that took days to train.
+
+## The entropy bonus
+
+A policy gradient method can converge too early: once one action's probability is near 1, its samples hardly ever show what the others would do, and the gradient that could revive them is tiny. The **entropy bonus** adds $c\, H(\pi_\theta(\cdot \mid s))$ to the objective, with $H(\pi) = -\sum_a \pi(a) \log \pi(a)$ ([Williams and Peng, 1991](#references); [Mnih et al., 2016](#references)). For a softmax policy with logits $z$, its gradient is
+
+$$
+\frac{\partial H}{\partial z_k} = -\pi_k \big( \log \pi_k + H \big),
+$$
+
+which is negative for actions more probable than average in the sense $\log \pi_k > -H$, and positive for the others: the bonus takes probability from dominant actions and gives it to rare ones. **Worked example.** For $\pi = (0.7, 0.2, 0.1)$, $H = 0.802$ nats, against a maximum of $\ln 3 = 1.099$. The gradient with respect to the logits is $(-0.312, 0.162, 0.150)$; it sums to zero, as it must, because adding the same constant to all logits does not change a softmax. PPO's Atari experiments used $c = 0.01$. Maximum-entropy reinforcement learning makes the entropy part of the return itself, as in soft actor–critic ([Haarnoja, Zhou, Abbeel and Levine, 2018](#references)).
+
+## The same objective trains language models
+
+A language model is a policy: the state is the prompt and the tokens written so far, the action is the next token, and $\pi_\theta(a \mid s)$ is the model's softmax. A reward for a whole response, from a learned reward model or a program that checks the answer, makes the generation of one response an episode. RLHF, introduced in the NLP course's [instruction-tuning note](/notes/nlp/instruction-tuning#with-a-reward-model-rlhf), trains such a policy with exactly this note's PPO, plus a KL penalty that keeps it near the starting model; later methods such as GRPO drop the critic and use the average reward of several responses to the same prompt as the baseline. [Reinforcement learning for language models](/notes/agents/rl-for-language-models) derives these objectives from the ones here.
+
+<aside class="callout"><strong>Check yourself.</strong> (1) Why can the dynamics $P$ be unknown when computing $\nabla \log p_\theta(\tau)$? (2) A baseline $b(s_t, a_t) = Q^\pi(s_t, a_t)$ would make $G_t - b$ tiny. What is wrong with it? (3) With $\varepsilon = 0.2$, a sample has $\hat A_t = -1$ and $r_t = 1.5$. What are the objective and its slope in $r_t$?<details><summary>Answers</summary>(1) $\log p_\theta(\tau)$ is a sum, and the terms $\log P(s_{t+1} \mid s_t, a_t)$ do not depend on $\theta$, so their gradient is zero. (2) It depends on the action, so it does not factor out of the expectation over $a_t$; subtracting it changes the expected gradient, here to zero. (3) $\min(1.5 \cdot (-1), 1.2 \cdot (-1)) = -1.5$: the unclipped term is smaller, so the slope is $-1$, and the gradient keeps pushing this bad action's probability down.</details></aside>
+
+## What changed
+
+| | value-based (DQN) | policy gradient (PPO) |
+| --- | --- | --- |
+| what is learned | $Q_\theta(s, a)$; the policy is its argmax | $\pi_\theta(a \mid s)$ directly, plus a critic $V_w$ |
+| actions | small discrete sets | discrete or continuous; stochastic policies |
+| update | regression on bootstrapped targets | ascent on $\hat A_t \nabla \log \pi_\theta(a_t \mid s_t)$ |
+| data | off-policy, a replay buffer | on-policy batches, a few epochs each |
+| what controls a step | target network, learning rate | the trust region: KL constraint or clipping |
+| in the short corridor | can only reach $-44.2$ with ε-greedy | finds $p^\star = 2 - \sqrt 2$, worth $-11.66$ |
+
+## Limitations
+
+- **Sample inefficiency.** On-policy methods use each batch for a few epochs and then discard it. Off-policy actor–critic methods (DDPG, TD3, SAC) reuse data from a replay buffer at the price of the instabilities of the previous note.
+- **High variance.** Even with baselines and GAE, the gradient estimates are noisy; large batches and many parallel environments are the usual remedy.
+- **Local optima.** Gradient ascent finds a local optimum of a non-concave objective, and the entropy bonus only delays premature convergence.
+- **Sensitivity to details.** Results depend on normalization, clipping and schedules that are often not in the papers.
+- **Rewards are still needed.** The methods optimize whatever reward they are given; for language models the reward is a learned model that can be exploited, the subject of later notes.
+
+## What you should remember
+
+- The log-derivative trick gives $\nabla J = \mathbb E[\sum_t \gamma^t G_t \nabla \log \pi_\theta(a_t \mid s_t)]$; the unknown dynamics drop out, and causality replaces the full return by the reward-to-go.
+- The score $\nabla \log \pi_\theta$ has mean zero, so any action-independent baseline leaves the gradient unbiased and, close to $V^\pi$, cuts its variance.
+- The advantage $A^\pi = Q^\pi - V^\pi$ is the right weight for an action; the TD error of a critic estimates it, and GAE averages n-step estimates with $(\gamma\lambda)^l$.
+- Large policy steps are dangerous because they change the data. TRPO limits the KL divergence per step; PPO clips the ratio $r_t$ to $[1 - \varepsilon, 1 + \varepsilon]$ in the direction that would improve the objective and so can safely run several epochs per batch.
+- The entropy bonus keeps the policy from collapsing too early. The same machinery, with tokens as actions, trains language models.
+
+## Code
+
+The short corridor: the exact value of every stochastic policy, the mean and spread of REINFORCE's gradient estimate with and without a baseline, and the learning runs of the figure; the GAE example; the table of PPO's clipped objective; and a linear softmax policy on CartPole trained by REINFORCE, by the unclipped surrogate and by PPO. NumPy only, seeds fixed; the figure runs the corridor experiment at build time with a different random generator and agrees to the precision quoted. Exact numbers vary across platforms. The script runs in about 30 seconds.
+
+```python
+import math
+import numpy as np
+
+# 1. the short corridor: three states that look the same; in the middle one the actions are swapped
+def corridor_value(p):                                         # J(p) = V(start) for P(right) = p, reward -1 per step
+    A = np.array([[p, -p, 0], [-p, 1, -(1 - p)], [0, -(1 - p), 1]])
+    return np.linalg.solve(A, -np.ones(3))[0]
+ps = np.linspace(0.01, 0.99, 9801)
+J = np.array([corridor_value(p) for p in ps])
+print('best p', ps[J.argmax()].round(3), 'J', J.max().round(2), '| eps-greedy p=0.95:', corridor_value(0.95).round(2), 'p=0.05:', corridor_value(0.05).round(2))
+# best p 0.586 J -11.66 | eps-greedy p=0.95: -44.21 p=0.05: -82.11
+
+def episode(p, rng, cap=1000):                                 # returns the actions (1 = right) until the goal
+    s, acts = 0, []
+    while s != 3 and len(acts) < cap:
+        a = rng.random() < p
+        acts.append(a)
+        right = (not a) if s == 1 else a
+        s = max(0, s + (1 if right else -1))
+    return np.array(acts, float)
+
+# 2. REINFORCE for the logit h of P(right) = sigmoid(h): grad log pi(a) = a - p; the baseline keeps the mean
+rng = np.random.default_rng(1)
+p = 0.3
+for bonus in (0, 100):                                         # bonus: extra reward at the goal, same optimal policy
+    eps_ = [episode(p, rng) for _ in range(20_000)]
+    G = [bonus - np.arange(len(a), 0, -1) for a in eps_]       # reward-to-go G_t = bonus - (T - t)
+    b = np.mean([g[0] for g in G])                              # baseline: the value of the start state
+    plain = [np.sum(g * (a - p)) for a, g in zip(eps_, G)]
+    based = [np.sum((g - b) * (a - p)) for a, g in zip(eps_, G)]
+    print(f'bonus {bonus:3d}: mean {np.mean(plain):5.2f} vs {np.mean(based):5.2f}   std {np.std(plain):6.1f} vs {np.std(based):5.1f}')
+h = 1e-5                                                       # the exact gradient dJ/dh = J'(p) p (1 - p)
+print('exact gradient', round((corridor_value(p + h) - corridor_value(p - h)) / (2 * h) * p * (1 - p), 2))
+# bonus   0: mean  8.13 vs  8.47   std   39.1 vs  24.0
+# bonus 100: mean  7.42 vs  8.35   std  156.0 vs  25.0
+# exact gradient 8.48
+
+def reinforce(alpha, baseline, bonus=100.0, alpha_w=2 ** -10, runs=100, episodes=1000, seed=0):
+    rng, steps = np.random.default_rng(seed), np.zeros(episodes)
+    for _ in range(runs):
+        h, w = math.log(0.05 / 0.95), 0.0                        # start: right with probability 0.05
+        for ep in range(episodes):
+            p = 1 / (1 + math.exp(-h))
+            a = episode(p, rng)
+            G = bonus - np.arange(len(a), 0, -1)
+            h += alpha * np.sum((G - (w if baseline else 0.0)) * (a - p))
+            h = min(20.0, max(-20.0, h))
+            if baseline:
+                w += alpha_w * np.sum(G - w)                    # the baseline learns the average return
+            steps[ep] += len(a) / runs
+    return steps
+for name, alpha, base in [('no baseline, alpha 2^-11', 2 ** -11, False), ('no baseline, alpha 2^-9', 2 ** -9, False),
+                          ('baseline,    alpha 2^-9', 2 ** -9, True)]:
+    st = reinforce(alpha, base)
+    print(f'{name}: steps per episode, episodes 91-110 {st[90:110].mean():5.1f}, 901-1000 {st[900:].mean():5.1f}')
+# no baseline, alpha 2^-11: steps per episode, episodes 91-110  23.6, 901-1000  13.9
+# no baseline, alpha 2^-9: steps per episode, episodes 91-110  18.3, 901-1000  19.7
+# baseline,    alpha 2^-9: steps per episode, episodes 91-110  13.7, 901-1000  11.8
+
+# 3. generalized advantage estimation on three steps: rewards 0, 0, 1, then the end; gamma = 0.9
+r, V, gamma = np.array([0.0, 0.0, 1.0]), np.array([0.5, 0.6, 0.8, 0.0]), 0.9
+delta = r + gamma * V[1:] - V[:-1]
+for lam in (0.0, 0.5, 1.0):
+    A, g = np.zeros(3), 0.0
+    for t in reversed(range(3)):
+        g = delta[t] + gamma * lam * g; A[t] = g               # A_t = delta_t + gamma lambda A_{t+1}
+    print('lambda', lam, 'deltas', delta.round(3), 'advantages', A.round(4))
+# lambda 0.0 deltas [0.04 0.12 0.2 ] advantages [0.04 0.12 0.2 ]
+# lambda 0.5 deltas [0.04 0.12 0.2 ] advantages [0.1345 0.21   0.2   ]
+# lambda 1.0 deltas [0.04 0.12 0.2 ] advantages [0.31 0.3  0.2 ]
+
+# 4. PPO's clipped objective on numbers: epsilon = 0.2, advantage +2 and -2
+for adv in (2.0, -2.0):
+    for ratio in (0.6, 0.9, 1.0, 1.1, 1.4):
+        clipped = min(max(ratio, 0.8), 1.2)
+        L = min(ratio * adv, clipped * adv)
+        grad = adv if ratio * adv <= clipped * adv else 0.0     # d L / d ratio: zero where the clipped term is smaller
+        print(f'A={adv:+.0f} r={ratio:.1f} L={L:+.1f} dL/dr={grad:+.0f}', end='  ')
+    print()
+# A=+2 r=0.6 L=+1.2 dL/dr=+2  A=+2 r=0.9 L=+1.8 dL/dr=+2  A=+2 r=1.0 L=+2.0 dL/dr=+2  A=+2 r=1.1 L=+2.2 dL/dr=+2  A=+2 r=1.4 L=+2.4 dL/dr=+0
+# A=-2 r=0.6 L=-1.6 dL/dr=+0  A=-2 r=0.9 L=-1.8 dL/dr=-2  A=-2 r=1.0 L=-2.0 dL/dr=-2  A=-2 r=1.1 L=-2.2 dL/dr=-2  A=-2 r=1.4 L=-2.8 dL/dr=-2
+
+# 5. CartPole with a linear softmax policy: one REINFORCE step per batch, against ten epochs of the surrogate
+#    with and without PPO's clipping; all three use a fitted value function and advantage normalization
+class CartPole:
+    g, m_cart, m_pole, half_len, force, dt = 9.8, 1.0, 0.1, 0.5, 10.0, 0.02
+    def __init__(self, rng):
+        self.rng = rng
+    def reset(self):
+        self.s, self.t = self.rng.uniform(-0.05, 0.05, 4), 0
+        return self.s.copy()
+    def step(self, a):
+        x, v, th, w = self.s
+        f, c, s, m = (self.force if a == 1 else -self.force), math.cos(th), math.sin(th), self.m_cart + self.m_pole
+        tmp = (f + self.m_pole * self.half_len * w * w * s) / m
+        acc_th = (self.g * s - c * tmp) / (self.half_len * (4 / 3 - self.m_pole * c * c / m))
+        acc_x = tmp - self.m_pole * self.half_len * acc_th * c / m
+        self.s = np.array([x + self.dt * v, v + self.dt * acc_x, th + self.dt * w, w + self.dt * acc_th])
+        self.t += 1
+        fell = abs(self.s[0]) > 2.4 or abs(self.s[2]) > 12 * math.pi / 180
+        return self.s.copy(), 1.0, fell, self.t >= 500
+
+phi = lambda s: np.append(s * [1, 1, 5, 1], 1.0)                 # policy features
+psi = lambda s: np.concatenate([s * [1, 1, 5, 1], (s * [1, 1, 5, 1]) ** 2, [1.0]])   # value features
+def softmax(z):
+    e = np.exp(z - z.max(-1, keepdims=True)); return e / e.sum(-1, keepdims=True)
+
+def batch(env, W, rng, n=2048):
+    F, A, R, fell, cut, logp, S, lens = [], [], [], [], [], [], [], []
+    s = env.reset()
+    for _ in range(n):
+        p = softmax(W @ phi(s)); a = int(rng.random() < p[1])
+        s2, r, f_, c_ = env.step(a)
+        F.append(phi(s)); S.append(s); A.append(a); R.append(r); fell.append(f_); cut.append(f_ or c_); logp.append(math.log(p[a]))
+        s = s2
+        if f_ or c_:
+            lens.append(env.t); s = env.reset()
+    return map(np.array, (F, S, A, R, fell, cut, logp)), s, lens
+
+def gae(S, R, fell, cut, last, w, gamma=0.99, lam=0.95):
+    V = np.array([psi(s) @ w for s in S]); T = len(V)
+    V_next = np.append(V[1:], psi(last) @ w)
+    V_next[cut & ~fell] = V[cut & ~fell]                         # a cut episode: bootstrap (approximately) on its last state
+    V_next[fell] = 0.0                                           # a fall is terminal
+    delta = R + gamma * V_next - V
+    A, g = np.zeros(T), 0.0
+    for t in reversed(range(T)):
+        g = delta[t] + gamma * lam * g * (not cut[t]); A[t] = g
+    return A, A + V
+
+def train(method, iters=40, lr=0.1, eps=0.2, epochs=10, mb=256, c_ent=0.01, seed=0):
+    rng = np.random.default_rng(seed); env = CartPole(rng)
+    W, w, lengths, kls = np.zeros((2, 5)), np.zeros(9), [], []
+    for _ in range(iters):
+        (F, S, A, R, fell, cut, logp_old), last, lens = batch(env, W, rng)
+        lengths.append(np.mean(lens) if lens else 2048)
+        adv, ret = gae(S, R, fell, cut, last, w, lam=1.0 if method == 'reinforce' else 0.95)
+        Psi = np.array([psi(s) for s in S])
+        w = np.linalg.solve(Psi.T @ Psi + 1e-3 * np.eye(9), Psi.T @ ret)   # the critic: least squares on the returns
+        adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+        P_old = softmax(F @ W.T)
+        if method == 'reinforce':                                # one gradient step on mean of A * grad log pi
+            W += lr * ((np.eye(2)[A] - P_old) * adv[:, None]).T @ F / len(F)
+        else:
+            for _ in range(epochs):
+                for j in np.array_split(rng.permutation(len(F)), len(F) // mb):
+                    P = softmax(F[j] @ W.T)
+                    ratio = np.exp(np.log(P[np.arange(len(j)), A[j]]) - logp_old[j])
+                    live = np.ones(len(j), bool) if method == 'no clip' else \
+                        ~(((adv[j] > 0) & (ratio > 1 + eps)) | ((adv[j] < 0) & (ratio < 1 - eps)))
+                    g = (ratio * adv[j] * live)[:, None] * (np.eye(2)[A[j]] - P)          # d(ratio A)/d logits
+                    H = -(P * np.log(P)).sum(1, keepdims=True)
+                    g += c_ent * (-P * (np.log(P) + H))                                    # d entropy / d logits
+                    W += lr * g.T @ F[j] / len(j)
+        P_new = softmax(F @ W.T)
+        kls.append(np.mean(np.sum(P_old * np.log(P_old / P_new), 1)))   # how far one iteration moved the policy
+    return np.array(lengths), np.array(kls)
+
+for lr in (0.1, 0.3):
+    for method in ('reinforce', 'no clip', 'ppo'):
+        res = [train(method, lr=lr, seed=s) for s in (0, 1, 2)]
+        L = np.array([r[0] for r in res]); K = np.array([r[1] for r in res])
+        drop = np.mean([np.max(np.maximum.accumulate(l) - l) for l in L])   # largest fall below the best length so far
+        print(f'lr {lr} {method:9s} length, iterations 31-40: {L[:, 30:].mean():5.1f}   '
+              f'KL per iteration: median {np.median(K):.4f}, largest {K.max():.3f}   largest drop {drop:5.1f}')
+# lr 0.1 reinforce length, iterations 31-40:  31.1   KL per iteration: median 0.0000, largest 0.000   largest drop   5.5
+# lr 0.1 no clip   length, iterations 31-40: 415.0   KL per iteration: median 0.0339, largest 0.288   largest drop 373.7
+# lr 0.1 ppo       length, iterations 31-40: 251.5   KL per iteration: median 0.0052, largest 0.024   largest drop 253.0
+# lr 0.3 reinforce length, iterations 31-40:  62.5   KL per iteration: median 0.0001, largest 0.000   largest drop  19.7
+# lr 0.3 no clip   length, iterations 31-40: 329.2   KL per iteration: median 0.1309, largest 2.344   largest drop 439.6
+# lr 0.3 ppo       length, iterations 31-40: 241.4   KL per iteration: median 0.0059, largest 0.018   largest drop 237.1
+```
+
+With a neural network in place of the linear policy, the gradients come from automatic differentiation instead of the hand-written softmax formulas, and the same loop, with more steps, solves CartPole reliably and scales to MuJoCo and Atari.
+
+## Next
+
+Every method so far learns only from what really happened: Q-learning, DQN and PPO never ask what *would* happen after an action they did not take. That makes them general and expensive; PPO's control results used a million environment steps per task, and DQN fifty million frames per game. The [next note](/notes/agents/model-based-rl) learns the environment's dynamics as a model and uses it to plan or to generate imagined experience, from Dyna's simple replay of a learned table to Dreamer, which trains its actor and critic entirely inside a learned world model, and MuZero.
+
+## References
+
+- R. S. Sutton, A. G. Barto. [*Reinforcement Learning: An Introduction*](http://incompleteideas.net/book/the-book-2nd.html), 2nd ed. MIT Press, 2018. Chapter 13 (policy gradient methods; example 13.1, the short corridor; REINFORCE with baseline; actor–critic).
+- R. J. Williams. [Simple statistical gradient-following algorithms for connectionist reinforcement learning](https://doi.org/10.1007/BF00992696). *Machine Learning*, 8:229–256, 1992.
+- R. J. Williams, J. Peng. [Function optimization using connectionist reinforcement learning algorithms](https://doi.org/10.1080/09540099108946587). *Connection Science*, 3(3):241–268, 1991.
+- R. S. Sutton, D. McAllester, S. Singh, Y. Mansour. [Policy gradient methods for reinforcement learning with function approximation](https://proceedings.neurips.cc/paper/1999/hash/464d828b85b0bed98e80ade0a5c43b0f-Abstract.html). NeurIPS 12, 2000.
+- P. S. Thomas. [Bias in natural actor-critic algorithms](https://proceedings.mlr.press/v32/thomas14.html). ICML, 2014.
+- C. Nota, P. S. Thomas. [Is the policy gradient a gradient?](https://arxiv.org/abs/1906.07073) AAMAS, 2020.
+- V. R. Konda, J. N. Tsitsiklis. [Actor-critic algorithms](https://proceedings.neurips.cc/paper/1999/hash/6449f44a102fde848669bdd9eb6b76fa-Abstract.html). NeurIPS 12, 2000.
+- V. Mnih, A. P. Badia, M. Mirza, A. Graves, T. Lillicrap, T. Harley, D. Silver, K. Kavukcuoglu. [Asynchronous methods for deep reinforcement learning](https://arxiv.org/abs/1602.01783). ICML, 2016.
+- J. Schulman, P. Moritz, S. Levine, M. Jordan, P. Abbeel. [High-dimensional continuous control using generalized advantage estimation](https://arxiv.org/abs/1506.02438). ICLR, 2016.
+- S. Kakade. [A natural policy gradient](https://proceedings.neurips.cc/paper/2001/hash/4b86abe48d358ecf194c56c69108433e-Abstract.html). NeurIPS 14, 2001.
+- S. Kakade, J. Langford. Approximately optimal approximate reinforcement learning. ICML, 2002.
+- J. Schulman, S. Levine, P. Abbeel, M. Jordan, P. Moritz. [Trust region policy optimization](https://arxiv.org/abs/1502.05477). ICML, 2015.
+- J. Schulman, F. Wolski, P. Dhariwal, A. Radford, O. Klimov. [Proximal policy optimization algorithms](https://arxiv.org/abs/1707.06347). arXiv:1707.06347, 2017. Section 3 (the clipped objective), table 1 (comparison of surrogate objectives), tables 3 and 5 (hyperparameters).
+- L. Engstrom, A. Ilyas, S. Santurkar, D. Tsipras, F. Janoos, L. Rudolph, A. Madry. [Implementation matters in deep policy gradients: a case study on PPO and TRPO](https://arxiv.org/abs/2005.12729). ICLR, 2020.
+- S. Huang, R. F. J. Dossa, A. Raffin, A. Kanervisto, W. Wang. [The 37 implementation details of proximal policy optimization](https://iclr-blog-track.github.io/2022/03/25/ppo-implementation-details/). ICLR Blog Track, 2022.
+- T. Haarnoja, A. Zhou, P. Abbeel, S. Levine. [Soft actor-critic: off-policy maximum entropy deep reinforcement learning with a stochastic actor](https://arxiv.org/abs/1801.01290). ICML, 2018.
+- J. Achiam. [Spinning Up in deep RL](https://spinningup.openai.com/). OpenAI, 2018. Part 3, intro to policy optimization.
+- S. Levine. [CS285: Deep Reinforcement Learning](https://rail.eecs.berkeley.edu/deeprlcourse/). University of California, Berkeley. Lectures on policy gradients and actor–critic algorithms.
