@@ -1,0 +1,418 @@
+---
+title: Observability
+section: Reliability
+description: "What a running service tells us about itself: monitoring against observability, structured logs, counters, gauges and histograms with why percentiles cannot be averaged, traces with context propagation, the golden signals, Prometheus and PromQL, and OpenTelemetry."
+course: devops
+order: 12
+status: published
+tags: [observability, monitoring, logging, metrics, tracing, prometheus, promql, histograms, percentiles, cardinality, opentelemetry]
+prerequisites: [Networking for services, Kubernetes in practice]
+---
+
+import ThreeSignals from '../../../components/figures/observability/ThreeSignals.astro';
+import HistogramQuantile from '../../../components/figures/observability/HistogramQuantile.astro';
+
+The [previous note](/notes/devops/kubernetes-in-practice) left a service deployed, exposed and scaled. Kubernetes now restarts a container that crashes and reschedules the pods of a node that dies. What it cannot tell us is whether the people using the service get correct answers, and how quickly. A pod can be running and passing its readiness probe while every checkout times out on a slow database. This note is about the data a running system emits so that we can answer such questions: logs, metrics and traces, what each one is good for, how Prometheus collects and queries metrics, and how OpenTelemetry standardizes all three. The notes after it turn these measurements into targets, alerts and designs.
+
+**Setup.** The worked example throughout is a checkout service behind a gateway, calling a database and a payment service. Python examples ran on CPython 3.14.7 (macOS, Apple M1) and `jq` 1.7.1, and their output is pasted as printed. PromQL and Prometheus configuration were written against the Prometheus 3.x documentation (October 2026) and not executed here.
+
+## Baseline: a log file and a CPU graph
+
+The traditional way to find out what a server is doing is to log in to it, read its log file with `tail -f` and `grep`, and look at a graph of its CPU and memory. For one long-lived server this works. It breaks in four ways on a modern deployment:
+
+1. **There is no single machine.** The service runs as thirty pods on ten nodes. A slow request may have touched any of them, and grepping thirty log files by hand does not scale.
+2. **Machines are ephemeral.** A pod that crashed at 03:00 has been replaced; its local files went with it.
+3. **One request crosses many services.** A checkout is slow, but the gateway, the checkout service, the database and the payment service each see only their own part. No single log says where the time went.
+4. **Resource graphs miss what users feel.** CPU at 40 % says nothing about the fact that 3 % of checkouts fail. The opposite also happens: CPU at 95 % during a batch job that nobody waits for is not a problem.
+
+The fix is to have every process emit data in a standard shape to a central place, and to choose that data so that it answers questions about users, not only about machines.
+
+## Monitoring and observability
+
+**Monitoring** is collecting, processing and displaying numbers about a system so that known failure modes are noticed: error rates, latencies, queue lengths, disks filling up ([Beyer et al., 2016, ch. 6](#references); [Beyer et al., 2018, ch. 4](#references)). The SRE book splits it into **white-box** monitoring, built on what the system reports about its internals, and **black-box** monitoring, which tests behaviour from outside the way a user would, for example a probe that requests the home page every minute. Black-box monitoring sees what users see; white-box monitoring sees problems before users do and explains them.
+
+**Observability** is a property, not an activity. The word comes from control theory, where a system is observable if its internal state can be inferred from its outputs ([Kalman, 1960](#references)). For software, [Majors, Fong-Jones and Miranda (2022)](#references) define it as the ability to understand any state the system gets into, including ones nobody predicted, from the telemetry it already emits, without shipping new code to ask a new question. The difference is the kind of question:
+
+- A monitoring question is fixed in advance: is the error rate above 1 %? Is the disk more than 90 % full?
+- An observability question is new: which customers, on which app version, in which region, have seen slow checkouts since the deploy at 14:02?
+
+The second kind needs data that keeps many attributes per event, including ones with very many possible values (customer IDs, versions, request IDs). The two are complementary: monitoring tells us that something is wrong, observability lets us find out what.
+
+## Three signals around one request
+
+A running system produces three kinds of telemetry, usually called the three **signals**. Each one answers a different question about the same events.
+
+<aside class="callout"><strong>Key idea.</strong> Each signal compresses the same events differently. A **log** keeps every detail of one event and is expensive per event. A **metric** keeps a few numbers about all events (how many, how fast) and forgets which event was which, so it is cheap enough to keep for months and to alert on. A **trace** keeps the causal tree of one request across services, with the time spent in each. Metrics say that something is wrong and how badly; traces say where; logs say what exactly happened. A shared trace ID links the three.</aside>
+
+<ThreeSignals />
+
+The figure follows one checkout request, `POST /checkout`, through the gateway, the checkout service and the database:
+
+- **Logs.** Each service writes a line about the request: the checkout service logs a warning about a slow query that took 190 ms. Both lines carry the trace ID `4bf9…4736`.
+- **Metrics.** The checkout service adds 1 to a counter of requests with route `/checkout` and status 200, and records 0.226 s in a latency histogram. The request disappears into those numbers; only the totals remain.
+- **Trace.** Each service records a **span**, an interval with a start and an end, and the spans form a tree: the gateway span (240 ms) contains the checkout span (226 ms), which contains the database span (190 ms) and a payment call (16 ms). The tree shows at a glance that the database query is most of the time.
+
+The sections below take the signals one at a time.
+
+## Logs: structured events and levels
+
+A log line is a record of one event. Two choices make logs useful at scale.
+
+**Structure.** A line such as `order o-1042 placed in 226 ms` is easy for a person to read and hard for a program: extracting the duration takes a regular expression that breaks when the wording changes. A **structured log** writes each event as a set of named fields, usually one JSON object per line. Python's [`logging` module](/notes/python/debugging-and-profiling#logging-instead-of-print) does this with a custom formatter:
+
+```python
+import json
+import logging
+import sys
+import time
+
+
+class JsonFormatter(logging.Formatter):
+    """One JSON object per line: a fixed set of fields plus whatever the call passes in extra=."""
+
+    def format(self, record):
+        event = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(record.created))
+                  + f".{int(record.msecs):03d}Z",
+            "level": record.levelname.lower(),
+            "logger": record.name,
+            "msg": record.getMessage(),
+        }
+        event.update(getattr(record, "fields", {}))
+        return json.dumps(event)
+
+
+handler = logging.StreamHandler(sys.stdout)
+handler.setFormatter(JsonFormatter())
+log = logging.getLogger("checkout")
+log.addHandler(handler)
+log.setLevel(logging.INFO)          # DEBUG lines are dropped before they are formatted
+
+trace = {"trace_id": "4bf92f3577b34da6a3ce929d0e0e4736"}
+log.debug("cart loaded", extra={"fields": {**trace, "items": 3}})
+log.info("order placed", extra={"fields": {**trace, "order_id": "o-1042", "amount_cents": 4599, "duration_ms": 226}})
+log.warning("slow query", extra={"fields": {**trace, "db.statement": "SELECT ... FROM stock", "duration_ms": 190}})
+log.error("payment declined", extra={"fields": {"trace_id": "0af7651916cd43dd8448eb211c80319c", "order_id": "o-1043", "code": "card_expired"}})
+```
+
+```console
+$ python -I logs_demo.py > logs.jsonl; cat logs.jsonl
+{"ts": "2026-10-23T01:41:39.326Z", "level": "info", "logger": "checkout", "msg": "order placed", "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736", "order_id": "o-1042", "amount_cents": 4599, "duration_ms": 226}
+{"ts": "2026-10-23T01:41:39.326Z", "level": "warning", "logger": "checkout", "msg": "slow query", "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736", "db.statement": "SELECT ... FROM stock", "duration_ms": 190}
+{"ts": "2026-10-23T01:41:39.326Z", "level": "error", "logger": "checkout", "msg": "payment declined", "trace_id": "0af7651916cd43dd8448eb211c80319c", "order_id": "o-1043", "code": "card_expired"}
+```
+
+The debug line is missing because the logger's level is `INFO`. Each remaining line is a self-contained event, and a query selects by field instead of by wording:
+
+```console
+$ jq -c 'select(.trace_id == "4bf92f3577b34da6a3ce929d0e0e4736") | {level, msg, duration_ms}' logs.jsonl
+{"level":"info","msg":"order placed","duration_ms":226}
+{"level":"warning","msg":"slow query","duration_ms":190}
+$ jq -r 'select(.level == "error") | .code' logs.jsonl
+card_expired
+```
+
+A log store such as Loki, Elasticsearch or OpenSearch runs the same kind of query over the lines of every pod at once.
+
+**Levels.** Each event has a severity, and the level set on a logger drops everything below it before any formatting is done. Python has `DEBUG`, `INFO`, `WARNING`, `ERROR` and `CRITICAL`; syslog has eight severities, from 0 (emergency) to 7 (debug) ([RFC 5424](#references)). A workable convention: `ERROR` means a request failed and someone may need to look; `WARNING` means something degraded but the request succeeded; `INFO` records normal business events; `DEBUG` is off in production and switched on for one service while investigating.
+
+Three practical rules follow from running in containers:
+
+- **Write to standard output.** The container runtime captures it, `kubectl logs` reads it, and a node-level agent (Fluent Bit, or the OpenTelemetry Collector) ships it to the store. Files inside a container vanish with it ([Wiggins, 2011, XI](#references)).
+- **Logs cost money per line.** At 2,000 requests per second, one 300-byte line per request is 52 GB a day. Log each request once, sample debug output, and keep detailed logs for days, not years.
+- **Never log secrets or personal data.** Tokens, passwords and card numbers in a log end up in a second database with weaker access control. The [last note](/notes/devops/incidents-and-security) returns to secrets.
+
+## Metrics: counters, gauges and histograms
+
+A **metric** is a number sampled over time: a **time series** of (timestamp, value) pairs, identified by a name and a set of **labels**, such as `http_requests_total{route="/checkout", code="200"}`. Prometheus, and the OpenTelemetry data model, distinguish a few types by what the number means ([Prometheus documentation, metric types](#references)):
+
+- **Counter.** A number that only goes up: requests served, bytes sent, errors. It starts at 0 when the process starts and drops back to 0 when the process restarts. The raw value is rarely interesting; its rate of increase is.
+- **Gauge.** A number that goes up and down: memory in use, requests in flight, queue length, temperature. The current value is the interesting part.
+- **Histogram.** Observations, usually durations or sizes, counted into **buckets**. In Prometheus a histogram with bucket bounds 0.05, 0.1, 0.25, 0.5 and 1 s is a set of counters: one per bound, named `_bucket` with a label `le` ("less than or equal"), each counting the observations at or below its bound, plus `le="+Inf"`, a `_sum` of all observed values and a `_count`. The buckets are **cumulative**: the 0.25 s bucket includes everything in the 0.1 s bucket.
+- **Summary.** The client computes quantiles itself (for example the 0.99 quantile over the last ten minutes) and exports them. Cheap to query, but, as the next section shows, impossible to combine across processes.
+
+Metrics are cheap because their cost depends on the number of series, not on traffic: a counter costs the same at ten requests per second and at ten thousand.
+
+### Why percentiles cannot be averaged
+
+Latency is described by **percentiles** (quantiles of the distribution, as in the [probability course](/notes/probability/continuous-distributions#the-distribution-function-and-quantiles)) rather than by the mean, because a mean hides the slow tail that some users hit. The **p99** is the latency that 99 % of requests stay at or below. Here we use the nearest-rank definition: sort the $n$ values and take the one at rank $\lceil 0.99\,n \rceil$.
+
+The temptation is to compute the p99 on each replica and average them on a dashboard. Two replicas show why that is wrong:
+
+- Replica A serves 9,000 requests: 8,820 take 10 ms and 180 (2 %) take 400 ms. Its rank $\lceil 0.99 \times 9{,}000 \rceil = 8{,}910$ falls among the slow ones, so its p99 is **400 ms**.
+- Replica B serves 1,000 requests, all at 10 ms. Its p99 is **10 ms**.
+- The mean of the two p99s is $(400 + 10)/2 = $ **205 ms**.
+- All 10,000 requests together contain 180 slow ones. The rank $\lceil 0.99 \times 10{,}000 \rceil = 9{,}900$ falls beyond the 9,820 fast ones, so the true p99 is **400 ms**.
+
+A script that computes the same numbers printed:
+
+```text
+p99 of A: 400 ms, p99 of B: 10 ms
+mean of the two p99s: 205 ms
+p99 of all 10,000 requests: 400 ms
+```
+
+The average understates the tail by half. It would overstate it if the slow replica were the quiet one. The reason is that a percentile is a property of the whole sorted list: it depends on how many values lie above it, and averaging two percentiles throws away exactly that information, including how much traffic each replica served. No arithmetic on the two p99s can recover the answer; the same two numbers, 400 and 10 ms, are consistent with a true p99 anywhere between them.
+
+What does combine exactly is a histogram. Bucket counts are counts, and counts add: the 0.25 s bucket of A plus the 0.25 s bucket of B is the 0.25 s bucket of both. Here A has 8,820 observations at or below 0.25 s and 9,000 at or below 0.5 s, B has 1,000 in both, and the merged buckets 9,820 and 10,000 give a p99 between 0.25 and 0.5 s (the interpolation, explained below, says 0.361 s; the true value is 0.4 s). This is why services export histograms and why the quantile is taken *after* the sum, never before.
+
+## Traces: spans and context propagation
+
+A **trace** is the record of one request through a distributed system. It is a tree of **spans**. Each span describes one unit of work and holds:
+
+- a **trace ID** shared by every span of the request (16 bytes, 32 hex digits);
+- its own **span ID** (8 bytes) and the span ID of its **parent**;
+- a name (`POST /checkout`, `SELECT stock`), a start time and a duration;
+- **attributes** (`http.route`, `db.system`, the customer tier) and a status (ok or error).
+
+The trace of the figure, as a tracing UI would draw it (the numbers are an example):
+
+```text
+trace 4bf92f3577b34da6a3ce929d0e0e4736
+gateway    POST /checkout   |████████████████████████|    0–240 ms
+checkout   POST /checkout   | ███████████████████████|    6–232 ms
+db         SELECT stock     |  ███████████████████   |   20–210 ms
+payments   POST /charge     |                     ██ |  212–228 ms
+```
+
+The idea comes from Google's **Dapper** ([Sigelman et al., 2010](#references)), which also showed that sampling a small fraction of requests is enough to find where time goes.
+
+**Context propagation** is what makes spans from different processes into one tree. When a service calls another, it sends the trace ID and its own span ID along with the request; the callee starts a child span with that parent. Over HTTP the standard header is the W3C **Trace Context** `traceparent` ([W3C, 2021](#references)):
+
+```text
+traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+```
+
+Read field by field, separated by `-`:
+
+1. `00`: the version of the format.
+2. `4bf92f3577b34da6a3ce929d0e0e4736`: the trace ID, the same in every service the request touches.
+3. `00f067aa0ba902b7`: the parent ID, the span ID of the caller's span. The callee creates a new span ID for its own span and sends *that* as the parent ID to its own callees.
+4. `01`: trace flags; bit 0 set means "sampled": the caller recorded this trace, so the callee should too.
+
+The weak point is that every hop must copy the context. A service that makes an outgoing call without forwarding the header, or a message queue that drops it, splits the trace into two unconnected trees. Instrumentation libraries do the copying for common HTTP and gRPC clients; custom thread pools and queues are where traces usually break. Inside one process the same context also reaches the logger, which is how the log lines above got their `trace_id`.
+
+**Sampling.** Recording every span of every request is expensive at high traffic. **Head sampling** decides at the root (keep 10 % of traces, say) and propagates the decision in the flags, so a trace is either complete or absent. **Tail sampling** buffers the spans of each trace in a collector until the trace ends and then decides, so it can keep every trace that had an error or was slow and only a fraction of the fast successful ones, at the price of holding all spans in memory for a few seconds.
+
+## What to measure: golden signals, RED and USE
+
+With unlimited choice of what to count, three short checklists keep a team focused.
+
+The SRE book's **four golden signals** for any user-facing service ([Beyer et al., 2016, ch. 6](#references)):
+
+| Signal | Question | Example metric |
+| --- | --- | --- |
+| Latency | How long do requests take? Successful and failed separately: a fast error is not a fast success. | p50, p99 of `http_request_duration_seconds` |
+| Traffic | How much demand is there? | requests per second |
+| Errors | What fraction of requests fail, explicitly (5xx) or implicitly (a 200 with the wrong content, a response slower than promised)? | 5xx per second / requests per second |
+| Saturation | How full is the most constrained resource? | requests in flight against the pool size, queue length |
+
+**RED** ([Wilkie, 2018](#references)) is the same idea trimmed for request-driven services: **R**ate, **E**rrors, **D**uration. **USE** ([Gregg, 2012](#references)) is for resources rather than services: for every resource (CPU, memory, disk, network interface, connection pool), its **U**tilization (fraction of time busy), **S**aturation (work waiting: a run queue, a swap rate) and **E**rrors. RED on every service and USE on every resource cover most of what a dashboard needs; saturation is the signal that warns before latency rises, a point the [note on capacity](/notes/devops/resilience-and-capacity) makes precise.
+
+## Prometheus: pull, labels and cardinality
+
+**Prometheus** is the most widely used open-source metrics system and a CNCF graduated project. Its model is simple ([Prometheus documentation, overview](#references)):
+
+1. Each process exposes its current metric values over HTTP, by convention at `/metrics`, in a plain text format.
+2. The Prometheus server **pulls**: every **scrape interval** (often 15 or 30 s) it requests `/metrics` from every target it knows, and stores each value with the scrape timestamp. Targets are found by **service discovery**, for example from the Kubernetes API (the [Example](#example) reads such a configuration).
+3. Queries in **PromQL** select and combine series; alert rules are PromQL expressions evaluated on a schedule.
+
+Part of what a scrape of the checkout service returns:
+
+```text
+# HELP http_requests_total Requests handled, by route, method and status code.
+# TYPE http_requests_total counter
+http_requests_total{route="/checkout",method="POST",code="200"} 41500
+http_requests_total{route="/checkout",method="POST",code="503"} 37
+# HELP http_request_duration_seconds Time to handle a request.
+# TYPE http_request_duration_seconds histogram
+http_request_duration_seconds_bucket{route="/checkout",le="0.05"} 520
+http_request_duration_seconds_bucket{route="/checkout",le="0.1"} 800
+http_request_duration_seconds_bucket{route="/checkout",le="0.25"} 940
+http_request_duration_seconds_bucket{route="/checkout",le="0.5"} 980
+http_request_duration_seconds_bucket{route="/checkout",le="1"} 1000
+http_request_duration_seconds_bucket{route="/checkout",le="+Inf"} 1000
+http_request_duration_seconds_sum{route="/checkout"} 88.7
+http_request_duration_seconds_count{route="/checkout"} 1000
+```
+
+Pulling has two consequences worth knowing. A target that stops answering is noticed at once, because the scrape fails and Prometheus records `up == 0` for it. And a short batch job that finishes between two scrapes is never seen; such jobs push their final values to a **Pushgateway** that Prometheus scrapes instead.
+
+**Labels and cardinality.** Every distinct combination of label values is a separate time series, with its own memory in the server and its own storage. The number of series is a product. With 20 routes, 3 methods and 5 status codes on 30 pods, a request counter has up to $20 \times 3 \times 5 \times 30 = 9{,}000$ series. A histogram with the same labels has $6$ bucket series (five bounds and `+Inf`) plus `_sum` and `_count`, so $8 \times 9{,}000 = 72{,}000$. Add a label `customer_id` with 100,000 active customers and the bound becomes 7.2 billion. This is the **cardinality** problem, and the rule is: labels take values from small, bounded sets (route templates such as `/orders/{id}`, never the raw path `/orders/81723`). Unbounded values, such as customer IDs, order IDs and trace IDs, belong in logs and traces, which are built for them. Prometheus can attach a trace ID to an individual histogram sample as an **exemplar**, which links a slow bucket on a graph to one slow trace without making it a label.
+
+### Reading rate and histogram_quantile
+
+Two PromQL functions do most of the work. The first computes the error ratio of the checkout service:
+
+```promql
+  sum by (route) (rate(http_requests_total{job="checkout", code=~"5.."}[5m]))
+/
+  sum by (route) (rate(http_requests_total{job="checkout"}[5m]))
+```
+
+Read from the inside out:
+
+1. `http_requests_total{job="checkout", code=~"5.."}` selects every counter series of the job whose `code` label matches the regular expression `5..`: one series per pod, route, method and status code.
+2. `[5m]` turns each series into a **range vector**: all samples of the last five minutes, about 20 at a 15 s scrape interval.
+3. `rate(...)` computes, for each series separately, the per-second average increase over the window. A counter that went from 41,200 to 41,500 in 300 s has a rate of $300 / 300 = 1$ per second. If the pod restarted, the counter drops to a small number; `rate` treats any decrease as a reset and adds the value before it, so 41,200 → 41,450, a restart, then 30 → 50 counts as $250 + 30 + 20 = 300$. It also extrapolates slightly to the edges of the window when the samples do not cover it exactly.
+4. `sum by (route) (...)` adds the per-second rates of all pods, methods and codes, keeping only the `route` label.
+5. The division matches the two sides on `route` and gives the fraction of requests that failed in the last five minutes, per route.
+
+Two rules hide in this order. **Take `rate` before `sum`**: summing raw counters first would turn one pod's restart into a drop of the total, which `rate` would misread as a reset of everything. And choose the window to cover several scrapes; `rate` needs at least two samples, and four scrape intervals is a common minimum.
+
+The second query is the p99 latency of the whole job:
+
+```promql
+histogram_quantile(
+  0.99,
+  sum by (le) (rate(http_request_duration_seconds_bucket{job="checkout"}[5m]))
+)
+```
+
+1. `rate(..._bucket[5m])` gives, for every bucket series, the number of observations per second at or below its bound over the last five minutes. Because the counters only count, this also discards everything older than five minutes.
+2. `sum by (le) (...)` merges all pods and routes bucket by bucket, keeping `le`. This is the exact merge of the previous section; to get a p99 per route, keep `route` as well: `sum by (le, route)`.
+3. `histogram_quantile(0.99, ...)` finds the bucket where the 0.99 quantile lies and interpolates linearly inside it, assuming observations are spread evenly across the bucket.
+
+<HistogramQuantile />
+
+With the bucket counts of the scrape above, 1,000 observations in total, the 0.99 quantile is the observation of rank $0.99 \times 1{,}000 = 990$. The bucket `le="0.5"` holds 980 observations and `le="1"` holds 1,000, so rank 990 lies in the bucket from 0.5 to 1 s, 10 of its 20 observations in:
+
+$$
+\boxed{\;q = \ell + (u - \ell)\,\frac{r - c_\ell}{c_u - c_\ell}\;}
+\qquad
+q_{0.99} = 0.5 + (1 - 0.5) \times \frac{990 - 980}{1{,}000 - 980} = 0.75\ \text{s},
+$$
+
+where $\ell$ and $u$ are the lower and upper bound of the bucket, $c_\ell$ and $c_u$ the cumulative counts at them, and $r$ the rank. The same rule gives a p50 of $0.05 \times 500/520 = 0.048$ s and a p90 of $0.1 + 0.15 \times (900-800)/(940-800) = 0.207$ s; a Python reimplementation printed `0.0481`, `0.2071` and `0.7500`. The answer is only as good as the buckets: the true p99 is somewhere between 0.5 and 1 s, and 0.75 s is a guess in the middle. Put bucket bounds close to the latencies you care about, such as the latency threshold of an objective. If the quantile falls in the `+Inf` bucket, `histogram_quantile` returns the highest finite bound, which says only "more than that".
+
+*Optional depth: native histograms. The rest of the note does not depend on it.* Prometheus also has **native histograms**, which use exponentially spaced buckets chosen automatically, so no one has to guess the bounds, and store a whole histogram as one series instead of one per bucket. They appeared as an experimental feature in Prometheus 2.40 (November 2022) and are a stable feature since 3.8, though scraping them still has to be switched on in the scrape configuration ([Prometheus documentation, native histograms](#references)). The functions above work on them unchanged, without the `_bucket` suffix and the `le` label.
+
+<aside class="callout"><strong>Check yourself.</strong> (1) A dashboard shows "p99 latency" as `avg(checkout_latency_p99)` over 30 pods, each exporting a summary. Why is the number unreliable, and what should the pods export instead? (2) A developer adds the label `path` with the raw request path, including order IDs. What happens to Prometheus, and what is the fix? (3) A counter reads 500, then 800, then 20 (after a restart), then 120 at four successive scrapes. What increase does `rate` see? (4) The checkout trace shows the gateway span and the payment span, but no checkout span, and the payment span appears as a separate trace. What is the likely cause?<details><summary>Answers</summary>(1) An average of per-pod percentiles is not a percentile of all requests: it ignores how many requests each pod served and how many lie above each p99, and can be off in either direction. Export a histogram and compute `histogram_quantile(0.99, sum by (le) (rate(..._bucket[5m])))`. (2) Every distinct path becomes a new series; with unbounded IDs the number of series grows without limit and the server runs out of memory or becomes slow. Use the route template (`/orders/{id}`) as the label and put the raw path in logs or span attributes. (3) $300 + 20 + 100 = 420$: the drop from 800 to 20 is read as a reset, so the 20 counts as new increase. (4) The checkout service is not instrumented or does not forward the `traceparent` header on its outgoing call: without its span the tree loses a link, and the payment service starts a new trace because it received no context.</details></aside>
+
+## OpenTelemetry: one vendor-neutral standard
+
+Every tracing system and every metrics vendor once had its own client library, its own wire format and its own conventions for naming things. Instrumenting a service tied it to one backend. **OpenTelemetry** (OTel) is the standard that removes the tie. It was formed in 2019 by merging two earlier projects, OpenTracing and OpenCensus, and is a CNCF project supported by the major vendors ([OpenTelemetry documentation](#references)). It has four parts:
+
+- **API and SDKs** for each major language: code calls the API to start spans, record metrics and emit logs; the SDK, configured at start-up, decides where they go. **Automatic instrumentation** wraps common frameworks and clients (HTTP servers, database drivers) so that most spans and metrics appear without code changes, including context propagation.
+- **OTLP**, the OpenTelemetry Protocol, one wire format for all three signals, over gRPC (port 4317) or HTTP (port 4318).
+- **The Collector**, a separate process that receives telemetry, processes it (batches, samples, drops attributes, adds Kubernetes metadata) and exports it to one or more backends. Changing vendors means changing the Collector's configuration, not the services.
+- **Semantic conventions**: shared names for common attributes, such as `service.name`, `http.request.method`, `http.route` and `http.response.status_code`, so that dashboards and queries work across services written in different languages.
+
+Status as of October 2026, from the project's specification status page: tracing, metrics and logs are stable in the specification and in OTLP; a fourth signal, **profiles** (where CPU time and memory go inside a process), is in development. Language SDKs mature at different speeds: the Python SDK, for example, lists traces and metrics as stable and logs as still in development, so check the status page for the language at hand. Prometheus and OpenTelemetry meet in both directions: the Collector can scrape Prometheus endpoints, and since Prometheus 3.0 (November 2024) the server can receive metrics over OTLP.
+
+## Dashboards and alerts
+
+The collected data reaches people in two ways, and they serve different moments.
+
+A **dashboard** (typically in Grafana) is for a person who is already looking: during an investigation, after a deploy, in a weekly review. A good service dashboard starts with the golden signals of that service, compares now with the same time last week, marks deploys on the time axis, and links each panel to the logs and traces behind it. Dashboards fail by accumulation: a hundred panels that nobody can read in an emergency.
+
+An **alert** interrupts a person who is doing something else, possibly asleep. It must therefore be rare, urgent and actionable, and should fire on what users experience (errors, latency) rather than on internal causes (CPU at 90 %), which belong on dashboards. The SRE book's rule is that every page should require intelligent human action; anything a script could respond to should be a script ([Beyer et al., 2016, ch. 6](#references)). How to choose what to alert on, and at what threshold, needs a target to compare against, which is the subject of the next note.
+
+## What changed
+
+| | A log file and a CPU graph (the baseline) | Three signals with central collection |
+| --- | --- | --- |
+| Many pods on many nodes | log in to each one | one query over all of them, by label |
+| A pod that has been replaced | its logs are gone | logs were shipped from standard output as they were written |
+| A slow request across services | each service sees only its part | one trace with a span per service |
+| "Is it bad, and how bad?" | read and count by eye | a counter's `rate` and a histogram's quantile |
+| p99 over 30 replicas | average of per-replica numbers, wrong | merge histograms, then take the quantile |
+| A new question after an incident | add logging and redeploy | ask it of attributes already recorded |
+| Vendor choice | built into every service | OpenTelemetry API in the code, backend chosen in the Collector |
+
+## Limitations
+
+- **Telemetry costs.** Every log line, span and series is stored and indexed. Large systems spend a noticeable share of their infrastructure budget on observability; sampling, retention limits and dropping unused metrics are part of running it.
+- **Histograms approximate.** A quantile from classic buckets is an interpolation; with badly placed bounds it can be wrong by a factor of two. Native histograms reduce the error but do not remove it.
+- **Sampling hides rare events.** A trace that was not sampled cannot be inspected later. Tail sampling helps for errors and slow requests, not for an odd but fast request.
+- **Observability does not explain itself.** The data shows that the database span grew from 20 to 190 ms; why it grew, a lock, a missing index, a noisy neighbour, still takes a person who understands the system.
+- **Not covered:** continuous profiling, real-user monitoring in browsers, log-based metrics, and the storage engines (Prometheus's time-series database, columnar trace stores) behind the signals.
+
+## What you should remember
+
+- Monitoring watches for known failures; observability is being able to ask new questions of the telemetry already collected.
+- Logs keep every detail of one event; metrics keep counts of all events; traces keep the path of one request. Link them with a trace ID.
+- Write logs as structured JSON to standard output, with levels, once per request, without secrets.
+- Counters only go up (use `rate`), gauges go up and down, histograms count observations into cumulative `le` buckets.
+- Percentiles cannot be averaged. Histogram buckets add; merge them, then take the quantile: `histogram_quantile(0.99, sum by (le) (rate(..._bucket[5m])))`.
+- `traceparent` carries version, trace ID, parent span ID and flags; every hop must forward it.
+- Golden signals: latency, traffic, errors, saturation. RED for services, USE for resources.
+- Prometheus pulls `/metrics`; every label combination is a series, so labels must have few values.
+- OpenTelemetry standardizes the API, the protocol (OTLP) and the attribute names; the Collector decides where data goes.
+- Dashboards are for people who are looking; alerts are for people who are not, and must be rare and actionable.
+
+## Example
+
+The Prometheus server configuration that finds and scrapes the checkout pods in a Kubernetes cluster. It uses the common `prometheus.io/scrape` annotation convention: a pod that wants to be scraped says so in its own manifest. (Clusters that run the Prometheus Operator express the same thing with `PodMonitor` and `ServiceMonitor` objects.) Not executed here; written against the Prometheus 3.x configuration reference and checked to be valid YAML.
+
+```yaml
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: prod-eu-1
+
+rule_files:
+  - /etc/prometheus/rules/*.yml
+
+scrape_configs:
+  - job_name: kubernetes-pods
+    kubernetes_sd_configs:
+      - role: pod
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+        regex: "true"
+        action: keep
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+        regex: (.+)
+        target_label: __metrics_path__
+      - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+        regex: ([^:]+)(?::\d+)?;(\d+)
+        replacement: $1:$2
+        target_label: __address__
+      - source_labels: [__meta_kubernetes_namespace]
+        target_label: namespace
+      - source_labels: [__meta_kubernetes_pod_name]
+        target_label: pod
+      - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_name]
+        regex: (.+)
+        target_label: job
+    metric_relabel_configs:
+      - source_labels: [__name__]
+        regex: go_gc_.*
+        action: drop
+```
+
+Read line by line:
+
+- `scrape_interval: 15s` is how often every target is pulled; `evaluation_interval: 15s` is how often recording and alert rules are evaluated. A shorter interval gives finer graphs and more samples to store.
+- `external_labels` are added to every series when they leave this server (to long-term storage or to the Alertmanager), so that data from several clusters can be told apart.
+- `rule_files` loads recording and alert rules; the [next note's Example](/notes/devops/slos-and-alerting#example) is such a file.
+- `kubernetes_sd_configs` with `role: pod` asks the Kubernetes API for every pod and turns each declared container port into a candidate target, with metadata labels starting `__meta_kubernetes_`.
+- The first relabel rule keeps only targets whose pod has the annotation `prometheus.io/scrape: "true"` (the annotation name, with its dots and slash replaced by underscores) and drops all others.
+- The second copies the annotation `prometheus.io/path`, if present, into `__metrics_path__`; the default is `/metrics`. `regex: (.+)` makes the rule apply only when the annotation is non-empty.
+- The third rewrites the address: `source_labels` are joined with `;`, so the regex sees `10.0.3.17:8080;9102`, captures the IP and the annotated port, and `replacement: $1:$2` produces `10.0.3.17:9102`.
+- The next three copy the namespace, the pod name and the standard `app.kubernetes.io/name` label into ordinary labels (`namespace`, `pod`, `job`); the last rule has `regex: (.+)` so that a pod without that label keeps the default `job`, the `job_name`. Labels starting with `__` are dropped after relabeling, so anything worth keeping must be copied this way. The pod name has high cardinality over time, since every rollout creates new pods; that is accepted for this label because it is bounded at any moment and essential for debugging.
+- `metric_relabel_configs` runs after the scrape, on every sample: here it drops the Go runtime's garbage-collector series, which nobody looks at. Dropping unused series at the source is the cheapest cardinality control.
+
+A pod opts in with three annotations in its template: `prometheus.io/scrape: "true"`, `prometheus.io/port: "9102"` and, if the path is not `/metrics`, `prometheus.io/path`.
+
+## Next
+
+We can now measure what users experience: the error ratio and the latency quantiles of every route, and the trace of any slow request. What we cannot yet say is whether 0.3 % of failed checkouts is fine or an emergency, and so when a person should be woken up. The [next note](/notes/devops/slos-and-alerting) turns these measurements into service level objectives, computes how much unreliability an objective allows, and derives alerts that fire on how fast that allowance is being spent.
+
+## References
+
+- B. Beyer, C. Jones, J. Petoff, N. R. Murphy (eds.). [*Site Reliability Engineering*](https://sre.google/sre-book/table-of-contents/). O'Reilly, 2016. Ch. 6, [Monitoring Distributed Systems](https://sre.google/sre-book/monitoring-distributed-systems/) (white-box and black-box monitoring, the four golden signals, pages that need human action); ch. 10, Practical Alerting from Time-Series Data.
+- B. Beyer, N. R. Murphy, D. K. Rensin, K. Kawahara, S. Thorne (eds.). [*The Site Reliability Workbook*](https://sre.google/workbook/table-of-contents/). O'Reilly, 2018. Ch. 4, [Monitoring](https://sre.google/workbook/monitoring/).
+- C. Majors, L. Fong-Jones, G. Miranda. *Observability Engineering*. O'Reilly, 2022. Ch. 1–2 (observability defined, against monitoring) and ch. 5–6 (structured events, tracing).
+- R. E. Kalman. On the general theory of control systems. *Proceedings of the First IFAC World Congress*, 1960.
+- B. H. Sigelman, L. A. Barroso, M. Burrows, P. Stephenson, M. Plakal, D. Beaver, S. Jaspan, C. Shanbhag. [Dapper, a Large-Scale Distributed Systems Tracing Infrastructure](https://research.google/pubs/dapper-a-large-scale-distributed-systems-tracing-infrastructure/). Google Technical Report dapper-2010-1, 2010.
+- W3C. [Trace Context](https://www.w3.org/TR/trace-context/). W3C Recommendation, 2021. §3.2 (the `traceparent` header).
+- R. Gerhards. [The Syslog Protocol](https://www.rfc-editor.org/rfc/rfc5424). RFC 5424, 2009. §6.2.1 (severities).
+- A. Wiggins. [The Twelve-Factor App](https://12factor.net/logs). 2011. XI, Logs.
+- Prometheus documentation: [overview](https://prometheus.io/docs/introduction/overview/); [data model](https://prometheus.io/docs/concepts/data_model/); [metric types](https://prometheus.io/docs/concepts/metric_types/); [exposition formats](https://prometheus.io/docs/instrumenting/exposition_formats/); [query functions](https://prometheus.io/docs/prometheus/latest/querying/functions/) (`rate`, `histogram_quantile`); [histograms and summaries](https://prometheus.io/docs/practices/histograms/); [naming and labels](https://prometheus.io/docs/practices/naming/); [configuration](https://prometheus.io/docs/prometheus/latest/configuration/configuration/) (`kubernetes_sd_config`, `relabel_config`); [native histograms](https://prometheus.io/docs/specs/native_histograms/). Accessed October 2026.
+- OpenTelemetry documentation: [what is OpenTelemetry](https://opentelemetry.io/docs/what-is-opentelemetry/); [specification status summary](https://opentelemetry.io/docs/specs/status/); [semantic conventions](https://opentelemetry.io/docs/specs/semconv/); [the Collector](https://opentelemetry.io/docs/collector/). Accessed October 2026.
+- B. Gregg. [The USE Method](https://www.brendangregg.com/usemethod.html). 2012.
+- T. Wilkie. [The RED Method: How to Instrument Your Services](https://grafana.com/blog/2018/08/02/the-red-method-how-to-instrument-your-services/). Grafana Labs, 2018.
+- University of Helsinki. [DevOps with Kubernetes](https://devopswithkubernetes.com/) (mooc.fi, 2026): monitoring a cluster with Prometheus, Grafana and Loki.

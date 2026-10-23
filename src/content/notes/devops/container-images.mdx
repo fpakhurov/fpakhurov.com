@@ -1,0 +1,466 @@
+---
+title: Container images
+description: "What a container image is underneath: content-addressed layers and a config named by an OCI manifest, union file systems, Dockerfile instructions and the order rule of the build cache, multi-stage builds, small base images, non-root users, and pinning images by digest."
+course: devops
+section: Build and Ship
+order: 4
+status: published
+tags: [containers, docker, oci, image-manifest, layers, content-addressing, overlayfs, dockerfile, build-cache, buildkit, multi-stage-builds, distroless, alpine, registries, digests, compose]
+prerequisites: [Builds and dependencies, Virtual machines and containers]
+---
+
+import ImageLayers from '../../../components/figures/container-images/ImageLayers.astro';
+
+The [previous note](/notes/devops/builds-and-dependencies) ended with an artifact: a program built once from a commit, with a version and a hash. A program alone does not run. A Python service needs an interpreter of the right version, the exact packages of its lockfile, system libraries such as OpenSSL, CA certificates and a time-zone database, and every machine that runs it has its own idea of all of these. A **container image** ships the program together with the whole file tree it expects. The [ACOS course](/notes/acos/virtual-machines-and-containers#containers-one-kernel-many-views) showed how a container runs: namespaces for a private view of the system, cgroups for limits, and layers stacked by OverlayFS. This note is about the image: what it is made of, how it is built so that rebuilds are fast and the result is small and safe, and how it is named so that what was tested is what runs.
+
+**Conventions.** The running example of the section from here on is the calculator turned into a small web service, `calc`: a Python 3.14 package that answers `POST /eval` with the value of an expression, with dependencies locked in `uv.lock`. Registry data in this note was fetched from Docker Hub and `gcr.io` on 23 October 2026. Docker was not run for this note: the Dockerfile and the Compose file are written against the Dockerfile reference and the Compose specification for Docker Engine 29.9 and Compose 5.6 (current in October 2026), and their behaviour is described from that documentation, not shown as output.
+
+## Baseline: copy the program to a server
+
+The traditional deployment copies the artifact to a server and runs it there. Everything else, the interpreter, the packages, the system libraries, is whatever the server has. The program then behaves differently on a laptop, on the CI machine and on each server, depending on what was installed on each and when. Upgrading Python for one service breaks another on the same machine. Configuration-management tools (Ansible, Puppet, Chef) make servers more alike by converging them to a description, but they converge them slowly and never completely, and every server keeps a history of its own.
+
+Virtual machine images solve this by shipping a whole disk, kernel included, and are gigabytes large and minutes slow to boot. A container image ships only the user-space file tree and the metadata to run one program in it, on the host's kernel.
+
+## What an image is
+
+An image is not one file. By the OCI image specification ([OCI Image Format Specification v1.1](#references)), it is a small graph of **blobs**, each stored and named by the SHA-256 digest of its bytes:
+
+- **Layers.** Each layer is a tar archive, usually gzip- or zstd-compressed, of the files that one build step added, changed or deleted. Stacked in order, they form the file tree.
+- **The config.** A JSON document with the metadata of the image: the processor architecture and operating system, the command to run, environment variables, the working directory, the user, and `rootfs.diff_ids`, the digests of the *uncompressed* layers in order.
+- **The manifest.** A JSON document that names the config and the layers by their digests, sizes and media types. The digest of the manifest is the identity of the image.
+- **The index.** For images built for several platforms, a JSON list of manifests, one per architecture, each with its digest. A tag such as `alpine:3.22` usually points to an index, and the client picks the manifest of its own platform.
+
+Every reference goes through a digest, so the whole image is a Merkle tree, like the [Git object graph](/notes/devops/git): changing one byte of one file changes that layer's digest, which changes the manifest, and nothing else. Two images that share a layer share its blob, on disk and in the registry.
+
+**Worked example: an image by hand.** Nothing in this structure needs Docker. `mkimage.py` writes an image in the **OCI image layout**, the format for images stored as files, with two layers: one with an `/etc/passwd` that defines an unprivileged user 65532, and one with the service's code (here a one-file version, `calc.py`). Every blob goes into `blobs/sha256/` under its own digest:
+
+```python
+# Write an OCI image layout by hand: two layers, a config and a manifest, every blob named by its SHA-256.
+import gzip, hashlib, io, json, pathlib, sys, tarfile
+
+OUT = pathlib.Path('image')
+BLOBS = OUT / 'blobs' / 'sha256'
+
+def sha(data: bytes) -> str:
+    return 'sha256:' + hashlib.sha256(data).hexdigest()
+
+def put(data: bytes) -> str:                         # store a blob under its own digest
+    BLOBS.mkdir(parents=True, exist_ok=True)
+    digest = sha(data)
+    (BLOBS / digest.split(':')[1]).write_bytes(data)
+    return digest
+
+def layer(files: dict[str, bytes]):
+    """A layer is a tar of files; returns (compressed blob, diff_id of the uncompressed tar)."""
+    raw = io.BytesIO()
+    with tarfile.open(fileobj=raw, mode='w', format=tarfile.PAX_FORMAT) as tar:
+        for name in sorted(files):
+            info = tarfile.TarInfo(name)
+            info.size, info.mtime, info.mode = len(files[name]), 0, 0o644
+            tar.addfile(info, io.BytesIO(files[name]))
+    tar_bytes = raw.getvalue()
+    return gzip.compress(tar_bytes, mtime=0), sha(tar_bytes)
+
+app_source = pathlib.Path(sys.argv[1]).read_bytes()
+layers = [
+    layer({'etc/passwd': b'root:x:0:0:root:/root:/sbin/nologin\nnonroot:x:65532:65532::/home/nonroot:/sbin/nologin\n'}),
+    layer({'app/calc.py': app_source}),
+]
+config = json.dumps({
+    'architecture': 'amd64', 'os': 'linux',
+    'config': {'User': '65532', 'WorkingDir': '/app', 'Cmd': ['python3', '/app/calc.py']},
+    'rootfs': {'type': 'layers', 'diff_ids': [diff_id for _, diff_id in layers]},
+}, indent=1).encode() + b'\n'
+manifest = json.dumps({
+    'schemaVersion': 2,
+    'mediaType': 'application/vnd.oci.image.manifest.v1+json',
+    'config': {'mediaType': 'application/vnd.oci.image.config.v1+json', 'digest': put(config), 'size': len(config)},
+    'layers': [{'mediaType': 'application/vnd.oci.image.layer.v1.tar+gzip', 'digest': put(blob), 'size': len(blob)}
+               for blob, _ in layers],
+}, indent=1).encode() + b'\n'
+index = {'schemaVersion': 2, 'mediaType': 'application/vnd.oci.image.index.v1+json',
+         'manifests': [{'mediaType': 'application/vnd.oci.image.manifest.v1+json', 'digest': put(manifest),
+                        'size': len(manifest), 'annotations': {'org.opencontainers.image.ref.name': '1.4.0'}}]}
+(OUT / 'index.json').write_text(json.dumps(index, indent=1) + '\n')
+(OUT / 'oci-layout').write_text('{"imageLayoutVersion": "1.0.0"}\n')
+print('manifest', index['manifests'][0]['digest'][:19])
+```
+
+The tar entries carry fixed times and sorted names, the reproducibility rules of the previous note, so the same inputs always give the same digests. Running it:
+
+```console
+$ python3.14 mkimage.py calc.py
+manifest sha256:cf856bfec9ca
+$ find image -type f | sort
+image/blobs/sha256/3523e3979265b8861fc9a2ad40919469883a280c462ef808b105a7896a33c919
+image/blobs/sha256/94ba12a8df415a7f7cb6ba4b29290e9e5899ca0772283b8c5e14827baa3ae086
+image/blobs/sha256/cf856bfec9cae6fff4ca8d306740c4e8ba1e3668e56e431e76e18cbc4ec5234f
+image/blobs/sha256/dd15937b14d01292066971ae23f14fb89ed7c8dd21f26ab5d04a0959c21ee71b
+image/index.json
+image/oci-layout
+$ blob() { cat "image/blobs/sha256/${1#sha256:}"; }
+$ M=$(jq -r '.manifests[0].digest' image/index.json); blob $M
+{
+ "schemaVersion": 2,
+ "mediaType": "application/vnd.oci.image.manifest.v1+json",
+ "config": {
+  "mediaType": "application/vnd.oci.image.config.v1+json",
+  "digest": "sha256:94ba12a8df415a7f7cb6ba4b29290e9e5899ca0772283b8c5e14827baa3ae086",
+  "size": 364
+ },
+ "layers": [
+  {
+   "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+   "digest": "sha256:3523e3979265b8861fc9a2ad40919469883a280c462ef808b105a7896a33c919",
+   "size": 148
+  },
+  {
+   "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+   "digest": "sha256:dd15937b14d01292066971ae23f14fb89ed7c8dd21f26ab5d04a0959c21ee71b",
+   "size": 232
+  }
+ ]
+}
+$ blob $(blob $M | jq -r .config.digest)
+{
+ "architecture": "amd64",
+ "os": "linux",
+ "config": {
+  "User": "65532",
+  "WorkingDir": "/app",
+  "Cmd": [
+   "python3",
+   "/app/calc.py"
+  ]
+ },
+ "rootfs": {
+  "type": "layers",
+  "diff_ids": [
+   "sha256:b8f4c317bb8d5c3ea8a3c0c5cc99842a6d6229a522da1e58f0cb38e4de54c1c9",
+   "sha256:9cc702020608aace0f8248605c0a948b5fbeb27275ea77e900a09c46dc7855f8"
+  ]
+ }
+}
+```
+
+Two digests describe each layer, and the difference matters:
+
+```console
+$ L=$(blob $M | jq -r '.layers[0].digest'); blob $L | shasum -a 256; blob $L | gunzip | shasum -a 256; blob $L | gunzip | tar -tvf -
+3523e3979265b8861fc9a2ad40919469883a280c462ef808b105a7896a33c919  -
+b8f4c317bb8d5c3ea8a3c0c5cc99842a6d6229a522da1e58f0cb38e4de54c1c9  -
+-rw-r--r--  0 0      0          87 Jan  1  1970 etc/passwd
+```
+
+The manifest's digest (`3523e3…`) is that of the compressed blob, which is what a registry stores and a client downloads and checks. The config's `diff_id` (`b8f4c3…`) is that of the uncompressed tar, which is what the file tree is built from; the same files compressed differently give a different blob but the same `diff_id`. Now one line of the service changes, and the image is rebuilt:
+
+```console
+$ ls image/blobs/sha256 > before.txt
+$ sed -i '' "s|'/': operator.truediv|'/': operator.truediv, '%': operator.mod|" calc.py
+$ python3.14 mkimage.py calc.py
+manifest sha256:1d23a475efde
+$ ls image/blobs/sha256 | comm -13 before.txt - | cut -c1-12      # new blobs
+1d23a475efde
+5f21aa63ccb2
+6891b973ae51
+$ M=$(jq -r '.manifests[0].digest' image/index.json); blob $M | jq -r '.layers[].digest' | cut -c1-19
+sha256:3523e3979265
+sha256:6891b973ae51
+```
+
+Three blobs are new: the code layer (`6891b9…`), the config, whose `diff_ids` changed (`5f21aa…`), and the manifest (`1d23a4…`), which is a new image. The first layer is the same blob as before, so a registry that already has it is not sent it again and a machine that already pulled it does not download it again. In a real image the first layers are the base system and the dependencies, hundreds of megabytes, and the code layer is a few kilobytes. The image built here does not run: it has no Python interpreter. Real images start from a base image that provides one, and the rest of the note builds such an image.
+
+**A real image from a registry.** The same structure, fetched from Docker Hub with the registry API of the [OCI distribution specification](#references): an anonymous token, then `GET /v2/<name>/manifests/<reference>`, where the reference is a tag or a digest.
+
+```console
+$ R=https://registry-1.docker.io/v2/library/alpine
+$ TOKEN=$(curl -s 'https://auth.docker.io/token?service=registry.docker.io&scope=repository:library/alpine:pull' | jq -r .token)
+$ get() { curl -s -H "Authorization: Bearer $TOKEN" -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json' "$R/$1"; }
+$ get manifests/3.22 | jq -c '.manifests[] | [.platform.architecture, .platform.variant, .digest[7:19], .size]' | head -8
+["amd64",null,"dc92f017beea",1022]
+["unknown",null,"ae0881df4bf2",838]
+["arm","v6","178826c1dd59",1023]
+["unknown",null,"e374a5b0c751",566]
+["arm","v7","2194dc1bfe94",1023]
+["unknown",null,"ff119a94eb06",838]
+["arm64","v8","3e07a4f627d1",1025]
+["unknown",null,"7d1b77cd4a9a",838]
+$ get manifests/sha256:3e07a4f627d12468155eb812785e10f2453a447c346872b47788a62437366764 | tee m.json | jq -c '.config, .layers[]'
+{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:f28fb2fa6085390a967d9b74491b91c53cf00dec45bf1c7defa6aae11a52e519","size":627}
+{"mediaType":"application/vnd.oci.image.layer.v1.tar+gzip","digest":"sha256:281d5a96263b1ebc7051f11d9b9a4ca111ed1c711d5e209682310fc62c4b8bef","size":4127381}
+$ shasum -a 256 m.json
+3e07a4f627d12468155eb812785e10f2453a447c346872b47788a62437366764  m.json
+$ jq -r '.annotations["org.opencontainers.image.version"], .annotations["org.opencontainers.image.created"]' m.json
+3.22.7
+2026-10-21T20:46:59Z
+```
+
+The tag `3.22` names an index with a manifest for each platform (the first eight entries of sixteen are shown). The entries with platform `unknown` are attestations: statements about how the image next to them was built (its provenance and its software bill of materials), stored as manifests of their own. The arm64 manifest has one layer of 4.1 MB, the whole Alpine 3.22.7 base system, built two days before this note was written; the file fetched by digest hashes to exactly that digest, which is how a client verifies what it downloaded.
+
+## Layers on disk: union file systems and copy-on-write
+
+To run an image, the container runtime unpacks each layer into a directory once and stacks the directories with a union file system, on Linux usually OverlayFS: the layers are read-only lower directories, and each container gets an empty writable upper directory on top. A read finds the file in the topmost layer that has it; a write to a file from a lower layer first copies it up; a deletion leaves a whiteout that hides the file below. The [ACOS note](/notes/acos/virtual-machines-and-containers#layered-images-a-private-file-tree-shared-on-disk) mounts such a stack by hand. Two consequences shape how images are built:
+
+- **A deleted file is still in the image.** A layer tar records a deletion as a whiteout entry, a file named `.wh.` followed by the deleted name ([OCI image spec, layer changesets](#references)). The bytes of the file stay in the lower layer and are downloaded with it. A secret copied in one step and deleted in the next is readable by anyone who pulls the image, and a large download removed in a later step still costs its full size.
+- **Containers share their layers.** A hundred containers from the same image on one host use one copy of the layers on disk and in the page cache; each adds only its own upper directory. Anything a container writes there disappears with the container, so data that must survive goes into a volume.
+
+## A Dockerfile, instruction by instruction
+
+A **Dockerfile** is the build script of an image ([Dockerfile reference](#references)). Each instruction is one build step on top of the result of the previous one:
+
+| Instruction | What it does | Produces |
+| --- | --- | --- |
+| `FROM image` | starts from a base image | its layers |
+| `WORKDIR /app` | sets (and creates) the working directory | a small layer, and config |
+| `COPY src dst` | copies files from the build context | a layer |
+| `RUN command` | runs a command in the image so far | a layer of the files it changed |
+| `ENV`, `USER`, `EXPOSE`, `CMD`, `ENTRYPOINT`, `LABEL` | set metadata | config only |
+| `ARG name` | a build-time variable | nothing in the image |
+
+The **build context** is the folder sent to the builder, usually `.`; `COPY` can only take files from it. BuildKit, the builder behind `docker build` since Docker 23, runs the steps as a graph and executes independent stages in parallel.
+
+**The build cache.** Rebuilding every step on every change would make images as slow as the baseline build script of the previous note. BuildKit keeps a cache of the results of each step, and reuses a step if its key matches ([Docker documentation, Build cache invalidation](#references)):
+
+- the key includes the cache key of the parent step, so a step can only be reused if every step before it was;
+- for `RUN`, the key is the command string. The builder does not look at what the command would fetch: `RUN apt-get update && apt-get install -y curl` is reused for months, with the package lists of the day it first ran;
+- for `COPY` and `ADD`, the key includes a checksum of the contents (and permissions) of the files copied, not their modification times.
+
+The first rule is the one that shapes a Dockerfile. When one step misses the cache, every later step runs again, whether its own inputs changed or not. Hence the **order rule**: put the steps whose inputs change least often first. For a service, the base image changes every few weeks, the dependencies every few days, and the code with every commit, so a Dockerfile copies the lockfile, installs dependencies, and only then copies the code:
+
+<ImageLayers />
+
+1. One file of the service's code changes; nothing else does.
+2. With `COPY . .` before the install, the copy's checksum changes, the step misses the cache, and every step after it runs again: all dependencies are downloaded and installed anew, and pushed as a new layer.
+3. With the lockfile copied first, the copy of `pyproject.toml` and `uv.lock` and the installation of the dependencies are cache hits. The miss comes at `COPY src/`, and only the cheap last steps run again.
+
+<aside class="callout"><strong>Key idea.</strong> An image is a stack of content-addressed layers named by a manifest, and a build step is reused only if its own inputs and every step below it are unchanged. Order the Dockerfile from what changes least to what changes most, keep what the program does not need out of the final stage, and refer to the result by its digest.</aside>
+
+## Multi-stage builds
+
+A build needs things the running service does not: compilers, headers, the package manager, its cache, test tools. A **multi-stage build** has several `FROM` instructions, each starting a stage, and later stages copy only selected files from earlier ones with `COPY --from=stage`. Only the last stage becomes the image. The build stage of `calc` has `uv` and resolves the lockfile into a virtual environment; the runtime stage starts from a fresh base and copies the finished environment, so `uv`, its cache and the build tools are not in the image. The full Dockerfile is read line by line in the [Example](#example).
+
+For a compiled language the effect is larger: a Go or Rust service built statically in a stage with the whole toolchain (hundreds of megabytes) can be copied alone into an empty base (`FROM scratch`) or a distroless one.
+
+## Small base images
+
+The base image decides most of an image's size and contents. Compressed sizes of the linux/amd64 images, summed over their layers, as listed by their registries on 23 October 2026:
+
+| Base image | Layers | Compressed size | What is in it |
+| --- | --- | --- | --- |
+| `gcr.io/distroless/static-debian12:nonroot` | 12 | 0.7 MB | CA certificates, time zones, `/etc/passwd`; no shell, no libc |
+| `busybox:1.37` | 1 | 2.2 MB | one static binary with the usual commands |
+| `alpine:3.22` | 1 | 3.8 MB | musl libc, BusyBox, the `apk` package manager |
+| `gcr.io/distroless/base-debian12` | 14 | 8.2 MB | glibc and OpenSSL, no shell |
+| `python:3.14-alpine` | 4 | 17.8 MB | Python on Alpine |
+| `gcr.io/distroless/python3-debian12` | 43 | 19.7 MB | Debian's Python, no shell, no pip |
+| `ubuntu:24.04` | 1 | 29.8 MB | a minimal Ubuntu |
+| `debian:trixie-slim` | 1 | 29.8 MB | a minimal Debian 13 |
+| `python:3.14-slim` | 4 | 43.5 MB | Python 3.14.9 on Debian slim |
+| `python:3.14` | 7 | 415.8 MB | Python on full Debian with compilers and headers |
+
+The choice is a trade-off, not a ranking:
+
+- **Debian slim** (`-slim`) keeps glibc, so prebuilt wheels for Linux (`manylinux`) install as they are, and it has a shell and `apt` for debugging. It is the usual default for Python services.
+- **Alpine** is small because it uses musl libc and BusyBox. Python wheels must be built for musl (`musllinux`); packages that publish none are compiled from source during the build. musl differs from glibc in details that occasionally matter, such as the DNS resolver and the default thread stack size.
+- **Distroless** images ([GoogleContainerTools/distroless](#references)) contain the runtime and its libraries and nothing else: no shell, no package manager. An attacker who gets code execution has no tools to work with, and a scanner has less to report. The price is debugging: `docker exec ... sh` does not work, and a debug variant or an ephemeral debug container is needed. Their Python image follows Debian's Python version, not the newest one.
+- **scratch** is empty, for static binaries only.
+
+**Size and time.** Size is not only disk. A node that starts a service for the first time must pull its image, and pull time is roughly size over bandwidth. At 100 Mbit/s, which is $12.5$ MB/s:
+
+$$
+t_{\text{full}} = \frac{415.8\ \text{MB}}{12.5\ \text{MB/s}} \approx 33\ \text{s}, \qquad
+t_{\text{slim}} = \frac{43.5\ \text{MB}}{12.5\ \text{MB/s}} \approx 3.5\ \text{s},
+$$
+
+before decompression. When a traffic spike makes an autoscaler start 50 new nodes at once, they pull $50 \times 415.8 \approx 20.8$ GB from the registry with the full base and $2.2$ GB with the slim one, and the service is short of capacity for the whole difference.
+
+## Running as non-root
+
+By default a container's process runs as root, UID 0. Namespaces give it its own view, but, as the [ACOS note](/notes/acos/virtual-machines-and-containers#limitations) put it, root inside a container is root on the shared kernel unless a user namespace maps it to an unprivileged UID, and a kernel bug or a misconfigured mount then reaches the host. The image should therefore name an unprivileged user with `USER`:
+
+- create the user in the image (`useradd --uid 10001 ...`), or use one the base provides (distroless `:nonroot` images run as 65532);
+- give `USER` a **numeric** UID. Kubernetes can then verify the policy `runAsNonRoot` from the image config alone, without reading `/etc/passwd`;
+- make the application's files readable but not writable by that user, so that a compromised process cannot change the code it runs. Files that must be written go to a volume or `/tmp`;
+- listen on a port above 1023, which needs no privilege.
+
+## `.dockerignore`
+
+`COPY . .` copies the whole build context, and everything in the context is sent to the builder. A `.dockerignore` file, with the syntax of `.gitignore`, excludes paths:
+
+```text
+.git
+.venv
+__pycache__/
+*.pyc
+.env
+.pytest_cache/
+tests/
+```
+
+Three reasons, each with a failure behind it. Size: a `.git` folder or a local `.venv` can be larger than the service. The cache: files that change on every run (`.git`, caches, editor files) change the checksum of any broad `COPY` and break the cache for no reason. Secrets: a `.env` file with credentials copied into a layer is in the image for good, for the reason of the whiteout section above. Build secrets that a step needs, such as a token for a private package index, are passed with `RUN --mount=type=secret`, which makes them available to that one command without writing them into a layer.
+
+## Image size and attack surface
+
+Every package in an image is code that can have vulnerabilities, and a **vulnerability scanner** (Trivy, Grype, Docker Scout) works by listing the packages in an image, its software bill of materials (SBOM), and matching them against databases of known vulnerabilities. A full Debian base with compilers carries hundreds of packages that a Python service never calls, and each of them can turn up in a report that someone must read. A smaller image has:
+
+- fewer packages to patch and fewer findings to triage;
+- fewer tools for an attacker who gets in: no shell, no `curl`, no package manager to fetch more;
+- a smaller, faster pull, as computed above.
+
+Small is not the same as up to date. A base image pinned once and never updated collects known vulnerabilities as they are published. Rebuilding regularly on a refreshed base, which the next section makes deliberate, matters as much as choosing a small one, and which findings to fix first is a question of [patching policy](/notes/devops/incidents-and-security#patching-and-dependency-updates).
+
+## Registries, tags and digests
+
+A **registry** stores blobs and manifests and serves them over the HTTP API above. An image is addressed as `registry/repository:tag` or `registry/repository@sha256:digest`. A digest names exactly one manifest forever, because it is the hash of its bytes. A **tag** is a mutable pointer to a manifest that the publisher can move at any time. Official images move their tags on purpose. With `R` pointing to the `python` repository and `TOKEN` and `get` defined as above:
+
+```console
+$ for tag in 3.14-slim 3.14.9-slim 3.14.8-slim; do
+  m=$(get manifests/$tag | jq -r '.manifests[] | select(.platform.architecture == "amd64") | .digest')
+  c=$(get manifests/$m | jq -r .config.digest)
+  echo "$tag ${m:7:12} $(get blobs/$c | jq -r '.created[0:16] + " " + (.config.Env[] | select(startswith("PYTHON_VERSION")))')"
+done
+3.14-slim 0214bda9af26 2026-10-21T22:26 PYTHON_VERSION=3.14.9
+3.14.9-slim 0214bda9af26 2026-10-21T22:26 PYTHON_VERSION=3.14.9
+3.14.8-slim 9b629e83e1a5 2026-10-21T01:06 PYTHON_VERSION=3.14.8
+```
+
+On this day `3.14-slim` and `3.14.9-slim` are the same amd64 image, built late on 21 October; the 3.14.8 image, built the same morning, keeps its own tag. A Dockerfile that says `FROM python:3.14-slim` and was built on 20 October got Python 3.14.8, and rebuilt on 22 October got 3.14.9, with no change in the repository. Base images are also rebuilt without a version change when Debian publishes security updates. A tag is therefore not a version of the build input, and the [previous note's](/notes/devops/builds-and-dependencies#reproducible-builds) rule applies: pin inputs exactly.
+
+**Pinning by digest** writes both: `FROM python:3.14.9-slim-trixie@sha256:b347e2dc…`. The tag documents the intent, and the digest, which wins when both are given, fixes the bytes. The same goes for the images a deployment runs: a deployment that refers to `calc:1.4.0` can be changed by anyone who can push that tag, while `calc@sha256:…` cannot. Pins go stale, so a bot such as Renovate or Dependabot proposes digest updates as pull requests, which then pass through CI like any other change: base-image updates become visible, tested and revertible. Digests prove which bytes arrived, not who produced them. **Signatures** do that: Sigstore's `cosign` signs a digest and stores the signature in the registry next to the image, and a cluster can be configured to run only images whose signature it can verify; the [last note of the course](/notes/devops/incidents-and-security#the-supply-chain-sboms-signatures-and-slsa) puts signatures, bills of materials and provenance together.
+
+## Compose: several containers on one machine
+
+A service rarely runs alone: `calc` keeps a history of evaluated expressions in PostgreSQL. **Docker Compose** describes a local setup of several containers, their networks and volumes in one file, `compose.yaml` ([Compose specification](#references)), started with `docker compose up`:
+
+```yaml
+services:
+  calc:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql://calc:calc@db:5432/calc
+    depends_on:
+      db:
+        condition: service_healthy
+  db:
+    image: postgres:18.6-trixie
+    environment:
+      POSTGRES_USER: calc
+      POSTGRES_PASSWORD: calc
+      POSTGRES_DB: calc
+    volumes:
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "calc"]
+      interval: 2s
+      retries: 15
+volumes:
+  pgdata:
+```
+
+Compose puts both services on one network where each is reachable by its service name, so `calc` connects to the host `db`. `depends_on` with `condition: service_healthy` starts `calc` only after the database's health check passes, not merely after its container started. The named volume `pgdata` keeps the data when the containers are recreated. The password here is for a laptop only. Compose is for development and tests on one machine; running containers across many machines, with restarts, scaling and rolling updates, is the job of the orchestrator of the [Kubernetes note](/notes/devops/kubernetes).
+
+<aside class="callout"><strong>Check yourself.</strong> (1) A Dockerfile runs `COPY . .` and then `RUN uv sync`. A developer changes a README. Which steps run again, and why? (2) A step runs `RUN curl -o model.bin https://example.com/model.bin && python prepare.py && rm model.bin`, and another Dockerfile splits it into three `RUN` lines. Why is the second image larger? (3) An image has two layers, and the code layer is recompressed with zstd instead of gzip. Which digests change: the layer's, its `diff_id`, the config's, the manifest's? (4) A Kubernetes cluster refuses a pod with "container has runAsNonRoot and image has non-numeric user (app), cannot verify user is non-root". What should the Dockerfile say? (5) The production deployment refers to `registry.example.com/calc:1.4.0`. Name a way this can run code that was never tested.<details><summary>Answers</summary>(1) `COPY . .` copies the README too, so its checksum changes, it misses the cache, and `uv sync` and everything after it run again, although no dependency changed. Copy the lockfile first and install, then copy the code; also list documentation in `.dockerignore`. (2) Each `RUN` is a layer, and a later deletion only adds a whiteout: the 3-line version keeps `model.bin` in the first layer. Within one `RUN` the file is created and deleted before the layer is taken. (3) The compressed blob changes, so the layer's digest in the manifest changes, and with it the manifest's digest. The uncompressed tar is the same, so the `diff_id` and with it the config are unchanged. (4) `USER 10001` (a numeric UID, created in the image), so the kubelet can check that it is not 0 from the config alone. (5) Anyone with push rights can move the tag `1.4.0` to another manifest, by mistake (a rebuild with a new base image) or on purpose; the next pod start, for example after a node failure, pulls the new image. Deploy by digest.</details></aside>
+
+## What changed
+
+| | Copying the program to a server (the baseline) | A container image |
+| --- | --- | --- |
+| What is shipped | the program | the program and its whole user-space file tree |
+| Interpreter and libraries | whatever each server has | fixed in the image |
+| Identity of what runs | a file name and a version | a manifest digest, verified on pull |
+| Sharing between versions | none | identical layers stored and transferred once |
+| Rebuild after a code change | rebuild and copy everything | only the layers after the first changed step |
+| Run-time user | whatever the service manager uses | `USER` in the image, ideally non-root and numeric |
+| Several services together | a setup guide | a Compose file (one machine) or an orchestrator |
+
+## Limitations
+
+- **An image is not a VM.** It shares the host's kernel, so the kernel version and its features are not part of the image, and an image built for amd64 needs emulation on arm64 unless it was built for both.
+- **The cache is local unless exported.** A fresh CI runner starts with an empty BuildKit cache; the [next note](/notes/devops/continuous-integration) exports it to a registry or the CI service's cache to keep the order rule worth something.
+- **`RUN` steps are not reproducible by themselves.** `apt-get install` and downloads give different bytes on different days; pinned base images, locked dependencies and fixed timestamps (`SOURCE_DATE_EPOCH`, supported by BuildKit) are needed for repeatable digests.
+- **Distroless and scratch images make debugging harder**, and small bases can lack things a program silently expects: CA certificates, time-zone data, a writable `/tmp`, a user entry for its UID.
+- **Scanners report known vulnerabilities in listed packages**, not whether the vulnerable code is reachable, and not problems in code that a package list does not show.
+- **Fast-moving facts.** The sizes, tags and versions above are those of 23 October 2026; tags and sizes change with every rebuild of a base image.
+
+## What you should remember
+
+- An OCI image is blobs named by SHA-256: layers (tar archives of changes), a config (metadata and the `diff_ids` of the uncompressed layers), a manifest naming both, and an index with one manifest per platform. The manifest digest is the image's identity.
+- Identical layers are stored and transferred once. A deleted file stays in the layer below it, so secrets and large temporary files must never be written in a separate step.
+- A Dockerfile step is reused only if every step before it was, `RUN` by its command string and `COPY` by the checksums of its files. Order steps from least to most often changed: lockfile, dependencies, then code.
+- Multi-stage builds keep compilers, package managers and caches out of the final image. Base images range from under 1 MB (distroless static) to over 400 MB (full Python); slim, Alpine and distroless trade size against compatibility and debuggability.
+- Run as a numeric non-root user, keep the build context small with `.dockerignore`, and pass build secrets with secret mounts.
+- Tags move; digests do not. Pin base images and deployed images by digest and let a bot propose updates as tested pull requests.
+- Compose runs a multi-container setup on one machine for development and tests.
+
+## Example
+
+The production Dockerfile of `calc`, a FastAPI application served by Uvicorn, with `pyproject.toml`, `uv.lock` and the package in `src/calc/`. It follows uv's guide for Docker ([uv documentation, Using uv in Docker](#references)). Not built here; the digests were current on 23 October 2026.
+
+```dockerfile
+# syntax=docker/dockerfile:1
+
+# Stage 1: resolve the lockfile into a virtual environment.
+FROM python:3.14.9-slim-trixie@sha256:b347e2dcbc7f0b6f9fb7182e9da6a187fb10ae715e0692518c1aed0eec94a700 AS build
+COPY --from=ghcr.io/astral-sh/uv:0.12.9@sha256:8b940d3a9d65bed080436972241af2e21c84b5e8c9193f7014ed71479ee795ff /uv /usr/local/bin/uv
+ENV UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy \
+    UV_PYTHON_DOWNLOADS=0
+WORKDIR /app
+COPY pyproject.toml uv.lock ./
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --locked --no-dev --no-install-project
+COPY src/ ./src/
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --locked --no-dev --no-editable
+
+# Stage 2: the same Python, the environment, and nothing else.
+FROM python:3.14.9-slim-trixie@sha256:b347e2dcbc7f0b6f9fb7182e9da6a187fb10ae715e0692518c1aed0eec94a700
+RUN groupadd --system --gid 10001 calc \
+ && useradd --system --uid 10001 --gid 10001 --no-create-home calc
+COPY --from=build /app/.venv /app/.venv
+ENV PATH="/app/.venv/bin:$PATH" \
+    PYTHONUNBUFFERED=1
+USER 10001
+EXPOSE 8000
+CMD ["uvicorn", "calc.web:app", "--host", "0.0.0.0", "--port", "8000"]
+
+ARG GIT_COMMIT=unknown
+LABEL org.opencontainers.image.revision=$GIT_COMMIT \
+      org.opencontainers.image.source=https://git.example.com/team/calc
+```
+
+- **`# syntax=docker/dockerfile:1`.** Asks BuildKit to use the current version 1 of the Dockerfile frontend, which supports the `--mount` options below.
+- **`FROM python:3.14.9-slim-trixie@sha256:… AS build`.** The build stage, on Debian 13 slim with Python 3.14.9, pinned by digest; the tag is kept for readers and for the update bot.
+- **`COPY --from=ghcr.io/astral-sh/uv:0.12.9@sha256:… /uv /usr/local/bin/uv`.** `COPY --from` also takes an image: this copies the single static `uv` binary out of uv's own image, pinned like the base.
+- **`ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy UV_PYTHON_DOWNLOADS=0`.** Compile `.pyc` files at build time, so that the service does not compile them on every start in a read-only image; copy files from uv's cache instead of linking them, because the cache is a mount that is not in the image; and use the base image's Python rather than downloading another.
+- **`COPY pyproject.toml uv.lock ./`, then `RUN … uv sync --locked --no-dev --no-install-project`.** The order rule: these two files change only when dependencies change, so this layer, the expensive one, is reused across code changes. `--locked` fails the build if `uv.lock` does not match `pyproject.toml`, instead of silently resolving anew; `--no-dev` leaves out test tools; `--no-install-project` installs the dependencies but not `calc` itself, whose code is not copied yet. The cache mount keeps uv's download cache between builds on the same builder without putting it into a layer.
+- **`COPY src/ ./src/`, then `RUN … uv sync --locked --no-dev --no-editable`.** The code, which changes with every commit, and the installation of the project into the environment. `--no-editable` copies the package into `.venv` instead of pointing at `src/`, so the environment works on its own.
+- **The second `FROM`.** The runtime stage starts again from the same base, so the interpreter paths inside `.venv` are valid, and nothing from the build stage comes along unless copied.
+- **`RUN groupadd … && useradd …`.** An unprivileged system user and group with fixed numeric IDs and no home directory.
+- **`COPY --from=build /app/.venv /app/.venv`.** The only thing taken from the build stage. The files stay owned by root, so the service user can read and run them but not modify them.
+- **`ENV PATH=… PYTHONUNBUFFERED=1`.** Puts the environment's `bin/` first, so `uvicorn` is the environment's; unbuffered output sends log lines to the container's standard output at once.
+- **`USER 10001`.** Every later instruction and the container's process run as this numeric UID.
+- **`EXPOSE 8000`.** Documents the port; it does not publish it. Publishing is done by `docker run -p`, Compose `ports` or a Kubernetes Service.
+- **`CMD [...]`.** The JSON (exec) form starts `uvicorn` directly as process 1, so it receives `SIGTERM` when the container is stopped; the shell form would start `/bin/sh -c`, which does not forward the signal.
+- **`ARG GIT_COMMIT` and `LABEL`, last.** The CI pipeline passes the commit with `--build-arg GIT_COMMIT=…`. A changed build argument invalidates the cache from the first step that uses it, so this step comes last, where a new value on every build costs nothing. The labels are the standard OCI annotations that lead from an image back to its source.
+
+## Next
+
+The image is the artifact that the rest of the section moves, and every step so far has been run by hand: build, test, build the image, push it. The [next note](/notes/devops/continuous-integration) makes this happen on every change, on machines that nobody logs into, with the build graph of the previous note scaled up to a pipeline of jobs, and asks what it takes to keep the main branch always green.
+
+## References
+
+- University of Helsinki. [*DevOps with Docker*](https://devopswithdocker.com/) (mooc.fi, 2026): images and Dockerfiles, Compose, and the part on security and image size (non-root users, multi-stage builds, smaller base images).
+- HSE University, Faculty of Computer Science. *DevOps* course (4th year, Applied Mathematics and Informatics, taught with MTS): containerization.
+- MIT, *The Missing Semester of Your CS Education* (2026). [Packaging and Shipping Code](https://missing.csail.mit.edu/2026/shipping-code/) (VMs and containers, publishing).
+- Open Container Initiative. [OCI Image Format Specification v1.1](https://github.com/opencontainers/image-spec/blob/v1.1.0/spec.md): [manifest](https://github.com/opencontainers/image-spec/blob/v1.1.0/manifest.md), [image index](https://github.com/opencontainers/image-spec/blob/v1.1.0/image-index.md), [configuration](https://github.com/opencontainers/image-spec/blob/v1.1.0/config.md) (`rootfs.diff_ids`), [layer changesets and whiteouts](https://github.com/opencontainers/image-spec/blob/v1.1.0/layer.md), [image layout](https://github.com/opencontainers/image-spec/blob/v1.1.0/image-layout.md), [pre-defined annotations](https://github.com/opencontainers/image-spec/blob/v1.1.0/annotations.md).
+- Open Container Initiative. [OCI Distribution Specification v1.1](https://github.com/opencontainers/distribution-spec/blob/v1.1.0/spec.md) (pulling manifests and blobs by tag or digest).
+- Docker documentation: [Dockerfile reference](https://docs.docker.com/reference/dockerfile/), [Build cache invalidation](https://docs.docker.com/build/cache/invalidation/), [Multi-stage builds](https://docs.docker.com/build/building/multi-stage/), [Build context and .dockerignore](https://docs.docker.com/build/concepts/context/), [Build secrets](https://docs.docker.com/build/building/secrets/), [Building best practices](https://docs.docker.com/build/building/best-practices/).
+- [Compose Specification](https://compose-spec.io/) and Docker documentation, [Control startup order in Compose](https://docs.docker.com/compose/how-tos/startup-order/).
+- Astral. [uv documentation: Using uv in Docker](https://docs.astral.sh/uv/guides/integration/docker/).
+- GoogleContainerTools. [distroless](https://github.com/GoogleContainerTools/distroless) (images, the `nonroot` tag and UID 65532).
+- Kubernetes documentation: [Configure a security context for a pod or container](https://kubernetes.io/docs/tasks/configure-pod-container/security-context/) (`runAsNonRoot`).
+- Sigstore. [cosign documentation](https://docs.sigstore.dev/cosign/signing/signing_with_containers/) (signing container images).
+- Linux kernel documentation. [Overlay filesystem](https://docs.kernel.org/filesystems/overlayfs.html).

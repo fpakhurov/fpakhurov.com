@@ -1,0 +1,440 @@
+---
+title: Kubernetes in practice
+description: "The pieces a real service needs on Kubernetes: ConfigMaps and Secrets, volumes and PersistentVolumeClaims, Ingress and the Gateway API, autoscaling with its formula, Helm and Kustomize, GitOps as reconciliation from Git, and when Kubernetes is the wrong tool."
+course: devops
+section: Orchestration
+order: 11
+status: published
+tags: [kubernetes, configmaps, secrets, persistent-volumes, statefulsets, ingress, gateway-api, autoscaling, hpa, cluster-autoscaler, helm, kustomize, gitops, argo-cd, flux]
+prerequisites: ["Kubernetes: desired state and reconciliation", Continuous delivery and deployment, Cloud building blocks]
+---
+
+import HpaScaling from '../../../components/figures/kubernetes-in-practice/HpaScaling.astro';
+
+The [previous note](/notes/devops/kubernetes) ran a stateless service on Kubernetes: a Deployment of four Pods behind a Service, rolled out by controllers and checked by probes. That service read no configuration, stored nothing, could be reached only from inside the cluster, ran a fixed number of copies, and was installed by one `kubectl apply` from someone's laptop. This note adds what a real service needs, and each addition follows the same pattern: an object that declares what is wanted and a controller that makes it so. It ends with the question that should come first: when Kubernetes is worth its cost.
+
+**Conventions.** Kubernetes 1.37 (October 2026). No cluster was available, so nothing was applied to one. `kubectl create ... --dry-run=client` and `kubectl kustomize` run without a cluster, and their output here is real, from `kubectl` 1.25 with its built-in Kustomize 4.5.7; the other manifests were written against current documentation and parsed with PyYAML. Versions of other tools are those of their latest releases on 23 October 2026: Gateway API 1.6.3, Helm 4.3.1, Argo CD 3.5.6, Flux 2.9.6.
+
+## Baseline: bake it in, pin it down, copy it
+
+The quickest way to finish the service of the previous note is to put the database password and the log level into the image, store uploads in a directory on whichever node the Pod lands on, open a port on every node for the load balancer, guess a number of replicas, and copy the YAML once per environment, editing each copy by hand. Each shortcut fails on the first real day:
+
+1. A configuration change needs a new image, and the password is readable by everyone who can pull the image.
+2. When the Pod moves to another node, the uploads stay behind on the old one.
+3. Every service needs its own port and its own load-balancer rule, and TLS is handled nowhere.
+4. The guessed replica count is too many at night and too few at the evening peak.
+5. The copies drift apart: production gets a fix that staging never sees.
+6. Nobody knows what is running in the cluster except by asking it, and anyone with credentials can change it.
+
+<aside class="callout"><strong>Key idea.</strong> Everything a service needs beyond its containers is another object with a controller behind it. Configuration and secrets are objects that Pods refer to; storage is a claim that a controller binds to a disk; traffic from outside is a Gateway and routes that a controller turns into a load balancer; the number of replicas is written by an autoscaler, which is a controller too. And the desired state itself moves out of people's terminals into Git, from which one more controller reconciles the cluster. The model of the previous note does not change: declare, and a loop converges.</aside>
+
+## ConfigMaps and Secrets
+
+A **ConfigMap** holds configuration as key–value pairs, separate from the image, so that one image runs in every environment with different settings, the rule of the [delivery note](/notes/devops/continuous-delivery#one-artifact-many-environments). A Pod uses it as environment variables or as files in a mounted volume, one file per key. The two behave differently when the ConfigMap changes: environment variables are read once, when the container starts, so a change reaches a running Pod only when it is restarted; mounted files are updated in place by the kubelet after a delay that can reach a minute or more, and the application must notice. (Kustomize, below, turns a change of configuration into a rollout, which is usually what one wants.)
+
+A **Secret** has the same shape and is meant for passwords, tokens and keys. It is handled a little more carefully: it is kept in memory (`tmpfs`) on nodes, it is given only to Pods that refer to it, and access to it can be granted separately. But a Secret is not encrypted:
+
+```console
+$ kubectl create secret generic db --from-literal=password=not-a-real-password --dry-run=client -o yaml
+apiVersion: v1
+data:
+  password: bm90LWEtcmVhbC1wYXNzd29yZA==
+kind: Secret
+metadata:
+  creationTimestamp: null
+  name: db
+$ echo bm90LWEtcmVhbC1wYXNzd29yZA== | base64 -d
+not-a-real-password
+```
+
+The value is **base64**, an encoding that lets arbitrary bytes travel in YAML, and decoding it needs no key. Why are Secrets not encrypted by default? Because the API server stores them in etcd as they are, unless an administrator configures **encryption at rest**: an `EncryptionConfiguration` that tells the API server to encrypt Secrets before writing them, ideally with a key held by an external key-management service (KMS), so that the key is not on the same disk as the data ([Kubernetes documentation, Secrets](#references)). Without it, anyone who can read etcd, its disk or its backups reads every Secret. And even with it, the API server decrypts Secrets for anyone allowed to `get` them, and anyone allowed to create a Pod in a namespace can mount any Secret of that namespace and print it. So the real protections are three: encryption at rest, access rules that grant reading Secrets to almost nobody, and keeping the source of secrets outside the cluster. Common choices for the last are an external secret store (HashiCorp Vault, OpenBao or a cloud provider's secret manager) synchronized into Secrets by an operator, or secrets encrypted in Git with SOPS or Sealed Secrets, so that the repository of the GitOps section below never holds a plain password ([University of Helsinki, part 2](#references)).
+
+## Volumes, PersistentVolumeClaims and StatefulSets
+
+A container's file system is the image's layers plus a thin writable layer, the [overlay](/notes/acos/virtual-machines-and-containers#layered-images-a-private-file-tree-shared-on-disk) of the systems course, and it disappears with the container. A **volume** is a directory that a Pod mounts from elsewhere. Some live as long as the Pod (`emptyDir`, scratch space shared by its containers), some project objects (a ConfigMap or Secret as files), and some are **persistent**: they outlive every Pod.
+
+Persistent storage is split in two objects so that applications need not know where disks come from:
+
+- A **PersistentVolumeClaim** (PVC), written by the application's team, asks for storage: a size, an **access mode** and a **storage class**. `ReadWriteOnce` means mountable read-write by one node at a time, the mode of a block-storage disk; `ReadWriteMany` means by many nodes, which needs file storage; `ReadWriteOncePod` restricts it to a single Pod.
+- A **PersistentVolume** (PV) is an actual piece of storage. With a **StorageClass**, a provisioner creates the PV on demand: when a claim appears, it calls the cloud API, creates a block-storage disk of the [cloud note](/notes/devops/cloud-building-blocks#storage-block-object-and-file), and binds the claim to it.
+
+A block-storage disk lives in one zone, so a Pod that uses it can run only on nodes of that zone. A storage class with `volumeBindingMode: WaitForFirstConsumer` waits until the scheduler has chosen a node for the Pod and then creates the disk in that node's zone, instead of creating the disk first and finding later that no node in its zone has room. The class's reclaim policy decides what happens to the disk when the claim is deleted: `Delete` destroys it with its data, `Retain` keeps it for a person to deal with.
+
+**StatefulSets**, in brief. A Deployment's Pods are interchangeable: random names, any order, shared claims or none. Replicated databases and queues need more, and a StatefulSet provides it: Pods with stable names (`db-0`, `db-1`, `db-2`) that keep their name when they are replaced; creation in order and deletion in reverse order; one PVC per Pod, created from a template, that follows the Pod by name, so that `db-1` always gets `db-1`'s disk back; and, with a *headless* Service, a stable DNS name per Pod (`db-0.db.shop.svc.cluster.local`), so that replicas can find each other. A StatefulSet does not make a database replicated or consistent: the database does that, and running one well on Kubernetes needs an **operator**, a controller that knows how to fail it over, back it up and upgrade it. Many teams prefer the managed database of the cloud note and keep Kubernetes for the stateless parts.
+
+## Traffic from outside: Ingress and the Gateway API
+
+A Service of type `LoadBalancer` gets one cloud load balancer per Service, which works for one service and becomes expensive and unmanageable for fifty. HTTP traffic is better served by one shared reverse proxy, the [L7 proxy](/notes/devops/networking-for-services#reverse-proxies-one-front-door-for-many-backends) of the networking note running in the cluster, which routes by host name and path to many Services and terminates TLS.
+
+**Ingress** (`networking.k8s.io/v1`, stable since Kubernetes 1.19) was the first API for this: an object lists rules of the form "host `www.example.com`, path `/api` → Service `api`, port 80", and an **ingress controller**, a proxy that watches Ingress objects, configures itself from them. Ingress is small by design, and everything beyond host and path (header matching, traffic splitting, timeouts) was added through controller-specific annotations, so an Ingress written for one controller rarely works with another.
+
+**Status, October 2026.** The Kubernetes documentation describes the Ingress API as frozen, with no new features, and recommends the Gateway API instead. The most widely used controller, Ingress NGINX, was retired by the Kubernetes project: best-effort maintenance ended in March 2026, its repository is archived, and it receives no further releases or security fixes, although existing installations keep working ([Kubernetes blog, 11 November 2025](#references)). New clusters should use an implementation of the Gateway API; existing Ingress objects remain valid, and many Gateway implementations also accept them.
+
+The **Gateway API** (`gateway.networking.k8s.io`, version 1.0 in October 2023, 1.6.3 in October 2026) is installed as an add-on of custom resources, and it splits the job by role ([Gateway API documentation](#references)):
+
+- a **GatewayClass**, set up by whoever provides the infrastructure, names an implementation (Envoy Gateway, Istio, Cilium, NGINX Gateway Fabric, a cloud provider's load balancer and others);
+- a **Gateway**, owned by the platform team, is one load balancer: its listeners, ports, host names, TLS certificates, and which namespaces may attach routes to it;
+- an **HTTPRoute** (or GRPCRoute, and others), owned by each application team in its own namespace, attaches to a Gateway and maps host names and paths to Services, with weights for splitting traffic between them.
+
+A Gateway for the whole company, written once by the platform team:
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: public
+  namespace: gateways
+spec:
+  gatewayClassName: example-lb
+  listeners:
+    - name: https
+      protocol: HTTPS
+      port: 443
+      hostname: "*.example.com"
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - name: wildcard-example-com
+      allowedRoutes:
+        namespaces:
+          from: All
+```
+
+The listener accepts HTTPS on port 443 for any name under `example.com`, terminates TLS with the certificate stored in the Secret `wildcard-example-com`, and lets routes from every namespace attach. The application team's HTTPRoute, in the Example section, refers to this Gateway by name and never touches certificates or ports. The `backendRefs` of a route can list two Services with weights, for example 95 and 5, which is the [canary](/notes/devops/continuous-delivery#canary) of the delivery note done by the proxy instead of by Pod counts.
+
+## Autoscaling: the HPA and the cluster autoscaler
+
+The **HorizontalPodAutoscaler** (HPA) is a controller that writes the `replicas` of a Deployment. Every 15 seconds it reads a metric for the Pods of the target, most often their CPU use as a share of their CPU **request**, and computes
+
+$$
+\boxed{n_{\text{desired}} = \left\lceil n \cdot \frac{m}{m^{*}} \right\rceil} ,
+$$
+
+where $n$ is the current number of replicas, $m$ the current average of the metric and $m^{*}$ the target ([Kubernetes documentation, horizontal Pod autoscaling](#references)).
+
+**Where the formula comes from.** The total load is spread evenly over the Pods. With $n$ Pods at average utilization $m$, the total is $n \cdot m$ "Pods' worth" of work, in units of one Pod's request. To bring the average down to the target $m^*$, the number of Pods $n'$ must satisfy $n' \cdot m^* = n \cdot m$, so $n' = n \cdot m / m^*$. Rounding up keeps the average at or below the target, since $\lceil x \rceil \ge x$. This assumes that the load per Pod falls in proportion as Pods are added, which holds for stateless services behind a balancer and fails for a bottleneck elsewhere, such as a database that all Pods share.
+
+**Worked examples.** The target is 60 % of the CPU request.
+
+- 4 replicas average 90 %: $\lceil 4 \times 90 / 60 \rceil = \lceil 6.0 \rceil = 6$ replicas.
+- 4 replicas average 63 %: the ratio $63 / 60 = 1.05$ is within the **tolerance** of 10 % around 1, so nothing happens. Without the tolerance, small fluctuations would add and remove a Pod every 15 seconds.
+- 10 replicas average 20 % after the evening peak: $\lceil 10 \times 20 / 60 \rceil = \lceil 3.33 \rceil = 4$. The HPA does not act at once. Scaling down is held back by a **stabilization window** of 5 minutes: the HPA uses the highest recommendation of the last 300 seconds, so a dip of a few minutes does not remove Pods that the next minute needs. Scaling up has no window by default, but at most 4 Pods or 100 % more, whichever is larger, every 15 seconds.
+
+The HPA computes utilization against the request, which is why an HPA on CPU requires CPU requests on every container. With a request of `250m`, a Pod at "100 %" uses a quarter of a core, and a Pod that uses half a core is at 200 %: utilization above 100 % is normal, because requests are reservations, not limits.
+
+<HpaScaling />
+
+The figure replays the rule every 15 seconds on a toy load that rises from 200 to 600 requests per second and drops back. Scale-up starts at 5 min 30 s, when the ratio first leaves the tolerance, and reaches 10 replicas as the load reaches 600. Scale-down waits five minutes after the drop, at 16 min 45 s, and then goes from 10 to 4 in one step. The real controller is more careful than this replay in one respect: it leaves out Pods that are not ready yet and treats missing metrics conservatively, so that Pods that are still starting do not make the average look low.
+
+**The cluster autoscaler** works one level down. The HPA adds Pods; if no node has enough unreserved CPU or memory for their requests, they stay `Pending`. The cluster autoscaler watches for such Pods and adds machines to a node group through the cloud API; it removes a node when the requests of its Pods use less than half of it for 10 minutes and its Pods can move elsewhere. Adding a node takes minutes rather than seconds (a virtual machine must boot and join the cluster), so the two together react in two speeds, and services with sudden peaks keep spare capacity. Karpenter, a newer node autoscaler from AWS that is now a Kubernetes project, chooses machine types to fit the pending Pods instead of growing fixed groups. A third autoscaler, the vertical one (VPA), adjusts the requests themselves from measured use.
+
+## Packaging: Helm and Kustomize
+
+The same service runs in staging and production with small differences: replicas, image tag, host names, log level, resource sizes. Copying the YAML per environment is the drift of the baseline. Two tools solve it in opposite ways.
+
+**Helm** (version 4 since November 2025) uses templates. A **chart** is a directory of manifests written as Go templates with placeholders such as `{{ .Values.image.tag }}`, a file `values.yaml` with the defaults, and metadata. `helm install web ./chart -f values-prod.yaml` renders the templates with the production values and applies the result; Helm records each installation as a numbered **release** revision, stored as a Secret in the namespace, so that `helm rollback web 3` returns to revision 3. Charts are versioned packages shared through repositories and OCI registries, and they are the usual way to install third-party software into a cluster: a monitoring stack, a database operator, a Gateway implementation. The cost of templates is that the manifests exist only after rendering, and a template with many conditions is hard to read.
+
+**Kustomize**, built into `kubectl` as `kubectl kustomize` and `kubectl apply -k`, uses no templates. A **base** is a directory of plain, valid manifests; an **overlay** for an environment lists the base and the changes to make to it: patches, a namespace, a new image tag, generated ConfigMaps. The [Example](#example) builds a production overlay of the web service with it, and the output there is real. One of Kustomize's generators deserves attention here. It names a generated ConfigMap with a hash of its content and rewrites every reference to it:
+
+```console
+$ kubectl kustomize overlays/prod | grep -n 'web-config-'
+6:  name: web-config-b6dh7b267t
+39:            name: web-config-b6dh7b267t
+$ sed -i '' 's/LOG_LEVEL=warning/LOG_LEVEL=error/' overlays/prod/kustomization.yaml
+$ kubectl kustomize overlays/prod | grep -n 'web-config-'
+6:  name: web-config-68d5cgcdf4
+39:            name: web-config-68d5cgcdf4
+```
+
+Changing one value changes the ConfigMap's name, and so the Deployment's Pod template that refers to it, and so the template's hash: a configuration change becomes a rolling update of the previous note, with readiness checks and a rollback, instead of files that change silently under running Pods. Reverting the line restores the first name. (The `sed -i ''` form is the macOS one; GNU `sed` takes `-i` alone.)
+
+Teams often combine the two: Helm charts for software made by others, Kustomize overlays for their own services, and Kustomize can render a Helm chart as part of an overlay.
+
+## GitOps: reconciliation from Git
+
+The [delivery note](/notes/devops/continuous-delivery#one-artifact-many-environments) introduced **GitOps** as a practice: the desired state of each environment lives in a Git repository, and a deployment is a commit. Kubernetes makes it a mechanism. A GitOps controller, **Argo CD** or **Flux** (both graduated projects of the Cloud Native Computing Foundation), runs inside the cluster and runs the loop of the previous note with Git as the spec:
+
+1. **Fetch** the repository at a given branch or tag, on a schedule (every 3 minutes by default in Argo CD) or when a webhook announces a push.
+2. **Render** the manifests of a path, with Kustomize or Helm.
+3. **Compare** them with the live objects in the cluster: the application is *Synced* or *OutOfSync*.
+4. **Apply** the difference. With **pruning**, objects that were removed from Git are deleted from the cluster; with **self-healing**, a change made by hand with `kubectl` is reverted at the next comparison, the drift of the [infrastructure-as-code note](/notes/devops/infrastructure-as-code#configuration-state-and-reality) corrected continuously.
+5. **Report** health, from the objects' own status: a Deployment whose rollout is stuck makes the application *Degraded*.
+
+An Argo CD **Application** tells the controller what to reconcile:
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: web-prod
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://git.example.com/shop/deploy.git
+    targetRevision: main
+    path: web/overlays/prod
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: shop
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+```
+
+`source` names the repository, the branch and the overlay directory of the Example; `destination` is the cluster Argo CD runs in (`kubernetes.default.svc` is the API server's address from inside the cluster) and the namespace; `automated` with `prune` and `selfHeal` makes Git the only way to change these objects. The CI pipeline of a service then ends by committing a new image tag to this repository, and the cluster pulls it.
+
+Two properties follow. The **pull model** means that CI never holds credentials for the cluster: it can only write to a repository, and the controller inside the cluster applies, which removes a powerful secret from every pipeline. And the history of the cluster is the history of the repository: who changed what is a `git log`, and a rollback is a `git revert`. The cost is one more component that must be watched, and one practical rule: a field that a controller in the cluster owns, such as the `replicas` that the HPA writes, must be left out of Git, or the GitOps controller and the HPA will fight over it. The base of the Example has no `replicas` for that reason.
+
+## When not to use Kubernetes
+
+Kubernetes solves the problems of the previous note's baseline at a price. Someone must upgrade the cluster: the project ships three minor versions a year and supports each for about 14 months, so a cluster that is not upgraded falls out of support within a year and a half. Someone must understand its networking, its storage, its access rules, its add-ons and their interactions, and debug them at night. A managed control plane removes part of this, not the add-ons, the manifests or the upgrades of the workloads.
+
+The price is worth paying when there are many services, several teams that deploy independently, a need to pack many workloads onto shared machines, or a platform team whose job is to provide this to others. It is usually not worth paying for one application with a database: a serverless container service or a platform-as-a-service, a managed database, or a pair of virtual machines with a reverse proxy and a deployment script give the same result with a fraction of the moving parts. The questions to ask first: how many services and teams, how much of the cluster's operation the team can own, and whether a simpler block of the [cloud note](/notes/devops/cloud-building-blocks#compute-virtual-machines-containers-functions) already provides what is missing.
+
+<aside class="callout"><strong>Check yourself.</strong> (1) A team stores a database password in a ConfigMap "because Secrets are only base64 anyway". What do they lose? (2) A Deployment with 3 replicas mounts one PVC with access mode `ReadWriteOnce` on a block-storage disk. What happens when the replicas are scheduled on different nodes? (3) An HPA targets 70 % CPU. Five replicas average 98 %. How many replicas does it ask for? And six replicas at 75 %? (4) The HPA asks for 12 Pods, but 3 stay `Pending`. Which component reacts, and roughly how fast? (5) Someone fixes an incident by running `kubectl scale deployment web --replicas=8` on a cluster reconciled by Argo CD with self-healing and an HPA. What happens to the fix?<details><summary>Answers</summary>(1) Secrets are separately access-controlled (reading ConfigMaps is often granted widely, reading Secrets should not be), are given only to Pods that refer to them, are kept in memory on nodes, and are what encryption at rest and external secret operators work with. Base64 is not protection, but the handling around Secrets is. (2) A `ReadWriteOnce` volume can be attached to one node at a time, so Pods on other nodes cannot mount it and stay in `ContainerCreating`; only Pods on the node that has the disk run. Either use one claim per replica (a StatefulSet) or a `ReadWriteMany` file store, or keep the data out of the Pods. (3) $\lceil 5 \times 98 / 70 \rceil = \lceil 7.0 \rceil = 7$. For six at 75 %, the ratio $75/70 = 1.07$ is within the 10 % tolerance, so it stays at 6. (4) The cluster autoscaler sees Pods that cannot be scheduled because no node has room for their requests, and adds nodes through the cloud API; the new nodes join in minutes, after which the scheduler places the Pods. (5) The `replicas` field belongs to the HPA, which recomputes it within 15 seconds from the metrics (scaling down only after its 5-minute window). If `replicas` were in Git, Argo CD would also revert it to the committed value. A durable fix goes through the HPA's bounds in Git, for example a higher `minReplicas`.</details></aside>
+
+## What changed
+
+| Problem of the baseline | Object | Controller |
+| --- | --- | --- |
+| Configuration baked into the image | ConfigMap, Secret | kubelet (env and files) |
+| Passwords readable by all | Secret, encryption at rest, external stores | API server, secret operators |
+| Data stuck on a node | PersistentVolumeClaim, StorageClass, StatefulSet | provisioner, StatefulSet controller |
+| A port and a balancer per service | Gateway, HTTPRoute (Ingress, frozen) | Gateway implementation |
+| A guessed replica count | HorizontalPodAutoscaler; node groups | HPA; cluster autoscaler |
+| Copies per environment | Kustomize overlays, Helm charts and values | rendering before apply |
+| Changes from laptops | Git as the desired state | Argo CD or Flux |
+
+## Limitations
+
+- Every addition is another controller with its own failure modes, versions and permissions. A cluster with a Gateway implementation, a GitOps controller, a secret operator, a storage driver and three autoscalers has many moving parts that can disagree.
+- The HPA reacts to a metric that lags the load: it needs the metric to rise, then one or more 15-second periods, then Pods that start and pass readiness, then possibly new nodes. Services with sharp peaks scale ahead of time, on a schedule or from a queue length, or keep headroom.
+- CPU utilization is a proxy for load. A service limited by a database, by memory or by an external API does not scale with CPU, and adding Pods may make the bottleneck worse.
+- Stateful workloads remain hard. Zonal disks pin Pods to zones, a StatefulSet does not make a database highly available, and an operator is only as good as its handling of the failure at hand.
+- GitOps makes Git the source of truth only for what is in Git: objects created by controllers, by operators or by hand outside the managed namespaces are not covered, and secrets need a separate path.
+
+## What you should remember
+
+- ConfigMaps and Secrets separate configuration from images. Environment variables are read at start, mounted files update later. Secrets are base64, stored in etcd unencrypted unless encryption at rest is configured; protect them with encryption, access rules and an external source.
+- A PVC asks for storage, a StorageClass provisions a PV (a cloud disk), and access modes follow the storage: `ReadWriteOnce` for a block disk. StatefulSets give stable names, ordered start and one claim per Pod.
+- Ingress is frozen and Ingress NGINX retired (March 2026); the Gateway API splits GatewayClass, Gateway and HTTPRoute by role, and routes can split traffic by weight.
+- HPA: $n_{\text{desired}} = \lceil n \cdot m / m^* \rceil$ every 15 s, with a 10 % tolerance and a 5-minute stabilization for scale-down; utilization is measured against requests. The cluster autoscaler adds nodes for Pods that do not fit.
+- Helm renders templates with values and records releases; Kustomize patches plain bases with overlays and rolls Pods when generated configuration changes.
+- GitOps: a controller in the cluster fetches Git, renders, compares, applies, prunes and self-heals. CI writes to Git, never to the cluster. Leave controller-owned fields such as `replicas` out of Git.
+- Use Kubernetes when many services and teams justify a platform; otherwise a simpler cloud block is cheaper.
+
+## Example
+
+The production overlay of the web service, as a GitOps repository would hold it: a Kustomize base with the Deployment, Service and a generated ConfigMap, and an overlay `overlays/prod` that adds the namespace, the new image tag, the production log level, an HPA and an HTTPRoute. `kubectl kustomize` built it for real (output below); it was not applied to a cluster.
+
+The base, `base/kustomization.yaml`, lists `deployment.yaml` (the Deployment of the previous note without `replicas` and without probes, for brevity, reading its environment from `web-config`), `service.yaml`, and a generator:
+
+```yaml
+resources:
+  - deployment.yaml
+  - service.yaml
+configMapGenerator:
+  - name: web-config
+    literals:
+      - LOG_LEVEL=info
+```
+
+The overlay, `overlays/prod/kustomization.yaml`:
+
+```yaml
+namespace: shop
+resources:
+  - ../../base
+  - hpa.yaml
+  - httproute.yaml
+images:
+  - name: registry.example.com/web
+    newTag: 1.4.3
+configMapGenerator:
+  - name: web-config
+    behavior: merge
+    literals:
+      - LOG_LEVEL=warning
+```
+
+`overlays/prod/hpa.yaml`:
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: web
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: web
+  minReplicas: 4
+  maxReplicas: 20
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+```
+
+`overlays/prod/httproute.yaml`:
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: web
+spec:
+  parentRefs:
+    - name: public
+      namespace: gateways
+  hostnames:
+    - www.example.com
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: web
+          port: 80
+```
+
+The kustomization, line by line:
+
+- `namespace: shop` puts every object of the overlay into the namespace `shop`, whatever its source said.
+- `resources` lists what to assemble: the whole base (a directory with its own `kustomization.yaml`) and two files that exist only in production.
+- `images` replaces the tag of every container that uses `registry.example.com/web` with `1.4.3`. Promoting a new version is a one-line commit here, which is the commit that a pipeline writes and Argo CD applies.
+- `configMapGenerator` with `behavior: merge` takes the base's `web-config` and overrides `LOG_LEVEL`; the generated name gets a content hash.
+
+The HPA: `scaleTargetRef` names the Deployment whose `replicas` it owns; `minReplicas: 4` and `maxReplicas: 20` bound it (four is enough for a Pod in each of three zones and one more, even at night); the metric is CPU utilization against requests with a target of 60 %, the numbers of the figure; and `behavior.scaleDown.stabilizationWindowSeconds: 300` states the default window explicitly, so that a reviewer sees it.
+
+The HTTPRoute: `parentRefs` attaches it to the Gateway `public` in the namespace `gateways`, which the platform team owns and which accepts routes from all namespaces; `hostnames` claims `www.example.com`, which falls under the listener's `*.example.com`; the single rule sends every path (`PathPrefix /`) to the Service `web` on port 80. A canary would add a second `backendRefs` entry with a `weight`.
+
+The output of the build, which is what Argo CD would compare with the cluster:
+
+```console
+$ kubectl kustomize overlays/prod
+apiVersion: v1
+data:
+  LOG_LEVEL: warning
+kind: ConfigMap
+metadata:
+  name: web-config-b6dh7b267t
+  namespace: shop
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+  namespace: shop
+spec:
+  ports:
+  - name: http
+    port: 80
+    targetPort: http
+  selector:
+    app: web
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+  namespace: shop
+spec:
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+      - envFrom:
+        - configMapRef:
+            name: web-config-b6dh7b267t
+        image: registry.example.com/web:1.4.3
+        name: web
+        ports:
+        - containerPort: 8080
+          name: http
+        resources:
+          limits:
+            memory: 256Mi
+          requests:
+            cpu: 250m
+            memory: 256Mi
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: web
+  namespace: shop
+spec:
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+  maxReplicas: 20
+  metrics:
+  - resource:
+      name: cpu
+      target:
+        averageUtilization: 60
+        type: Utilization
+    type: Resource
+  minReplicas: 4
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: web
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: web
+  namespace: shop
+spec:
+  hostnames:
+  - www.example.com
+  parentRefs:
+  - name: public
+    namespace: gateways
+  rules:
+  - backendRefs:
+    - name: web
+      port: 80
+    matches:
+    - path:
+        type: PathPrefix
+        value: /
+```
+
+Every object now has `namespace: shop`; the ConfigMap is named `web-config-b6dh7b267t` and the Deployment's `configMapRef` was rewritten to match; the image has the tag `1.4.3`; `LOG_LEVEL` is `warning`; the namespace of the Gateway reference was left alone, because it names another namespace on purpose. Kustomize sorts the output by kind and the keys of each object alphabetically, which is why the order differs from the input. The Deployment has no `replicas`: on its first apply Kubernetes sets one, and the HPA immediately raises it to its minimum of 4.
+
+## Next
+
+The service now runs, scales, is reachable and is deployed from Git. Whether it works is another question: whether requests succeed, how long they take, which of four replicas is slow and why. Kubernetes reports the state of its objects, not the experience of users. The [next note](/notes/devops/observability) begins the section on reliability with the three signals a running system emits, logs, metrics and traces, and how to read them.
+
+## References
+
+- Kubernetes documentation, version 1.37, 2026: [ConfigMaps](https://kubernetes.io/docs/concepts/configuration/configmap/); [Secrets](https://kubernetes.io/docs/concepts/configuration/secret/) (stored unencrypted in etcd by default; base64; 1 MiB limit); [Encrypting confidential data at rest](https://kubernetes.io/docs/tasks/administer-cluster/encrypt-data/); [Persistent volumes](https://kubernetes.io/docs/concepts/storage/persistent-volumes/); [Storage classes](https://kubernetes.io/docs/concepts/storage/storage-classes/); [StatefulSets](https://kubernetes.io/docs/concepts/workloads/controllers/statefulset/); [Ingress](https://kubernetes.io/docs/concepts/services-networking/ingress/) (the API is frozen); [Gateway API](https://kubernetes.io/docs/concepts/services-networking/gateway/); [Horizontal Pod autoscaling](https://kubernetes.io/docs/concepts/workloads/autoscaling/horizontal-pod-autoscale/) (algorithm, tolerance, stabilization, scaling policies); [Node autoscaling](https://kubernetes.io/docs/concepts/cluster-administration/node-autoscaling/); [Version skew and release support](https://kubernetes.io/releases/).
+- Kubernetes blog. [Ingress NGINX Retirement: What You Need to Know](https://kubernetes.io/blog/2025/11/11/ingress-nginx-retirement/). 11 November 2025. The [ingress-nginx repository](https://github.com/kubernetes/ingress-nginx), archived, records the end of maintenance in March 2026.
+- Kubernetes SIG Network. [Gateway API](https://gateway-api.sigs.k8s.io/): concepts, roles, HTTPRoute. Release 1.0.0 (31 October 2023) and 1.6.3 (6 October 2026).
+- [Helm documentation](https://helm.sh/docs/): charts, values, releases and rollback. Helm 4.0.0 was released on 12 November 2025.
+- [Kustomize documentation](https://kubectl.docs.kubernetes.io/references/kustomize/): bases, overlays, `images`, `configMapGenerator`.
+- [Argo CD documentation](https://argo-cd.readthedocs.io/): Application specification, automated sync, pruning, self-healing. [Flux documentation](https://fluxcd.io/flux/).
+- B. Burns, B. Grant, D. Oppenheimer, E. Brewer, J. Wilkes. [Borg, Omega, and Kubernetes](https://queue.acm.org/detail.cfm?id=2898444). ACM Queue, 14(1), 2016.
+- University of Helsinki. [DevOps with Kubernetes](https://devopswithkubernetes.com/), 2026. Part 1, "Introduction to Storage"; part 2, "Configuring applications" (Secrets encrypted with SOPS) and "StatefulSets and Jobs"; part 3, "Deployment Pipeline" (Kustomize) and "GKE features" (scaling Pods and nodes); part 4, "GitOps" (Argo CD); part 5, "Beyond Kubernetes".
+- B. Beyer et al. (eds.). [The Site Reliability Workbook](https://sre.google/workbook/table-of-contents/). O'Reilly, 2018. Ch. 11 (managing load: autoscaling and its failure modes).
+- HSE University, Faculty of Computer Science. *DevOps* (4th year, Applied Mathematics and Informatics, taught with MTS): containerization, GitLab and application deployment.

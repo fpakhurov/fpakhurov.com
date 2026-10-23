@@ -1,0 +1,442 @@
+---
+title: Continuous integration
+description: "Continuous integration as a practice of merging small changes into one main branch that stays green: pipelines as graphs of jobs on runners, caches and artifacts, the test pyramid and flaky tests, merge queues, the time arithmetic of a pipeline, and CI security."
+course: devops
+section: Build and Ship
+order: 5
+status: published
+tags: [continuous-integration, ci, pipelines, github-actions, gitlab-ci, runners, caching, artifacts, test-pyramid, flaky-tests, merge-queue, trunk-based-development, critical-path, supply-chain-security]
+prerequisites: ["Git: the object model and workflows", Builds and dependencies, Container images, Testing]
+---
+
+import PipelineGraph from '../../../components/figures/continuous-integration/PipelineGraph.astro';
+
+The [previous note](/notes/devops/container-images) ended with an image built, tested and pushed by hand. By hand means sometimes: when someone remembers, on their own laptop, with whatever is installed there. **Continuous integration** turns these steps into something that happens on every change, on clean machines, with a result that everyone can see. This note separates the practice from the tools that support it, follows a change through a pipeline of jobs, works out how long that pipeline takes and why, and asks how a team keeps its main branch always releasable when tests are slow, flaky, and run by many people at once.
+
+**Conventions.** The examples are the pipeline of the `calc` service in GitHub Actions and in GitLab CI, written against their documentation as of October 2026, with every third-party action pinned to the commit of its current release on 23 October 2026 (`actions/checkout` v7.0.1, `astral-sh/setup-uv` v10.3.2, `docker/setup-buildx-action` v4.4.1, `docker/login-action` v4.6.0, `docker/build-push-action` v7.4.0, `actions/upload-artifact` v7.0.2). The workflows were parsed as YAML but not run; job durations in the timing section are toy numbers chosen to illustrate the arithmetic.
+
+## Baseline: integrate at the end
+
+The traditional workflow gives each feature its own long-lived branch and merges the branches shortly before a release. Each branch is tested on its own and works. Then they meet. The merge has textual conflicts, which Git reports, and **semantic conflicts**, which it does not: one branch renames a function that the other branch calls in new code, or one changes a default that the other relies on. Both grow with the age of the branches, because every day adds code that the other side has never seen. The weeks before a release become "integration", nobody can say how long it will take, and a bug found there may come from any of hundreds of changes.
+
+## CI is a practice, not a server
+
+Continuous integration, in the sense of the people who named it ([Fowler, 2024](#references); [Beck, 1999](#references)), is a team practice with three parts:
+
+1. **Everyone integrates into one main branch at least daily**, in small changes, so that no change waits long enough to drift from the others.
+2. **Every integration is verified by an automated build with tests**, on a clean machine, so that "it works on my machine" is replaced by "it works from the repository alone".
+3. **A broken main branch is fixed at once**, before anything else is merged, by a fix or by reverting the change, because every later change is integrated with a broken base.
+
+A **CI server** (GitHub Actions, GitLab CI, Jenkins, Buildkite) is the tool that runs part 2. Running it on long-lived feature branches that merge once a month is automation, not continuous integration: the integration problem of the baseline is untouched. The practice is what the research measured: in the State of DevOps studies, teams that merge into trunk at least daily, with branches that live less than a day, deliver more often and fail less often ([Forsgren, Humble and Kim, 2018, chapter 4](#references)). The branching side of this, trunk-based development and short-lived branches, is in the [Git note](/notes/devops/git#branching-workflows).
+
+<aside class="callout"><strong>Key idea.</strong> Integrate small changes into one main branch continuously, and let a machine prove after each one that the result builds and passes its tests. The pipeline is a graph of jobs whose length is set by its critical path; the practice works only if that path is short, the tests are trustworthy, and nothing reaches main without having been tested in exactly the combination that main will contain.</aside>
+
+## A pipeline is a graph of jobs
+
+A CI system runs a **pipeline** (GitHub calls it a workflow run) when an event happens: a push, a pull request, a schedule, a manual trigger. The pipeline is made of **jobs**, and a job is a list of **steps**, shell commands or reusable actions, that run in order on one machine. Jobs declare which other jobs they need, so a pipeline is a directed acyclic graph, the [build graph](/notes/devops/builds-and-dependencies#a-build-is-a-graph-of-targets) one level up: there the nodes were files, here they are jobs. Jobs without dependencies between them run in parallel.
+
+Each job runs on a **runner**, a machine that takes jobs from the CI service. Hosted runners are fresh virtual machines, created for one job and destroyed after it, so no state leaks from one job to the next; self-hosted runners are machines the team operates itself, cheaper for heavy work and dangerous if they keep state between jobs (see [Security of CI](#security-of-ci)). Because every job starts on a clean machine, two mechanisms carry data:
+
+- An **artifact** is a declared output of a job that later jobs or people need: a test report, a built package, the digest of a pushed image. It must exist; a job that needs it fails without it.
+- A **cache** is a best-effort speedup: a directory saved under a key and restored when the same key is asked for again, typically the package manager's download cache keyed by a hash of the lockfile. A cache may be missing or evicted at any time, and the job must still be correct without it, only slower. Using a cache to pass results between jobs is a bug that appears on the first cache miss.
+
+Docker layer caching fits the same pattern. A fresh runner has an empty BuildKit cache, so the order rule of the [image note](/notes/devops/container-images#a-dockerfile-instruction-by-instruction) saves nothing unless the cache is exported, for example to a tag in the registry, and imported by the next build.
+
+The pipeline of `calc` has five jobs: `lint` (style and static checks), `unit` (unit tests), `build` (build the image and push it under the commit's hash), `integration` (run the pushed image against a real PostgreSQL and test it through HTTP), and `release` (on the main branch only, mark the tested image as the new release candidate):
+
+<PipelineGraph />
+
+1. `lint`, `unit` and `build` need nothing and start together at minute 0.
+2. `integration` needs the image, so it starts when `build` ends, at minute 6.
+3. `release` needs all four and starts at minute 11, when the last of them, `integration`, ends.
+4. The longest chain, `build` → `integration` → `release`, sets the length of the pipeline: 12 minutes. The other jobs have slack: `lint` could take ten more minutes without delaying anything.
+
+## The time arithmetic of a pipeline
+
+The time from push to result is the feedback loop of the whole team, so it is worth computing rather than guessing. Let job $j$ take $d_j$ minutes. A job can start when all the jobs it needs have finished, so its earliest start and finish are
+
+$$
+\begin{aligned}
+\mathrm{ES}(j) &= \max_{i \in \mathrm{needs}(j)} \mathrm{EF}(i) \quad (0 \text{ if it needs nothing}), \\
+\mathrm{EF}(j) &= \mathrm{ES}(j) + d_j ,
+\end{aligned}
+$$
+
+and with enough runners the pipeline takes $T = \max_j \mathrm{EF}(j)$, the length of the longest path through the graph, its **critical path**. With the toy durations of the figure (lint 1, unit 4, build 6, integration 5, release 1 minute):
+
+$$
+\begin{aligned}
+\mathrm{EF}(\text{lint}) &= 1, \quad \mathrm{EF}(\text{unit}) = 4, \quad \mathrm{EF}(\text{build}) = 6, \\
+\mathrm{EF}(\text{integration}) &= \mathrm{EF}(\text{build}) + 5 = 11, \\
+\mathrm{EF}(\text{release}) &= \max(1, 4, 6, 11) + 1 = 12 .
+\end{aligned}
+$$
+
+The same five jobs run one after another would take $1 + 4 + 6 + 5 + 1 = 17$ minutes. The **slack** of a job is how much it can grow without lengthening the pipeline: the latest finish allowed by its successors minus its earliest finish. `release` must start by 11, so `lint` has $11 - 1 = 10$ minutes of slack and `unit` $11 - 4 = 7$; the jobs on the critical path have none. Four consequences follow, and each is a common mistake:
+
+- **Speeding up a job off the critical path changes nothing.** Making `lint` instant leaves the pipeline at 12 minutes.
+- **Shortening the critical path helps until another path takes over.** If the registry cache cuts `build` from 6 to 2 minutes, the chain becomes $2 + 5 + 1 = 8$ minutes. If `integration` is then split into two shards that run in parallel, each with half of the tests plus half a minute of setup, it takes 3 minutes and the chain $2 + 3 + 1 = 6$, with `unit` → `release` at $4 + 1 = 5$ close behind.
+- **Runners are a resource.** The formula assumes a free runner for every ready job. With one runner the jobs queue and the pipeline takes all 17 minutes. With two, a scheduler that starts the job with the longest remaining path first (`build`, then `unit`, then `lint` at minute 4 on the runner `unit` frees) still finishes at 12. Queue time, the wait for a runner when many pipelines run at once, adds to every job on the path.
+- **Fixed costs add up along the path.** Each job pays for starting a runner, checking out the repository and installing tools before its real work. Splitting work into more jobs shortens the path only while that overhead stays small next to the work moved off it.
+
+## The test pyramid and fast feedback
+
+Tests differ in what they prove and what they cost. **Unit tests** check one function or class in memory, in milliseconds, and point exactly at what broke (the [Python course](/notes/python/testing) writes them with pytest). **Integration tests** check that components work together through real interfaces: the service with a real database, two services over HTTP. They take seconds each and need setup. **End-to-end tests** drive the whole system as a user would and take longest, break for the most reasons, and say least about where the fault is. The **test pyramid** ([Cohn, 2009](#references); [Fowler, 2012](#references)) recommends many unit tests, fewer integration tests and few end-to-end tests; a Google testing guide suggested roughly 70%, 20% and 10% as a starting point ([Wacker, 2015](#references)). The pyramid is about feedback: a failure should be found by the cheapest test that can find it, as early as possible.
+
+In a pipeline this becomes a time budget. The commonly quoted target, from extreme programming, is a ten-minute build ([Beck and Andres, 2004](#references)): short enough that a developer waits for the result and fixes a failure while the change is still fresh. Slower checks run in parallel jobs, or later, after merge, or nightly, on a separate schedule, accepting that they find some problems later. Long pipelines change behaviour: people batch changes to wait less often, and batches are what continuous integration was meant to remove.
+
+## Flaky tests
+
+A **flaky test** passes and fails on the same code. The usual causes are timing (a sleep instead of waiting for a condition, a timeout too close to the normal duration), order (tests that share state and pass only in one order), concurrency, the network, and the clock (a test that fails around midnight or on a leap day). Google reported that about 1.5% of all its test runs gave a flaky result and that almost 16% of its tests had some level of flakiness ([Micco, 2016](#references)).
+
+Flakiness compounds. If each of $n$ tests fails spuriously with probability $f$, independently, a run on correct code is green with probability
+
+$$
+P(\text{green}) = (1 - f)^n .
+$$
+
+With $n = 400$ tests and $f = 0.001$, one spurious failure per thousand runs of each test, $P(\text{green}) = 0.999^{400} = 0.67$: a third of pipelines on correct code fail. With $n = 1000$ the probability is $0.37$, and red becomes the normal colour. Then the practice breaks: developers rerun until green, stop reading failures, and merge real bugs along with the noise.
+
+Retrying a failed test once changes the arithmetic to a per-test failure probability of $f^2$, so $(1 - 10^{-6})^{400} = 0.9996$, which is why CI systems offer automatic retries. A retry hides the problem, though, and a flaky test is sometimes a real race in the product. The working policy is to detect flakiness (a test that failed and then passed on the same commit is flaky by definition), **quarantine** it: keep running it but stop it from blocking merges, give it an owner, and fix or delete it within a fixed time.
+
+## Keeping main green: merge queues
+
+A pull request is tested on its branch, that is, on the main branch as it was when the branch was last updated. By the time it is merged, main has moved. Two pull requests can each pass on their own and break main together: the semantic conflict of the baseline, now at the scale of hours. Graydon Hoare, describing the bot that guarded Rust's repository, called the fix the "not rocket science rule": "automatically maintain a repository of code that always passes all the tests", by never merging a change that was not tested in exactly the combination that will be in main ([Hoare, 2014](#references)).
+
+A **merge queue** implements it. A pull request that is approved enters the queue instead of being merged. The queue builds a temporary branch with main plus the pull requests ahead of it plus this one, runs the pipeline on it, and merges only if it passes; a failing one is removed and the queue rebuilds the candidates behind it. GitHub's merge queue runs workflows on the event `merge_group` for these candidates, and GitLab calls the same thing a merge train.
+
+**Throughput.** Testing candidates one at a time limits merges to one per pipeline run. With the 12-minute pipeline, that is at most $60/12 = 5$ merges an hour. A team of 40 developers that each merge two changes in an eight-hour day produces $80/8 = 10$ an hour, twice what the queue can serve, and as in any queue whose arrival rate exceeds its service rate the wait grows without bound. Queues therefore test **speculatively**: candidate $k$ contains the $k - 1$ pull requests ahead of it, and the pipelines of, say, four candidates run at the same time. If all four pass, four changes are merged in the time of one pipeline, up to 20 an hour. If candidate 2 fails, candidates 3 and 4 were tested on top of a change that will not be merged, and must be retested without it: speculation trades runner time for throughput, and pays off when failures in the queue are rare, which is another reason to keep the pipeline free of flaky tests. Batching several pull requests into one candidate and bisecting a failed batch is the other common strategy.
+
+## Reading a workflow: GitHub Actions
+
+The pipeline of the figure as a GitHub Actions workflow, the file `.github/workflows/ci.yml`. It is meant for a private repository whose pull requests come from branches of the same repository; the next section explains what changes when pull requests come from forks.
+
+```yaml
+name: ci
+
+on:
+  pull_request:
+  merge_group:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  IMAGE: registry.example.com/team/calc
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: "0.12.9"
+      - run: uv run --locked ruff check
+      - run: uv run --locked ruff format --check
+
+  unit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: "0.12.9"
+          enable-cache: true
+      - run: uv run --locked pytest tests/unit --junitxml=unit.xml
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: unit-report
+          path: unit.xml
+
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: registry.example.com
+          username: ${{ vars.REGISTRY_USER }}
+          password: ${{ secrets.REGISTRY_TOKEN }}
+      - id: push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          push: true
+          tags: ${{ env.IMAGE }}:${{ github.sha }}
+          build-args: GIT_COMMIT=${{ github.sha }}
+          cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache
+          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache,mode=max
+
+  integration:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    services:
+      db:
+        image: postgres:18.6-trixie
+        env:
+          POSTGRES_USER: calc
+          POSTGRES_PASSWORD: calc
+          POSTGRES_DB: calc
+        ports:
+          - "5432:5432"
+        options: >-
+          --health-cmd "pg_isready -U calc"
+          --health-interval 2s
+          --health-retries 15
+    env:
+      DIGEST: ${{ needs.build.outputs.digest }}
+      CALC_URL: http://localhost:8000
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: registry.example.com
+          username: ${{ vars.REGISTRY_USER }}
+          password: ${{ secrets.REGISTRY_TOKEN }}
+      - run: >-
+          docker run --detach --network host
+          --env DATABASE_URL=postgresql://calc:calc@localhost:5432/calc
+          "$IMAGE@$DIGEST"
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: "0.12.9"
+          enable-cache: true
+      - run: uv run --locked pytest tests/integration
+
+  release:
+    needs: [build, lint, unit, integration]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      DIGEST: ${{ needs.build.outputs.digest }}
+    steps:
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: registry.example.com
+          username: ${{ vars.REGISTRY_USER }}
+          password: ${{ secrets.REGISTRY_TOKEN }}
+      - run: docker buildx imagetools create --tag "$IMAGE:main" "$IMAGE@$DIGEST"
+```
+
+- **`on`.** Three triggers: every pull request, every candidate of the merge queue (`merge_group`), and every push to `main`, which happens when the queue merges. Without `merge_group` the queue would wait forever for a check that never runs.
+- **`permissions: contents: read`.** The automatic `GITHUB_TOKEN` of every job may only read the repository. A workflow gets broad write permissions by default in older repositories; asking for the minimum limits what a compromised step can do.
+- **`concurrency`.** One pipeline per branch at a time; on pull requests, a new push cancels the run for the previous commit, which nobody needs any more. On `main` runs are not cancelled, so that every merged commit is tested.
+- **`env: IMAGE`.** The image repository, used by several jobs. `registry.example.com` stands for the team's registry.
+- **`lint`.** `runs-on` names the runner image, pinned to a version rather than `ubuntu-latest`, which moves. `timeout-minutes` stops a hung job long before the default of six hours. `actions/checkout` fetches the commit; `persist-credentials: false` keeps it from leaving the token in `.git/config` for later steps. `setup-uv` installs a pinned uv, and `uv run --locked` runs Ruff inside the locked environment and fails if the lockfile is out of date.
+- **`unit`.** The same setup with `enable-cache: true`, which saves uv's download cache keyed by a hash of `uv.lock`. The test report is uploaded as an artifact with `if: always()`, so that it is there especially when tests fail.
+- **`build`.** `setup-buildx-action` starts a BuildKit builder that can export its cache. `login-action` reads the registry user from a repository variable and the token from a secret. `build-push-action` builds the [Dockerfile of the image note](/notes/devops/container-images#example), passes the commit as `GIT_COMMIT`, imports and exports the layer cache through the tag `buildcache` (`mode=max` caches the build stage too, not only the final one), and pushes the image under the commit's hash. Its output `digest` becomes the job's output, the artifact that the rest of the pipeline refers to.
+- **`integration`.** `needs: build` gives the edge of the graph and makes `needs.build.outputs.digest` available. The `services` block starts PostgreSQL next to the job, and the runner waits for its health check. The digest goes into an environment variable rather than being written into the shell command with `${{ }}`, a habit that matters for values an attacker can influence, as the next section explains. The step runs the *pushed image by digest*, so the tests check exactly the bytes that will be released, not a rebuild.
+- **`release`.** Runs after all four jobs and only on `main`. `imagetools create` adds the tag `main` to the existing manifest without rebuilding or re-pushing layers. The tested digest is now the release candidate that the [next note](/notes/devops/continuous-delivery) deploys.
+
+The GitLab CI version of the same pipeline is read in the [Example](#example).
+
+## Security of CI
+
+A CI system runs code from the repository with credentials to the registry, the cloud and sometimes production. That makes it one of the most valuable targets of an attacker, and the [reproducible-builds section](/notes/devops/builds-and-dependencies#reproducible-builds) of the build note showed what a compromised builder can do. Four rules cover most of the risk.
+
+**Secrets.** Store credentials in the CI system's secret store, not in the repository (secrets in general, and what to do when one leaks, are in the [operational security section](/notes/devops/incidents-and-security#secrets-never-in-git)); the system masks them in logs, but masking is a last line of defence, since a step can print a secret in any encoding. Give each job only what it needs: the `lint` job above has no secrets at all. Scope deployment credentials to protected environments that only the main branch can use. Prefer short-lived credentials: with OpenID Connect, a job requests a signed token from the CI system (`permissions: id-token: write` on GitHub) and exchanges it with the cloud provider for credentials that expire within the hour, so no long-lived key exists to steal.
+
+**Untrusted code from pull requests.** A pull request from a fork contains code written by anyone. GitHub runs the event `pull_request` from forks with a read-only token and without the repository's secrets, which is safe: the worst the code can do is fail its own build. The event `pull_request_target` runs in the context of the base repository, with its secrets and a write token, and was made for tasks such as labelling that never run the pull request's code. Checking out and running the fork's code in such a workflow, or in one triggered by `workflow_run` after it, hands the secrets to the author of the pull request: a "pwn request" ([GitHub Security Lab, 2021](#references)). As of `actions/checkout` v7 the action refuses to check out a fork's pull request in these contexts unless the workflow sets `allow-unsafe-pr-checkout: true`. A similar injection happens without a checkout: a title or branch name of a pull request written into a `run:` line with `${{ }}` is pasted into the shell before it runs, so a title such as `"; curl …` executes; passing such values through environment variables, as the workflow above does for the digest, keeps them data.
+
+**Third-party actions are dependencies.** `uses: owner/action@v4` runs whatever commit the tag `v4` points to today, and the owner, or anyone who compromises the owner's account, can move the tag. In March 2025 that happened to `tj-actions/changed-files`, used by tens of thousands of repositories: an attacker pointed its version tags at a commit that printed the runner's secrets into the build logs (CVE-2025-30066) ([CISA, 2025](#references)). Workflows that referred to the action by a full commit hash kept running the old code. Pinning by hash, with the version in a comment for people and for update bots, is the rule of the [image note](/notes/devops/container-images#registries-tags-and-digests) applied to CI, and GitHub's security guidance recommends it ([GitHub, Security hardening](#references)).
+
+**Runners and caches.** Hosted runners are discarded after each job. A self-hosted runner that is reused can be modified by one job to attack the next, so self-hosted runners should be ephemeral, and never attached to public repositories that accept pull requests from forks. Caches are shared state too: a job that can write a cache entry that a later job on `main` restores can plant code there, which is why CI systems scope caches by branch and why caches must never be trusted as artifacts.
+
+<aside class="callout"><strong>Check yourself.</strong> (1) A pipeline has jobs A (3 min), B (8 min, needs A), C (2 min, needs A) and D (4 min, needs B and C). How long does it take with unlimited runners, and with one? Which job has slack, and how much? (2) A suite of 600 tests, each failing spuriously one time in 2,000. What share of pipelines on correct code are red? (3) Two pull requests both pass CI and are merged one after the other; main is now red. What happened, and what prevents it? (4) Why does the `integration` job run the image by its digest instead of building it again? (5) A workflow on `pull_request_target` checks out the pull request's head and runs `npm install`. Why is that dangerous even if the workflow never runs the tests?<details><summary>Answers</summary>(1) EF(A) = 3, EF(B) = 11, EF(C) = 5, EF(D) = max(11, 5) + 4 = 15 minutes; with one runner $3 + 8 + 2 + 4 = 17$. C has slack: D must start by 11, and C ends at 5, so 6 minutes. (2) $1 - (1 - 0.0005)^{600} = 1 - 0.741 = 0.26$: about a quarter. (3) Each was tested against main without the other; together they conflict semantically. A merge queue tests each change on top of main and the changes ahead of it, and merges only what passed in that combination. (4) The tests must check the exact artifact that will be released; a rebuild can differ (a moved base-image tag, a new dependency resolution) and would then ship untested bytes. (5) Installing runs the package's install scripts, which the pull request controls, in a job that has the base repository's secrets and a write token.</details></aside>
+
+## What changed
+
+| | Integration at the end (the baseline) | Continuous integration |
+| --- | --- | --- |
+| How often changes meet | before each release | many times a day, in small changes |
+| Who verifies | developers, by hand, on their machines | a pipeline on clean runners, for every change |
+| Where a conflict shows | in a long integration phase | in the pipeline of the change that caused it |
+| State of main | unknown until the release | green, enforced by a merge queue |
+| Speed of feedback | weeks | minutes, bounded by the critical path |
+| What is released | a fresh build | the image that passed the pipeline, by digest |
+| Credentials | on developers' machines | in a secret store, scoped per job, ideally short-lived |
+
+## Limitations
+
+- **CI tests only what the tests test.** A green pipeline says that the checks passed, not that the change is correct; coverage, the quality of assertions and the realism of integration environments decide what green means.
+- **Shared environments are not production.** A service container of PostgreSQL in CI is not the production database with its data, size and configuration; some problems appear only after deployment, which the [next note](/notes/devops/continuous-delivery) addresses with gradual rollouts.
+- **Monorepos and very large test suites** need test selection (running only the tests affected by a change, from the build graph), remote caching and remote execution to keep the critical path short; the arithmetic here is the same, at a scale where it matters more.
+- **Speculative merge queues cost runner time**, and with frequent failures in the queue they can be slower than testing one candidate at a time.
+- **Platform details move.** Action versions, runner images and default token permissions change; the pins above are those of October 2026 and need updating, by a bot, like any other dependency.
+
+## What you should remember
+
+- Continuous integration is a practice: small changes into one main branch at least daily, an automated build with tests for every change, and a broken main fixed at once. The CI server is only the tool.
+- A pipeline is a DAG of jobs on fresh runners. Artifacts are required outputs passed between jobs; caches are optional speedups that must never be relied on for correctness.
+- The pipeline's duration is its critical path: $\mathrm{EF}(j) = \max_{i \in \mathrm{needs}(j)} \mathrm{EF}(i) + d_j$. Speeding up jobs with slack changes nothing; runners, queueing and per-job overhead add to the path.
+- Find each failure with the cheapest test that can find it: many unit tests, fewer integration tests, few end-to-end tests, within a budget of about ten minutes.
+- Flakiness compounds as $(1 - f)^n$. Detect, quarantine and fix flaky tests rather than retrying them silently.
+- A merge queue keeps main green by testing each change in the exact combination that will be merged; speculation raises throughput when failures are rare.
+- Secure CI like production: least-privilege tokens, scoped and short-lived secrets, no untrusted code with secrets (`pull_request_target`), third-party actions pinned by commit hash, ephemeral runners.
+
+## Example
+
+The same five jobs as a GitLab CI configuration, the file `.gitlab-ci.yml`, written against the GitLab CI/CD YAML reference as documented in October 2026, for runners with the Docker executor. GitLab provides its own container registry per project, so the image name and the registry credentials come from predefined variables instead of secrets.
+
+```yaml
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+stages: [check, build, test, release]
+
+default:
+  interruptible: true
+
+variables:
+  IMAGE: $CI_REGISTRY_IMAGE
+
+.uv:
+  image: ghcr.io/astral-sh/uv:0.12.9-python3.14-trixie-slim
+  variables:
+    UV_CACHE_DIR: .uv-cache
+  cache:
+    key:
+      files: [uv.lock]
+    paths: [.uv-cache]
+
+.docker:
+  image: docker:29.9.2
+  services: ["docker:29.9.2-dind"]
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+  before_script:
+    - echo "$CI_REGISTRY_PASSWORD" | docker login --username "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+
+lint:
+  extends: .uv
+  stage: check
+  needs: []
+  script:
+    - uv run --locked ruff check
+    - uv run --locked ruff format --check
+
+unit:
+  extends: .uv
+  stage: check
+  needs: []
+  script:
+    - uv run --locked pytest tests/unit --junitxml=unit.xml
+  artifacts:
+    when: always
+    reports:
+      junit: unit.xml
+
+build:
+  extends: .docker
+  stage: build
+  needs: []
+  script:
+    - apk add --no-cache jq
+    - docker buildx create --use --driver docker-container
+    - >-
+      docker buildx build --push
+      --tag "$IMAGE:$CI_COMMIT_SHA"
+      --build-arg GIT_COMMIT="$CI_COMMIT_SHA"
+      --cache-from type=registry,ref="$IMAGE:buildcache"
+      --cache-to type=registry,ref="$IMAGE:buildcache",mode=max
+      --metadata-file meta.json .
+    - echo "DIGEST=$(jq -r '."containerimage.digest"' meta.json)" > build.env
+  artifacts:
+    reports:
+      dotenv: build.env
+
+integration:
+  extends: .uv
+  stage: test
+  needs: [build]
+  variables:
+    FF_NETWORK_PER_BUILD: "true"
+    CALC_URL: http://calc:8000
+  services:
+    - name: postgres:18.6-trixie
+      alias: db
+      variables:
+        POSTGRES_USER: calc
+        POSTGRES_PASSWORD: calc
+        POSTGRES_DB: calc
+    - name: $IMAGE:$CI_COMMIT_SHA
+      alias: calc
+      variables:
+        DATABASE_URL: postgresql://calc:calc@db:5432/calc
+  script:
+    - uv run --locked pytest tests/integration
+
+release:
+  extends: .docker
+  stage: release
+  needs: [build, lint, unit, integration]
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  script:
+    - docker buildx imagetools create --tag "$IMAGE:main" "$IMAGE@$DIGEST"
+```
+
+- **`workflow: rules`.** Pipelines run for merge requests and for the default branch, and not twice for a branch that has an open merge request. Merge trains, GitLab's merge queue, run merge-request pipelines on the combined result.
+- **`stages`.** GitLab orders jobs by stages, but `needs` overrides the order: a job with `needs: []` starts at once, whatever its stage, so `lint`, `unit` and `build` run together as in the figure. Stages remain as the columns of the pipeline view.
+- **`default: interruptible: true`.** A newer pipeline on the same branch may cancel this one, the counterpart of `cancel-in-progress`.
+- **`variables: IMAGE: $CI_REGISTRY_IMAGE`.** The project's own registry path, predefined by GitLab, as are `CI_REGISTRY`, `CI_REGISTRY_USER` and `CI_REGISTRY_PASSWORD`, a short-lived credential valid for the job.
+- **`.uv` and `.docker`.** Hidden jobs (names starting with a dot) that are never run themselves and that other jobs `extends`. `.uv` runs jobs in uv's image with Python 3.14 and caches uv's downloads under a key computed from `uv.lock`; `cache` must point inside the project directory, hence `UV_CACHE_DIR`. `.docker` runs the Docker client against a Docker-in-Docker service over TLS and logs in to the registry before each script.
+- **`lint` and `unit`.** The same commands as on GitHub. The JUnit report is an artifact of type `junit`, which GitLab shows in the merge request.
+- **`build`.** `buildx create` makes a builder that can export its cache to the registry, as `setup-buildx-action` did. The build writes its metadata, including the pushed digest, to `meta.json`; the job writes `DIGEST=…` into a dotenv report, and GitLab exports it as a variable to every job that needs `build`.
+- **`integration`.** Starts PostgreSQL and the pushed image as services. `FF_NETWORK_PER_BUILD` puts the job and its services on one network, so that the service `calc` can reach the service `db` by its alias; without it, services reach only the job, not each other. The service image is named by the commit tag that this pipeline pushed, and the tests reach it at `CALC_URL`.
+- **`release`.** On the default branch only, after all four jobs, tags the tested digest as `main` without rebuilding.
+
+The two systems differ in vocabulary more than in model: workflow and pipeline, `runs-on` and runner tags, `services` in both, `needs` in both, artifacts and caches in both. The graph, its critical path and the security rules are the same.
+
+## Next
+
+The pipeline now ends with a tested image and a tag that says so. Nothing has reached users yet. The [next note](/notes/devops/continuous-delivery) takes that digest through environments to production: how to release without downtime, how to find out quickly and on little traffic that a release is bad, how to change a database under a running service, and how to undo a release.
+
+## References
+
+- HSE University, Faculty of Computer Science. *DevOps* course (4th year, Applied Mathematics and Informatics, taught with MTS): CI/CD and GitLab. *Инструменты промышленной разработки*, course wiki at [wiki.cs.hse.ru](http://wiki.cs.hse.ru/): the start of CI/CD.
+- MIT, *The Missing Semester of Your CS Education* (2026). [Code Quality](https://missing.csail.mit.edu/2026/code-quality/) (testing, continuous integration and deployment).
+- M. Fowler. [Continuous Integration](https://martinfowler.com/articles/continuousIntegration.html). martinfowler.com, revised January 2024.
+- K. Beck. *Extreme Programming Explained: Embrace Change*. Addison-Wesley, 1999. (Continuous integration.)
+- K. Beck and C. Andres. *Extreme Programming Explained: Embrace Change*, 2nd ed. Addison-Wesley, 2004. (The ten-minute build as a primary practice.)
+- N. Forsgren, J. Humble, G. Kim. *Accelerate: The Science of Lean Software and DevOps*. IT Revolution, 2018. Chapter 4 (technical practices: continuous integration, trunk-based development).
+- J. Humble, D. Farley. *Continuous Delivery*. Addison-Wesley, 2010. Chapters 3 and 5 (continuous integration, the deployment pipeline).
+- M. Cohn. *Succeeding with Agile*. Addison-Wesley, 2009. (The test automation pyramid.) M. Fowler. [TestPyramid](https://martinfowler.com/bliki/TestPyramid.html), 2012.
+- M. Wacker. [Just Say No to More End-to-End Tests](https://testing.googleblog.com/2015/04/just-say-no-to-more-end-to-end-tests.html). Google Testing Blog, 2015.
+- J. Micco. [Flaky Tests at Google and How We Mitigate Them](https://testing.googleblog.com/2016/05/flaky-tests-at-google-and-how-we.html). Google Testing Blog, 2016.
+- A. Memon et al. [Taming Google-scale continuous testing](https://doi.org/10.1109/ICSE-SEIP.2017.16). *ICSE-SEIP*, 2017.
+- G. Hoare. [The Not Rocket Science Rule Of Software Engineering](https://graydon2.dreamwidth.org/1597.html). 2014.
+- GitHub documentation: [Workflow syntax for GitHub Actions](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax), [Managing a merge queue](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/configuring-pull-request-merges/managing-a-merge-queue), [Security hardening for GitHub Actions](https://docs.github.com/en/actions/security-for-github-actions/security-guides/security-hardening-for-github-actions) (pinning actions to a full-length commit SHA, script injection), [OpenID Connect](https://docs.github.com/en/actions/security-for-github-actions/security-hardening-your-deployments/about-security-hardening-with-openid-connect).
+- GitHub Security Lab. [Keeping your GitHub Actions and workflows secure, part 1: preventing pwn requests](https://securitylab.github.com/resources/github-actions-preventing-pwn-requests/). 2021.
+- actions/checkout. [action.yml at v7.0.1](https://github.com/actions/checkout/blob/3d3c42e5aac5ba805825da76410c181273ba90b1/action.yml) (the `allow-unsafe-pr-checkout` input).
+- CISA. [Supply chain compromise of third-party tj-actions/changed-files (CVE-2025-30066)](https://www.cisa.gov/news-events/alerts/2025/03/18/supply-chain-compromise-third-party-tj-actionschanged-files-cve-2025-30066-and-reviewdogaction). Alert, 18 March 2025.
+- GitLab documentation: [CI/CD YAML syntax reference](https://docs.gitlab.com/ci/yaml/) (`needs`, `rules`, `cache:key:files`, `artifacts:reports:dotenv`, `interruptible`), [Services](https://docs.gitlab.com/ci/services/) (`FF_NETWORK_PER_BUILD`), [Use Docker to build Docker images](https://docs.gitlab.com/ci/docker/using_docker_build/), [Merge trains](https://docs.gitlab.com/ci/pipelines/merge_trains/), [GitLab container registry](https://docs.gitlab.com/user/packages/container_registry/).
+- Astral. [uv documentation: Using uv in GitHub Actions](https://docs.astral.sh/uv/guides/integration/github/) and [Using uv in GitLab CI/CD](https://docs.astral.sh/uv/guides/integration/gitlab/).
+- Docker documentation: [Cache storage backends: registry](https://docs.docker.com/build/cache/backends/registry/), [docker buildx imagetools create](https://docs.docker.com/reference/cli/docker/buildx/imagetools/create/).

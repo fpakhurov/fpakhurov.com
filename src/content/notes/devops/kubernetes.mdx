@@ -1,0 +1,327 @@
+---
+title: "Kubernetes: desired state and reconciliation"
+description: "How Kubernetes keeps running what was declared: the API server, etcd, controllers and the scheduler as control loops; Pods, ReplicaSets, Deployments, Services, namespaces and labels; a rollout step by step; requests, limits and probes."
+course: devops
+section: Orchestration
+order: 10
+status: published
+tags: [kubernetes, control-loop, reconciliation, api-server, etcd, controllers, scheduler, kubelet, pods, deployments, services, labels, requests-and-limits, probes]
+prerequisites: [Cloud building blocks, Container images, Continuous delivery and deployment, Virtual machines and containers]
+---
+
+import ReconcileLoop from '../../../components/figures/kubernetes/ReconcileLoop.astro';
+
+The [previous note](/notes/devops/cloud-building-blocks) ended with machines, disks and networks that can be created by an API call, and with the question of who places containers on those machines, restarts them when they fail and replaces them one by one during a deploy. The [infrastructure-as-code note](/notes/devops/infrastructure-as-code) answered a similar question for infrastructure with a plan and an apply that a person starts. Kubernetes runs the same comparison of desired and actual state continuously, for every object, without anyone starting it. This note explains how: the components of a cluster, the handful of objects that describe a service, how a rollout happens as a sequence of controllers acting, and how resources and health are declared.
+
+**Conventions.** Kubernetes 1.37 is the current release (1.37.1 on 23 October 2026). No cluster was available on the test machine, so nothing here was applied to one. The manifests printed by `kubectl create ... --dry-run=client`, which builds an object without contacting a server, are real output of `kubectl` 1.25; the other manifests were written against the documentation of 1.37 and parsed with PyYAML; what a cluster would print is described in prose. The rollout script ran with Python 3.14.7.
+
+## Baseline: a script that starts containers on machines
+
+With three machines and an [image](/notes/devops/container-images) in a registry, the first deployment is a script: `ssh node1 docker run -d registry.example.com/web:1.4.2`, the same on `node2`, and a list of addresses for the load balancer. It breaks in five ways:
+
+1. **Placement by hand.** The script decides which container goes where, without knowing how full each machine is.
+2. **Nobody watches.** When a container crashes or a machine dies, the service runs with fewer copies until a person notices.
+3. **Deploys are loops.** Replacing version 1.4.2 by 1.4.3 means a loop over machines with its own error handling, and a failure halfway leaves a mix.
+4. **Addresses move.** Every restarted container may get a new address, and the load balancer's list goes stale.
+5. **Resources are unaccounted.** One container that leaks memory takes its neighbours on the same machine down with it.
+
+## Desired state and the control loop
+
+<aside class="callout"><strong>Key idea.</strong> In Kubernetes nobody issues commands such as "start three containers". A user stores **objects** that describe what should exist, each with a `spec` (the desired state) and a `status` (the observed state), in one API. Many independent **controllers** each watch one kind of object and run the same loop forever, called **reconciliation**: observe the actual state, compare it with the spec, act to reduce the difference, and write what they see into the status. The loop is **level-triggered**: it reacts to the difference between states, not to the events that caused it, so a controller that restarts, misses an event or sees two changes at once still converges to the right state.</aside>
+
+A thermostat is the classic control loop: it does not remember that someone opened a window; it measures the temperature, compares it with the setting, and heats or not. The design comes from Google's Borg and Omega cluster managers ([Verma et al., 2015](#references); [Burns et al., 2016](#references)), and it explains the rest of Kubernetes: every feature is an object kind plus a controller that makes the world match it.
+
+## The cluster: the API server, etcd, controllers, the scheduler, the kubelet
+
+A cluster has a **control plane**, usually on three dedicated machines (or run by a cloud provider as a managed service), and **nodes**, the machines that run the containers.
+
+- **The API server** is the only entry point. It authenticates each request, checks permissions (role-based access control, RBAC), runs **admission** checks that validate or modify objects, and stores them. Clients and components can **watch** a kind of object: they receive a stream of changes instead of polling.
+- **etcd** is the database behind the API server, a key-value store that keeps several replicas consistent with the Raft consensus protocol. A write succeeds when a majority of members, a **quorum**, has stored it: $\lfloor n/2 \rfloor + 1$ of $n$. Three members tolerate the loss of one ($2$ of $3$ remain), five tolerate two; four tolerate only one, as three do, which is why the sizes are odd. Only the API server talks to etcd.
+- **The controller manager** runs the built-in controllers: for Deployments, ReplicaSets, nodes, jobs, endpoints and dozens more. Each is a loop over its own kind.
+- **The scheduler** watches for Pods that have no node yet. For each, it **filters** the nodes that can run it (enough unreserved CPU and memory, matching constraints), **scores** the rest (spreading copies, packing, preferences), and writes the chosen node into the Pod: the **binding**.
+- **The kubelet**, an agent on every node, watches the Pods bound to its node, asks the **container runtime** (containerd or CRI-O, through the Container Runtime Interface) to create their containers, runs their health probes, and reports their status.
+- **kube-proxy**, or a replacement based on eBPF, programs each node's packet filtering so that the virtual addresses of Services reach Pods.
+
+No component calls another. Each one reads objects from the API server and writes its results back to it, so any component can restart without the others noticing, and every intermediate state can be inspected with `kubectl get`.
+
+<ReconcileLoop />
+
+1. `kubectl apply` sends a Deployment to the API server, which validates it and stores it in etcd.
+2. The Deployment controller sees a Deployment with no ReplicaSet and creates one.
+3. The ReplicaSet controller sees 0 of 3 Pods and creates 3 Pods with no node.
+4. The scheduler sees Pods without a node, picks a node for each and writes the binding.
+5. The kubelet of each node sees the Pods bound to it and asks the runtime to start their containers.
+6. The kubelets report status. The controllers compare status with spec again; if a Pod dies later, the ReplicaSet controller sees two Pods where three should be and creates a new one, and the same path repeats.
+
+## Objects: Pods, ReplicaSets, Deployments, Services, namespaces
+
+**A Pod** is the unit that Kubernetes schedules: one or more containers that run together on one node and share a network namespace, so one IP address and `localhost` between them, and can share volumes. The isolation comes from the [namespaces and cgroups](/notes/acos/virtual-machines-and-containers#containers-one-kernel-many-views) of the systems course. Usually a Pod holds one application container, plus sometimes a helper beside it (a *sidecar*, such as a proxy or a log shipper). A Pod is mortal: when its node fails, it is not moved; a controller creates a new Pod, with a new name and a new address, somewhere else.
+
+**Labels** are key–value pairs on any object, such as `app: web` or `tier: frontend`, and **selectors** choose sets of objects by their labels. They are the glue of Kubernetes: a ReplicaSet owns the Pods that match its selector, and a Service sends traffic to the Pods that match its selector. Nothing holds a list of Pod names, so Pods can come and go freely.
+
+**A ReplicaSet** keeps a given number of Pods that match its selector running, creating them from a Pod template. **A Deployment** manages ReplicaSets: one per version of the template. Changing the template, for example the image, creates a new ReplicaSet and moves the replicas from the old one to the new one; the old ReplicaSets stay, scaled to zero, as the history that a rollback returns to. Users create Deployments and almost never touch ReplicaSets directly.
+
+`kubectl` can build a Deployment without a cluster:
+
+```console
+$ kubectl create deployment web --image=registry.example.com/web:1.4.2 --replicas=3 --port=8080 --dry-run=client -o yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  creationTimestamp: null
+  labels:
+    app: web
+  name: web
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: web
+  strategy: {}
+  template:
+    metadata:
+      creationTimestamp: null
+      labels:
+        app: web
+    spec:
+      containers:
+      - image: registry.example.com/web:1.4.2
+        name: web
+        ports:
+        - containerPort: 8080
+        resources: {}
+status: {}
+```
+
+The structure is the whole idea in miniature. `spec.replicas` and `spec.template` are the desired state; `spec.selector` says which Pods count; the template's labels, `app: web`, match that selector, so the Pods the Deployment creates are the ones it counts. `status: {}` is empty because no controller has observed anything yet: on a cluster, the Deployment controller would fill it with the numbers of replicas that exist, are updated and are available. Empty fields such as `strategy: {}` and `resources: {}` take defaults or mean "none"; the Example section fills them in.
+
+**A Service** gives a set of Pods one stable name and one virtual address. Its selector picks the Pods; the **EndpointSlice** controller keeps the list of addresses of those that are *ready*; and kube-proxy on every node translates connections to the Service's address into connections to one of those Pods. Inside the cluster, the Service `web` in the namespace `shop` is reachable by DNS as `web.shop.svc.cluster.local`, or simply `web` from the same namespace. The type `ClusterIP` (the default) is reachable only inside the cluster; `NodePort` opens a port on every node; `LoadBalancer` asks the cloud provider for a load balancer of the [previous note](/notes/devops/cloud-building-blocks#networks-vpc-subnets-security-groups) in front of those ports. HTTP routing by host and path is the subject of the [next note](/notes/devops/kubernetes-in-practice).
+
+**A namespace** is a scope for names (two teams can each have a Deployment `web`) and the unit to which access rules and resource quotas are attached. It is not a security boundary by itself: without network policies, Pods in different namespaces can reach each other.
+
+## How a rollout happens, controller by controller
+
+The [delivery note](/notes/devops/continuous-delivery#rolling-update) chose the rolling update as a strategy. Here is what the controllers do when the image of a Deployment changes, with `replicas: 4` and the defaults `maxSurge: 25%` and `maxUnavailable: 25%`.
+
+1. `kubectl apply` stores the Deployment with the new image. Its template has changed, so its hash has changed: the Deployment controller labels every ReplicaSet with a `pod-template-hash` of the template it was made from.
+2. No ReplicaSet has the new hash, so the controller creates one, with 0 replicas.
+3. It computes its bounds. `maxSurge` is rounded up and `maxUnavailable` down: $\lceil 0.25 \times 4 \rceil = 1$ and $\lfloor 0.25 \times 4 \rfloor = 1$. So at most $4 + 1 = 5$ Pods may exist, and at least $4 - 1 = 3$ must be **available**: ready, and for at least `minReadySeconds` (0 by default).
+4. On each pass the controller either scales the new ReplicaSet up as far as the surge allows, or scales the old one down as far as availability allows. A Pod of the new version counts as available only once its readiness probe passes, which the kubelet reports.
+5. When the old ReplicaSet reaches 0 and every new Pod is available, the rollout is complete. The old ReplicaSet stays with 0 replicas; `kubectl rollout undo` scales it back up by the same procedure.
+
+**Worked example.** A script that repeats the controller's arithmetic, with each new Pod becoming ready one pass after it starts:
+
+```python
+import math
+
+# The arithmetic of the Deployment controller in a rolling update (apps/v1).
+# Each pass is one sync of the controller: it scales the new ReplicaSet up if it may,
+# and otherwise scales the old one down. New pods pass their readiness probe one pass after they start.
+replicas = 4
+max_surge = math.ceil(0.25 * replicas)          # 25 %, rounded up
+max_unavailable = math.floor(0.25 * replicas)   # 25 %, rounded down
+min_available = replicas - max_unavailable
+
+old, new, new_ready, started = replicas, 0, 0, 0
+print("pass  action          old  new  new ready  pods  available")
+print(f"{0:>4}  {'':15} {old:>3} {new:>4} {new_ready:>10} {old + new:>5} {old + new_ready:>10}")
+for step in range(1, 20):
+    new_ready = started                          # pods started in an earlier pass are ready now
+    up = min(replicas, new + max(0, replicas + max_surge - (old + new))) - new
+    if up > 0:
+        new += up
+        action = f"new +{up}"
+    else:
+        down = max(0, min(old, (old + new) - min_available - (new - new_ready)))
+        old -= down
+        action = f"old -{down}" if down else "done"
+    started = new
+    print(f"{step:>4}  {action:15} {old:>3} {new:>4} {new_ready:>10} {old + new:>5} {old + new_ready:>10}")
+    if old == 0 and new_ready == replicas:
+        break
+print("maxSurge", max_surge, "maxUnavailable", max_unavailable, "minAvailable", min_available)
+```
+
+```console
+$ python3.14 rollout.py
+pass  action          old  new  new ready  pods  available
+   0                    4    0          0     4          4
+   1  new +1            4    1          0     5          4
+   2  old -2            2    1          1     3          3
+   3  new +2            2    3          1     5          3
+   4  old -2            0    3          3     3          3
+   5  new +1            0    4          3     4          3
+   6  done              0    4          4     4          4
+maxSurge 1 maxUnavailable 1 minAvailable 3
+```
+
+Read the scale-down in pass 2: there are 5 Pods, at least 3 must stay available, and the new Pod is already ready, so $5 - 3 - 0 = 2$ old Pods may go. In pass 4 the same rule removes the last two old Pods, because the two new Pods started in pass 3 are ready by then. The number of Pods never exceeds 5 and the number of available Pods never falls below 3, the two bounds of step 3. If the new version never becomes ready, the rollout stops as soon as the new Pods that are not ready use up the budget: here after the third pass, with two new Pods that are not ready and three old Pods still serving, and after `progressDeadlineSeconds` (600 s by default) the Deployment reports that it failed to progress. Kubernetes does not roll back by itself; a pipeline or a person does.
+
+## Scheduling: requests and limits
+
+Each container declares what it needs and what it may use, per resource:
+
+- A **request** is what the scheduler reserves. A Pod fits on a node only if the sum of the requests of all Pods on the node, including the new one, stays within the node's **allocatable** capacity (its size minus what the system reserves). Requests are not measurements: the scheduler never looks at actual use.
+- A **limit** is what the kernel enforces, through the [control groups](/notes/acos/virtual-machines-and-containers#control-groups-limits) of the systems course. A CPU limit becomes a quota in `cpu.max`: a container over its quota is **throttled**, it waits until the next period. A memory limit becomes `memory.max`: a container over it is killed by the out-of-memory killer and restarted, with exit status 137.
+
+CPU is counted in cores and **millicores**: `250m` is a quarter of a core. Memory is counted in bytes, with `Mi` and `Gi` for powers of 1,024.
+
+**Worked example.** A CPU limit of `500m` is half a core. The kubelet writes it as `50000 100000` into the container's `cpu.max`: 50 ms of CPU time in every 100 ms period, the exact setting of the [cgroups experiment](/notes/acos/virtual-machines-and-containers#control-groups-limits) in the systems course, where a busy loop under it received $0.50$ of a CPU and was throttled in every period. A memory limit of `256Mi` becomes $256 \times 2^{20} = 268{,}435{,}456$ bytes in `memory.max`. A CPU request of `250m` becomes a relative weight (`cpu.weight`): it matters only when the CPU is contended, when containers share the CPU in proportion to their requests.
+
+**Worked example.** A node has 4 cores and 16 GiB allocatable. Pods of the web service request `500m` of CPU and `1Gi` of memory. By CPU, $4{,}000 / 500 = 8$ Pods fit; by memory, $16 / 1 = 16$. The scheduler places at most 8, even if each uses only 100 m in practice, and a ninth stays `Pending` with an event saying that no node has enough CPU. Requests set too high waste machines; set too low, they pack the node with Pods that then compete for CPU and memory that is not there.
+
+The two settings together give each Pod a **quality-of-service class**: *Guaranteed* when every container's requests equal its limits, *Burstable* when some request is set, *BestEffort* when none is. When a node runs short of memory, the kubelet evicts BestEffort Pods first and Guaranteed Pods last. A common practice is to set the memory limit equal to the memory request (a Pod should not count on memory the scheduler did not reserve) and to set a CPU request without a CPU limit, because throttling adds latency even when the node has idle cores.
+
+## Probes: is it alive, is it ready, has it started
+
+The kubelet checks each container with up to three probes, each an HTTP request, a TCP connection, a gRPC health check or a command run inside the container.
+
+- **Liveness**: is the process working at all? When it fails `failureThreshold` times in a row, the kubelet kills the container and starts it again. It catches deadlocks and hung processes, which a crash-only view would miss.
+- **Readiness**: should the Pod receive traffic now? When it fails, the Pod is removed from the endpoints of its Services, but not restarted; when it passes again, it returns. This is the check that makes rolling updates safe, the Kubernetes form of the balancer's [health checks](/notes/devops/networking-for-services#load-balancers-l4-and-l7-algorithms-health-checks) in the networking note.
+- **Startup**: has a slow-starting application finished starting? Until it passes, the other two are not run, so a liveness probe does not kill an application that is still loading.
+
+The defaults are a probe every `periodSeconds: 10`, a timeout of 1 s, and `failureThreshold: 3`. With these, a process that hangs is restarted between $2 \times 10 + 1 = 21$ and $3 \times 10 + 1 = 31$ s later, by the same arithmetic as the balancer's health check. A container that keeps failing is restarted with growing delays, 10 s, 20 s, 40 s and so on up to 5 minutes, which `kubectl get pods` shows as `CrashLoopBackOff`.
+
+The rule for liveness is the rule of the networking note: check the process, not its dependencies. A liveness probe that queries the database restarts every Pod of the service when the database is slow, which makes the outage worse and longer. Readiness may include whether the Pod can do useful work. During a shutdown, the kubelet sends `SIGTERM` and, at the same time, the Pod is removed from the Service's endpoints; for the `terminationGracePeriodSeconds` (30 s by default) that follow, the application should finish requests in progress and accept new ones that arrive late, and only then exit; after the grace period the kubelet sends `SIGKILL`.
+
+<aside class="callout"><strong>Check yourself.</strong> (1) A Pod of a ReplicaSet with `replicas: 3` is deleted by hand. Which component notices, through which object, and what happens next? (2) Why is the controllers' loop level-triggered, and what would go wrong if the ReplicaSet controller counted "Pod created" and "Pod deleted" events instead? (3) A Deployment with `replicas: 10`, `maxSurge: 2` and `maxUnavailable: 0` gets an image that never becomes ready. How many Pods of each version exist after the controller stops making progress, and is the service degraded? (4) A container with a memory request of `512Mi` and no memory limit keeps growing. What happens to it and to its neighbours? (5) An etcd cluster of five members loses two. Can the cluster still change objects? And if it loses three?<details><summary>Answers</summary>(1) The ReplicaSet controller, watching Pods through the API server, sees two Pods matching its selector where the spec says three, and creates a new Pod from its template; the scheduler binds it and a kubelet starts it. (2) Because it compares states: it counts the Pods that exist and match, whatever events it saw. Counting events would drift after any missed or duplicated event, and after a restart of the controller it would know nothing. (3) The surge allows 12 Pods and unavailability 0 allows no old Pod to go, so 2 new Pods start and never become ready, and 10 old Pods keep serving. The service is not degraded; the Deployment reports after the progress deadline that the rollout failed. (4) It is not throttled or killed by its own limit, since it has none; when the node runs short of memory, the kubelet evicts Pods, Burstable ones using the most memory above their requests first, and the kernel may kill processes before that. Its growth can thus push out its neighbours. A memory limit equal to the request would have killed only this container. (5) With two lost, three of five remain, a quorum, so writes continue. With three lost, two remain, below the quorum of three: etcd refuses writes, and the cluster cannot change anything, although running containers keep running.</details></aside>
+
+## What changed
+
+| Problem of the script | Mechanism | Component |
+| --- | --- | --- |
+| Placement by hand | requests, filtering and scoring of nodes | scheduler |
+| Nobody watches | level-triggered control loops over ReplicaSets and Pods | controllers |
+| Deploys are loops | a Deployment moves replicas between ReplicaSets within `maxSurge` and `maxUnavailable` | Deployment controller |
+| Addresses move | labels, selectors, Services with a stable name and address, endpoints of ready Pods | EndpointSlice controller, kube-proxy |
+| Hung or slow containers | liveness, readiness and startup probes | kubelet |
+| Resources unaccounted | requests reserved by the scheduler, limits enforced by cgroups | scheduler, kubelet, kernel |
+
+## Limitations
+
+- Kubernetes is eventually consistent. Between a change and its effect there are several watches and passes, and for a moment different components see different states: a Pod being deleted can still receive a request, a new one may not yet be in the endpoints.
+- A controller can only converge to what is possible. A Pod that requests more than any node has stays `Pending` forever, a rollout of a broken image stops halfway, and the cluster reports the problem without fixing it.
+- Requests are guesses written by people. Too high, they waste money; too low, they overload nodes; and they drift as the code changes. Measuring actual use and adjusting is ongoing work.
+- The control plane is a distributed system of its own: etcd needs a quorum, backups and fast disks, and the API server can be overloaded by clients that list large collections. Managed services take this work away but not its failure modes.
+- This note covers stateless services. Configuration, storage, routing from outside, autoscaling and packaging follow in the [next note](/notes/devops/kubernetes-in-practice).
+
+## What you should remember
+
+- Objects have a spec (desired) and a status (observed). Controllers loop forever: observe, compare, act. The loop is level-triggered, so it converges after missed events and restarts.
+- Only the API server talks to etcd, and no component calls another: they watch objects and write results. etcd needs a majority, $\lfloor n/2 \rfloor + 1$ of $n$ members.
+- Pod: containers on one node sharing a network namespace; mortal, replaced rather than moved. Labels and selectors tie ReplicaSets and Services to Pods. A Deployment owns one ReplicaSet per template version.
+- A rolling update keeps at most `replicas + maxSurge` Pods and at least `replicas - maxUnavailable` available, with surge rounded up and unavailability rounded down; readiness decides what counts as available.
+- Requests are what the scheduler reserves; limits are what cgroups enforce: CPU over its limit is throttled, memory over its limit is killed (exit 137).
+- Liveness restarts, readiness removes from traffic, startup protects slow starts. Probe the process, not its dependencies.
+
+## Example
+
+A Deployment and a Service for the web service, as one file with two documents. It was written against the Kubernetes 1.37 API reference and parsed with PyYAML; it was not applied to a cluster here. Applied with `kubectl apply -f web.yaml`, it would print one line per object, saying that `deployment.apps/web` and `service/web` were created.
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+  namespace: shop
+  labels:
+    app: web
+spec:
+  replicas: 4
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      app: web
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: web
+          image: registry.example.com/web:1.4.2
+          ports:
+            - name: http
+              containerPort: 8080
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              memory: 256Mi
+          startupProbe:
+            httpGet:
+              path: /healthz/live
+              port: http
+            periodSeconds: 2
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /healthz/live
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /healthz/ready
+              port: http
+            periodSeconds: 5
+            failureThreshold: 2
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+  namespace: shop
+spec:
+  type: ClusterIP
+  selector:
+    app: web
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+```
+
+- `apiVersion: apps/v1`, `kind: Deployment`: every object names its API group, version and kind; Deployments live in the group `apps`.
+- `metadata.name` and `namespace`: the object is `shop/web`. The namespace must exist. The label on the Deployment itself is for people and tools; the ones that matter for the Pods are in the template.
+- `replicas: 4` is the desired number of Pods. `revisionHistoryLimit: 5` keeps the five most recent old ReplicaSets, at zero replicas, for rollbacks (the default is 10).
+- `selector.matchLabels: app: web` says which Pods belong to the Deployment; it cannot be changed after creation, and it must match `template.metadata.labels`, or the API server rejects the object.
+- `strategy`: a rolling update within the bounds of the worked example: with 4 replicas, at most 5 Pods and at least 3 available.
+- `template` is a complete Pod description, the part whose hash names the ReplicaSet. Changing anything in it, the image or an environment variable, starts a rollout; changing `replicas` does not.
+- `terminationGracePeriodSeconds: 30`: after `SIGTERM`, the container has 30 s to finish its requests before `SIGKILL`.
+- `image`: a tag for readability. In production the [image note](/notes/devops/container-images#registries-tags-and-digests) recommends a digest, so that the Pods of one ReplicaSet cannot run different builds behind the same tag.
+- `ports`: the container listens on 8080 and the port is named `http`, so probes and the Service can refer to it by name.
+- `resources`: the scheduler reserves a quarter of a core and 256 MiB for each Pod; the memory limit equals the request, so a leak kills only this container; no CPU limit, so the container may use idle CPU on the node. The Pod is Burstable.
+- `startupProbe`: up to $30 \times 2 = 60$ s for the application to start before liveness checks begin.
+- `livenessProbe`: `GET /healthz/live` every 10 s; three failures in a row restart the container. The endpoint should only report that the process works.
+- `readinessProbe`: `GET /healthz/ready` every 5 s; two failures take the Pod out of the Service until it recovers. This endpoint may check that the Pod can serve, for example that it has loaded its data.
+- `securityContext`: refuse to start if the image would run as root (the [image note](/notes/devops/container-images#running-as-non-root) built it to run as an ordinary user), forbid gaining privileges through setuid programs, and mount the image's file system read-only, so that an attacker inside cannot modify the program.
+- The second document, after `---`, is the Service. `type: ClusterIP` gives it an address inside the cluster only. `selector: app: web` picks the same Pods as the Deployment, and only those that are ready receive traffic. `port: 80` is the Service's port, `targetPort: http` the named port of the containers, so clients call `http://web.shop.svc.cluster.local/` and reach port 8080 of some ready Pod.
+
+## Next
+
+The Deployment above takes its configuration from nowhere, keeps no data, can be reached only from inside the cluster, and runs a fixed number of replicas. A real service reads settings and secrets, sometimes stores state, is reached from the internet by host name and path, scales with its load, and is installed in several environments from one description. The [next note](/notes/devops/kubernetes-in-practice) adds those pieces: ConfigMaps and Secrets, volumes, Ingress and the Gateway API, autoscaling, Helm and Kustomize, and GitOps.
+
+## References
+
+- Kubernetes documentation. [Cluster architecture](https://kubernetes.io/docs/concepts/architecture/); [Controllers](https://kubernetes.io/docs/concepts/architecture/controller/); [Pods](https://kubernetes.io/docs/concepts/workloads/pods/); [Deployments](https://kubernetes.io/docs/concepts/workloads/controllers/deployment/) (rolling update, rounding of `maxSurge` and `maxUnavailable`, progress deadline); [Service](https://kubernetes.io/docs/concepts/services-networking/service/); [Resource management for Pods and containers](https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/); [Pod quality of service classes](https://kubernetes.io/docs/concepts/workloads/pods/pod-qos/); [Liveness, readiness and startup probes](https://kubernetes.io/docs/concepts/configuration/liveness-readiness-startup-probes/). Version 1.37, 2026.
+- Kubernetes. [Release v1.37.1](https://github.com/kubernetes/kubernetes/releases) and the stable-release marker [dl.k8s.io/release/stable.txt](https://dl.k8s.io/release/stable.txt), read on 23 October 2026.
+- B. Burns, B. Grant, D. Oppenheimer, E. Brewer, J. Wilkes. [Borg, Omega, and Kubernetes](https://queue.acm.org/detail.cfm?id=2898444). ACM Queue, 14(1), 2016.
+- A. Verma et al. [Large-scale cluster management at Google with Borg](https://doi.org/10.1145/2741948.2741964). EuroSys, 2015.
+- D. Ongaro, J. Ousterhout. [In Search of an Understandable Consensus Algorithm](https://www.usenix.org/conference/atc14/technical-sessions/presentation/ongaro). USENIX ATC, 2014. (Raft, the protocol of etcd.)
+- The Linux kernel documentation. [Control Group v2](https://docs.kernel.org/admin-guide/cgroup-v2.html): `cpu.max`, `cpu.weight`, `memory.max`.
+- University of Helsinki. [DevOps with Kubernetes](https://devopswithkubernetes.com/), 2026. Part 1, "First Deploy" and "Introduction to Networking"; part 4, "Update Strategies and Prometheus" (readiness and liveness probes); part 5, "Kubernetes Internals" (controllers and the control plane).
+- MIT. [The Missing Semester of Your CS Education](https://missing.csail.mit.edu/2026/shipping-code/), 2026. Lecture "Packaging and Shipping Code", section "Services & Orchestration".
+- B. Beyer, C. Jones, J. Petoff, N. R. Murphy (eds.). [Site Reliability Engineering](https://sre.google/sre-book/table-of-contents/). O'Reilly, 2016. Ch. 7 (the evolution of automation at Google, from scripts to Borg).
+- HSE University, Faculty of Computer Science. *DevOps* (4th year, Applied Mathematics and Informatics, taught with MTS): containerization and application deployment.

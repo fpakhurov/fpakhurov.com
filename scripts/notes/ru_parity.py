@@ -9,7 +9,9 @@ def body(s):
     return s.split('\n---\n', 1)[1]
 
 def math(s):
+    # Code is not math: drop fenced blocks and inline code, where a `$` is a shell variable or prompt.
     s = re.sub(r'```.*?```', '', body(s), flags=re.S)
+    s = re.sub(r'`[^`\n]*`', '', s)
     display = re.findall(r'\$\$(.*?)\$\$', s, re.S)
     rest = re.sub(r'\$\$.*?\$\$', '', s, flags=re.S)
     return display + re.findall(r'(?<!\\)\$(.+?)(?<!\\)\$', rest)
