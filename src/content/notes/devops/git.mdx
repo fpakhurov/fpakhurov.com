@@ -1,0 +1,509 @@
+---
+title: "Git: the object model and workflows"
+description: "Git as a content-addressed store of blobs, trees and commits, shown on a real repository; refs, HEAD and the index; SHA-1 and SHA-256; the commit graph, three-way merge, conflicts and rebase; undoing; remotes as object transfer; branching workflows, review and protected branches."
+course: devops
+section: Foundations
+order: 2
+status: published
+tags: [git, version-control, content-addressing, sha-1, sha-256, merkle, dag, merge, rebase, conflicts, reflog, bisect, remotes, trunk-based-development, code-review, branch-protection, git-lfs, monorepo]
+prerequisites: [The shell and text tools, Files and input/output]
+---
+
+import ObjectGraph from '../../../components/figures/git/ObjectGraph.astro';
+import MergeRebase from '../../../components/figures/git/MergeRebase.astro';
+
+The [previous note](/notes/devops/the-shell) ended with scripts, configuration and code: text files that change every day, often by several people at once. Every build in the rest of the course starts from an exact version of those files, and every deployment must be traceable back to one. Git keeps that history. Its commands have a reputation for being arbitrary, but they are operations on a small and regular data structure: a store of immutable objects named by their hashes, linked into a graph, with a few movable names pointing into it. This note builds that structure on a real throwaway repository, then reads merging, rebasing, undoing and pushing as operations on the graph, and ends with the ways teams organize their branches around it.
+
+**Setup.** Git 2.47.0 on macOS 26. The repository was created for this note with the author name, the e-mail and the clock fixed through the environment variables `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`, `GIT_AUTHOR_DATE` and their `GIT_COMMITTER_` twins, one minute later for every command, and with the user's global configuration ignored. That makes every hash below reproducible: the same commands with the same dates give the same object names on any machine.
+
+## Baseline: copies of files
+
+Without a version-control system, history is kept as copies: `app_v2_final.py`, a dated folder per release, or a shared drive. Three things break. A change to several files is not recorded as one change, so there is no way to get "the state of the project on Tuesday" back. Two people editing the same file overwrite each other, or work out by hand what the other changed. And nothing records why a line changed or who changed it.
+
+Centralized systems such as CVS (1990) and Subversion (2000) fixed the first and third problems with a server that holds the history, and the second with locks or merges against the server. Every operation needed the server, and branches were expensive copies. Git, written by Linus Torvalds in April 2005 for the Linux kernel, made every clone a complete repository with the whole history, so that committing, branching and reading history are local operations, and exchanging work is copying objects between repositories.
+
+## Objects: blobs, trees and commits
+
+Git's storage is a **key–value store** under `.git/objects`. The value is an object; the key is a hash of the object's type, its size and its content. There are three kinds of object that matter here ([Pro Git, ch. 10](#references)):
+
+- a **blob** holds the bytes of one file, with no name and no permissions;
+- a **tree** holds one directory: a list of entries, each with a mode, a type, a hash and a name;
+- a **commit** holds the hash of one root tree, the hashes of zero or more parent commits, an author, a committer, timestamps and a message.
+
+A fourth kind, the annotated tag, names a commit with a message and, often, a signature.
+
+**Worked example.** A new repository with a README and one Python file. `git add` stores the content of each file as a blob and records it in the index; nothing is committed yet.
+
+```console
+$ git init -q -b main shop && cd shop
+$ echo 'Shop service' > README.md
+$ mkdir src && printf 'def total(prices):\n    return sum(prices)\n' > src/app.py
+$ git add README.md src/app.py
+$ git ls-files --stage
+100644 968833021ad0e455854d495ed63783700c559153 0	README.md
+100644 aa11c8780835909b20ba5d886e45b00f65b2026c 0	src/app.py
+$ find .git/objects -type f
+.git/objects/96/8833021ad0e455854d495ed63783700c559153
+.git/objects/aa/11c8780835909b20ba5d886e45b00f65b2026c
+$ git cat-file -t 9688330
+blob
+$ git cat-file -p 9688330
+Shop service
+```
+
+Two objects exist, one per file, each in a file named by its hash: the first two hex digits are a directory, the other 38 the file name. `git cat-file` reads an object back: `-t` prints its type, `-p` its content. The name is not arbitrary. It is the SHA-1 hash of a header, the type, a space, the size in bytes and a zero byte, followed by the content. `Shop service` with its newline is 13 bytes, and hashing the same bytes with an ordinary tool gives the same name:
+
+```console
+$ printf 'blob 13\0Shop service\n' | shasum -a 1
+968833021ad0e455854d495ed63783700c559153  -
+$ git hash-object README.md
+968833021ad0e455854d495ed63783700c559153
+```
+
+A commit writes the trees and the commit object:
+
+```console
+$ git commit -q -m 'Add README and total()'
+$ git cat-file -p HEAD
+tree f31a99ca63ff20a7a758d0b9d1e47abe829a64b4
+author Ada Example <ada@example.com> 1792660260 +0000
+committer Ada Example <ada@example.com> 1792660260 +0000
+
+Add README and total()
+$ git cat-file -p 'HEAD^{tree}'
+100644 blob 968833021ad0e455854d495ed63783700c559153	README.md
+040000 tree 54955cdb23c8e01de7f84d02c260622e1920d748	src
+$ git cat-file -p HEAD:src
+100644 blob aa11c8780835909b20ba5d886e45b00f65b2026c	app.py
+```
+
+The commit names its root tree and has no parent, because it is the first. The timestamp is in seconds since 1970 with a time-zone offset: 1792660260 is 22 October 2026, 09:11 UTC. The root tree lists the blob of `README.md` with mode `100644` (an ordinary file) and the subtree `src` with mode `040000`; the subtree lists `app.py`. A second commit changes one line of `app.py`:
+
+```console
+$ printf 'def total(prices):\n    return round(sum(prices), 2)\n' > src/app.py
+$ git commit -q -am 'Round the total'
+$ git cat-file -p HEAD
+tree 6aca1b53c821cf4e1bf8d46687d36df3cbd9d8f6
+parent aba6e652e101170a8a0d2546a19a0ae27257699d
+author Ada Example <ada@example.com> 1792660620 +0000
+committer Ada Example <ada@example.com> 1792660620 +0000
+
+Round the total
+$ git ls-tree -r HEAD
+100644 blob 968833021ad0e455854d495ed63783700c559153	README.md
+100644 blob b7332794ea787bc9b0e3495d430886e3c45e681c	src/app.py
+$ git count-objects
+9 objects, 36 kilobytes
+$ git log --oneline
+1702a7d Round the total
+aba6e65 Add README and total()
+```
+
+Each commit is a full snapshot, not a diff: it names a complete tree. Yet the second commit added only four objects, a new blob for `app.py`, a new `src` tree, a new root tree and the commit, because the README's content had not changed, so its blob has the same name and is already stored. Nine objects in all: two commits, four trees, three blobs. (Each loose object occupies a 4 KiB block on disk, hence 36 kilobytes for a few hundred bytes of data; Git later packs objects into one compressed file, storing similar objects as deltas.)
+
+<aside class="callout"><strong>Key idea.</strong> Git is a content-addressed store: every object is named by the hash of its content, and objects refer to each other by those names. A commit names a tree and its parents, so its hash covers the entire snapshot and the entire history behind it. Objects never change; everything that looks like a change, a new commit, a merge, a rebase, a reset, adds objects or moves a name.</aside>
+
+Content addressing has three consequences that the rest of the course relies on. **Deduplication**: identical content is stored once, whichever file, directory or commit it appears in. **Integrity**: changing any byte of any file in the history would change its blob's name, hence the tree that lists it, hence every commit above it, so a commit hash is a fingerprint of everything reachable from it (a structure known as a Merkle tree). Two repositories that agree on a commit hash agree on the whole history. **Immutability**: an object cannot be edited, only replaced by a new one with a new name. A build that records the commit hash it was made from is therefore reproducible from that hash alone, which is the starting point of the [builds note](/notes/devops/builds-and-dependencies).
+
+## Refs, HEAD and the index
+
+Hashes are not names people use. A **ref** is a file that holds a hash: a branch `main` is the file `.git/refs/heads/main`, a tag `v1.0` is `.git/refs/tags/v1.0`. **HEAD** says what is checked out. Normally it is a *symbolic* ref, holding the name of a branch rather than a hash:
+
+```console
+$ cat .git/HEAD .git/refs/heads/main
+ref: refs/heads/main
+aba6e652e101170a8a0d2546a19a0ae27257699d
+```
+
+(This was printed after the first commit.) A commit does three things: it writes a tree from the index, writes a commit object whose parent is the commit HEAD resolves to, and moves the branch that HEAD names to the new commit. A branch is therefore a movable pointer, and creating one writes 41 bytes. When HEAD holds a hash directly instead of a branch name, the repository is in a *detached HEAD* state: new commits are made, but no branch moves to them.
+
+The **index** (`.git/index`, also called the staging area) is the tree of the next commit, being assembled. `git add` stores a blob and points the index entry for that path at it; `git commit` turns the index into trees. That gives every file three versions to compare:
+
+| Where | What it holds | Compared by |
+| --- | --- | --- |
+| working tree | the files on disk, as you edit them | `git diff` (working tree against the index) |
+| index | the snapshot that the next commit will record | `git diff --staged` (index against HEAD) |
+| HEAD | the snapshot of the last commit | `git diff HEAD` (working tree against HEAD) |
+
+<ObjectGraph />
+
+1. Blobs hold the content of files. The README blob `9688330` is stored once and listed by both root trees.
+2. Trees list names, modes and hashes; `src` is a tree inside the root tree.
+3. Commits name a root tree and their parent: `1702a7d` points to `aba6e65`.
+4. The branch `main` holds the hash `1702a7d`; HEAD holds the name of the branch.
+5. The index lists the same blobs as the tree of HEAD, because nothing has changed since the commit.
+
+## SHA-1, SHA-256 and the hash transition
+
+The safety of content addressing depends on the hash. If two different objects had the same name, one could be substituted for the other. In February 2017 the SHAttered attack produced the first practical SHA-1 collision, two different PDF files with the same SHA-1 ([Stevens et al., 2017](#references)). Git responded in two steps (as of October 2026):
+
+- **Collision detection.** Since Git 2.13 (May 2017), Git computes SHA-1 with a hardened implementation, SHA-1DC, that recognizes the pattern of the known collision attacks and refuses such input. Object names are unchanged.
+- **A new object format.** Git 2.29 (October 2020) added repositories whose objects are named by SHA-256, as an experiment. Git 2.42 (August 2023) dropped the "experimental" warning and promised that SHA-256 repositories created from then on stay readable. A repository uses one format or the other; exchanging objects between a SHA-1 and a SHA-256 repository was still not supported in 2026, and support on hosting services was partial, so most repositories still use SHA-1.
+- **The default.** Git's list of planned breaking changes makes SHA-256 the default for new repositories in Git 3.0, together with `main` as the default branch name, once the ecosystem supports it. In October 2026 Git 3.0 had no release date ([Git, BreakingChanges](#references)).
+
+In a SHA-256 repository the same README gets a 64-digit name, which is again the hash of the header and the content:
+
+```console
+$ git init -q --object-format=sha256 -b main shop256 && cd shop256
+$ echo 'Shop service' > README.md && git hash-object README.md
+456d2d4af7b3d0b91048f814e52142db640bfc8dc4e9e452b7213ad8640ca6f1
+$ git rev-parse --show-object-format
+sha256
+```
+
+## Commits form a graph
+
+Each commit names its parents, so the commits form a **directed acyclic graph** (DAG): edges point from a commit to its parents, back in time, and no commit can be its own ancestor, since a commit's name depends on its parents' names, which must exist first. The history of a branch is everything reachable from the commit it points to. Branches that diverge are just two names pointing at commits with a common ancestor.
+
+The example continues: a commit on `main` adds a function `greet`, then the branch `discount` adds a discount parameter to `total` and a test, while `main` changes `greet` to an f-string, and a branch `currency` made from that point formats the total in euros.
+
+```console
+$ git log --graph --oneline --all
+* 38b0e01 Format the total in euros
+* 64e3131 Use an f-string in greet()
+| * 3e85af1 Test the discount
+| * 5059e4d Add a discount to total()
+|/  
+* ff2de94 Add greet()
+* 1702a7d Round the total
+* aba6e65 Add README and total()
+$ git merge-base main discount
+ff2de943b308ab39c6dd3b5ae78215901cc55ecc
+```
+
+`git merge-base` finds the best common ancestor of two commits: the commit reachable from both that no other such commit descends from. Here it is `ff2de94`, where `discount` forked. The merge base is what makes merging possible.
+
+## Merge and rebase
+
+There are two ways to combine the work of `discount` with `main`: record that the histories joined, or rewrite one history on top of the other.
+
+**A three-way merge** compares three versions of every file: the merge base, *ours* (the current branch) and *theirs* (the branch being merged). For each region of each file:
+
+- if only one side changed it, take that side's version;
+- if both sides made the same change, take it once;
+- if both sides changed it differently, it is a **conflict**, left for a person.
+
+Comparing with the base is what makes this work. A two-way comparison of ours and theirs could not tell "theirs added this line" from "ours deleted it"; the base answers that. The result is recorded as a new **merge commit** with two parents.
+
+```console
+$ git merge --no-edit discount
+Auto-merging src/app.py
+Merge made by the 'ort' strategy.
+ src/app.py        | 4 ++--
+ tests/test_app.py | 5 +++++
+ 2 files changed, 7 insertions(+), 2 deletions(-)
+ create mode 100644 tests/test_app.py
+$ git cat-file -p HEAD
+tree 981d4c985f533f4066767d8b5734de6b582956a8
+parent 64e3131590ec51878ddc789c5c31da3082d725c7
+parent 3e85af12326bf50c0384daa3e033add3b7046793
+author Ada Example <ada@example.com> 1792662120 +0000
+committer Ada Example <ada@example.com> 1792662120 +0000
+
+Merge branch 'discount'
+```
+
+Both branches edited `src/app.py`, but in different functions, so the merge took `main`'s new `greet` and `discount`'s new `total` without asking. `ort` has been Git's default merge strategy since version 2.34 (2021). The `currency` branch is different: it changed the `return` line of `total`, which `discount` had also changed. With `merge.conflictStyle` set to `diff3`, the conflict shows all three versions:
+
+```console
+$ git config merge.conflictStyle diff3
+$ git merge currency
+Auto-merging src/app.py
+CONFLICT (content): Merge conflict in src/app.py
+Automatic merge failed; fix conflicts and then commit the result.
+$ git status --short
+UU src/app.py
+$ sed -n '4,14p' src/app.py
+
+<<<<<<< HEAD
+def total(prices, discount=0):
+    return round(sum(prices) * (1 - discount), 2)
+||||||| 64e3131
+def total(prices):
+    return round(sum(prices), 2)
+=======
+def total(prices):
+    return f"{sum(prices):.2f} EUR"
+>>>>>>> currency
+```
+
+Between `<<<<<<<` and `|||||||` is ours, `main` with the discount; between `|||||||` and `=======` the base, `64e3131`; then theirs, `currency`. The base shows what each side meant: ours added a discount, theirs changed the formatting. No rule can combine those automatically, but a person can: keep both, as `f"{sum(prices) * (1 - discount):.2f} EUR"`. After the file is edited, `git add` marks it resolved (`UU` means unmerged on both sides) and `git commit` records the merge.
+
+**A rebase** takes the commits of a branch that are not on the target, and replays their changes one by one on top of the target, as new commits. To compare with the merge, a copy of `discount` was rebased onto `main` before the merge:
+
+```console
+$ git branch discount-rebased discount
+$ git rebase main discount-rebased
+Rebasing (1/2)
+Rebasing (2/2)
+Successfully rebased and updated refs/heads/discount-rebased.
+$ git log --graph --oneline main discount-rebased
+* 39e52f2 Test the discount
+* e51616d Add a discount to total()
+* 64e3131 Use an f-string in greet()
+* ff2de94 Add greet()
+* 1702a7d Round the total
+* aba6e65 Add README and total()
+```
+
+The two commits have the same messages and make the same changes, but they are new commits, `e51616d` and `39e52f2` instead of `5059e4d` and `3e85af1`. Their parents differ, so their content differs, so their names differ. The history is a straight line, as if the work had been started after `64e3131`.
+
+<MergeRebase />
+
+Which to use follows from what each does to the graph.
+
+- **Merge** keeps history true: the graph shows that work happened in parallel and where it joined, and no existing commit changes. It is safe on branches others have fetched. The cost is a graph with many joins, which is harder to read and to bisect.
+- **Rebase** keeps history linear and easy to read, and is the usual way to bring a feature branch up to date with `main` before review, or to clean up local commits (`git rebase -i` reorders, squashes and edits them). The cost is that it creates new commits and abandons the old ones. Anyone who built on the old commits now has commits that no longer exist on the branch, and their next merge duplicates the changes. Hence the rule: rebase only commits that nobody else has.
+- **Squash merge**, offered by hosting services, combines a whole branch into a single new commit on `main`: linear like a rebase, one commit per reviewed change.
+
+## Undoing: reset, revert, reflog
+
+Since objects never change, "undoing" means moving names or adding commits.
+
+**`git reset <commit>`** moves the current branch to another commit. With `--soft` it moves only the branch, so the index and working tree still hold the newer content, ready to commit again; with `--mixed`, the default, it also resets the index; with `--hard` it resets the index and the working tree too, discarding uncommitted changes. It rewrites the branch's history, so it is for commits that have not been shared.
+
+**`git revert <commit>`** adds a new commit that applies the inverse of the given one. History only grows, so it is the safe undo on a shared branch.
+
+**The reflog** records every position that HEAD and each branch have had, locally. It is what makes a mistaken reset recoverable: the abandoned commit is still in the object store, and the reflog still names it.
+
+```console
+$ echo 'print("debug")' >> src/app.py && git commit -q -am 'WIP debug'
+$ git reset --hard HEAD~1
+HEAD is now at 0df5ce9 Merge branch 'currency'
+$ git reflog -3
+0df5ce9 HEAD@{0}: reset: moving to HEAD~1
+bfbe147 HEAD@{1}: commit: WIP debug
+0df5ce9 HEAD@{2}: commit (merge): Merge branch 'currency'
+$ git reset --hard 'HEAD@{1}'
+HEAD is now at bfbe147 WIP debug
+$ git revert --no-edit HEAD
+[main 2c22ec0] Revert "WIP debug"
+ Date: Thu Oct 22 09:57:00 2026 +0000
+ 1 file changed, 1 deletion(-)
+$ git log --oneline -3
+2c22ec0 Revert "WIP debug"
+bfbe147 WIP debug
+0df5ce9 Merge branch 'currency'
+```
+
+`HEAD~1` is the first parent of HEAD. The reset left `bfbe147` unreachable from any branch, and `HEAD@{1}`, "where HEAD was one move ago", brought it back. The revert then undid it in the shared way: both the mistake and its correction stay in history. Reflog entries expire, by default after 90 days, or after 30 for commits no longer reachable from the current tip of the ref; only then can garbage collection delete the objects ([git-reflog, git-gc](#references)).
+
+**Finding the commit that broke something** is a search over the graph. `git bisect` takes a bad commit and a good one and checks out the commit halfway between; you say whether it is good or bad, and it halves the range again, so $n$ commits need about $\log_2 n$ tests, the search of the [batch-size argument](/notes/devops/what-devops-is#why-small-batches-lower-risk). With `git bisect run`, a command decides: exit status 0 means good, 1 to 127 (except 125) bad. A test that the total of 10 and 20 is the number 30:
+
+```console
+$ printf 'from src.app import total\nassert total([10, 20]) == 30\n' > check.py
+$ git bisect start HEAD aba6e65
+Bisecting: 5 revisions left to test after this (roughly 2 steps)
+[3e85af12326bf50c0384daa3e033add3b7046793] Test the discount
+$ git bisect run python3 check.py 2>/dev/null
+running 'python3' 'check.py'
+Bisecting: 3 revisions left to test after this (roughly 2 steps)
+[38b0e019e24e1d880fcbec5be7141e3581731e6e] Format the total in euros
+running 'python3' 'check.py'
+Bisecting: 0 revisions left to test after this (roughly 0 steps)
+[64e3131590ec51878ddc789c5c31da3082d725c7] Use an f-string in greet()
+running 'python3' 'check.py'
+38b0e019e24e1d880fcbec5be7141e3581731e6e is the first bad commit
+commit 38b0e019e24e1d880fcbec5be7141e3581731e6e
+Author: Ada Example <ada@example.com>
+Date:   Thu Oct 22 09:34:00 2026 +0000
+
+    Format the total in euros
+
+ src/app.py | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+bisect found first bad commit
+$ git bisect reset
+```
+
+Three runs of the test among the commits between `aba6e65` and HEAD found `38b0e01`, the commit that made `total` return a string. Bisection works across merges, but it is most precise when every commit builds and passes its tests on its own, one more argument for small, self-contained commits.
+
+## Remotes: fetch and push move objects
+
+A **remote** is another repository, named locally with a URL, such as `origin`. Its branches are mirrored by **remote-tracking refs**, `refs/remotes/origin/main`, which change only when you talk to the remote. Talking to it is object transfer:
+
+- **push** asks the remote which refs it has, works out which objects the remote lacks (everything reachable from your commits and not from its), sends them as one compressed **packfile**, and asks the remote to move its branch. The remote accepts only a **fast-forward**, a move from its current commit to a descendant of it, unless the push is forced.
+- **fetch** does the same in the other direction and updates the remote-tracking refs. It never touches your branches; `merge` or `rebase` does that afterwards. `pull` is fetch followed by one of them.
+
+The example repository is pushed to a bare repository (one without a working tree, as on a server), a second clone adds a commit, and the first fetches it. Progress lines are shortened to their final state:
+
+```console
+$ git init -q --bare -b main ../origin.git
+$ git remote add origin ../origin.git
+$ git push --progress -u origin main
+Enumerating objects: 42, done.
+Counting objects: 100% (42/42), done.
+Delta compression using up to 8 threads
+Compressing objects: 100% (30/30), done.
+Writing objects: 100% (42/42), 3.46 KiB | 3.46 MiB/s, done.
+Total 42 (delta 8), reused 0 (delta 0), pack-reused 0 (from 0)
+To ../origin.git
+ * [new branch]      main -> main
+branch 'main' set up to track 'origin/main'.
+$ git -C ../origin.git count-objects
+42 objects, 168 kilobytes
+$ git clone -q ../origin.git ../alice
+$ cd ../alice && echo '- run tests with pytest' >> README.md && git commit -q -am 'Document the tests' && git push -q && cd ../shop
+$ git fetch --progress origin
+remote: Enumerating objects: 5, done.
+remote: Counting objects: 100% (5/5), done.
+remote: Compressing objects: 100% (2/2), done.
+remote: Total 3 (delta 0), reused 0 (delta 0), pack-reused 0 (from 0)
+From ../origin
+   2c22ec0..d6cd86a  main       -> origin/main
+$ git status -sb | head -n 1
+## main...origin/main [behind 1]
+$ git merge --ff-only origin/main
+Updating 2c22ec0..d6cd86a
+Fast-forward
+ README.md | 1 +
+ 1 file changed, 1 insertion(+)
+```
+
+The push sent the 42 objects reachable from `main` (the branch `discount-rebased` was not pushed, so its two commits stayed behind) in a pack of 3.46 KiB, 8 of them as deltas against similar objects. The receiving side unpacked them into 42 loose files, since Git keeps small pushes, under 100 objects by default, as loose objects. The fetch brought exactly 3 objects, the new commit, its root tree and the new README blob; the `src` tree and everything else were already there, recognized by name. The local `main` was then one commit behind `origin/main`, and `--ff-only` moved it forward without creating a merge commit. If both sides had committed, the push would have been rejected as not a fast-forward, and the fix is to fetch and merge or rebase, not to force. When a force is truly needed, after rebasing one's own branch, `git push --force-with-lease` refuses to overwrite a remote branch that has moved since the last fetch.
+
+## Branching workflows
+
+Git allows any branching structure; teams choose one. Three are common ([Driessen, 2010](#references); [Chacon, 2011](#references); [Hammant, trunkbaseddevelopment.com](#references)):
+
+- **Trunk-based development.** Everyone integrates into one branch, the trunk (`main`), at least daily, either directly or through branches that live for hours. Unfinished features are merged hidden behind **feature flags**, switches in configuration, rather than kept on long branches. Releases are cut from the trunk.
+- **GitHub flow.** A short-lived branch per change, a pull request for review and CI, a merge to `main`, and `main` is always deployable and deployed. It is trunk-based development with mandatory review, when branches are kept short.
+- **Git flow.** Long-lived `develop` and `master` branches, feature branches off `develop`, release branches for stabilization and hotfix branches off `master`. It suits software released in versions that must be maintained side by side, such as an installed product or a library. Its author added a note in 2020 that teams shipping a continuously delivered web application should use a simpler workflow.
+
+| | Trunk-based | GitHub flow | Git flow |
+| --- | --- | --- | --- |
+| Long-lived branches | `main` only | `main` only | `master` and `develop` |
+| Branch lifetime | hours | hours to days | days to weeks |
+| Integration | continuous | at each merge | at release time |
+| Unfinished work | behind feature flags | on its branch | on its branch |
+| Fits | continuous delivery | continuous delivery with review | versioned releases maintained in parallel |
+| Main risk | flags left in the code | branches that grow old | big merges, slow lead time |
+
+The DORA research links the first style to delivery performance. Teams that had three or fewer active branches, merged them into the trunk at least once a day, and had no code freezes or integration phases had higher delivery performance in the 2016 and 2017 surveys ([Forsgren, Humble and Kim, 2018](#references); [DORA, trunk-based development](#references)). It is the batch-size argument of the [first note](/notes/devops/what-devops-is#why-small-batches-lower-risk) applied to integration: a branch that lives for a day conflicts with little, and a branch that lives for a month integrates a month of other people's changes at once.
+
+## Code review and protected branches
+
+Most teams require that a change be read by someone other than its author before it reaches `main`, usually as a **pull request** (GitLab: merge request): a proposal to merge a branch, with its diff, a discussion, and the results of CI. Review catches defects, but in studies of review at Microsoft and Google its larger effects were spreading knowledge of the code and keeping it consistent ([Bacchelli and Bird, 2013](#references); [Sadowski et al., 2018](#references)). Review quality falls with the size of the change, which is another reason for small batches.
+
+The rules are enforced by the hosting service, not by Git: a **protected branch**, or in GitHub's newer form a **ruleset**, refuses pushes that break them. Typical rules: no direct pushes, only merged pull requests; at least one approval, from the owners of the files touched, listed in a `CODEOWNERS` file; CI checks that must pass on the up-to-date branch; a linear history; no force pushes and no deletion. A **merge queue** goes one step further: it tests each pull request merged with the pull requests ahead of it, so that two changes that pass separately cannot break `main` together. The Example section reads one ruleset line by line.
+
+## Large files and monorepos, briefly
+
+Git stores every version of every file, and every clone receives all of them. For source code this is cheap, since text compresses and deltas well. For large binaries, such as datasets, model weights, videos and build outputs, every version of a 2 GB file stays in every clone forever. Three tools address it:
+
+- **Git LFS** (Large File Storage) commits a small text pointer instead of the file, three lines naming the spec version, the SHA-256 of the content and its size, and keeps the content on a separate server, downloaded only for the checked-out version.
+- **Partial clone**, `git clone --filter=blob:none`, fetches commits and trees but no blobs, and fetches each blob the first time a command needs it. A **shallow clone**, `--depth 1`, fetches only the latest commit, which is enough for many CI jobs.
+- **Sparse checkout** writes only some directories of the tree into the working directory.
+
+A **monorepo** keeps many projects in one repository. A change that touches a library and all its users is then one atomic commit, reviewed and tested together, and there is one version of everything. The costs are scale (Google's monorepo runs on its own system, Piper, rather than Git), the need for a build system that rebuilds and tests only what a change affects, which the [builds note](/notes/devops/builds-and-dependencies) covers, and ownership rules for many teams in one tree. Git's own `scalar` command configures partial clone, sparse checkout and background maintenance for large repositories. The alternative, one repository per project, gives each team autonomy and pays for it with version coordination across repositories.
+
+<aside class="callout"><strong>Check yourself.</strong> (1) You change one line of `a/b/c/app.py` and commit. How many new objects does the commit create? (2) Why does `git rebase` change the hashes of commits whose changes are identical? (3) A teammate rebased the branch you were working on and force-pushed it. What do you see when you next fetch, and why is `git pull` with a merge the wrong reaction? (4) What do `git reset --soft HEAD~1` and `git revert HEAD` each leave behind, and which one is safe after a push?<details><summary>Answers</summary>(1) Six: a blob for the new content, new trees for `a/b/c`, `a/b` and `a`, a new root tree, and the commit. Everything else is reused by name. (If the new content happens to equal a blob that already exists, that blob is reused too.) (2) A commit's content includes its parent's hash, and the replayed commit has a different parent; a different content means a different name. (3) Your local branch and `origin/…` have diverged: the remote has new copies of the commits, yours has the old ones. Merging would combine the old and the new copies and duplicate every change; instead rebase your own new commits onto the rewritten branch (`git rebase --onto`) or reset to it and reapply them. (4) The soft reset moves the branch back one commit and leaves that commit's changes staged in the index, rewriting the branch's history; after a push it forces everyone else to recover. Revert leaves both commits in history and adds the inverse change, so it is safe after a push.</details></aside>
+
+## What changed
+
+| | Copies of files (baseline) | Centralized VCS | Git |
+| --- | --- | --- | --- |
+| Unit of history | a copied file or folder | a numbered revision on the server | a commit: a full snapshot named by its hash |
+| Works offline | yes, without history | no | yes, with the whole history |
+| Branch | a copied folder | a server-side copy | a 41-byte file holding a hash |
+| Integrity | none | the server's | every hash covers all history below it |
+| Combining parallel work | by hand | merge against the server | three-way merge or rebase, locally |
+| Exchanging work | copying files | commit to the server | fetch and push of missing objects |
+
+## Limitations
+
+- **The interface hides the model.** The same command does unrelated things (`checkout` switches branches and restores files, which is why `switch` and `restore` were added in 2.23), and destructive commands such as `reset --hard` and `push --force` give no warning.
+- **Merges are textual.** Two changes in different places can merge cleanly and still be wrong together: one renames a function that the other calls. Only building and testing the merged result, as CI does, catches that.
+- **History is forever.** A secret committed once is in every clone and in every fork, and removing it means rewriting history and still rotating the secret. Large binaries committed once weigh on every clone.
+- **SHA-1 is still the default** in October 2026; collision detection guards against the known attacks, and the move to SHA-256 waits on the ecosystem.
+- **Git records content, not intent.** A rename is detected afterwards from content similarity, and a commit message is only as useful as its author made it.
+
+## What you should remember
+
+- Git stores blobs (file content), trees (directories) and commits (a tree, parents, author, message), each named by the hash of `type size\0content`. A commit is a snapshot; identical content is stored once; a commit hash covers the whole history behind it.
+- A branch is a file holding a commit hash, HEAD names the current branch, and the index is the next tree. Committing writes objects and moves the branch.
+- Git 2.42 made SHA-256 repositories non-experimental; SHA-1 with collision detection is still the default, and Git 3.0 plans to switch the default for new repositories, with no date yet in October 2026.
+- Commits form a DAG. A three-way merge uses the merge base to decide each region and records a commit with two parents; a conflict is two different changes to the same region. A rebase replays commits as new commits with new hashes: never rebase what others have.
+- `reset` moves a branch, `revert` adds an inverse commit, the reflog remembers where branches were, and `bisect` finds the first bad commit in about $\log_2 n$ tests.
+- Push and fetch send the objects the other side lacks and move refs; a push must be a fast-forward unless forced.
+- Trunk-based development, with branches merged within a day, goes with higher delivery performance in the DORA data; protected branches and review enforce the rules on the server.
+
+## Example
+
+A GitHub ruleset for the default branch, in the JSON form accepted by the REST endpoint `POST /repos/{owner}/{repo}/rulesets`, which is also the form in which rulesets are exported and imported in the repository settings. It was written against the REST documentation as of October 2026 and checked to be valid JSON, but not applied to a repository.
+
+```json
+{
+  "name": "protect main",
+  "target": "branch",
+  "enforcement": "active",
+  "conditions": {
+    "ref_name": { "include": ["~DEFAULT_BRANCH"], "exclude": [] }
+  },
+  "bypass_actors": [],
+  "rules": [
+    { "type": "deletion" },
+    { "type": "non_fast_forward" },
+    { "type": "required_linear_history" },
+    {
+      "type": "pull_request",
+      "parameters": {
+        "required_approving_review_count": 1,
+        "require_code_owner_review": true,
+        "dismiss_stale_reviews_on_push": true,
+        "require_last_push_approval": true,
+        "required_review_thread_resolution": true,
+        "allowed_merge_methods": ["squash", "rebase"]
+      }
+    },
+    {
+      "type": "required_status_checks",
+      "parameters": {
+        "strict_required_status_checks_policy": true,
+        "required_status_checks": [{ "context": "test" }, { "context": "lint" }]
+      }
+    }
+  ]
+}
+```
+
+Reading it line by line:
+
+- `target: "branch"` and `conditions.ref_name.include: ["~DEFAULT_BRANCH"]` apply the rules to the default branch, whatever it is called; patterns such as `"refs/heads/release/*"` would add more. `enforcement: "active"` enforces them (`"disabled"` keeps the ruleset without effect).
+- `bypass_actors: []`: nobody, administrators included, may skip the rules. An emergency path, for example a team allowed to bypass, is a deliberate decision recorded here, not a habit.
+- `deletion` forbids deleting the branch, and `non_fast_forward` forbids force pushes: the history of `main` can only grow, so every commit that was ever on it, and so every commit that was ever deployed, stays reachable. Mistakes on `main` are undone with `revert`.
+- `required_linear_history` refuses merge commits on `main`, so pull requests land as squashed or rebased commits; `allowed_merge_methods` offers exactly those two buttons.
+- `pull_request` requires a reviewed pull request for every change. One approval is required, and it must come from a code owner of the touched files (`require_code_owner_review`), as listed in a `CODEOWNERS` file. `dismiss_stale_reviews_on_push` withdraws approvals when new commits arrive, and `require_last_push_approval` requires that the last push be approved by someone other than its author, so nobody can push unreviewed code after an approval. Open review threads must be resolved first.
+- `required_status_checks` requires the CI jobs named `test` and `lint` to pass. `strict_required_status_checks_policy: true` requires the branch to be up to date with `main` before merging, so the checks ran on the code that will actually land; on a busy repository this forces frequent rebases, which a merge queue does automatically.
+
+The matching `CODEOWNERS` file, in `.github/CODEOWNERS`, with made-up team names:
+
+```text
+# Each line: a path pattern and the owners who must review changes to it. The last match wins.
+*                 @example-org/shop-team
+/deploy/          @example-org/platform
+/src/payments/    @example-org/payments @example-org/security
+```
+
+## Next
+
+A commit is now an exact, named snapshot of the source. Source files are not something a machine runs: between them and a running service lie compiling, packaging and fetching other people's code, and each of those steps must give the same result every time it runs. The [next note](/notes/devops/builds-and-dependencies) treats a build as a graph of steps and dependencies, and asks how to make it fast, correct and reproducible.
+
+## References
+
+- S. Chacon, B. Straub. [*Pro Git*](https://git-scm.com/book/en/v2), 2nd ed. Apress, 2014 (CC BY-NC-SA 3.0). Ch. 2 (basics), ch. 3 (branching, rebasing), ch. 5 (distributed workflows), ch. 7.10 (bisect), ch. 10 (internals: objects, references, packfiles, transfer protocols).
+- Git documentation, version 2.47: [git-cat-file](https://git-scm.com/docs/git-cat-file), [git-merge](https://git-scm.com/docs/git-merge) (three-way merge, `diff3` conflict style, the `ort` strategy), [git-rebase](https://git-scm.com/docs/git-rebase), [git-reset](https://git-scm.com/docs/git-reset), [git-reflog](https://git-scm.com/docs/git-reflog), [git-gc](https://git-scm.com/docs/git-gc) (`gc.reflogExpire`), [git-bisect](https://git-scm.com/docs/git-bisect), [git-push](https://git-scm.com/docs/git-push), [gitglossary](https://git-scm.com/docs/gitglossary), [partial clone](https://git-scm.com/docs/partial-clone), [scalar](https://git-scm.com/docs/scalar).
+- Git documentation: [hash-function-transition](https://git-scm.com/docs/hash-function-transition) and [BreakingChanges](https://git-scm.com/docs/BreakingChanges) (SHA-256 and `main` as defaults in Git 3.0); release notes of [Git 2.29](https://github.com/git/git/blob/master/Documentation/RelNotes/2.29.0.adoc) and [Git 2.42](https://github.com/git/git/blob/master/Documentation/RelNotes/2.42.0.adoc).
+- M. Stevens, E. Bursztein, P. Karpman, A. Albertini, Y. Markov. [The first collision for full SHA-1](https://shattered.io/static/shattered.pdf). *CRYPTO*, 2017.
+- MIT. *The Missing Semester of Your CS Education*, 2026: [Version control and Git](https://missing.csail.mit.edu/2026/version-control/).
+- HSE University, Faculty of Computer Science. [«Инструменты промышленной разработки»](http://wiki.cs.hse.ru/Инструменты_промышленной_разработки), 2025/26: lecture 3 (version control systems, Git).
+- V. Driessen. [A successful Git branching model](https://nvie.com/posts/a-successful-git-branching-model/). 2010, with a note of reflection added in March 2020.
+- S. Chacon. [GitHub flow](https://scottchacon.com/2011/08/31/github-flow/). 2011.
+- P. Hammant. [trunkbaseddevelopment.com](https://trunkbaseddevelopment.com/).
+- N. Forsgren, J. Humble, G. Kim. *Accelerate*. IT Revolution, 2018. Ch. 4 (trunk-based development).
+- DORA. [Capabilities: trunk-based development](https://dora.dev/capabilities/trunk-based-development/).
+- A. Bacchelli, C. Bird. [Expectations, outcomes, and challenges of modern code review](https://doi.org/10.1109/ICSE.2013.6606617). *ICSE*, 2013.
+- C. Sadowski, E. Söderberg, L. Church, M. Sipko, A. Bacchelli. [Modern code review: a case study at Google](https://doi.org/10.1145/3183519.3183525). *ICSE-SEIP*, 2018.
+- GitHub documentation: [about rulesets](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/about-rulesets), [REST API: repository rules](https://docs.github.com/en/rest/repos/rules), [about code owners](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners), [managing a merge queue](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/configuring-pull-request-merges/managing-a-merge-queue).
+- [Git LFS specification](https://github.com/git-lfs/git-lfs/blob/main/docs/spec.md) (pointer files).
+- R. Potvin, J. Levenberg. [Why Google stores billions of lines of code in a single repository](https://doi.org/10.1145/2854146). *Communications of the ACM*, 59(7), 78–87, 2016.

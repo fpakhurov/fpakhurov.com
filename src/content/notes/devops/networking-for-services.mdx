@@ -1,0 +1,415 @@
+---
+title: Networking for services
+description: "The path of one HTTPS request to a service: DNS records and caching, the TCP and TLS 1.3 handshakes with certificates and SNI, HTTP versions, reverse proxies and load balancers with health checks, and a latency budget for each hop."
+course: devops
+section: Infrastructure
+order: 7
+status: published
+tags: [networking, dns, ttl, tls, certificates, sni, http2, http3, quic, reverse-proxy, load-balancing, health-checks, latency]
+prerequisites: [Continuous delivery and deployment, Computer networks, Sockets]
+---
+
+import RequestPath from '../../../components/figures/networking-for-services/RequestPath.astro';
+import LatencyBudget from '../../../components/figures/networking-for-services/LatencyBudget.astro';
+
+The [previous note](/notes/devops/continuous-delivery) released a new version safely: a canary received 5 % of the traffic, a rolling update sent requests to an instance only after it reported ready. Both assumed that requests reach the right instance. A request from a user crosses several machines before it reaches the process that answers it, and each of them can be configured, cached or broken. The course on computer architecture explained how bytes cross one network: [layers, IP, TCP and DNS](/notes/acos/networking), and the [socket calls](/notes/acos/sockets) a server makes. This note builds on that and follows one HTTPS request from a browser to a backend, through the pieces an operator runs and configures: DNS records, TLS certificates, a reverse proxy, a load balancer and its health checks. Each hop adds round trips, so the note ends by adding them up into a latency budget.
+
+**Conventions.** Commands were run on 23 October 2026 with `dig` 9.10.6, `curl` 8.7.1, OpenSSL 3.6.2 and Python 3.14.7 on macOS, against public sites. The network of the test machine blocks outgoing UDP, so `dig` uses `+tcp`; the answers are the same as over UDP. Addresses in configuration examples come from the ranges reserved for documentation (`203.0.113.0/24`, [RFC 5737](#references)) and the private ranges.
+
+## Baseline: one server with a public address
+
+The simplest service is one virtual machine with a public IP address. The server process listens on port 443, holds the TLS certificate and its private key, and users reach it by address. This works for a demo, and it breaks in five ways once people depend on it:
+
+1. **The address is the machine.** Replacing the machine changes the address, and every client that remembered it breaks.
+2. **One machine is one failure.** When it crashes, or a deploy restarts the process, the service is down. When the load exceeds what it can serve, every request slows down.
+3. **Secrets on every server.** With ten servers instead of one, ten machines hold the private key, and renewing the certificate means touching all ten.
+4. **No way to take a server out gently.** Nothing tells clients to stop sending requests to a server that is about to restart.
+5. **Distance costs round trips.** A user 2,000 km away pays at least 20 ms of propagation for every round trip, and setting up a connection takes several of them.
+
+The rest of the note answers these in order: names (1), proxies and load balancers (2–4), and fewer round trips (5).
+
+<aside class="callout"><strong>Key idea.</strong> A request crosses a chain of hops, and each hop is an indirection: the client knows a name, the name points to a proxy, the proxy chooses a backend. Every layer behind the name can change, its machines, versions and addresses, without the client noticing, and each layer can check the health of the next one and route around failures. The price is paid in round trips and in caches that can be stale, so the design of a service's network is mostly a matter of counting round trips and choosing how long each answer may be cached.</aside>
+
+<RequestPath />
+
+1. **DNS.** The client asks a recursive resolver for the address of `www.example.com`; a cached answer comes back with the time it may still be kept.
+2. **TCP.** The client opens a connection to the proxy: one round trip.
+3. **TLS.** The client and the proxy agree on keys, and the proxy proves it owns the name: one more round trip.
+4. **HTTP.** The request reaches the proxy, which reads its host name and path.
+5. **Health.** The proxy has been probing its backends on its own and knows that `web2` is failing.
+6. **Forward.** The proxy sends the request to a healthy backend over a connection it opened earlier, and the response comes back along the same path.
+
+## DNS: what an operator controls
+
+How a resolver walks the tree from the root to an answer is in the [networking note](/notes/acos/networking#dns-from-names-to-addresses). An operator sees DNS from the other end: they own a **zone**, such as `example.com`, publish its records on authoritative servers (usually a managed DNS service), and choose for each record how long resolvers may cache it, its **TTL** (time to live, in seconds).
+
+| Record | Maps a name to | Typical use for a service |
+| --- | --- | --- |
+| `A`, `AAAA` | an IPv4 or IPv6 address | the address of a load balancer |
+| `CNAME` | another name (an alias) | `www` pointing at a provider's load-balancer name |
+| `NS` | the authoritative servers of a zone | delegating `example.com` to a DNS provider |
+| `TXT` | free text | proving ownership of a domain to a certificate authority |
+| `CAA` | the certificate authorities allowed to issue for the name | refusing certificates from any other authority |
+| `HTTPS` | connection hints: protocols, ports, addresses | announcing that HTTP/3 is available ([RFC 9460](#references)) |
+
+**Worked example.** Ask a public resolver for `www.wikipedia.org`, then ask Wikimedia's own name server the same question (`+norec` asks it not to recurse; `+nocmd +nostats` drop the banner and the timing lines):
+
+```console
+$ dig +tcp +nocmd +nostats @1.1.1.1 www.wikipedia.org A
+;; Got answer:
+;; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 850
+;; flags: qr rd ra; QUERY: 1, ANSWER: 2, AUTHORITY: 0, ADDITIONAL: 1
+
+;; OPT PSEUDOSECTION:
+; EDNS: version: 0, flags:; udp: 1232
+;; QUESTION SECTION:
+;www.wikipedia.org.		IN	A
+
+;; ANSWER SECTION:
+www.wikipedia.org.	86331	IN	CNAME	dyna.wikimedia.org.
+dyna.wikimedia.org.	111	IN	A	185.15.58.224
+```
+
+```console
+$ dig +tcp +nocmd +nostats +norec @ns0.wikimedia.org www.wikipedia.org A
+;; Got answer:
+;; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 38118
+;; flags: qr aa; QUERY: 1, ANSWER: 1, AUTHORITY: 0, ADDITIONAL: 1
+...
+;; ANSWER SECTION:
+www.wikipedia.org.	86400	IN	CNAME	dyna.wikimedia.org.
+$ dig +tcp +nocmd +nostats +norec @ns0.wikimedia.org dyna.wikimedia.org A
+...
+;; ANSWER SECTION:
+dyna.wikimedia.org.	180	IN	A	185.15.58.224
+```
+
+(The `...` lines stand for the OPT and question sections, which repeat the first output.) Read it line by line:
+
+- `status: NOERROR`: the name exists. A name that does not exist gives `NXDOMAIN`, and that negative answer is cached too, for a time set in the zone's SOA record ([RFC 2308](#references)). A client that looked up a record before it was created can keep getting `NXDOMAIN` after it exists.
+- The flags differ. The resolver's answer has `rd ra` (recursion desired and available) and no `aa`: it is a copy from a cache. The authoritative server's answer has `aa`, authoritative answer: it comes from the zone itself.
+- `www.wikipedia.org` is a `CNAME`, an alias, for `dyna.wikimedia.org`, which has the `A` record. The resolver followed the alias and returned both records. The operator can move every alias at once by changing the one name they point to.
+- The TTLs are the point. The zone says 86,400 s (one day) for the alias and 180 s for the address. The resolver shows 86,331 and 111: it fetched both $86{,}400 - 86{,}331 = 180 - 111 = 69$ s earlier and counts down. Until its copy expires, it answers from the cache and never asks Wikimedia. The alias rarely changes and gets a long TTL; the address may change within minutes, for example to send users to another data centre, and gets a short one.
+
+**The TTL is a trade-off.** A long TTL means fewer queries and faster answers; a short one means faster changes. With 10,000 resolvers caching a name, a TTL of 60 s brings $10{,}000 / 60 \approx 167$ queries per second to the authoritative servers, and a TTL of 3,600 s brings 2.8. When an address must change, the change reaches clients only after the old TTL runs out. A migration therefore lowers the TTL first: from 86,400 s to 300 s at least one old TTL, a day, before the switch, so that every cache already holds the short-lived copy; after the switch, clients that respect the TTL move within 300 s; afterwards the TTL goes back up. Some clients keep answers longer than the TTL allows, so the old address keeps serving for a while.
+
+A `CNAME` cannot sit next to other records for the same name ([RFC 1034](#references), §3.6.2). The apex of a zone, `example.com` itself, must carry `SOA` and `NS` records, so it cannot be a `CNAME`; DNS providers offer a non-standard "alias" or "flattening" record that resolves the target on their side and publishes plain `A` records.
+
+## TCP and TLS 1.3: two round trips to a private channel
+
+The client now has an address. It opens a TCP connection, one round trip of the [three-way handshake](/notes/acos/networking#tcp-a-reliable-byte-stream), and then runs **TLS** over it. TLS gives three things: **confidentiality** (an observer on the path sees ciphertext), **integrity** (a changed byte is detected), and **authentication of the server** (the client knows it talks to the owner of the name, not to whoever answered on that address). Version 1.3 ([RFC 8446](#references)) does this in one round trip:
+
+1. The client sends a **ClientHello**: the versions and cipher suites it supports, a fresh **key share** (an ephemeral Diffie–Hellman public key, usually on the X25519 curve), the **server name** it wants (**SNI**, [RFC 6066](#references)) and the application protocols it speaks (**ALPN**, [RFC 7301](#references)), for example `h2` and `http/1.1`.
+2. The server answers with a **ServerHello**: the chosen suite and its own key share. From the two shares both sides compute the same secret, and everything after this message is encrypted.
+3. Still in the same flight, the server sends **EncryptedExtensions** (among them its ALPN choice), its **Certificate** chain, a **CertificateVerify** (a signature over the whole handshake so far, made with the certificate's private key) and a **Finished** message (a MAC over the handshake).
+4. The client checks the certificate and the signature, sends its own Finished, and can send the HTTP request in the same packet.
+
+TLS 1.2 needed two round trips for the same job. Because the keys are ephemeral, a stolen certificate key does not decrypt recordings of past sessions (forward secrecy).
+
+**Worked example.** `curl -v` prints every handshake message. The first part of its output for Wikipedia:
+
+```console
+$ curl -sv -o /dev/null https://www.wikipedia.org/
+* Host www.wikipedia.org:443 was resolved.
+* IPv6: 2a02:ec80:600:ed1a::1
+* IPv4: 185.15.58.224
+*   Trying 185.15.58.224:443...
+* Connected to www.wikipedia.org (185.15.58.224) port 443
+* ALPN: curl offers h2,http/1.1
+* (304) (OUT), TLS handshake, Client hello (1):
+} [322 bytes data]
+*  CAfile: /etc/ssl/cert.pem
+*  CApath: none
+* (304) (IN), TLS handshake, Server hello (2):
+{ [122 bytes data]
+* (304) (IN), TLS handshake, Unknown (8):
+{ [19 bytes data]
+* (304) (IN), TLS handshake, Certificate (11):
+{ [4143 bytes data]
+* (304) (IN), TLS handshake, CERT verify (15):
+{ [79 bytes data]
+* (304) (IN), TLS handshake, Finished (20):
+{ [36 bytes data]
+* (304) (OUT), TLS handshake, Finished (20):
+} [36 bytes data]
+* SSL connection using TLSv1.3 / AEAD-CHACHA20-POLY1305-SHA256 / [blank] / UNDEF
+* ALPN: server accepted h2
+* Server certificate:
+*  subject: CN=*.wikipedia.org
+*  start date: Oct  4 18:34:51 2026 GMT
+*  expire date: Jan  2 18:34:50 2027 GMT
+*  subjectAltName: host "www.wikipedia.org" matched cert's "*.wikipedia.org"
+*  issuer: C=US; O=Let's Encrypt; CN=YE2
+*  SSL certificate verify ok.
+* using HTTP/2
+```
+
+- The name resolved to an IPv6 and an IPv4 address; curl connected over IPv4.
+- `ALPN: curl offers h2,http/1.1`: the client's list of protocols, carried in the ClientHello.
+- `(304)` is the TLS version on the wire, `0x0304`, which means 1.3. The numbers in parentheses after each message name are the message types of RFC 8446: ClientHello is 1, ServerHello 2, EncryptedExtensions 8 (this curl build prints it as `Unknown`), Certificate 11, CertificateVerify 15, Finished 20. The order is exactly the four steps above: one message out, five in, one out.
+- The certificate message is the largest, 4,143 bytes: it carries the chain, not one certificate.
+- `CAfile: /etc/ssl/cert.pem` is the **trust store**, the root certificates this machine accepts.
+- `server accepted h2`: the server chose HTTP/2 from the client's list, inside the encrypted part of the handshake.
+- The certificate is valid for 90 days, from 4 October 2026 to 2 January 2027, is issued for `*.wikipedia.org`, and the requested name matches it. A wildcard covers exactly one label: `www.wikipedia.org`, but not `wikipedia.org` or `a.b.wikipedia.org`.
+
+### Certificates and chains
+
+A certificate ([X.509, RFC 5280](#references)) binds a public key to names, and a **certificate authority** (CA) signs that binding. Browsers and operating systems ship a store of root CAs, more than a hundred of them. A root does not sign server certificates directly; it signs intermediates, which sign the servers' certificates, and the server sends its certificate together with the intermediates. OpenSSL lists what Wikipedia sends:
+
+```console
+$ openssl s_client -connect www.wikipedia.org:443 -servername www.wikipedia.org </dev/null 2>/dev/null | grep -E '^ [0-9] s:|^   i:'
+ 0 s:CN=*.wikipedia.org
+   i:C=US, O=Let's Encrypt, CN=YE2
+ 1 s:C=US, O=Let's Encrypt, CN=YE2
+   i:C=US, O=ISRG, CN=Root YE
+ 2 s:C=US, O=ISRG, CN=Root YE
+   i:C=US, O=Internet Security Research Group, CN=ISRG Root X2
+ 3 s:C=US, O=Internet Security Research Group, CN=ISRG Root X2
+   i:C=US, O=Internet Security Research Group, CN=ISRG Root X1
+```
+
+Each `s:` is a certificate's subject, the `i:` under it its issuer, and each issuer is the subject of the next entry. The client walks up the chain, checks each signature with the issuer's key, checks the validity dates and the name, and stops at a certificate in its trust store. The last two entries are **cross-signatures**: newer roots signed by older ones, so that a client whose trust store holds only the older root still finds a path.
+
+Certificates expire, and an expired one takes a service down as surely as a crash. Since March 2026 the CA/Browser Forum allows publicly trusted certificates to be valid for at most 200 days, falling to 100 days in March 2027 and 47 days in March 2029 ([CA/Browser Forum, ballot SC-081](#references)). At those lifetimes renewal must be automatic: the **ACME** protocol ([RFC 8555](#references)) lets a server prove control of the name (by serving a token over HTTP or publishing a `TXT` record) and fetch a new certificate without a person.
+
+### SNI: many names on one address
+
+Wikimedia serves dozens of sites from the same addresses, and many services share one load balancer. The server must pick the right certificate before any encryption exists, so the ClientHello names the host in clear text: that is SNI, the `-servername` option above. A proxy can also route on SNI alone, without decrypting (TLS **passthrough**), which keeps the key on the backend. Wikimedia's certificate lists 41 names in its subject alternative names, so one certificate serves them all. Because SNI is visible to anyone on the path, the Encrypted Client Hello extension (ECH) encrypts it with a key published in DNS; it is being deployed by browsers and large providers but is far from universal in 2026.
+
+**Resumption and 0-RTT.** A client that has talked to the server before can resume with a key from the previous session and send its first request in the very first flight, **0-RTT** data. The cost is that an attacker can replay that first flight, so servers accept 0-RTT only for requests that are safe to repeat, such as a `GET` without side effects ([RFC 8446](#references), §8).
+
+## HTTP/1.1, HTTP/2 and HTTP/3, in brief
+
+The semantics of HTTP, methods, status codes and headers, are the same in all three versions ([RFC 9110](#references)). What changes is how requests travel.
+
+| | HTTP/1.1 | HTTP/2 | HTTP/3 |
+| --- | --- | --- | --- |
+| Carried by | TCP, usually with TLS | TCP with TLS | QUIC over UDP, TLS 1.3 inside |
+| Requests on one connection | one at a time | many streams, interleaved | many streams, independent |
+| A lost packet stalls | that connection | every stream on it | only its own stream |
+| Round trips before the first request | 2 (TCP, TLS) | 2 (TCP, TLS) | 1, or 0 when resumed |
+| Headers | text | binary, compressed (HPACK) | binary, compressed (QPACK) |
+| How the client learns it is available | default | ALPN in the TLS handshake | `Alt-Svc` header or `HTTPS` record |
+
+HTTP/1.1 ([RFC 9112](#references)) sends one request at a time on a connection, so browsers open several connections per host. HTTP/2 ([RFC 9113](#references)) cuts requests into frames on numbered streams and interleaves many of them on one TCP connection; the cost is that TCP delivers bytes in order, so one lost segment holds up every stream until it is retransmitted. HTTP/3 ([RFC 9114](#references)) runs over **QUIC** ([RFC 9000](#references)), a transport in user space over UDP that keeps streams independent, merges its handshake with TLS 1.3 into one round trip, and identifies a connection by an ID rather than by addresses, so a phone that moves from Wi-Fi to mobile data keeps its connection. A client first reaches a site over TCP and learns about HTTP/3 from a header; `example.com` sends one:
+
+```console
+$ curl -sI https://example.com/ | grep -iE '^(HTTP|server|alt-svc)'
+HTTP/2 200 
+server: cloudflare
+alt-svc: h3=":443"; ma=86400
+```
+
+`h3=":443"` says that HTTP/3 is served on UDP port 443 of the same host, and `ma=86400` that the client may remember this for a day ([RFC 7838](#references)). Networks that block UDP exist, so clients fall back to TCP.
+
+For load balancing the important row is the second. An HTTP/2 client sends all its requests over one long-lived connection. A balancer that chooses a backend per connection sends all of that client's requests to one backend, however many there are.
+
+## Reverse proxies: one front door for many backends
+
+A **reverse proxy** accepts connections on behalf of servers: to the client it is the server, and it forwards each request to a backend it chooses. (A forward proxy is the mirror image: it acts on behalf of clients.) It answers problems 2–4 of the baseline and does several more jobs on the way:
+
+- **TLS termination.** Certificates and keys live on the proxies only; backends speak plain HTTP inside a private network, or a separate internal TLS.
+- **Routing.** By host name and path: `/api` to one pool of backends, `/static` to another, a new version to 5 % of requests.
+- **Buffering.** The proxy reads a slow client's request in full before sending it on and absorbs the response at backend speed, so a backend process is not held for seconds by a phone on a weak network.
+- **Caching and compression.** A response that many users request can be served from the proxy's cache.
+- **Client information.** The backend sees the proxy's address, not the client's, so the proxy adds the client address in a `Forwarded` or `X-Forwarded-For` header ([RFC 7239](#references)). A backend must trust that header only when it comes from its own proxies, since anyone can send it.
+- **Limits.** Timeouts on slow clients, request size limits and rate limits stop one client from tying up the service.
+
+**Worked example.** The response headers of the same Wikipedia request show what answered it (a selection of the lines; the rest of the response is cut):
+
+```console
+< HTTP/2 200 
+< date: Thu, 22 Oct 2026 08:01:28 GMT
+< cache-control: s-maxage=86400, must-revalidate, max-age=3600
+< server: ATS/9.2.15
+< age: 62975
+< x-cache: cp6016 miss, cp6002 hit/753406
+< x-cache-status: hit-front
+```
+
+- `age: 62975`: this response came out of a cache, which has held it for 62,975 s, 17.5 hours ([RFC 9111](#references)). The `date` is when it was generated: 08:01:28 plus 62,975 s is 01:31:03 the next day, the moment the request was made.
+- `cache-control`: shared caches (`s-maxage`) may keep it for one day, a browser (`max-age`) for one hour.
+- `x-cache` names two cache servers of the content-delivery layer, and `x-cache-status: hit-front` says that the front one had a copy. No application server worked on this request at all; `server` names Apache Traffic Server, the caching proxy software of that layer.
+
+## Load balancers: L4 and L7, algorithms, health checks
+
+A load balancer is a proxy whose main job is to spread requests over backends. The layer numbers are the OSI layers of the [networking note](/notes/acos/networking#layers-who-solves-which-problem).
+
+- An **L4** (transport-layer) balancer sees addresses and ports. It forwards packets or splices TCP connections and chooses a backend once per connection, often by hashing the connection's five-tuple. It is fast, can pass TLS through untouched, and knows nothing about requests: no routing by path, no retries of a failed request, and the HTTP/2 imbalance above.
+- An **L7** (application-layer) balancer terminates TCP and TLS, parses HTTP, and chooses a backend per request. It can route, retry, add headers and measure each request's latency and status; it pays with CPU for TLS and parsing, and it must hold the certificates.
+
+Large services stack them: an L4 layer spreads connections over a fleet of L7 proxies, which spread requests over backends ([Eisenbud et al., 2016](#references); [Beyer et al., 2016](#references), ch. 19–20).
+
+**Algorithms.** *Round robin* sends request $k$ to backend $k \bmod N$, with weights for unequal machines; it ignores that some requests are slower than others. *Least connections* (or least outstanding requests) sends each request to the backend with the fewest requests in progress, which follows the real load. Checking every backend is expensive in a large pool, and picking two at random and taking the less loaded of the two, the *power of two choices*, does almost as well ([Mitzenmacher, 2001](#references)). *Hashing* sends the same key, such as a user ID, to the same backend, which keeps a backend's cache warm for its users. Plain hashing modulo $N$ moves almost every key when $N$ changes, which empties all those caches at once; *consistent hashing* ([Karger et al., 1997](#references)) places backends at many points on a ring of hash values and gives each key to the next point clockwise, so adding a backend moves only the keys that the new backend takes over. A script compares the two on 100,000 keys, going from four backends to five:
+
+```python
+import bisect, hashlib
+
+def h(s):                                   # a 64-bit hash of a string
+    return int.from_bytes(hashlib.sha256(s.encode()).digest()[:8], "big")
+
+keys = [f"user-{i}" for i in range(100_000)]
+
+# Hashing modulo N: the backend of a key is h(key) % N
+moved = sum(h(k) % 4 != h(k) % 5 for k in keys)
+print(f"mod N, 4 -> 5 backends: {moved / len(keys):.1%} of keys move")
+
+# Consistent hashing: each backend owns 100 points on a ring of hash values,
+# and a key belongs to the first point clockwise from h(key)
+def ring(n):
+    return sorted((h(f"web{b}#{p}"), b) for b in range(n) for p in range(100))
+
+def owner(r, key):
+    return r[bisect.bisect(r, (h(key),)) % len(r)][1]
+
+r4, r5 = ring(4), ring(5)
+moved = sum(owner(r4, k) != owner(r5, k) for k in keys)
+print(f"ring, 4 -> 5 backends: {moved / len(keys):.1%} of keys move")
+```
+
+```console
+$ python3.14 hashing.py
+mod N, 4 -> 5 backends: 79.9% of keys move
+ring, 4 -> 5 backends: 20.2% of keys move
+```
+
+The ideal is $1/5 = 20\,\%$, the share of the new backend, and the ring comes within a fraction of a percent of it. Under modulo hashing a key stays only when $k \bmod N = k \bmod (N+1)$, which holds for $N$ of every $N(N+1)$ consecutive integers, so a share $1 - 1/(N+1)$ of the keys moves: $4/5$ here.
+
+**Health checks.** A balancer must stop sending requests to a backend that cannot serve them. An **active** check probes each backend on a schedule, for example `GET /healthz` every 5 s with a 2 s timeout; after `fall` consecutive failures the backend is marked down, after `rise` consecutive successes it is back. A **passive** check (outlier detection) watches real traffic and ejects a backend after, say, five errors in a row.
+
+**Worked example.** Interval 5 s, timeout 2 s, `fall` 3. A backend dies at time 0. The next probe starts within 5 s and fails 2 s later; the third failure comes two intervals after the first. The backend is marked down between $2 \cdot 5 + 2 = 12$ and $3 \cdot 5 + 2 = 17$ s after it died. With 200 requests per second spread over four backends, it receives 50 per second during that time, up to $17 \times 50 = 850$ failed requests, unless the balancer retries them elsewhere. A passive check that ejects after five consecutive errors reacts after $5 / 50 = 0.1$ s. Balancers use both: passive checks react fast to real failures, active ones notice that an idle or ejected backend has recovered.
+
+A health check should test whether *this* process can serve, not everything behind it. A check that also queries the database marks every backend down at once when the database is slow, and turns a slow service into an absent one. Kubernetes makes the same distinction between its readiness and liveness probes, in the [Kubernetes note](/notes/devops/kubernetes).
+
+**Draining.** Before a backend is stopped for a deploy, it is taken out of rotation first: the balancer sends it no new requests and lets the ones in progress finish, and only then is the process stopped. The SRE book calls this the *lame duck* state: the backend still answers, but asks not to be sent new work ([Beyer et al., 2016](#references), ch. 20). Together with health checks, this is what makes the [rolling updates](/notes/devops/continuous-delivery#rolling-update) of the previous note invisible to users.
+
+## Latency budget per hop
+
+How long does one request take? Count the round trips. For a new connection over TCP with TLS 1.3 and HTTP/2, with $\mathrm{RTT}$ the round-trip time between client and proxy,
+
+$$
+T_{\text{new}} = T_{\text{DNS}} + \underbrace{\mathrm{RTT}}_{\text{TCP}} + \underbrace{\mathrm{RTT}}_{\text{TLS}} + \underbrace{\mathrm{RTT}}_{\text{request}} + T_{\text{proxy}} + T_{\text{backend}} ,
+$$
+
+where the request round trip covers sending the request and receiving the first bytes of a small response; a large response adds its transfer time, the $8S/B$ term of the [networking note](/notes/acos/networking#latency-versus-bandwidth).
+
+**Worked example.** A toy setup: the resolver answers from its cache in $T_{\text{DNS}} = 5$ ms, $\mathrm{RTT} = 40$ ms, the proxy adds $T_{\text{proxy}} = 1$ ms (its own work and a round trip inside the data centre on a pooled connection), and the backend takes $T_{\text{backend}} = 60$ ms.
+
+- A new HTTP/2 connection: $5 + 40 + 40 + 40 + 1 + 60 = 186$ ms.
+- A new HTTP/3 connection, where QUIC and TLS share one round trip: $5 + 40 + 40 + 1 + 60 = 146$ ms.
+- A resumed session with 0-RTT, which sends the request in its first flight: $5 + 40 + 1 + 60 = 106$ ms.
+- A connection that is already open, with the name cached in the browser: $40 + 1 + 60 = 101$ ms.
+
+<LatencyBudget />
+
+Three conclusions follow. First, on a new connection the handshakes cost more than the backend: $80$ of the $186$ ms, against its $60$. Reusing connections removes them, which is why browsers keep connections open and why proxies keep pools of open connections to their backends; a proxy that opened a new TLS connection to a backend in another region for every request would add two round trips of that longer path. Second, the round trip is set by distance, which no server can shorten, so providers put proxies near users (a content-delivery network) and carry the request to the backend over connections that are already open. Third, a DNS lookup that misses every cache can cost far more than 5 ms, about 90 ms in the example of the [networking note](/notes/acos/networking#dns-from-names-to-addresses), and the TTLs decide how often that happens.
+
+**Budgets and percentiles.** A team that promises a latency, say 300 ms for 99 % of requests, divides it among the hops: so much for the network, so much for the proxy, so much for each backend call. Averages add up; percentiles do not. The 99th percentile of the total is not the sum of the hops' 99th percentiles, so a budget for the tail is checked by measuring the total. Fan-out makes the tail worse: when one request calls $N$ backends in parallel and waits for all of them, and each answers within 10 ms with probability 0.99, all $N$ answer within 10 ms with probability $0.99^N$, if they are independent: $0.904$ for $N = 10$ and $0.366$ for $N = 100$. A rare slow answer from one machine becomes the common case for the request ([Dean and Barroso, 2013](#references)). Why percentiles cannot be averaged is shown in the note on [observability](/notes/devops/observability#why-percentiles-cannot-be-averaged), and the timeouts and retries that bound them in [resilience and capacity](/notes/devops/resilience-and-capacity).
+
+<aside class="callout"><strong>Check yourself.</strong> (1) A record has a TTL of 3,600 s. You change its address at 12:00. Until when can a client that respects TTLs still use the old address, and what should you have done the day before? (2) Behind an L4 load balancer with four backends, one backend is overloaded and the others are idle. Most clients use HTTP/2. Explain why, and name a fix. (3) A health check runs every 2 s with a 1 s timeout and `fall` 2. What is the longest time a dead backend keeps receiving requests? (4) Using the toy numbers of the latency budget, how much does a new HTTP/2 connection cost compared with a reused one if the round trip grows to 150 ms?<details><summary>Answers</summary>(1) Until 13:00: a resolver may have cached the old answer at 11:59:59 for a full hour. A day before (at least one old TTL before), lower the TTL to a few minutes, so that at 12:00 every cached copy expires quickly; raise it again afterwards. (2) An L4 balancer chooses a backend once per connection, and an HTTP/2 client sends all its requests over one long-lived connection, so a few busy clients pin their load to whichever backends they happened to connect to. An L7 balancer, which chooses per request, fixes it; so does limiting how long a connection may live, so that clients reconnect and are spread again. (3) The first probe after the death starts within 2 s and fails 1 s later; the second starts 2 s after the first and fails 1 s later. The backend is marked down between $2 + 1 = 3$ and $2 + 2 + 1 = 5$ s after it died, so 5 s at most. (4) New: $5 + 3 \times 150 + 61 = 516$ ms; reused: $150 + 61 = 211$ ms. The DNS lookup and the two handshakes now cost 305 ms, five times the backend.</details></aside>
+
+## What changed
+
+| Problem of the single server | Mechanism | Where it lives |
+| --- | --- | --- |
+| The address is the machine | DNS names, aliases, TTLs chosen per record | authoritative servers, resolver caches |
+| Anyone on the path can read or forge | TLS 1.3: ephemeral keys, certificate chain, signature over the handshake | client and the proxy that terminates TLS |
+| One machine is one failure | a pool of backends behind a load balancer | L4 and L7 balancers |
+| Keys on every server | TLS termination, certificates renewed by ACME | the proxy layer |
+| No gentle way to remove a server | health checks, draining, lame duck | balancer and backend together |
+| Round trips cost distance | TLS 1.3, connection reuse, HTTP/3, 0-RTT, proxies near users | client, edge proxies |
+
+## Limitations
+
+- Health checks and DNS see failure from one vantage point. A backend can pass its health check and still fail real requests, and a name can resolve in one network and not another; only measurements of real traffic show what users see.
+- TTLs are advice. Some clients and runtimes cache answers longer than the TTL, so a DNS change never finishes at a precise moment, and a record that was wrong for an hour can be wrong for some users for a day.
+- The latency budget counts round trips and leaves out loss, congestion windows and queueing in the backend, which dominate under load; the [resilience note](/notes/devops/resilience-and-capacity) adds queueing.
+- Every proxy is one more component that can fail, be misconfigured or run out of connections, and its own limits (timeouts, buffer sizes, connection pools) become part of the service's behaviour.
+- The note treats a single region. Global routing (anycast addresses, DNS answers that depend on the client's location, failover between regions) builds on the same pieces and is out of scope.
+
+## What you should remember
+
+- A request crosses resolver, proxy, balancer and backend; each is an indirection that lets the layer behind it change, and each has a cache or a health view that can be stale.
+- DNS: records map names to addresses (`A`, `AAAA`) or to other names (`CNAME`). The TTL trades query load against how fast a change spreads; lower it before a migration, by at least one old TTL.
+- TLS 1.3 costs one round trip after TCP's one: ClientHello with key share, SNI and ALPN; ServerHello; then encrypted certificate chain, signature and Finished. The client verifies the chain up to its trust store and the name against the certificate.
+- HTTP/2 multiplexes streams on one TCP connection; HTTP/3 does it over QUIC, with independent streams and a one-round-trip handshake.
+- A reverse proxy terminates TLS, routes, buffers, caches and adds the client address. An L4 balancer chooses per connection, an L7 balancer per request.
+- Health checks: active probes detect a dead backend within about `fall` intervals plus a timeout, passive checks within a few failed requests; a check tests the process, not its dependencies. Drain before stopping.
+- Latency: $T_{\text{new}} = T_{\text{DNS}} + 3\,\mathrm{RTT} + T_{\text{server}}$ for a new HTTP/2 connection, $\mathrm{RTT} + T_{\text{server}}$ for a reused one. Averages add across hops, percentiles do not, and fan-out turns rare slow answers into common slow requests.
+
+## Example
+
+A configuration of HAProxy, a widely used open-source load balancer, for the service of the figure: it terminates TLS for `www.example.com`, redirects plain HTTP to HTTPS, and balances requests over three backends with active health checks. It is written for HAProxy 3.4 (2026) against its configuration manual and was not executed here; `haproxy -c -f haproxy.cfg` checks such a file without starting it.
+
+```text
+global
+    log stdout format raw local0
+
+defaults
+    mode http
+    log global
+    option httplog
+    timeout connect 3s
+    timeout client 30s
+    timeout server 30s
+    timeout http-request 10s
+    timeout check 2s
+
+frontend www
+    bind :80
+    bind :443 ssl crt /etc/haproxy/certs/www.example.com.pem alpn h2,http/1.1
+    http-request redirect scheme https code 301 unless { ssl_fc }
+    http-request set-header X-Forwarded-Proto https
+    option forwardfor
+    default_backend web
+
+backend web
+    balance leastconn
+    option httpchk
+    http-check send meth GET uri /healthz ver HTTP/1.1 hdr Host www.example.com
+    http-check expect status 200
+    default-server inter 5s fall 3 rise 2
+    server web1 10.0.1.11:8080 check
+    server web2 10.0.2.12:8080 check
+    server web3 10.0.3.13:8080 check
+```
+
+- `log stdout format raw local0` writes the access log to standard output, where a container runtime collects it.
+- `mode http` makes this an L7 proxy: it parses requests. With `mode tcp` it would be an L4 proxy that only splices connections.
+- `timeout connect 3s`: give up on a backend that does not accept a connection within 3 s. `timeout client` and `timeout server`: close a connection that stays silent for 30 s. `timeout http-request 10s`: a client must send its complete request headers within 10 s, which defeats clients that trickle a request byte by byte to hold connections open. `timeout check 2s` is the probe timeout of the worked example.
+- `frontend www` is the listening side. `bind :80` accepts plain HTTP; `bind :443 ssl crt ...` accepts TLS with the certificate and key in one PEM file and offers `h2` and `http/1.1` by ALPN. This is TLS termination.
+- `http-request redirect scheme https code 301 unless { ssl_fc }`: a request that did not arrive over TLS (`ssl_fc`, "the front connection is SSL", is false) gets a permanent redirect to HTTPS. The braces enclose an anonymous condition.
+- `set-header X-Forwarded-Proto https` tells the backend that the client used HTTPS (after the redirect, every request that reaches a backend did); `option forwardfor` adds `X-Forwarded-For` with the client's address. Both overwrite whatever the client sent, so the backend can trust them.
+- `backend web` is the pool. `balance leastconn` sends each request to the server with the fewest connections in progress.
+- `option httpchk` turns on HTTP health checks; the `http-check send` line defines the probe, `GET /healthz` with a `Host` header, and `http-check expect status 200` says that only a 200 counts as healthy.
+- `default-server inter 5s fall 3 rise 2` sets, for every server below, a probe every 5 s, down after three failures, up after two successes: the numbers of the worked example.
+- Each `server` line names a backend by a private address and port; `check` enables the health check for it. Removing a server from rotation for a deploy is done at run time through HAProxy's runtime API (setting the server to the `drain` state), without reloading the file.
+
+## Next
+
+The proxies, balancers, DNS records and addresses of this note had to be created somewhere, by someone, and they change as the service grows. Created by hand in a console, they cannot be reviewed, repeated or rebuilt after a mistake. The [next note](/notes/devops/infrastructure-as-code) describes infrastructure as code: a file that states what should exist, a tool that compares it with what does exist, and a plan to read before anything changes.
+
+## References
+
+- P. Mockapetris. [Domain Names — Concepts and Facilities](https://www.rfc-editor.org/rfc/rfc1034). RFC 1034, 1987. §3.6.2 (aliases and canonical names).
+- M. Andrews. [Negative Caching of DNS Queries (DNS NCACHE)](https://www.rfc-editor.org/rfc/rfc2308). RFC 2308, 1998.
+- B. Schwartz, M. Bishop, E. Nygren. [Service Binding and Parameter Specification via the DNS (SVCB and HTTPS Resource Records)](https://www.rfc-editor.org/rfc/rfc9460). RFC 9460, 2023.
+- J. Arkko, M. Cotton, L. Vegoda. [IPv4 Address Blocks Reserved for Documentation](https://www.rfc-editor.org/rfc/rfc5737). RFC 5737, 2010.
+- E. Rescorla. [The Transport Layer Security (TLS) Protocol Version 1.3](https://www.rfc-editor.org/rfc/rfc8446). RFC 8446, 2018. §2 (protocol overview), §4 (handshake messages), §8 (0-RTT and anti-replay).
+- D. Eastlake 3rd. [Transport Layer Security (TLS) Extensions: Extension Definitions](https://www.rfc-editor.org/rfc/rfc6066). RFC 6066, 2011. §3 (server name indication).
+- S. Friedl, A. Popov, A. Langley, E. Stephan. [TLS Application-Layer Protocol Negotiation Extension](https://www.rfc-editor.org/rfc/rfc7301). RFC 7301, 2014.
+- D. Cooper et al. [Internet X.509 Public Key Infrastructure Certificate and Certificate Revocation List (CRL) Profile](https://www.rfc-editor.org/rfc/rfc5280). RFC 5280, 2008.
+- R. Barnes et al. [Automatic Certificate Management Environment (ACME)](https://www.rfc-editor.org/rfc/rfc8555). RFC 8555, 2019.
+- CA/Browser Forum. [Ballot SC-081v3: Introduce Schedule of Reducing Validity and Data Reuse Periods](https://cabforum.org/2025/04/11/ballot-sc081v3-introduce-schedule-of-reducing-validity-and-data-reuse-periods/). April 2025.
+- R. Fielding, M. Nottingham, J. Reschke (eds.). [HTTP Semantics](https://www.rfc-editor.org/rfc/rfc9110), RFC 9110; [HTTP Caching](https://www.rfc-editor.org/rfc/rfc9111), RFC 9111, §5.1 (Age); [HTTP/1.1](https://www.rfc-editor.org/rfc/rfc9112), RFC 9112. 2022.
+- M. Thomson, C. Benfield (eds.). [HTTP/2](https://www.rfc-editor.org/rfc/rfc9113). RFC 9113, 2022.
+- M. Bishop (ed.). [HTTP/3](https://www.rfc-editor.org/rfc/rfc9114). RFC 9114, 2022.
+- J. Iyengar, M. Thomson (eds.). [QUIC: A UDP-Based Multiplexed and Secure Transport](https://www.rfc-editor.org/rfc/rfc9000). RFC 9000, 2021.
+- M. Nottingham, P. McManus, J. Reschke. [HTTP Alternative Services](https://www.rfc-editor.org/rfc/rfc7838). RFC 7838, 2016.
+- A. Petersson, M. Nilsson. [Forwarded HTTP Extension](https://www.rfc-editor.org/rfc/rfc7239). RFC 7239, 2014.
+- B. Beyer, C. Jones, J. Petoff, N. R. Murphy (eds.). [Site Reliability Engineering](https://sre.google/sre-book/table-of-contents/). O'Reilly, 2016. Ch. 19 (load balancing at the frontend), ch. 20 (load balancing in the datacenter: health, lame duck, subsetting).
+- D. E. Eisenbud et al. [Maglev: A Fast and Reliable Software Network Load Balancer](https://www.usenix.org/conference/nsdi16/technical-sessions/presentation/eisenbud). NSDI, 2016.
+- M. Mitzenmacher. [The Power of Two Choices in Randomized Load Balancing](https://doi.org/10.1109/71.963420). IEEE Transactions on Parallel and Distributed Systems, 12(10), 2001.
+- D. Karger et al. [Consistent Hashing and Random Trees](https://doi.org/10.1145/258533.258660). STOC, 1997.
+- J. Dean, L. A. Barroso. [The Tail at Scale](https://doi.org/10.1145/2408776.2408794). Communications of the ACM, 56(2), 2013.
+- HAProxy Technologies. [HAProxy 3.4 Configuration Manual](https://docs.haproxy.org/3.4/configuration.html). 2026. Sections on `bind` (ssl, alpn), `http-check`, `balance` and server options (`check`, `inter`, `fall`, `rise`).

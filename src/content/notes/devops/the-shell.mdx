@@ -1,0 +1,608 @@
+---
+title: The shell and text tools
+description: "The shell as a loop that turns lines into processes: quoting and the order of expansions, pipes and redirections as file descriptors, exit codes and strict mode with its traps, a log analysis built from text tools, robust scripts, and when to switch to Python."
+course: devops
+section: Foundations
+order: 1
+status: published
+tags: [shell, bash, quoting, expansion, pipes, redirection, file-descriptors, exit-status, set-e, pipefail, grep, sed, awk, xargs, find, jq, scripting, trap, idempotence]
+prerequisites: [What DevOps is, Processes and threads, Files and input/output, Inter-process communication]
+---
+
+import PipelineFds from '../../../components/figures/the-shell/PipelineFds.astro';
+
+The [previous note](/notes/devops/what-devops-is) described delivery as a stream of steps from a commit to production, and argued that the steps must be cheap enough to run for every change. A step becomes cheap when a machine can run it, and almost every step, building, testing, packaging, copying, restarting, is in the end a sequence of commands. The language in which those commands are typed, combined and saved as scripts is the shell. This note explains what the shell does with a line of text, why the rules by which it splits that line into words cause most shell bugs, how pipes connect programs through file descriptors, how a script detects failure, and where the shell stops being the right tool.
+
+**Setup.** `/bin/bash` 3.2.57 on macOS 26, with the BSD versions of `grep`, `sed`, `awk`, `sort`, `xargs` and `find` that macOS ships, and `jq` 1.7.1. Linux distributions ship bash 5 and the GNU tools; every command in this note gives the same result there unless the text says otherwise. The commands of each listing were fed to one bash process, so an error message names the line of that session (`bash: line 8:`) where an interactive shell would print only `bash:`.
+
+## Baseline: commands typed by hand
+
+The simplest automation is none: an engineer logs in to a server and types the commands from a wiki page. It works once. It fails as a delivery step for the reasons of the previous note: the procedure lives in someone's head and in a page that drifts from reality, a typo in the fifth command goes unnoticed until the tenth, and nobody can run it fifty times a day.
+
+Saving the same commands in a file does not fix it by itself. Here is a cleanup script of three lines, run where the build directory does not exist and the variable `BUILD_DIR` is empty (the `rm` is printed with `echo` instead of run):
+
+```bash
+#!/usr/bin/env bash
+cd /nonexistent/build
+echo "still running, in ${PWD##*/}"
+echo rm -rf "$BUILD_DIR/tmp"
+```
+
+```console
+$ BUILD_DIR= bash nosafety.sh
+nosafety.sh: line 2: cd: /nonexistent/build: No such file or directory
+still running, in project
+rm -rf /tmp
+```
+
+The `cd` failed, and the script carried on in the wrong directory. The empty variable turned `$BUILD_DIR/tmp` into `/tmp`. Without the `echo`, the script would have tried to delete `/tmp`. Both mistakes are silent by default, and the rest of the note is about the rules that cause them and the habits that prevent them.
+
+## What the shell is
+
+A shell is a read–evaluate–print loop whose values are processes. It reads a line, splits it into words, expands the words, and treats the first word as a command. If the command is a **builtin**, the shell runs it itself; otherwise it searches the directories in `PATH` for a program of that name, creates a child process with `fork`, replaces the child's program with `exec`, and waits for the child to exit, as in the [processes note](/notes/acos/processes-and-threads#creating-a-process-fork-exec-and-wait). The child's exit status is saved in `$?`, and the loop reads the next line.
+
+```console
+$ type cd ls printf awk
+cd is a shell builtin
+ls is /bin/ls
+printf is a shell builtin
+awk is /usr/bin/awk
+```
+
+`cd` must be a builtin: the current directory is a property of a process, and a child that changed its own directory and exited would leave the shell where it was. The same holds for variable assignments, `export`, `set` and `source`. Everything else is an ordinary program, and the shell's job is to start it with the right arguments, the right environment and the right open files.
+
+<aside class="callout"><strong>Key idea.</strong> A shell program is a program whose statements are processes, whose values are streams of bytes and small integer exit statuses, and whose syntax is decided by how a line is split into words. Quote every expansion so that words stay whole, connect programs through file descriptors, and check every exit status, or errors pass silently into the next command.</aside>
+
+## Words, quoting and expansion
+
+Before running anything, bash turns a line into a list of words through a fixed sequence of steps ([Bash manual, §3.5](#references)):
+
+1. **Brace expansion**: `file{1..3}.log` becomes three words.
+2. **Tilde expansion** (`~` becomes the home directory), **parameter and variable expansion** (`$x`, `${x:-default}`), **arithmetic expansion** (`$((n + 1))`) and **command substitution** (`$(cmd)`), all in one pass from left to right.
+3. **Word splitting**: the results of step 2 that were *not* inside double quotes are split on the characters in `IFS`, by default space, tab and newline.
+4. **Pathname expansion**: an unquoted word that contains `*`, `?` or `[` is replaced by the matching file names.
+5. **Quote removal**: the quote characters themselves disappear.
+
+Single quotes stop every expansion. Double quotes allow step 2, except the tilde, but stop steps 3 and 4, so the value of a variable stays one word, whatever it contains. Most shell bugs are steps 3 and 4 applied to a value that should have stayed whole. The command `printf '<%s>\n'` prints each of its arguments on its own line between angle brackets, which makes the words visible. In a directory that holds `my report.txt` and `notes.txt`:
+
+```console
+$ f='my report.txt'
+$ printf '<%s>\n' $f
+<my>
+<report.txt>
+$ printf '<%s>\n' "$f"
+<my report.txt>
+$ ls -l $f
+ls: my: No such file or directory
+ls: report.txt: No such file or directory
+$ x='*.txt'
+$ printf '<%s>\n' $x
+<my report.txt>
+<notes.txt>
+$ printf '<%s>\n' "$x"
+<*.txt>
+```
+
+Unquoted, the value `my report.txt` was split into two words, and `ls` looked for two files. Unquoted, the value `*.txt` was expanded as a pattern after the variable was substituted. Quoted, each stayed a single word. The order of the steps explains more:
+
+```console
+$ printf '<%s>\n' '$HOME' "$HOME" ~ "~"
+<$HOME>
+</Users/ada>
+</Users/ada>
+<~>
+$ n=3; printf '<%s>\n' {1..$n}
+<{1..3}>
+$ printf '<%s>\n' "$(echo 'a  b')" $(echo 'a  b')
+<a  b>
+<a>
+<b>
+$ empty=''; [ $empty = yes ] && echo yes
+bash: line 24: [: =: unary operator expected
+$ [ "$empty" = yes ] || echo 'not yes'
+not yes
+$ [[ $empty = yes ]] || echo 'not yes, [[ ]] does not split'
+not yes, [[ ]] does not split
+```
+
+`{1..$n}` stays as it is because brace expansion, step 1, runs before `$n` is expanded in step 2: at step 1 the text `{1..$n}` is not a valid range, so it is left alone, and step 2 only fills in the 3. The quoted command substitution keeps both spaces, the unquoted one is split. `[` is a command (a builtin, and also the program `/bin/[`) that receives words like any other: with `$empty` unquoted it received `=`, `yes` and `]`, one word short of a comparison, and failed. `[[ … ]]` is part of bash's grammar, not a command, and does not split or glob the words inside it.
+
+The habits that follow are few. Put double quotes around every `$variable` and `$(command)` unless splitting is what you want. Keep a list of file names in an array, `files=(*.log)`, and pass it as `"${files[@]}"`, which expands to one word per element. Use `[[ … ]]` in bash scripts. The static checker ShellCheck reports the unquoted cases as SC2086 ([ShellCheck wiki](#references)).
+
+## Pipes and redirection
+
+Every process starts with three open file descriptors, small integers that index its table of open files ([files note](/notes/acos/files-and-io#what-a-program-sees-descriptors-and-five-calls)): 0 is standard input, 1 standard output, 2 standard error. A program that reads from 0 and writes to 1 does not know or care whether they are a terminal, a file or another program. The shell decides that before it calls `exec`, in the child.
+
+- `cmd > file` opens `file` for writing (creating or truncating it) and makes it descriptor 1 of `cmd`; `>>` appends; `< file` makes `file` descriptor 0.
+- `2> file` does the same for descriptor 2, and `2>&1` makes descriptor 2 a copy of whatever descriptor 1 is *at that moment*, with the system call `dup2(1, 2)`.
+- `a | b` creates a **pipe**, a kernel buffer with a write end and a read end ([pipes](/notes/acos/inter-process-communication#pipes)), makes the write end descriptor 1 of `a` and the read end descriptor 0 of `b`, and starts both processes at once.
+
+Redirections are applied from left to right, which is why their order matters:
+
+```console
+$ ls /etc/hosts /nonexistent > out.txt; cat out.txt
+ls: /nonexistent: No such file or directory
+/etc/hosts
+$ ls /etc/hosts /nonexistent > all.txt 2>&1; wc -l < all.txt
+       2
+$ ls /etc/hosts /nonexistent 2>&1 > all.txt; wc -l < all.txt
+ls: /nonexistent: No such file or directory
+       1
+$ ls /etc/hosts /nonexistent 2> /dev/null | wc -l
+       1
+```
+
+In the first command only descriptor 1 went to the file, so the error still reached the terminal. In the second, `> all.txt` came first, and `2>&1` then copied descriptor 1, the file, into 2: both lines went to the file. In the third, `2>&1` copied descriptor 1 while it was still the terminal, and only then was 1 pointed at the file, so the error went to the terminal and the file got one line. In the fourth, errors were discarded and only the file name entered the pipe. Two more forms are worth knowing: a here-string `<<< text` feeds a string to descriptor 0, and bash's process substitution `<(cmd)` runs `cmd` with its output connected to a pipe and passes the pipe's name, such as `/dev/fd/63`, as a file argument:
+
+```console
+$ sort <<< $'pear\napple\nfig'
+apple
+fig
+pear
+$ diff <(printf 'a\nb\n') <(printf 'a\nc\n')
+2c2
+< b
+---
+> c
+```
+
+<PipelineFds />
+
+1. For the line `awk '$9 >= 500 {print $7}' < access.log | sort | uniq -c > report.txt`, bash finds three commands and two pipe symbols. It creates two pipes and forks three children.
+2. In the first child, `< access.log` opens the log file as descriptor 0; then the child `exec`s `awk`.
+3. The first pipe's write end becomes descriptor 1 of `awk`, its read end descriptor 0 of `sort`.
+4. The second pipe joins descriptor 1 of `sort` to descriptor 0 of `uniq`.
+5. `> report.txt` opens the output file as descriptor 1 of `uniq`.
+6. Nobody redirected descriptor 2, so the error messages of all three processes go straight to the terminal, never into the pipes or the report.
+7. The shell waits for all three; the status of the pipeline is the status of `uniq`, its last command.
+
+The three programs run concurrently. `awk` writes into the first pipe as it reads, and when the pipe's buffer is full (64 KiB by default on Linux) the kernel blocks it until `sort` reads. `sort` cannot write anything before it has read all of its input, and `uniq` then counts adjacent equal lines. Run for real on the log of the next section:
+
+```console
+$ awk '$9 >= 500 {print $7}' < access.log | sort | uniq -c > report.txt; cat report.txt
+   4 /api/orders
+   5 /api/search?q=desk
+   9 /api/search?q=lamp
+   5 /api/search?q=mug
+   6 /api/search?q=shoes
+```
+
+## Exit codes and strict mode
+
+A program ends with an **exit status**, an integer from 0 to 255. Zero means success; anything else means failure, and the program decides what each value says. A few conventions are shared ([Bash manual, §3.7.5](#references)): 126 means the file was found but could not be executed, 127 that the command was not found, and $128 + n$ that the process was killed by signal $n$. `grep` uses three values: 0 when a line matched, 1 when none did, 2 on an error.
+
+```console
+$ grep -q ' 502 ' ../demo/logs/access.log; echo $?
+0
+$ grep -q ' 503 ' ../demo/logs/access.log; echo $?
+1
+$ grep -q ' 503 ' /no/such/file; echo $?
+grep: /no/such/file: No such file or directory
+2
+$ nosuchcommand; echo $?
+bash: line 8: nosuchcommand: command not found
+127
+$ false && echo 'not printed'; echo "status $?"
+status 1
+```
+
+The shell's control flow runs on exit statuses. `a && b` runs `b` only if `a` succeeded, `a || b` only if it failed, and `if cmd; then` tests the status of `cmd`, not a Boolean value. In `false && echo`, the `echo` was skipped and the list kept the status 1 of `false`.
+
+By default, though, a script ignores failures: a command fails, prints a message, and the next line runs, as in the baseline. Three options of `set`, usually written together as `set -euo pipefail` at the top of a script, change that:
+
+- **`-e` (errexit)**: exit as soon as a command fails. It protects against carrying on after a failed `cd`, `cp` or download.
+- **`-u` (nounset)**: treat the expansion of an unset variable as an error. It protects against `$BUILD_DIR/tmp` silently becoming `/tmp`.
+- **`-o pipefail`**: make the status of a pipeline the status of the last command that failed, instead of the status of the last command. Without it, `curl … | tar x` succeeds whenever `tar` does, even if the download failed.
+
+```console
+$ bash safety.sh; echo "exit $?"
+safety.sh: line 3: RELEASE: unbound variable
+exit 1
+$ bash pipefail.sh
+without pipefail: 0
+with pipefail: 1
+yes | head: 141  PIPESTATUS: 141 0
+```
+
+`safety.sh` is `set -euo pipefail` followed by `echo "deploying ${RELEASE}"`: it stopped instead of deploying a release with an empty name. `pipefail.sh` runs `false | true` twice, without and with the option. Its last line shows the price of the option, the **pipefail trap**. `head -n 1` exits after one line; the next write of `yes` into the pipe, which now has no reader, makes the kernel send `yes` the signal `SIGPIPE`, number 13, and `yes` dies with status $128 + 13 = 141$ ([signals](/notes/acos/inter-process-communication#signals)). `PIPESTATUS` holds the status of each command of the last pipeline. The pipeline did exactly what was meant, but under `pipefail` it counts as failed, and under `-e` it ends the script. The same happens when a pipeline legitimately finds nothing:
+
+```bash
+#!/usr/bin/env bash
+# trap.sh
+set -euo pipefail
+count=$(grep ' 503 ' ../demo/logs/access.log | wc -l)
+echo "503 responses: $count"
+```
+
+```bash
+#!/usr/bin/env bash
+# sigpipe.sh
+set -euo pipefail
+first=$(seq 1 100000 | head -n 1)
+echo "first: $first"
+```
+
+```console
+$ bash trap.sh; echo "exit $?"
+exit 1
+$ bash sigpipe.sh; echo "exit $?"
+exit 141
+```
+
+Both scripts died without a word. In `trap.sh`, no line contains ` 503 `, `grep` exited with 1, and `pipefail` turned "zero matches" into a failure. In `sigpipe.sh`, `seq` wrote more than the pipe holds, `head` left after the first line, and `seq` was killed by `SIGPIPE`: five runs out of five gave 141. The fixes are local: say where "no match" is acceptable, and use a reader that consumes all of its input. `grep -c` prints 0 but still exits with 1 when nothing matches, so it needs an explicit `|| true`; `awk 'NR == 1'` prints the first line and keeps reading, so the writer never meets a closed pipe:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+count=$(grep -c ' 503 ' ../demo/logs/access.log || true)
+first=$(seq 1 100000 | awk 'NR == 1')
+echo "503 responses: $count, first: $first"
+```
+
+```console
+$ bash fixed.sh; echo "exit $?"
+503 responses: 0, first: 1
+exit 0
+```
+
+`-e` has holes of its own. It is ignored for a command whose status is tested: in an `if` or `while` condition, on the left of `&&` or `||`, or after `!`. The rule applies to everything that runs inside such a command, including whole functions. And `local x=$(cmd)` returns the status of `local`, which succeeded, not of `cmd`:
+
+```bash
+#!/usr/bin/env bash
+# efunc.sh
+set -e
+check() { false; echo "check went on after false"; }
+if check; then echo "check succeeded"; fi
+check
+echo "never printed"
+```
+
+```bash
+#!/usr/bin/env bash
+# local.sh
+set -e
+f() { local out=$(false); echo "local hid the failure: $?"; }
+f
+g() { local out; out=$(false); echo "not reached"; }
+g
+echo "never printed"
+```
+
+```console
+$ bash efunc.sh; echo "exit $?"
+check went on after false
+check succeeded
+exit 1
+$ bash local.sh; echo "exit $?"
+local hid the failure: 0
+exit 1
+```
+
+Inside `if check`, the `false` in the function did not stop it, and `check` "succeeded" because its last command, `echo`, did. Called on its own line, the same function stopped the script at `false`. In `local.sh`, `f` went on because `local` hid the status of `$(false)`; `g` declares first and assigns separately, and the failure stops the script. Strict mode is a safety net with known holes, not a proof that a script checks every error ([Wooledge, BashFAQ 105](#references)).
+
+## A toolkit of text tools
+
+Unix programs share one data format, lines of text, and most of the useful ones do one thing to a stream of lines. A small set covers most of operations work:
+
+| Tool | Does | Typical use |
+| --- | --- | --- |
+| `grep` | prints lines that match a regular expression | find errors, count matches with `-c`, test with `-q` |
+| `sed` | edits each line with a script, mostly `s/old/new/` | normalize, rewrite, delete lines |
+| `awk` | splits each line into fields `$1 … $NF` and runs a small program | filter by a field, sum, group with arrays |
+| `cut`, `tr` | pick fields by a delimiter; translate or delete characters | take the first column, drop quotes |
+| `sort`, `uniq` | order lines; collapse adjacent duplicates, `-c` counts them | the frequency table `sort \| uniq -c \| sort -rn` |
+| `head`, `tail`, `wc` | first or last lines; count lines, words, bytes | peek, follow a log with `tail -f` |
+| `find` | walks directories and prints paths that match tests | files by name, age, size |
+| `xargs` | turns lines of input into arguments of a command | run a command on every file `find` found |
+| `jq` | the same ideas for JSON values | filter structured logs and API responses |
+
+The tools compose through pipes, which is the point of them ([McIlroy, Pinson and Tague, 1978](#references)). The way to use them is to build a pipeline one stage at a time, looking at the output after each stage.
+
+**Worked example.** A web service behind nginx had a bad hour on 22 October 2026 between 14:00 and 15:00, and its access log is all we have. (The log is synthetic, generated with a fixed seed, in nginx's combined format with the request time in seconds appended.) The question: what failed, when, and for whom?
+
+```console
+$ wc -l logs/access.log
+    1200 logs/access.log
+$ head -n 2 logs/access.log
+203.0.113.7 - - [22/Oct/2026:14:00:01 +0000] "GET /api/orders/1666 HTTP/1.1" 200 1079 "-" "curl/8.7.1" 0.015
+203.0.113.61 - - [22/Oct/2026:14:00:02 +0000] "GET /api/orders/1564 HTTP/1.1" 200 1114 "-" "python-httpx/0.28.1" 0.026
+```
+
+Split on spaces, field 1 is the client address, `$4` the time, `$6` the method with a leading quote, `$7` the path, `$9` the status and `$NF` (the last field) the request time. Server errors have statuses from 500 to 599. `grep` can count them with a pattern anchored on the closing quote of the request, but `awk` compares the field itself, which cannot match a 5 in some other column by accident:
+
+```console
+$ grep -c '" 5[0-9][0-9] ' logs/access.log
+29
+$ awk '$9 >= 500' logs/access.log | wc -l
+      29
+```
+
+Which endpoints? Print method and path, remove the quote with `tr`, then use `sed` to drop the query string and replace numeric IDs with `:id`, so that `/api/orders/1842` and `/api/orders/1666` count as one endpoint. Then the frequency idiom: `sort` brings equal lines together, `uniq -c` counts each run, `sort -rn` puts the largest count first.
+
+```console
+$ awk '$9 >= 500 {print $6, $7}' logs/access.log | head -n 3
+"POST /api/orders
+"POST /api/orders
+"GET /api/search?q=lamp
+$ awk '$9 >= 500 {print $6, $7}' logs/access.log | tr -d '"' | sed -E 's/[?].*//; s#/[0-9]+#/:id#g' | sort | uniq -c | sort -rn
+  25 GET /api/search
+   4 POST /api/orders
+```
+
+When? Characters 14 to 17 of the time field `[22/Oct/2026:14:23:05` are `14:2`; appending `0` gives ten-minute buckets. And how long did the failing requests take?
+
+```console
+$ awk '$9 >= 500 {print $9, substr($4, 14, 4) "0"}' logs/access.log | sort | uniq -c
+   2 500 14:10
+   1 500 14:20
+   1 500 14:40
+  15 502 14:20
+  10 502 14:30
+$ awk '$9 == 502 {print $NF}' logs/access.log | sort -n | sed -n '1p;$p'
+5.000
+5.010
+```
+
+Two different problems separate. The 502s, "bad gateway", came only between 14:20 and 14:40, and every one of them took between 5.000 and 5.010 seconds (`sed -n '1p;$p'` prints the first and last line of the sorted list): that uniformity is the signature of a timeout, the proxy giving up on the search backend after 5 seconds. The four 500s from `POST /api/orders` are spread over the hour, a separate and smaller issue. Counts alone hide how bad the window was, so the next stage is a small `awk` program that keeps two arrays, requests and errors per bucket, and prints a rate:
+
+```console
+$ awk '$7 ~ /^\/api\/search/ {b = substr($4, 14, 4) "0"; n[b]++; if ($9 >= 500) e[b]++} END {for (b in n) printf "%s %4d %4d %6.1f%%\n", b, n[b], e[b], 100 * e[b] / n[b]}' logs/access.log | sort
+14:00   32    0    0.0%
+14:10   34    0    0.0%
+14:20   24   15   62.5%
+14:30   34   10   29.4%
+14:40   20    0    0.0%
+14:50   32    0    0.0%
+```
+
+The search endpoint failed 62.5% of the time from 14:20 to 14:30 and 29.4% in the next ten minutes, then recovered. For whom? `cut` takes the first space-separated field:
+
+```console
+$ awk '$9 == 502' logs/access.log | cut -d ' ' -f 1 | sort | uniq -c | sort -rn | head -n 3
+  10 198.51.100.3
+   4 203.0.113.7
+   4 203.0.113.12
+$ cut -d ' ' -f 1 logs/access.log | sort | uniq -c | sort -rn | head -n 3
+ 247 203.0.113.7
+ 246 198.51.100.3
+ 199 203.0.113.12
+```
+
+The clients with the most failures are the clients with the most traffic: the failures follow the endpoint and the time, not a client. Was this the first such hour? The older logs are rotated and compressed. `find` lists them, `-print0` and `xargs -0` pass the names separated by zero bytes, so that a name with a space or a newline survives, and `gzip -dcf` decompresses `.gz` files and passes plain ones through unchanged:
+
+```console
+$ find logs -name 'access.log*' -mtime -2
+logs/access.log.1.gz
+logs/access.log
+$ find logs -name 'access.log*' -print0 | xargs -0 gzip -dcf | awk '$9 >= 500 {print $9, substr($4, 1, 12)}' | tr -d '[' | sort | uniq -c
+   7 500 20/Oct/2026
+   3 500 21/Oct/2026
+   4 500 22/Oct/2026
+  25 502 22/Oct/2026
+```
+
+(`-mtime -2` selects files modified less than two days before the moment the command ran, so its output depends on the clock; the rest does not.) The 500s of the orders endpoint happen every day; the 502s are new. The application's own log is JSON, one object per line, and `jq` filters it by field instead of by position:
+
+```console
+$ jq -r 'select(.level == "error") | [.ts, .svc, .msg] | @tsv' logs/app.jsonl
+2026-10-22T14:20:09Z	search	upstream timeout
+2026-10-22T14:21:40Z	search	upstream timeout
+2026-10-22T14:27:13Z	orders	db deadlock, retrying
+$ jq -s 'map(select(.svc == "search" and .ms != null) | .ms) | max' logs/app.jsonl
+5000
+```
+
+Every stage was checked before the next was added, and each answer took one line. Two cautions apply to this style. `sort` orders lines by the rules of the current locale, so scripts that compare sorted output set `LC_ALL=C` for byte order, which is also faster. And field positions are a fragile contract: a user agent with a space in it is harmless here only because it comes after the fields we use, and a change of log format breaks every pipeline silently, which is one reason services log JSON.
+
+## Scripts
+
+A pipeline that will be run again belongs in a file. A script is a text file whose first line, the **shebang**, names its interpreter: when a file that starts with `#!` is executed, the kernel's `execve` runs the named interpreter with the file's path as an argument. `#!/usr/bin/env bash` finds `bash` through `PATH`, so the same script works where bash is not in `/bin`. `chmod +x` sets the execute bit.
+
+Four habits make a script safe to run unattended.
+
+- **Fail early.** `set -euo pipefail` at the top, checks of the arguments, and a usage message on standard error with a non-zero status.
+- **Functions with local variables.** A function is a named group of commands with its own `$1`, `$2` and `"$@"`; `local` keeps its variables from leaking into the rest of the script. Its status is the status of its last command.
+- **Clean up with `trap`.** `trap 'rm -f "$tmp"' EXIT` registers a command that bash runs when the script exits, whether it finished, failed under `-e`, or was stopped by Ctrl-C or `kill` (but not by `kill -9`, which no process can catch). Temporary files then never outlive the script.
+- **Idempotence.** Running the script twice should leave the same state as running it once, because a delivery step will be retried after a failure. `mkdir -p` succeeds if the directory exists, `ln -sfn` replaces a link, and appending a line is guarded by a test that it is not already there.
+
+```console
+$ bash naive.sh; bash naive.sh; echo "exit $?"; cat profile
+mkdir: releases: File exists
+exit 1
+export APP_ENV=staging
+export APP_ENV=staging
+$ rm -rf releases profile
+$ bash setup.sh; bash setup.sh; echo "exit $?"; cat profile; ls releases; readlink releases/current
+exit 0
+export APP_ENV=staging
+2026-10-22
+current
+2026-10-22
+```
+
+`naive.sh` appends `export APP_ENV=staging` to `profile` and then runs `mkdir releases`. The second run appended the line again and then failed. `setup.sh` does the same work idempotently:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+release=releases/2026-10-22
+mkdir -p "$release"
+ln -sfn "${release#releases/}" releases/current
+line='export APP_ENV=staging'
+grep -qxF "$line" profile 2>/dev/null || echo "$line" >> profile
+```
+
+`${release#releases/}` removes the prefix `releases/`, so the link `releases/current` points to `2026-10-22`, relative to its own directory. `grep -qxF` asks quietly (`-q`) whether a whole line (`-x`) equals the fixed string (`-F`, no regular expression); only if not is the line appended. A last habit concerns output files: write to a temporary file in the same directory and `mv` it into place. A rename within one file system is atomic ([files note](/notes/acos/files-and-io#where-the-bytes-live-inodes-and-directories)), so a reader sees the old file or the new one, never half of one. The Example section puts all of this into one script.
+
+## When to stop writing shell
+
+The shell is the best language for starting programs and connecting them. It is a poor language for most other things: its only data types are strings and arrays of strings, its arithmetic is integer-only, its error handling has the holes shown above, and its code is hard to test. Google's style guide puts the limit plainly: if a script is longer than about 100 lines or has non-trivial control flow, rewrite it in a structured language ([Google Shell Style Guide](#references)). Other signs that the time has come:
+
+- the data has structure beyond lines and fields: nested JSON, CSV with quoted commas, dates to compute with;
+- the logic needs data structures: maps of lists, records with several fields;
+- the script needs tests, or error messages with context;
+- it must run on Windows, or on systems with different versions of the tools.
+
+The same report of server errors in Python, with the standard library only:
+
+```python
+import gzip
+import re
+import sys
+from collections import Counter
+from pathlib import Path
+
+LINE = re.compile(r'"(?P<method>\S+) (?P<path>\S+) [^"]*" (?P<status>\d{3}) ')
+counts = Counter()
+for log in sorted(Path(sys.argv[1]).glob("access.log*")):
+    opener = gzip.open if log.suffix == ".gz" else open
+    with opener(log, "rt") as f:
+        for line in f:
+            m = LINE.search(line)
+            if m and int(m["status"]) >= 500:
+                path = re.sub(r"/\d+", "/:id", m["path"].split("?")[0])
+                counts[f'{m["method"]} {path}'] += 1
+print(f"5xx responses: {counts.total()}")
+for endpoint, n in counts.most_common():
+    print(f"{n:4} {endpoint}")
+```
+
+```console
+$ python3 -I errors.py logs
+5xx responses: 39
+  25 GET /api/search
+  14 POST /api/orders
+```
+
+It is longer than the pipeline, but it parses the request line with a regular expression instead of trusting field positions, it fails with a traceback that names the file and the line when a compressed log is truncated, and each part can be tested with the tools of the [testing note](/notes/python/testing). A practical rule: explore in the shell, keep one-line pipelines and short glue scripts in the shell, and move to Python when a script needs to grow.
+
+<aside class="callout"><strong>Check yourself.</strong> (1) `dir="My Files"; rm -r $dir/tmp` — what does `rm` receive, and what could go wrong? (2) What do `cmd 2>&1 | less` and `cmd | less 2>&1` send to `less`? (3) A script under `set -euo pipefail` contains `n=$(ls *.log | wc -l)`. In which case does it stop, and how would you count the files instead? (4) Why is `cd` a builtin, and why does `(cd /tmp; ls)` not change the directory of the shell you typed it in?<details><summary>Answers</summary>(1) Two words, `My` and `Files/tmp`: it tries to remove a directory `My` and `Files/tmp` relative to the current directory, which may exist and be the wrong thing. Write `rm -r "$dir/tmp"`. (2) The first sends both standard output and standard error into the pipe, because `2>&1` is applied in `cmd` after the pipe has become its descriptor 1. The second sends only standard output; the `2>&1` applies to `less`. (3) When there is no `.log` file: the unmatched pattern stays as the literal word `*.log`, `ls` fails, and `pipefail` with `-e` stops the script. Use an array: `shopt -s nullglob; logs=(*.log); n=${#logs[@]}`. (4) The current directory belongs to the process; a child that changed its own and exited would leave the shell unchanged. The parentheses run their commands in a subshell, a forked copy of the shell, so the `cd` happens in the copy.</details></aside>
+
+## What changed
+
+| | Commands by hand | A plain script | A strict script | Python |
+| --- | --- | --- | --- | --- |
+| Repeatable | no | yes | yes | yes |
+| A failed step stops the rest | when someone notices | no | yes, with known holes | yes, an exception |
+| Unset variables | visible to the person | silently empty | an error | an error |
+| Data it handles well | anything a person reads | lines and fields | lines and fields | any structure |
+| Safe to rerun | depends on the person | rarely | if written idempotently | if written idempotently |
+| Testable | no | barely | barely | yes |
+
+## Limitations
+
+- **Portability.** Bash is not POSIX `sh`: `[[`, arrays, `PIPESTATUS`, `<(…)` and `$'…'` do not exist in `dash`, which runs `/bin/sh` on Debian and Ubuntu. GNU and BSD tools differ in flags: `sed -i` takes a mandatory suffix argument on macOS, `xargs` without `-r` runs its command once on empty input with GNU and not at all with BSD, and `find -printf` exists only in GNU.
+- **macOS ships bash 3.2**, from 2006, for licensing reasons; associative arrays (`declare -A`), `mapfile` and `${var,,}` need bash 4 or later. The examples here avoid them.
+- **Strict mode has holes**, shown above: `-e` is ignored in conditions and in functions called from them, `local` hides statuses, and `pipefail` turns `SIGPIPE` and "no match" into failures.
+- **Text pipelines trust formats.** A field moving one position, a locale that changes sort order, or a value containing a separator breaks a pipeline without an error.
+- **Secrets leak through the shell easily.** Command-line arguments are visible to other users in `ps`, `set -x` prints expanded variables into logs, and the history file records what was typed. Pass secrets in files or in the environment of a single command, never as arguments.
+
+## What you should remember
+
+- The shell reads a line, splits and expands it into words, and runs the first word as a builtin or as a program through `fork`, `exec` and `wait`; `$?` holds the exit status.
+- Expansion runs in a fixed order: brace, tilde, parameter, arithmetic and command substitution, then word splitting and globbing of unquoted results, then quote removal. Double-quote every expansion.
+- Descriptors 0, 1 and 2 are set up by the shell before `exec`; redirections apply left to right, so `> file 2>&1` sends both streams to the file and `2>&1 > file` does not. A pipe joins descriptor 1 of one process to descriptor 0 of the next, and all stages run at once.
+- Exit status 0 is success; 127 is "command not found"; $128 + n$ is death by signal $n$, so 141 is `SIGPIPE`.
+- `set -e` stops on failure, `-u` on unset variables, `pipefail` on failures inside pipelines. Know the traps: `grep` finding nothing, `head` closing a pipe, `-e` ignored in conditions, `local` hiding statuses.
+- Build pipelines stage by stage and look at each output; `sort | uniq -c | sort -rn` is the frequency table; `find -print0 | xargs -0` survives any file name; `jq` is `awk` for JSON.
+- Scripts: a shebang, strict mode, functions with `local`, `trap … EXIT` for cleanup, idempotent steps, `mv` for atomic output. Move to Python past about 100 lines or when data has structure.
+
+## Example
+
+The script reports server errors per endpoint across current and rotated access logs. It is the pipeline of the worked example with the habits of the Scripts section around it.
+
+```bash
+#!/usr/bin/env bash
+# error-report.sh: count 5xx responses per endpoint in nginx access logs, current and rotated.
+# Usage: error-report.sh LOG_DIR [OUT_FILE]
+set -euo pipefail
+
+usage() {
+  echo "usage: ${0##*/} LOG_DIR [OUT_FILE]" >&2
+  exit 2
+}
+
+log_lines() {                     # every access log under $1, rotated ones decompressed
+  find "$1" -name 'access.log*' -type f -print0 | xargs -0 -r gzip -dcf
+}
+
+endpoint() {                      # "GET /api/orders/17?x=1  ->  GET /api/orders/:id
+  tr -d '"' | sed -E 's/[?].*//; s#/[0-9]+#/:id#g'
+}
+
+main() {
+  [[ $# -ge 1 && $# -le 2 ]] || usage
+  local dir=$1 out=${2:-}
+  [[ -d $dir ]] || { echo "no such directory: $dir" >&2; exit 1; }
+
+  tmp=$(mktemp "${out:-/tmp/error-report}.XXXXXX")   # beside OUT_FILE, so mv is a rename
+  trap 'rm -f "$tmp"' EXIT        # runs on success, on error and on Ctrl-C
+
+  log_lines "$dir" | awk '$9 >= 500 {print $6, $7}' | endpoint |
+    sort | uniq -c | sort -rn |
+    awk '{n += $1; s = s $0 "\n"} END {printf "5xx responses: %d\n%s", n, s}' > "$tmp"
+
+  if [[ -z $out ]]; then
+    cat "$tmp"
+  else
+    mv "$tmp" "$out"              # readers see the old report or the new one, never half
+  fi
+}
+
+main "$@"
+```
+
+```console
+$ ./error-report.sh
+usage: error-report.sh LOG_DIR [OUT_FILE]
+$ ./error-report.sh logs
+5xx responses: 39
+  25 GET /api/search
+  14 POST /api/orders
+$ ./error-report.sh logs report.txt && ls report.txt*
+report.txt
+$ ./error-report.sh empty
+5xx responses: 0
+$ ./error-report.sh nologs; echo "exit $?"
+no such directory: nologs
+exit 1
+$ ./error-report.sh bad report.txt; echo "exit $?"; ls report.txt* /tmp/error-report.* 2>&1; head -n 1 report.txt
+gzip: bad/access.log.1.gz: unexpected end of file
+gzip: bad/access.log.1.gz: uncompress failed
+exit 1
+ls: /tmp/error-report.*: No such file or directory
+report.txt
+5xx responses: 39
+```
+
+Reading it line by line:
+
+- The shebang finds bash through `PATH`; `set -euo pipefail` makes any failure, unset variable or failed stage of a pipeline end the script. The pipefail trap does not bite here: no stage closes its input early, and `awk` succeeds when it matches nothing.
+- `usage` writes to descriptor 2 with `>&2`, so that a caller who redirects the report to a file still sees the message, and exits with 2, the conventional status for wrong usage. `${0##*/}` strips the directory from the script's path.
+- `log_lines` finds the logs with `-type f -print0` and hands them to `gzip -dcf` through `xargs -0`. The `-r` stops GNU `xargs` from running `gzip` once with no file arguments when `find` finds nothing; BSD `xargs` already behaves that way. Here the stray run would be harmless, since GNU `xargs` gives the command `/dev/null` as standard input, but with a command that does something without arguments, such as `xargs ls -l`, which would list the current directory, it is not. The run on the directory `empty` shows the result: no logs, 0 errors.
+- `endpoint` is a function used as a stage of a pipeline: it reads its standard input and writes its standard output like any program.
+- In `main`, `[[ $# -ge 1 && $# -le 2 ]]` checks the number of arguments, and `${2:-}` gives an empty default, which `-u` would otherwise reject.
+- `mktemp` creates the temporary file next to the output file, `report.txt.XXXXXX` with the X's replaced, so that the final `mv` is a rename within one directory. Without an output file it goes to `/tmp`.
+- The `trap` removes the temporary file whatever happens. After `mv`, the file no longer exists under that name and `rm -f` does nothing.
+- The pipeline is the worked example's; its last `awk` adds up the counts and prints the total line before the table.
+- The last run shows the safety net working: a truncated rotated log makes `gzip` fail, `pipefail` passes the failure to the pipeline, `-e` ends the script with status 1, the trap deletes the temporary file, and the previous `report.txt` is untouched, still holding its 39.
+
+## Next
+
+Scripts like this one, the configuration of servers, and the code of the service itself are text files that change every day, often by several people at once. Before any of them can be built and deployed, they need a history: what exactly changed, when, by whom, and how two people's changes are combined. The [next note](/notes/devops/git) explains Git, the tool that keeps that history, from the objects it stores on disk to the branching workflows teams use.
+
+## References
+
+- C. Ramey, B. Fox. [*Bash Reference Manual*](https://www.gnu.org/software/bash/manual/bash.html). §3.1 (shell syntax and quoting), §3.5 (shell expansions, in order), §3.6 (redirections), §3.7.5 (exit status), §4.3.1 (the `set` builtin, `-e`, `-u`, `-o pipefail`).
+- The Open Group. [*POSIX.1-2024*, Shell Command Language](https://pubs.opengroup.org/onlinepubs/9799919799/utilities/V3_chap02.html). §2.6 (word expansions), §2.7 (redirection).
+- MIT. *The Missing Semester of Your CS Education*, 2026: [Course overview and the shell](https://missing.csail.mit.edu/2026/course-shell/), [Command-line environment](https://missing.csail.mit.edu/2026/command-line-environment/).
+- HSE University, Faculty of Computer Science. [«Инструменты промышленной разработки»](http://wiki.cs.hse.ru/Инструменты_промышленной_разработки) (Industrial development tools), 2025/26: lecture 1 (introduction and the shell), lecture 2 (shell scripting).
+- Google. [Shell Style Guide](https://google.github.io/styleguide/shellguide.html). "When to use shell".
+- [ShellCheck](https://www.shellcheck.net/), and its wiki entry [SC2086: double quote to prevent globbing and word splitting](https://www.shellcheck.net/wiki/SC2086).
+- G. Wooledge. [BashFAQ/105: why doesn't `set -e` do what I expected?](https://mywiki.wooledge.org/BashFAQ/105) and [BashPitfalls](https://mywiki.wooledge.org/BashPitfalls).
+- M. D. McIlroy, E. N. Pinson, B. A. Tague. [UNIX time-sharing system: foreword](https://doi.org/10.1002/j.1538-7305.1978.tb02135.x). *Bell System Technical Journal*, 57(6), 1899–1904, 1978.
+- A. V. Aho, B. W. Kernighan, P. J. Weinberger. *The AWK Programming Language*, 2nd ed. Addison-Wesley, 2023.
+- B. W. Kernighan, R. Pike. *The UNIX Programming Environment*. Prentice Hall, 1984. Ch. 3 (using the shell), ch. 4 (filters).
+- [jq 1.7 manual](https://jqlang.org/manual/v1.7/).
+- nginx documentation: [log_format](https://nginx.org/en/docs/http/ngx_http_log_module.html#log_format) (the combined format).
+- Linux manual pages: [pipe(7)](https://man7.org/linux/man-pages/man7/pipe.7.html) (pipe capacity, `SIGPIPE`), [execve(2)](https://man7.org/linux/man-pages/man2/execve.2.html) (interpreter scripts), [rename(2)](https://man7.org/linux/man-pages/man2/rename.2.html) (atomic replacement).

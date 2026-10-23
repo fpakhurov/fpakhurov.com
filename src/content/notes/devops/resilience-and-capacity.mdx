@@ -1,0 +1,369 @@
+---
+title: Resilience and capacity
+section: Reliability
+description: "How a service survives slow and failing dependencies and heavy load: timeouts and deadlines, retries with backoff and jitter, retry amplification, circuit breakers, bulkheads, rate limiting, load shedding, backpressure and idempotency keys, Little's law, queueing delay against utilization, and capacity planning."
+course: devops
+order: 14
+status: published
+tags: [sre, resilience, timeouts, retries, backoff, jitter, circuit-breaker, load-shedding, backpressure, idempotency, queueing, littles-law, capacity-planning, load-testing]
+prerequisites: ["SLOs, error budgets and alerting", Networking for services, Discrete distributions]
+---
+
+import RetryAmplification from '../../../components/figures/resilience-and-capacity/RetryAmplification.astro';
+import Backoff from '../../../components/figures/resilience-and-capacity/Backoff.astro';
+import LatencyUtilization from '../../../components/figures/resilience-and-capacity/LatencyUtilization.astro';
+
+The [previous note](/notes/devops/slos-and-alerting) showed that a service's availability is at most the product of the availabilities of its hard dependencies, and that the error budget is spent by every failure users see. This note is about keeping failures small: making sure that a slow or broken dependency costs a few failed requests rather than the whole service, and that heavy load produces quick refusals rather than a queue that never drains. The tools are a short list of patterns, timeouts, retries, circuit breakers, bulkheads, load shedding and idempotency, and one piece of mathematics, queueing, which says how much load a service can take before its latency explodes.
+
+**Setup.** Python examples ran on CPython 3.14.7 (macOS, Apple M1) with only the standard library; their output is pasted as printed. The Istio configuration in the [Example](#example) was written against the Istio documentation of October 2026 and not executed.
+
+## Baseline: call and wait
+
+The simplest client calls a dependency and waits for the answer. The checkout service calls the payment service, and the payment service calls the bank:
+
+```python
+response = requests.post("https://payments.example.com/charge", json=order)   # no timeout given
+```
+
+Most HTTP clients, Python's `requests` among them, wait forever by default when no timeout is given. As long as everything is healthy, this works. Then the bank becomes slow, not down, just slow, answering in 30 s instead of 300 ms:
+
+1. Each checkout request now holds a worker thread and a connection for 30 s instead of 0.3 s.
+2. At 200 checkouts per second, the number of requests in flight grows from 60 to 6,000 (the [section on Little's law](#littles-law) makes this exact). The worker pool of, say, 256 threads fills within seconds.
+3. New checkouts queue behind them, then time out at the gateway. Requests that have nothing to do with payments, such as browsing the catalogue, share the same threads and fail too.
+4. Users and the gateway retry. The load on the already saturated service doubles.
+
+One slow dependency has taken down a service that was itself healthy. This is a **cascading failure**, and almost every pattern in this note exists to prevent one ([Beyer et al., 2016, ch. 22](#references)).
+
+## How distributed calls fail
+
+A call over the network can fail in more ways than a local function call ([Nygard, 2018, ch. 4](#references)):
+
+- **Fast failure.** Connection refused, a 503, a reset: the caller learns at once. This is the easy case.
+- **Slow failure.** No answer, or an answer after a long time: a hung process, a lost packet that TCP retransmits after a timeout of a second or more ([the ACOS course](/notes/acos/networking#tcp-a-reliable-byte-stream)), a database waiting on a lock. The caller learns nothing and keeps waiting, holding resources. Slow is worse than down.
+- **Partial and gray failure.** One replica of ten is broken, or a server passes its health check while failing real requests ([Huang et al., 2017](#references)). Averages look fine; some users see errors.
+- **Overload.** The dependency works but has more requests than capacity, and every additional request makes the latency of all of them worse.
+- **Ambiguous failure.** A timeout says nothing about whether the request was carried out. The payment service may have charged the card and lost the response. Retrying such a call is only safe if it is idempotent, a point the section on idempotency keys returns to.
+
+<aside class="callout"><strong>Key idea.</strong> Bound everything that can grow, and make repetition safe. Bound **time** with timeouts and propagated deadlines, so a slow dependency cannot hold resources forever. Bound **attempts** with retry limits, backoff and budgets, so retries cannot multiply load. Bound **concurrency** with bulkheads and circuit breakers, so one dependency cannot take all the workers. Bound **load** with rate limits, load shedding and backpressure, so overload produces fast refusals rather than an endless queue. And make retried operations **idempotent**, so that doing them twice is harmless. Queueing theory then says how much headroom to keep: latency grows like $1/(1-\rho)$ with utilization $\rho$.</aside>
+
+## Timeouts and deadlines
+
+A **timeout** bounds how long a caller waits for one call. Choose it from the dependency's latency distribution: a little above its high percentile, so that a healthy dependency almost never hits it. If the payment service has a p99.9 of 180 ms, a timeout of 250 to 300 ms fails fewer than one healthy call in a thousand and releases resources quickly when something is wrong. A timeout of 30 s protects against nothing.
+
+Timeouts on separate calls do not compose. A **deadline** is an absolute point in time by which the whole request must be answered, and **deadline propagation** passes what is left of it to every downstream call. The SRE book's example: a request with a 30 s deadline spends 7 s in server A, so A gives B a deadline of 23 s; B spends 4 s and gives C 19 s ([Beyer et al., 2016, ch. 22](#references)). With the checkout's own numbers:
+
+1. The gateway accepts `POST /checkout` with a deadline of 2 s from now.
+2. After 40 ms of its own work it calls the checkout service with 1.96 s left.
+3. The checkout service spends 300 ms on stock and pricing, then calls payments with at most 1.66 s left, minus a margin for sending the answer back over the network (the [latency budget per hop](/notes/devops/networking-for-services#latency-budget-per-hop) of the networking note counts those round trips).
+4. If payments sees that less time remains than its fastest possible answer, it fails at once instead of starting work that nobody will wait for.
+
+Without propagation, a payment service with a hard-coded 5 s timeout of its own keeps working, and keeps calling the bank, for three seconds after the user has been told the checkout failed. gRPC propagates deadlines automatically in the `grpc-timeout` header (`grpc-timeout: 1660m` is 1,660 milliseconds); over plain HTTP, services pass the remaining time or the absolute deadline in a header of their own.
+
+## Retries, backoff and jitter
+
+Many failures are transient: a replica restarting, a dropped connection, a brief overload. Retrying turns them into successes. Three rules make retries help rather than hurt.
+
+**Retry only what can succeed and is safe to repeat.** A connection refused, a 503 or a timeout may succeed on a second try; a `400 Bad Request` or a `403 Forbidden` will not. A request that changes state (a payment, an order) may be retried only if it is idempotent.
+
+**Wait before retrying, exponentially longer each time.** With a base delay $d$ and a cap $c$, the $k$-th retry waits
+
+$$
+\text{delay}_k = \min(c,\ d \cdot 2^{k}), \qquad k = 0, 1, 2, \dots
+$$
+
+With $d = 100$ ms the delays are 0.1, 0.2, 0.4, 0.8 and 1.6 s, and the attempts happen at 0.1, 0.3, 0.7, 1.5 and 3.1 s after the first failure. Backing off gives a struggling dependency time to recover instead of hitting it again at once.
+
+**Add jitter.** If a thousand clients failed at the same moment, say because the dependency restarted, plain exponential backoff makes them all retry at exactly the same moments: a thousand requests at 0.1 s, a thousand at 0.3 s, and so on. Each synchronized wave can knock the recovering service over again. **Full jitter** draws each delay uniformly between zero and the exponential value ([Brooker, 2015](#references)):
+
+$$
+\text{delay}_k \sim \mathcal{U}\bigl(0,\ \min(c,\ d \cdot 2^{k})\bigr).
+$$
+
+<Backoff />
+
+In the figure, 1,000 clients each make five retries after a failure at time 0. Without jitter, every retry of every client falls into the same 20 ms slot: five spikes of 1,000. With full jitter, the same 5,000 retries spread over 2.9 s, and the busiest 20 ms holds 313 of them. The total work is the same; the peak load is a third. The SRE book puts it as a rule: always use randomized exponential backoff ([Beyer et al., 2016, ch. 22](#references)). TCP's own retransmission timer has backed off exponentially since the 1980s for the same reason.
+
+### Retry amplification
+
+Retries at one layer are reasonable. Retries at every layer multiply. Let a request pass through $L$ layers that each retry, and let each layer make up to $a$ attempts (the first try and $a - 1$ retries) at the layer below. If the bottom fails completely, every attempt at every layer fails, so each call at one layer becomes $a$ calls at the next:
+
+$$
+\boxed{\text{calls at the bottom} = a^{L}}
+$$
+
+The checkout path has three retrying layers, the API, the orders service and the inventory service, in front of the database. With $a = 3$:
+
+<RetryAmplification />
+
+A script that simulates the call chain against a database that always fails, counting the calls each layer receives, printed:
+
+```text
+3 attempts per layer, database down: {'api': 1, 'orders': 3, 'inventory': 9, 'db': 27}
+4 attempts per layer, database down: {'api': 1, 'orders': 4, 'inventory': 16, 'db': 64}
+```
+
+One user click becomes 27 database calls, and with four attempts per layer, the figure the SRE book uses, 64 ([Beyer et al., 2016, ch. 22](#references)). Worse, the multiplication happens exactly when the database is weakest. If each database call fails independently with probability $p$, one call at a layer makes $1 + p + \dots + p^{a-1}$ attempts on average, and a call fails only if all its attempts fail, with probability $p^a$. Carried up three layers with $a = 3$:
+
+| Database failure probability $p$ | 0.01 | 0.1 | 0.5 | 0.9 | 1.0 |
+| --- | --- | --- | --- | --- | --- |
+| Database calls per user request | 1.01 | 1.11 | 2.00 | 9.42 | 27.00 |
+
+When failures are rare, retries are almost free. When the database is overloaded and failing nine calls in ten, retries multiply its load by more than nine, which guarantees that it stays overloaded. The fixes:
+
+1. **Retry at one layer only**, usually the one closest to the failing dependency or the one closest to the user, and have the others fail fast.
+2. **Use a retry budget.** Allow retries only up to a fraction of normal traffic, say 10 % per client or per process; the SRE book's example is at most 60 retries a minute per process. With a 10 % budget per layer, the worst-case amplification over three layers is $1.1^3 = 1.33$ instead of 27.
+3. **Do not retry on overload.** A response that says "overloaded, do not retry" (a 429, or a 503 with `Retry-After`) should stop retries at every layer above.
+
+## Circuit breakers
+
+If a dependency is failing, calling it at all wastes the caller's resources and adds load to the dependency. A **circuit breaker** wraps calls to one dependency and has three states ([Nygard, 2018, ch. 5](#references)):
+
+- **Closed:** calls pass through; failures are counted over a sliding window.
+- **Open:** after failures exceed a threshold (for example, more than 50 % of the last 20 calls), calls fail immediately without being sent, for a cool-down period such as 30 s.
+- **Half-open:** after the cool-down, a few trial calls are let through. If they succeed, the breaker closes; if not, it opens again.
+
+While the breaker is open, the caller does something cheaper than waiting: returns a cached answer, a default, or a fast error. A service mesh offers a per-host variant, **outlier detection**, which removes one bad replica from the load-balancing pool after a run of errors, as the Example shows.
+
+## Bulkheads
+
+A ship is divided into watertight compartments, **bulkheads**, so that one hole floods one compartment. In a service the compartments are separate resource pools per dependency. The checkout service gives payments a pool of 20 connections and recommendations a separate pool of 10. When recommendations hang, its 10 connections fill and calls to it fail fast, while the 20 for payments are untouched. Without bulkheads, the slowest dependency eventually holds every thread in the process, which is the baseline's failure.
+
+## Rate limiting and load shedding
+
+**Rate limiting** caps how many requests a client may send. The common algorithm is the **token bucket**: a bucket holds up to $b$ tokens and is refilled at $r$ tokens per second; each request takes a token, and a request that finds the bucket empty is rejected with `429 Too Many Requests`. With $r = 100$/s and $b = 20$, a client may send a burst of 20 at once and then 100 per second; a burst of 50 at once gets 20 through and 30 rejected.
+
+**Load shedding** protects the server rather than fairness between clients. When a server is beyond its capacity, it is better to reject some requests quickly than to accept all of them and serve all of them slowly, because a quick rejection costs almost nothing while a slow request holds resources and probably times out anyway. A server sheds load when its in-flight requests or its queue exceed a limit, answering `503` at once, and preferably sheds by priority: background jobs and prefetching before user checkouts ([Beyer et al., 2016, ch. 21](#references)).
+
+Clients can shed too. In **adaptive throttling**, each client tracks over the last two minutes how many requests it sent and how many the backend accepted, and drops new requests locally with probability
+
+$$
+\max\left(0,\ \frac{\text{requests} - K \cdot \text{accepts}}{\text{requests} + 1}\right),
+$$
+
+with $K = 2$ in the SRE book's description ([Beyer et al., 2016, ch. 21](#references)). If a client sent 1,000 requests and only 400 were accepted, it rejects $(1{,}000 - 800)/1{,}001 \approx 20\,\%$ of new requests itself, without sending them; as long as the backend accepts at least half, it sends everything.
+
+## Backpressure
+
+**Backpressure** is a consumer telling its producer to slow down. Its opposite, an unbounded queue between them, is a hidden failure: when the producer is faster, the queue grows without limit, and the system converts overload into ever-growing latency and memory until something crashes. The remedy is to make every queue **bounded** and to decide what happens when it is full: block the producer (TCP does this with its receive window, Python's `queue.Queue(maxsize=...)` with `put`), reject new work, or drop the oldest items when only fresh data matters. The SRE book recommends queues that are small relative to the thread pool, 50 % of it or less, so that a full queue is a signal rather than a buffer that hides the problem for minutes ([Beyer et al., 2016, ch. 22](#references)).
+
+## Idempotency keys
+
+A retried payment that charges a card twice is worse than a failed one. An operation is **idempotent** if doing it twice has the same effect as doing it once: `PUT` and `DELETE` are idempotent by definition in HTTP, `POST` is not. An **idempotency key** makes a `POST` safe to retry. The client generates a unique key per logical operation and sends it with every attempt; the server records the key with the result and, for a repeated key, returns the recorded result instead of acting again. The header is being standardized as an IETF Internet-Draft ([Jena and Dalal, 2026](#references)):
+
+```text
+POST /charge HTTP/1.1
+Host: payments.example.com
+Idempotency-Key: "8e03978e-40d5-43e8-bc93-6894a57f9324"
+Content-Type: application/json
+
+{"order_id": "o-1042", "amount_cents": 4599}
+```
+
+1. The first attempt reaches the server, which stores the key as "in progress", charges the card, stores the result under the key and sends the answer. The answer is lost in the network.
+2. The client times out and retries with the same key. The server finds the key with a stored result and returns that result, `201 Created` with the same charge, without charging again.
+3. If the retry arrives while the first attempt is still running, the draft says to answer `409 Conflict`; if the same key arrives with a different body, `422 Unprocessable Content`.
+
+The key must be stored atomically with the effect, in the same database transaction where possible, and kept at least as long as clients may retry, typically a day.
+
+<aside class="callout"><strong>Check yourself.</strong> (1) A mobile app retries 3 times (4 attempts), the gateway makes up to 2 attempts, and the API makes up to 3 attempts at a database that is down. How many database calls does one tap cause? (2) Why does full jitter not reduce the total number of retries, and what does it reduce? (3) A user request has a 1 s deadline. The gateway spends 50 ms, the API 200 ms before calling a service with a fixed 2 s timeout. What goes wrong, and what should the API send? (4) Why is a 30 s timeout on a call whose p99 is 100 ms almost as bad as no timeout?<details><summary>Answers</summary>(1) $4 \times 2 \times 3 = 24$. (2) Each client still makes the same number of attempts; jitter spreads them in time, so the peak load on the recovering service falls (from 1,000 to 313 per 20 ms in the figure). (3) The service may work for up to 2 s, 1.25 s after the user's deadline has passed, wasting its own and its dependencies' capacity; the API should pass the remaining 750 ms, minus a margin, as the deadline. (4) When the dependency becomes slow, every call holds a thread and a connection for up to 30 s, so by Little's law the number of calls in flight grows 300-fold and the caller's pools fill long before the timeout releases anything.</details></aside>
+
+## Capacity and queueing
+
+Every pattern above handles overload once it happens. Capacity planning tries to keep it from happening, and it rests on two results from queueing theory.
+
+### Little's law
+
+Let $\lambda$ be the average rate at which requests arrive (per second), $W$ the average time a request spends in the system, and $L$ the average number of requests in the system at once. Then
+
+$$
+\boxed{L = \lambda\,W}
+$$
+
+for any system in a steady state, whatever the distribution of arrivals and service times ([Little, 1961](#references)). The [first note](/notes/devops/what-devops-is#how-much-work-is-in-flight-littles-law) derived it for changes in a delivery pipeline; for requests in a server the argument is the same. Over a long time $\tau$, the area under the curve of $N(t)$, the number of requests inside at time $t$, counted by time is $\int_0^\tau N(t)\,dt = L\,\tau$; counted by request it is $\sum_i W_i$, each of the $n = \lambda\tau$ requests contributing a strip of height 1 for as long as it is inside (up to the few that straddle the ends). Equating the two, $L\,\tau = \lambda\tau \cdot W$.
+
+**Applied.**
+
+- **Concurrency from rate and latency.** The checkout service receives 200 requests per second, each taking 250 ms on average: $L = 200 \times 0.25 = 50$ requests in flight. A pool of 64 workers suffices. If a slow dependency raises the average to 2 s, $L = 400$, and the same pool overflows: this is the arithmetic of the baseline.
+- **Throughput from a pool.** A pool of 20 database connections, each held for 40 ms per query, can complete at most $\lambda = L / W = 20 / 0.04 = 500$ queries per second. At 600 per second the extra 100 per second queue, whatever the database's CPU says.
+
+### Latency against utilization
+
+How long do requests wait as a server gets busier? The simplest model, **M/M/1**, has requests arriving as a Poisson process at rate $\lambda$ ([discrete distributions](/notes/probability/discrete-distributions#poisson)), one server, and exponentially distributed service times with rate $\mu$, a mean of $S = 1/\mu$. The **utilization** is $\rho = \lambda/\mu$, the fraction of time the server is busy; the model needs $\rho < 1$.
+
+*Optional depth: the derivation of the M/M/1 formula. The rest of the note uses only its result.* The number of requests in the system is a [Markov chain](/notes/probability/markov-chains#stationary-distributions) that moves up by one at rate $\lambda$ and down by one at rate $\mu$. In the stationary distribution $p_n$, the flow from state $n$ to $n+1$ equals the flow back: $\lambda p_n = \mu p_{n+1}$, so $p_{n+1} = \rho\,p_n$ and $p_n = \rho^n p_0$. The probabilities sum to 1, $p_0 \sum_{n \ge 0} \rho^n = p_0/(1-\rho) = 1$, so $p_n = (1-\rho)\rho^n$. The mean number in the system is
+$$
+L = \sum_{n \ge 0} n(1-\rho)\rho^n = (1-\rho)\,\frac{\rho}{(1-\rho)^2} = \frac{\rho}{1-\rho},
+$$
+using $\sum_n n\rho^n = \rho/(1-\rho)^2$. Little's law gives the mean time in the system, $W = L/\lambda$:
+
+$$
+\boxed{W = \frac{\rho}{\lambda(1-\rho)} = \frac{S}{1-\rho}}
+$$
+
+The time in the system is in fact exponentially distributed with rate $\mu - \lambda$, so its p99 is $\ln(100)\,W \approx 4.6\,W$.
+
+A simulation of 2 million requests per row, with $S = 10$ ms, against the formula:
+
+```text
+ rho   W formula   W simulated   p99 formula   p99 simulated
+ 0.5     20.0 ms       20.0 ms       92.1 ms        91.8 ms
+ 0.7     33.3 ms       33.2 ms      153.5 ms       152.0 ms
+ 0.8     50.0 ms       49.7 ms      230.3 ms       226.4 ms
+ 0.9    100.0 ms       99.7 ms      460.5 ms       457.9 ms
+0.95    200.0 ms      200.1 ms      921.0 ms       910.5 ms
+```
+
+<LatencyUtilization />
+
+At half load a request takes twice its service time; at 80 %, five times; at 90 %, ten; at 95 %, twenty. The p99 at 80 % is 230 ms for 10 ms of work.
+
+### Why to run below about 70–80 %
+
+Four reasons, each one enough on its own, put the practical limit for a latency-sensitive service well below 100 %:
+
+1. **The curve is steep at the top.** The slope is $dW/d\rho = S/(1-\rho)^2$: $4S$ per unit of $\rho$ at 50 %, $25S$ at 80 %, $100S$ at 90 %. At 80 %, a 10 % rise in traffic (to 88 %) raises the mean from $5S$ to $8.3S$; at 50 %, the same rise (to 55 %) moves it from $2S$ to $2.2S$.
+2. **Real traffic is burstier than Poisson, and real service times vary more than exponential ones.** Both make the queue longer at the same utilization; for a single server with arbitrary service times, the mean wait grows with the squared coefficient of variation of the service time ([Harchol-Balter, 2013](#references)).
+3. **Failures move load.** With $n$ replicas at utilization $u$, losing one puts the rest at $u \cdot n/(n-1)$. Four replicas at 60 % go to 80 % when one fails; at 75 % they go to 100 %.
+4. **Autoscaling is slow.** New pods take tens of seconds to minutes to start and warm up; the headroom must carry the load until they do.
+
+Many servers sharing one queue do better than one: pooling lets busy and idle servers balance, so large pools can run hotter at the same latency. The shape of the curve, flat and then vertical, is the same.
+
+## Load testing and capacity planning
+
+**Load testing** measures what the formulas only model: the throughput at which one replica stops meeting its latency objective. Tools such as k6, Locust, Gatling and wrk2 generate controlled traffic. Two details decide whether the result means anything:
+
+- **Open against closed load.** A closed-loop generator sends the next request only after the previous one returns, so when the service slows down, the generator slows down too and the measured latency looks better than users would see. An open-loop generator sends at a fixed rate regardless, like real users. Measuring with a closed loop and correcting nothing is called **coordinated omission** ([Tene, wrk2](#references)).
+- **Ramp, and find the knee.** Increase the rate step by step and record the p99 at each step. The **knee** is where latency starts rising steeply; the capacity of a replica is the highest rate at which the p99 still meets the SLO.
+
+**Capacity planning** turns that measurement into a number of replicas. Worked example:
+
+1. The forecast peak for the next quarter is 3,000 requests per second.
+2. A load test shows that one replica meets the latency SLO up to 400 requests per second.
+3. Plan to run at no more than 70 % of that at peak: 280 per replica, so $3{,}000 / 280 = 10.7$, rounded up to 11 replicas.
+4. The service runs in three zones and must survive the loss of one. The two remaining zones must carry the whole load, so the total is $11 \times 3/2 = 16.5$, rounded up to 18 so that every zone gets the same number, six.
+5. Check: with one zone lost, 12 replicas at 280 per second carry 3,360 per second, above the peak. With all zones up, the replicas run at $3{,}000 / (18 \times 400) = 42\,\%$ of their tested capacity.
+
+Repeat the test after every significant change; capacity is a property of the code as well as of the hardware.
+
+## Graceful degradation
+
+When capacity or a dependency is lost anyway, a service can still serve something useful by doing less ([Beyer et al., 2016, ch. 22](#references)):
+
+- serve **stale data**: product prices from a cache a few minutes old rather than an error;
+- drop **optional features**: show a product page without recommendations or reviews;
+- switch to a **read-only mode**: browsing works, ordering is paused with a clear message;
+- lower **quality**: smaller images, fewer search results, cheaper ranking.
+
+Each degraded mode is a code path that is rarely used, and code paths that are never used tend not to work when they are finally needed. Switch degradations behind feature flags and exercise them regularly, for example in a scheduled test or the chaos experiments of the [next note](/notes/devops/incidents-and-security).
+
+## What changed
+
+| | Call and wait (the baseline) | Bounded calls, shed load, planned capacity |
+| --- | --- | --- |
+| A slow dependency | holds every thread; the whole service fails | a timeout releases resources; the deadline stops wasted work downstream |
+| A transient failure | the request fails | a retry with jittered backoff succeeds |
+| A dead dependency | 27 database calls per click from retries at three layers | one layer retries within a budget; the breaker opens and fails fast |
+| One bad dependency among several | takes all the workers | a bulkhead limits it to its own pool |
+| More traffic than capacity | everything slows, then times out | the excess is rejected at once; important work is served first |
+| A retried payment | may charge twice | the idempotency key returns the first result |
+| How many replicas | guessed | load-tested capacity, a 70 % target, and enough to lose a zone |
+
+## Limitations
+
+- **The patterns interact.** Timeouts that are too short cause retries; retries trip circuit breakers; a breaker that opens moves load to the remaining replicas, which may then fail. Each setting needs to be chosen with the others and tested under failure.
+- **M/M/1 is a model.** Its exact numbers hold only for Poisson arrivals and exponential service; real systems have caches, garbage-collection pauses, multiple resources and bursty traffic. Its shape, latency rising like $1/(1-\rho)$, is what transfers.
+- **Load tests are not production.** Synthetic traffic has a different mix of requests, a warmer cache, and none of the slow clients of real users. Production capacity should be confirmed with real-traffic metrics, for example by gradually concentrating traffic on fewer replicas.
+- **Idempotency needs storage.** Keys must be stored durably, atomically with the effect, and expired; a store that loses keys silently reintroduces double effects.
+- **Not covered:** hedged requests, which send a second copy of a slow request to another replica to cut the tail ([Dean and Barroso, 2013](#references)); consistency trade-offs during partitions; multi-region failover.
+
+## What you should remember
+
+- Slow is worse than down: a call without a timeout can take down a healthy caller. Set timeouts from the dependency's high percentiles, and propagate deadlines.
+- Retry only transient failures of safe operations, with exponential backoff and full jitter: $\text{delay}_k \sim \mathcal{U}(0, \min(c, d \cdot 2^k))$.
+- Retries multiply across layers: $a$ attempts at each of $L$ layers give $a^L$ calls at the bottom, 27 for three layers of three. Retry at one layer, within a budget.
+- Circuit breakers fail fast while a dependency is broken; bulkheads keep one dependency from taking every resource.
+- Rate limits protect fairness, load shedding protects the server: a fast `503` beats a slow timeout. Bound every queue.
+- Idempotency keys make retried `POST` requests safe.
+- Little's law: $L = \lambda W$, for any stable system.
+- M/M/1: $W = S/(1-\rho)$; twice the service time at 50 %, five times at 80 %, ten at 90 %. Plan for 70–80 % at peak, and for losing a zone.
+
+## Example
+
+The checkout service calls the payment service through a **service mesh**: a proxy (Envoy, in Istio's case) runs next to every pod and handles its traffic, so that timeouts, retries, connection limits and outlier detection are configured once, declaratively, instead of in every client library. The two Istio resources below set those policies for calls to `payments`. They were written against the Istio documentation (API version `networking.istio.io/v1`, October 2026) and checked to be valid YAML; they were not applied to a cluster.
+
+```yaml
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: payments
+  namespace: shop
+spec:
+  hosts:
+    - payments.shop.svc.cluster.local
+  http:
+    - timeout: 2s
+      retries:
+        attempts: 2
+        perTryTimeout: 600ms
+        retryOn: connect-failure,refused-stream,503
+      route:
+        - destination:
+            host: payments.shop.svc.cluster.local
+            port:
+              number: 8080
+---
+apiVersion: networking.istio.io/v1
+kind: DestinationRule
+metadata:
+  name: payments
+  namespace: shop
+spec:
+  host: payments.shop.svc.cluster.local
+  trafficPolicy:
+    connectionPool:
+      tcp:
+        maxConnections: 100
+        connectTimeout: 250ms
+      http:
+        http1MaxPendingRequests: 50
+        http2MaxRequests: 200
+        maxRetries: 20
+    outlierDetection:
+      consecutive5xxErrors: 5
+      interval: 10s
+      baseEjectionTime: 30s
+      maxEjectionPercent: 50
+```
+
+Read line by line:
+
+- `VirtualService` describes how requests to a host are routed; `hosts` names the Kubernetes service it applies to, and the `route` sends everything to its port 8080.
+- `timeout: 2s` is the overall budget for one request from the caller's proxy, including every retry. It bounds what the checkout service can lose to payments.
+- `retries.attempts: 2` means up to two retries, three attempts in all; in Istio, `attempts` counts retries, not tries. Envoy waits between them with jittered exponential backoff starting at 25 ms by default.
+- `perTryTimeout: 600ms` bounds each attempt. Three attempts of 600 ms plus the backoff fit inside the 2 s overall timeout; a per-try timeout as long as the overall one would leave no time for a retry.
+- `retryOn: connect-failure,refused-stream,503` retries when no connection could be made, when the server refused the stream before processing it, and on `503`. The first two are safe for any request because the payment service never saw it. The proxy does not check whether a request is idempotent, so retrying `503` on `POST /charge` is safe only because the checkout service sends an idempotency key.
+- Only this one layer retries. The checkout code itself must then not retry calls to payments, or the attempts multiply as in the amplification section.
+- `DestinationRule` sets policies for the traffic once it is routed to the host. `connectionPool` is a bulkhead. Envoy applies its limits in each calling proxy to the destination service as a whole, not per payments pod: at most 100 connections, a connect timeout of 250 ms (the default is 10 s), at most 50 requests queued while waiting for a connection, and at most 200 active requests (the field is named `http2MaxRequests`, but the documentation describes it simply as the maximum number of active requests to a destination). Requests beyond these limits fail at once with a `503` from the proxy instead of queueing.
+- `maxRetries: 20` caps the number of retries in flight to the whole payments service at once, across all of this client's requests: a retry budget in absolute numbers, so that a broken payments service receives at most 20 extra concurrent requests from retries.
+- `outlierDetection` is a per-replica circuit breaker: a payments pod that returns 5 consecutive `5xx` errors, checked every 10 s, is removed from load balancing for 30 s (longer each time it is ejected again), but never more than half of the pods at once, so that a service-wide problem does not eject everything.
+
+## Next
+
+The patterns in this note keep most failures small, and capacity planning keeps most overloads from happening. Some failures still get through: a bad configuration that every replica accepts, a dependency outage that no fallback covers, a leaked credential. The [next note](/notes/devops/incidents-and-security), the last of the course, is about those: how to run an incident and learn from it without blame, how to remove the repetitive work that wears out an on-call team, and how to keep the operation itself secure, from secrets and permissions to the software supply chain.
+
+## References
+
+- B. Beyer, C. Jones, J. Petoff, N. R. Murphy (eds.). [*Site Reliability Engineering*](https://sre.google/sre-book/table-of-contents/). O'Reilly, 2016. Ch. 21, [Handling Overload](https://sre.google/sre-book/handling-overload/) (load shedding, criticality, client-side adaptive throttling); ch. 22, [Addressing Cascading Failures](https://sre.google/sre-book/addressing-cascading-failures/) (retry amplification, retry budgets, deadline propagation, queue sizes, graceful degradation).
+- B. Beyer, N. R. Murphy, D. K. Rensin, K. Kawahara, S. Thorne (eds.). [*The Site Reliability Workbook*](https://sre.google/workbook/table-of-contents/). O'Reilly, 2018. Ch. 11, [Managing Load](https://sre.google/workbook/managing-load/).
+- M. T. Nygard. *Release It! Design and Deploy Production-Ready Software*, 2nd ed. Pragmatic Bookshelf, 2018. Ch. 4 (stability antipatterns: integration points, cascading failures, slow responses) and ch. 5 (stability patterns: timeouts, circuit breaker, bulkheads, shed load, back pressure).
+- M. Brooker. [Exponential Backoff And Jitter](https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/). AWS Architecture Blog, 2015. And [Timeouts, retries, and backoff with jitter](https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/). Amazon Builders' Library, 2019.
+- P. Huang, C. Guo, L. Zhou, J. R. Lorch, Y. Dang, M. Chintalapati, R. Yao. [Gray Failure: The Achilles' Heel of Cloud-Scale Systems](https://doi.org/10.1145/3102980.3103005). HotOS, 2017.
+- J. Dean, L. A. Barroso. [The Tail at Scale](https://doi.org/10.1145/2408776.2408794). Communications of the ACM, 56(2), 2013.
+- J. Jena, S. Dalal. [The Idempotency-Key HTTP Header Field](https://datatracker.ietf.org/doc/draft-ietf-httpapi-idempotency-key-header/). IETF Internet-Draft draft-ietf-httpapi-idempotency-key-header-08, October 2026 (`409` for a concurrent duplicate, `422` for a reused key with a different body).
+- R. Fielding, M. Nottingham, J. Reschke (eds.). [HTTP Semantics](https://www.rfc-editor.org/rfc/rfc9110). RFC 9110, 2022. §9.2.2 (idempotent methods), §15.6.4 (503 and `Retry-After`).
+- J. D. C. Little. [A Proof for the Queuing Formula L = λW](https://doi.org/10.1287/opre.9.3.383). Operations Research, 9(3), 1961.
+- M. Harchol-Balter. *Performance Modeling and Design of Computer Systems: Queueing Theory in Action*. Cambridge University Press, 2013. (Little's law, M/M/1, the M/G/1 waiting time and its dependence on service-time variability.)
+- gRPC documentation. [Deadlines](https://grpc.io/docs/guides/deadlines/). Accessed October 2026.
+- Istio documentation: [VirtualService](https://istio.io/latest/docs/reference/config/networking/virtual-service/) (`HTTPRetry`: `attempts`, `perTryTimeout`, `retryOn`, the 25 ms backoff base); [DestinationRule](https://istio.io/latest/docs/reference/config/networking/destination-rule/) (`ConnectionPoolSettings`, `OutlierDetection`). Accessed October 2026.
+- G. Tene. [wrk2: a constant-throughput, correct-latency recording variant of wrk](https://github.com/giltene/wrk2) (coordinated omission).
+- University of Helsinki. [DevOps with Kubernetes](https://devopswithkubernetes.com/) (mooc.fi, 2026): service meshes.

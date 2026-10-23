@@ -1,0 +1,334 @@
+---
+title: Incidents and operational security
+section: Reliability
+description: "What to do when production breaks and how to keep the operation itself safe: incident roles, severity and a timeline, blameless postmortems, eliminating toil, secrets kept out of Git, least privilege, SBOMs, signing and SLSA, patching, and chaos engineering."
+course: devops
+order: 15
+status: published
+tags: [sre, incident-response, postmortem, toil, security, secrets, least-privilege, supply-chain, sbom, sigstore, slsa, patching, chaos-engineering]
+prerequisites: ["SLOs, error budgets and alerting", Continuous integration, "Users, groups and permissions"]
+---
+
+import IncidentTimeline from '../../../components/figures/incidents-and-security/IncidentTimeline.astro';
+
+The [previous note](/notes/devops/resilience-and-capacity) built defences that keep most failures small. Some get through anyway. A configuration change that every replica accepts, a credential that leaks, a compromised dependency: none of these is stopped by a timeout or a circuit breaker. This last note covers what happens then. The first half is about people: how a team runs an incident, learns from it without blame, and frees itself from the repetitive work that wears out on-call engineers. The second half is about the security of the operation itself, secrets, permissions and the software supply chain, because an attacker who reaches the deployment pipeline reaches everything it deploys. A short section on chaos engineering closes the loop by causing failures on purpose. The note ends with the whole course in one paragraph.
+
+**Setup.** Shell examples ran in GNU bash 3.2.57 with Git 2.47.0 on macOS, in a throwaway repository, and their output is pasted as printed. The CI workflow in the [Example](#example) was written against the GitHub Actions and Sigstore documentation of October 2026 and not executed.
+
+## Baseline: everyone jumps in
+
+Without a process, an outage goes like this. An alert fires; three engineers notice it at once and each starts investigating on their own. One restarts pods, another reverts a commit that turns out to be unrelated, a third changes a database setting. Nobody tells the support team, so customers learn about the outage from social media. Two hours later the problem stops, nobody is sure which action fixed it, and the next week the same outage happens again. In the meeting afterwards, the discussion is about who pushed the change.
+
+Four things went wrong: nobody was in charge, actions were not coordinated or recorded, nobody communicated, and the follow-up looked for a person to blame instead of a system to fix. Incident management addresses the first three, postmortems the fourth.
+
+## Incident response: roles and severity
+
+An **incident** is an unplanned event that degrades a service enough to need a coordinated response. The SRE book's incident management, adapted from the Incident Command System used by emergency services, rests on separating responsibilities ([Beyer et al., 2016, ch. 14](#references)):
+
+- The **incident commander (IC)** holds the overall picture, assigns roles and decides. The IC does not debug; their job is to keep everyone else effective. At first the IC is whoever declares the incident, usually the on-call engineer, and the role can be handed over explicitly.
+- The **operations lead** and the people they bring in change the system: they are the only ones who do, so changes are not made in parallel and untracked.
+- The **communications lead** sends regular updates to stakeholders and users (a status page, the support team, management) on a fixed schedule, such as every 20 minutes, so that the responders are not interrupted by questions.
+- A **planning lead**, in long incidents, handles everything that is not urgent: filing bugs, arranging hand-offs between shifts, ordering food.
+
+Every incident keeps one written **log** of observations, decisions and actions with their times, in the incident channel or a shared document. It is the raw material of the postmortem.
+
+<aside class="callout"><strong>Key idea.</strong> In an incident, **mitigate first, understand later**: roll back, fail over, shed load, so that users stop being hurt, and only then look for the root cause. Give one person command, one group the hands, and one person the voice. Afterwards, write a **blameless postmortem**: assume that everyone acted reasonably given what they knew, and change the system so that the same mistake becomes hard to make. The same habit of distrust towards hidden assumptions protects the operation itself: secrets out of Git, every identity with the least privilege it needs, every artifact traceable to its source and signed.</aside>
+
+**Severity levels** decide how big a response an incident gets. Each organization defines its own; a typical scheme, with criteria tied to the SLOs of the [earlier note](/notes/devops/slos-and-alerting):
+
+| Level | Impact | Response |
+| --- | --- | --- |
+| SEV-1 | A critical user journey is down for most users, or data loss, or a security breach | page the on-call and their backup; IC and communications lead at once; public status page; leadership informed |
+| SEV-2 | Significant degradation for some users, or more than 5 % of the 30-day error budget at risk | page the on-call; IC declared; status page if users notice |
+| SEV-3 | Limited impact, a workaround exists, or the budget burns slowly | ticket, handled in working hours |
+| SEV-4 | No user impact; a near miss worth learning from | ticket; optional postmortem |
+
+Two rules of thumb from practice: **declare early** (an incident that turns out to be small costs a few minutes, an undeclared one that grows costs hours), and **when in doubt, take the higher severity** and lower it later.
+
+## A timeline
+
+The incident behind day 9 of the [budget chart](/notes/devops/slos-and-alerting#checking-them-on-numbers), as its log recorded it:
+
+<IncidentTimeline />
+
+1. **14:02.** A configuration change lowers the connection limit for calls from checkout to payments, and is applied to every pod at once. 12 % of checkouts start failing with `503`.
+2. **14:09.** The 1-hour burn-rate alert pages the on-call engineer, 7 minutes after the start, when 2 % of the error budget has been spent.
+3. **14:12.** The on-call acknowledges. The service dashboard shows errors beginning at 14:02. It marks deploys of code but not configuration changes, so the on-call finds the change in the history of the configuration repository.
+4. **14:15.** The on-call declares a SEV-2 incident and becomes incident commander. A communications lead joins and posts the first status update at 14:21.
+5. **14:24.** The operations lead, brought in at 14:18, starts a rollback of the configuration. The IC chose a rollback over a fix forward because it restores a known state ([rollback or roll forward](/notes/devops/continuous-delivery#rollback-or-roll-forward)).
+6. **14:31.** The rollback completes and errors fall to the background rate: the incident is **mitigated**.
+7. **15:10.** After 39 minutes of normal metrics the IC declares the incident **resolved**.
+8. **Day 12.** The postmortem is reviewed and its action items are assigned.
+
+The timeline yields the numbers that incident reviews track: **time to detect** (start to page) 7 minutes, **time to acknowledge** 3 minutes, **time to mitigate** (start to mitigation) 29 minutes. At 200 checkouts per second, 12 % failing for 29 minutes is about 42,000 failed checkouts, 8.1 % of the 30-day error budget. Time to restore service is also one of the four DORA delivery metrics ([Forsgren, Humble and Kim, 2018](#references)) introduced in the [first note](/notes/devops/what-devops-is).
+
+## Blameless postmortems
+
+A **postmortem** is a written record of an incident: what happened, its impact, how it was handled, why it happened, and what will change. A postmortem is **blameless** when it treats the actions of people as the reasonable result of what they knew and what the system allowed, and looks for causes in the system ([Beyer et al., 2016, ch. 15](#references); [Allspaw, 2012](#references)). The reason is practical, not only kind: people who expect blame hide information, and a postmortem without information fixes nothing. "Engineer X applied a bad change" ends the analysis; "the pipeline let a configuration change reach every pod at once without a canary" leads to a fix.
+
+Teams write a postmortem when an incident crosses agreed criteria: user-visible downtime or degradation beyond a threshold, any data loss, intervention by on-call, a resolution time above a limit, or, in the error-budget policy of the [earlier note](/notes/devops/slos-and-alerting#the-error-budget-and-its-policy), more than 20 % of the budget in one incident. A short template, filled in for the incident above:
+
+```text
+Postmortem: checkout failures after a configuration change (2026-10-09)
+Status: action items in progress            Severity: SEV-2
+Authors: on-call engineer, incident commander    Reviewed: 2026-10-12
+
+Summary   From 14:02 to 14:31 UTC, 12 % of checkout requests failed with 503.
+Impact    29 minutes; about 42,000 failed checkouts; 8.1 % of the 30-day error budget.
+Detection Error-budget burn alert (1 h window, 14.4x) paged at 14:09, 7 minutes in.
+Trigger   A configuration change lowered the checkout -> payments connection limit
+          from 100 to 10 and was applied to all pods at once.
+Contributing factors
+          - Configuration changes skip the canary stage that code changes go through.
+          - The limit was not checked against peak concurrency from the last load test.
+          - The change was reviewed as "a tuning value"; its effect was not visible in the diff.
+Timeline  14:02 change applied; 14:09 page; 14:12 ack; 14:15 SEV-2 declared, IC assigned;
+          14:21 first status update; 14:24 rollback started; 14:31 mitigated; 15:10 resolved.
+What went well     The burn-rate page fired within minutes; rollback was one command.
+What went wrong    The dashboard did not mark configuration changes, only deploys of code.
+Where we got lucky The change was made at 14:02, not during the evening peak.
+Action items
+  [P0] Route configuration changes through the canary stage   owner: delivery   CHG-311
+  [P1] Validate connection limits against load-test concurrency in CI   owner: payments  CHG-312
+  [P2] Show configuration changes as markers on service dashboards   owner: observability  CHG-313
+```
+
+Read line by line:
+
+- **Title, status, severity, authors, review date.** The title says what users saw, not who did what. The status tracks the postmortem to completion: a postmortem whose action items are never done has not finished.
+- **Summary and impact.** Two lines a manager can read: what, when, how much. Impact is quantified in the units of the SLO, so it can be compared with other incidents and with the budget.
+- **Detection.** How the team found out. "A customer told us" is a finding in itself.
+- **Trigger and contributing factors.** The trigger is the event that started the incident; the contributing factors are the conditions that let the trigger become an outage. There is rarely a single root cause; asking "why" repeatedly is useful as long as each answer points at a system, not a person.
+- **Timeline.** The condensed incident log, with times. It is where slow detection, slow escalation or a wrong turn becomes visible.
+- **What went well, what went wrong, where we got lucky.** The last one is the most honest: luck is a defence that will not be there next time.
+- **Action items.** Each has a priority, an owner and a ticket. "Be more careful" is not an action item; a change to the pipeline, a check in CI or a dashboard is. The P0 here is a [delivery](/notes/devops/continuous-delivery) fix, the P1 a [continuous integration](/notes/devops/continuous-integration) check, the P2 an [observability](/notes/devops/observability) fix: incidents feed back into every earlier part of the course.
+
+The postmortem is then reviewed in a meeting, shared widely, and kept in a searchable archive; the SRE book's appendix has a complete example ([Beyer et al., 2016, appendix D](#references)).
+
+## Toil and eliminating it
+
+**Toil** is the kind of operational work that is manual, repetitive, automatable, reactive rather than strategic, without lasting value, and that grows linearly with the size of the service ([Beyer et al., 2016, ch. 5](#references)). Restarting a stuck consumer by hand, renewing a certificate, adding a customer to a configuration file, approving a routine access request: each is quick, and together they fill the week. Not all operational work is toil: an incident or a capacity review needs judgment.
+
+Toil matters because it scales with growth while the team does not, and because it crowds out the engineering that would remove it. Google's SRE teams cap operational work, toil included, at 50 % of their time, so that at least half goes to engineering that makes the service better ([Beyer et al., 2016, ch. 5](#references)). The first step to eliminating it is to measure it:
+
+1. **Count.** For a few weeks, the on-call notes every manual task and its duration.
+2. **Rank by cost.** Say the list shows a consumer that has to be restarted by hand three times a week (20 minutes each), certificate renewals, and a weekly report assembled from three dashboards: 4 hours a week in total.
+3. **Compare with the cost of automation.** If automating all three takes a week of one engineer, 40 hours, the investment pays back in $40 / 4 = 10$ weeks and saves $4 \times 52 - 40 = 168$ hours in the first year, and more as the service grows.
+4. **Prefer removing the cause to automating the response.** A consumer that needs restarting has a bug; fixing it removes the task, and the alert, for good.
+
+Automation is also how the earlier notes removed toil: [CI](/notes/devops/continuous-integration) instead of manual testing, [infrastructure as code](/notes/devops/infrastructure-as-code) instead of clicking in a console, [Kubernetes](/notes/devops/kubernetes) controllers instead of restarting processes by hand.
+
+<aside class="callout"><strong>Check yourself.</strong> (1) During an incident, the IC starts reading logs to find the bug. What is lost? (2) Why is "the engineer should have checked the value" a poor contributing factor, and what would be a better one? (3) An incident started at 09:40, paged at 09:52, was acknowledged at 09:55 and mitigated at 10:31. What are the times to detect and to mitigate? (4) A manual task takes 15 minutes, happens 6 times a week, and would take 30 hours to automate. When does the automation pay back?<details><summary>Answers</summary>(1) Coordination: nobody is tracking who is changing what, deciding between options, or making sure communication happens; the IC's attention is the scarce resource. (2) It blames a person and suggests no change; a better one names the system condition, such as "the pipeline does not validate this value" or "the change bypassed the canary", which leads to an action item. (3) 12 minutes to detect, 51 minutes to mitigate. (4) 1.5 hours a week, so after $30 / 1.5 = 20$ weeks.</details></aside>
+
+## Operational security
+
+The pipeline that the course has built, from a commit through CI, a registry and infrastructure code to a running cluster, holds the keys to everything it deploys. Operational security is the set of practices that keep those keys from leaking and limit the damage when they do. Four topics cover most of it.
+
+### Secrets: never in Git
+
+A **secret** is any value that grants access: a database password, an API key, a TLS private key, a cloud access key, a signing key. The first rule is that secrets never go into a Git repository, not even a private one, and not even briefly. Git keeps every version of every file ([the Git note](/notes/devops/git)), so deleting a secret in a later commit hides it from the working tree and from nobody else. A throwaway repository shows it (the key is an obviously fake value):
+
+```console
+$ cat config.env
+DB_HOST=db.internal.example.com
+$ git log --oneline
+0873fda Remove the API key from the configuration
+fb674ad Add service configuration
+$ git log -S PAYMENTS_API_KEY --oneline
+0873fda Remove the API key from the configuration
+fb674ad Add service configuration
+$ git show HEAD~1:config.env
+DB_HOST=db.internal.example.com
+PAYMENTS_API_KEY=demo-0000-not-a-real-key
+$ git grep PAYMENTS_API_KEY $(git rev-list --all)
+fb674ad38a37188e116b31a9b66295decd097600:config.env:PAYMENTS_API_KEY=demo-0000-not-a-real-key
+```
+
+The current file is clean, but `git log -S` (the "pickaxe", which lists commits that added or removed the string) finds both commits, and `git show` prints the old version. Every clone, fork and CI cache made before the cleanup has a copy. Rewriting history afterwards reduces the exposure but cannot recall the copies, so **a secret that reached a shared repository is compromised: revoke and rotate it first**, then clean up.
+
+The practices that keep secrets out, in the order they act:
+
+1. **Scan before the commit lands.** A pre-commit hook or a CI job runs a secret scanner (gitleaks, TruffleHog) on every change; hosting platforms also scan pushes and can reject a push that contains a recognized key format (GitHub calls this push protection).
+2. **Store secrets in a secret manager.** A **vault** (HashiCorp Vault, its open-source fork OpenBao, or a cloud provider's secret manager) stores secrets encrypted, controls who can read each one, and logs every read. Applications fetch secrets at start-up or have them injected by the platform.
+3. **Know what Kubernetes Secrets are.** A Kubernetes `Secret` keeps its values base64-encoded, which is an encoding, not encryption:
+
+   ```console
+   $ echo c3VwZXItc2VjcmV0LXBhc3N3b3Jk | base64 -d
+   super-secret-password
+   ```
+
+   Secrets are stored in the cluster's etcd unencrypted unless encryption at rest is configured, and anyone allowed to read them in a namespace can read all of them ([Kubernetes documentation, Secrets good practices](#references)). Clusters usually sync them from a vault (the External Secrets Operator), and teams that keep configuration in Git commit only encrypted secrets (SOPS, Sealed Secrets).
+4. **Prefer short-lived credentials.** A CI job that deploys to a cloud account can exchange the platform's OIDC identity token for credentials that expire in an hour, instead of storing a long-lived access key in the CI settings ([Continuous integration](/notes/devops/continuous-integration#security-of-ci)). Vault can issue a database password per application instance that expires with its lease. A leaked credential that expires in an hour is a much smaller problem than one that works for years.
+5. **Rotate.** Change secrets on a schedule and immediately after any suspicion of a leak. To rotate without downtime, allow two valid credentials during a transition: issue the new one, deploy it, then revoke the old one.
+
+### Least privilege
+
+Every identity, a person, a service, a CI job, should have only the permissions its task needs, for only as long as it needs them. The principle is old ([Saltzer and Schroeder, 1975](#references)) and the ACOS course shows it at the level of [Unix users and permissions](/notes/acos/users-and-permissions); the same reasoning applies at every layer of the stack:
+
+- **Containers** run as a non-root user, with a read-only root filesystem, no privilege escalation and all Linux capabilities dropped unless one is needed; in Kubernetes these are fields of a pod's `securityContext`.
+- **Services** each get their own identity (a Kubernetes service account, a cloud role) with access to their own database and queue, not a shared administrator credential.
+- **CI jobs** get a token scoped to the job: read access to the repository by default, write access to the registry only in the release job, cloud access through short-lived OIDC credentials.
+- **People** get production access through a recorded, time-limited request rather than standing administrator rights; routine changes go through the pipeline, not a console.
+
+The payoff is a small **blast radius**: a compromised component can do only what it was allowed to do. The [agent security note](/notes/agents/agent-security#defences-in-layers) of the AI Agents course applies the same principle to tools given to language models.
+
+### The supply chain: SBOMs, signatures and SLSA
+
+A service is mostly code that its team did not write: base images, language packages, CI actions, build tools. The **software supply chain** is everything between the source code and the artifact that runs, and attackers target it because one compromise reaches every user downstream. The [build note](/notes/devops/builds-and-dependencies#reproducible-builds) described two such attacks, SolarWinds (2020), where a compromised build server put a backdoor into signed updates, and xz-utils (2024), where the backdoor existed only in the release tarballs, and showed how reproducible builds detect them. Two more mark the other threats:
+
+- **Codecov (April 2021):** a modified upload script, run in customers' CI pipelines, sent their environment variables, including secrets, to the attackers.
+- **Log4Shell (CVE-2021-44228, December 2021):** a critical vulnerability in a ubiquitous Java logging library. The first question for every organization was "where do we run it?", and most could not answer quickly.
+
+Three practices answer them:
+
+**Software bills of materials (SBOMs).** An SBOM lists every component of an artifact with its version and origin. With SBOMs stored for every release, "where do we run log4j 2.14?" is a query, not a week of investigation. The two standard formats are **SPDX** (ISO/IEC 5962:2021) and **CycloneDX** (ECMA-424, 2024); build tools and scanners such as Syft and BuildKit generate them from an image or a source tree.
+
+**Signing artifacts.** A signature binds an artifact, identified by its digest, to whoever built it, so that a cluster can refuse to run an image that was not produced by the expected pipeline. Classic signing requires managing long-lived private keys, which are themselves secrets that leak. **Sigstore** avoids them ([Newman, Meyers and Torres-Arias, 2022](#references)): the signer proves an identity through OIDC (for a CI job, the identity of the workflow that is running), the **Fulcio** certificate authority issues a certificate for that identity valid for about ten minutes, the artifact is signed with a key that exists only for that moment, and the signature is recorded in **Rekor**, a public append-only transparency log, so that anyone can later check that it was made while the certificate was valid. The tool for container images is **cosign**; its version 3 (October 2025) made the standardized Sigstore bundle format the default. The same mechanism signs npm packages with provenance (since 2023) and attestations on PyPI (since 2024).
+
+**SLSA.** Supply-chain Levels for Software Artifacts is a framework of graded requirements on how artifacts are built ([SLSA specification](#references)). Its **build track** has four levels:
+
+| Level | Requirement | Protects against |
+| --- | --- | --- |
+| Build L0 | none | nothing |
+| Build L1 | the build produces **provenance**: a record of what was built, from which source, by which process | mistakes, such as releasing from the wrong commit; easy to forge |
+| Build L2 | builds run on a hosted build platform that **signs** the provenance | tampering after the build |
+| Build L3 | the platform is hardened: builds cannot influence each other, and signing secrets are out of reach of the build steps | tampering during the build, by insiders or other tenants |
+
+SLSA 1.0 (2023) defined the build track; version 1.2 (November 2025) added a **source track** with requirements on how the source repository itself is protected. Provenance is written as an **attestation**, a signed statement about an artifact, and is verified at deploy time together with the image signature. Hosted CI platforms increasingly generate and sign provenance for the artifacts their jobs build.
+
+### Patching and dependency updates
+
+Every component in the SBOM accumulates known vulnerabilities over time, published as **CVE** entries and scored with **CVSS**. Keeping up has three parts:
+
+- **Pin and lock.** Dependencies are pinned by version and locked, as the Python course explains for [lockfiles](/notes/python/modules-and-packages#lockfiles-and-reproducible-experiments), and base images by digest ([Container images](/notes/devops/container-images)), so that updates happen on purpose and can be reverted.
+- **Update continuously in small steps.** Bots such as Dependabot and Renovate open a pull request for each new version; CI tests it; it merges like any other change. Small, frequent updates are easier to review and roll back than a yearly jump across many versions. Images are rebuilt regularly even when the application has not changed, so that they pick up a patched base image.
+- **Prioritize by exploitation, not only by score.** A scanner (Trivy, Grype) run on every image reports hundreds of CVEs, most of them in code that is never reached. Fix first what is known to be exploited, such as entries in CISA's Known Exploited Vulnerabilities catalog, and what is reachable from the network, then work down.
+
+## Chaos engineering, in brief
+
+Every resilience mechanism of the previous note, every runbook and every failover is a claim that something works under failure. **Chaos engineering** tests such claims by injecting failures deliberately, in a controlled way ([Basiri et al., 2016](#references)). Netflix's Chaos Monkey, which terminated random production instances during working hours, made the idea known in 2011. The method is an experiment:
+
+1. Define the **steady state** in terms of an SLI, such as the checkout success ratio.
+2. **Hypothesize** that it will hold when something fails: "if one payments pod is killed, the success ratio stays above 99.9 %, because outlier detection and retries route around it."
+3. **Inject** the failure: kill a pod, add 300 ms of latency to a dependency, block a zone's network, expire a certificate in a test environment.
+4. **Observe**, and stop at once if the SLI moves beyond a limit. Start in a test environment with a small **blast radius**, and move to production only once the experiment is routine.
+
+Experiments either confirm the design or find a weakness before a real outage does. Game days, scheduled exercises where a team practises an incident from injection to postmortem, also train the people.
+
+## What changed
+
+| | Everyone jumps in (the baseline) | Incident process, postmortems and operational security |
+| --- | --- | --- |
+| Who decides during an outage | whoever is loudest | one incident commander |
+| Changes during an outage | made in parallel, unrecorded | made by the operations lead, logged with times |
+| Users and support | find out on their own | a communications lead updates them on a schedule |
+| First goal | find the bug | mitigate: roll back, fail over, shed load |
+| Afterwards | find who did it | a blameless postmortem with owned action items |
+| Repetitive operations | done by hand forever | measured as toil, then automated or removed |
+| A secret in a commit | deleted in the next commit, still in history | blocked by scanning; secrets live in a vault; a leak means rotation |
+| Permissions | shared administrator credentials | one identity per service and job, with the least privilege it needs |
+| "What do we run, and who built it?" | unknown | SBOMs, signed images and SLSA provenance |
+| Does the failover work? | discovered in the outage | tested by chaos experiments and game days |
+
+## Limitations
+
+- **Process does not replace skill.** A perfect incident structure with nobody who understands the system is still slow. Roles help people who know the system work together.
+- **Blamelessness is a culture, not a template.** A postmortem in an organization that punishes the people named in it will be blameless only in its wording.
+- **Supply-chain tooling verifies who built an artifact, not whether its code is safe.** A signed image built by the right pipeline from a backdoored dependency passes every signature check; xz-utils would have been signed by its legitimate maintainer.
+- **Security here is operational.** The note leaves out application security (input validation, authentication, the OWASP Top 10), network security beyond least privilege, threat modelling, and compliance frameworks.
+- **The dated facts move.** Cosign versions, SLSA levels and the formats around them change every year or two; check the current specifications before relying on the details here.
+
+## What you should remember
+
+- Declare incidents early; one incident commander, one operations lead who makes the changes, one communications lead; keep a timestamped log.
+- Mitigate first: roll back, fail over, shed load. Root cause comes after.
+- Measure time to detect, to acknowledge and to mitigate; express impact in the units of the SLO.
+- Postmortems are blameless: look for system conditions, not culprits; every action item has an owner and a ticket.
+- Toil is manual, repetitive, automatable work that grows with the service; measure it, cap it, and remove its causes.
+- Secrets never go into Git: once pushed, they are compromised and must be rotated. Scan before commit, keep secrets in a vault, prefer short-lived credentials. Kubernetes Secrets are base64, not encryption.
+- Least privilege for every identity keeps the blast radius small.
+- SBOMs say what is inside an artifact; Sigstore signatures say who built it, without long-lived keys; SLSA levels say how far the build can be trusted.
+- Patch continuously in small steps; prioritize what is exploited and reachable.
+- Chaos engineering tests resilience claims with controlled failures.
+
+## Example
+
+A release workflow that builds the checkout image, attaches an SBOM and build provenance, and signs the image with Sigstore, so that the cluster can verify where it came from. It is a GitHub Actions workflow; the [CI note](/notes/devops/continuous-integration) explains the format. Written against the documentation of GitHub Actions, Docker's `build-push-action` and Sigstore's cosign (October 2026), checked to be valid YAML, not executed.
+
+```yaml
+name: release-image
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build-sign:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      IMAGE: registry.example.com/shop/checkout
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: registry.example.com
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_TOKEN }}
+
+      - name: Build and push, with SBOM and provenance
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          push: true
+          tags: ${{ env.IMAGE }}:${{ github.ref_name }}
+          sbom: true
+          provenance: mode=max
+
+      - uses: sigstore/cosign-installer@v3
+
+      - name: Sign the image by digest
+        run: cosign sign --yes "${IMAGE}@${{ steps.build.outputs.digest }}"
+```
+
+Read line by line:
+
+- `on: push: tags: ["v*"]` runs the workflow only when a release tag such as `v2.14.0` is pushed, so that every published image corresponds to a tag.
+- The top-level `permissions: contents: read` makes the default token of every job read-only. The job then asks for the one extra permission it needs: `id-token: write`, which lets it request an OIDC identity token from GitHub. That token is what Sigstore uses instead of a signing key; no long-lived secret is stored anywhere.
+- `actions/checkout@v5` and the other `uses:` lines pull third-party code into the pipeline: the supply chain of the pipeline itself. Tags such as `@v5` can be moved by whoever controls the action's repository, so a hardened workflow pins each action to a full commit hash, as the [CI note](/notes/devops/continuous-integration#security-of-ci) explains; the tags here keep the example readable.
+- `docker/login-action` logs in to the registry with a push token kept in the repository's encrypted secrets, never in the workflow file; GitHub masks its value in the logs. The token should be scoped to pushing this one repository of the registry. Registries that accept OIDC federation, as most cloud registries do, can replace it with a short-lived credential obtained from the same identity token.
+- `docker/build-push-action` builds the image with BuildKit and pushes it. `sbom: true` makes BuildKit generate an SBOM of the image and attach it to the image in the registry; `provenance: mode=max` attaches a SLSA provenance attestation describing the build (source, commit, build steps, parameters). Its `digest` output is the content digest of the pushed image.
+- `cosign sign --yes "${IMAGE}@<digest>"` signs by **digest**, never by tag, because a tag can later point to a different image. With no key given, cosign signs keyless: it exchanges the job's OIDC token with Fulcio for a short-lived certificate naming this workflow, signs, uploads the signature to the registry next to the image, and records it in Rekor. `--yes` skips the interactive confirmation that the record will be public.
+- Verification happens at the other end. A cluster admission policy, or a person, runs `cosign verify` with the expected identity, for example `--certificate-identity-regexp '^https://github.com/example-org/checkout/'` and `--certificate-oidc-issuer https://token.actions.githubusercontent.com`, and refuses images whose signature was not made by this repository's workflow.
+
+The digest that cosign signs is that of the image index, which also references the SBOM and the provenance attached to it, so the signature covers them too. Together with a protected default branch and required reviews, this gives a chain from a reviewed commit to a running image. Which SLSA level it reaches depends on the guarantees of the build platform; GitHub, for example, also offers provenance signed by the platform itself (artifact attestations).
+
+## The course in one paragraph
+
+DevOps is the practice of making the path from a commit to a reliable service short, automatic and safe, and of measuring it by how often it delivers and how quickly it recovers. **Foundations**: the shell automates any task as a pipeline of small tools, and Git records every change as an immutable graph of content-addressed objects, so that any state of the code can be named, compared and restored. **Build and Ship**: a build is a dependency graph that turns sources into an artifact; a container image packages that artifact with everything it needs as content-addressed layers; continuous integration tests every change in a clean environment; continuous delivery ships the tested artifact gradually, with canaries and a way back. **Infrastructure**: a request crosses DNS, TLS, proxies and load balancers on its way to a backend; infrastructure as code declares the networks and machines it runs on and shows the plan before applying it; the cloud supplies them as building blocks for compute, storage and identity. **Orchestration**: Kubernetes runs the containers by reconciling a declared desired state with the actual one, so that crashed pods, lost nodes and new versions are handled by controllers rather than by people. **Reliability**: logs, metrics and traces show what the running system does; SLOs turn those measurements into an error budget and alerts on how fast it burns; timeouts, retries with jitter, circuit breakers, load shedding and headroom under the $1/(1-\rho)$ curve keep failures small; and incident response, blameless postmortems and operational security handle the failures that remain. The Machine Learning in production course, MLOps, comes next and applies this machinery to systems whose behaviour is learned from data: versioned datasets and models, training pipelines, model serving and monitoring for drift.
+
+## References
+
+- B. Beyer, C. Jones, J. Petoff, N. R. Murphy (eds.). [*Site Reliability Engineering*](https://sre.google/sre-book/table-of-contents/). O'Reilly, 2016. Ch. 5, [Eliminating Toil](https://sre.google/sre-book/eliminating-toil/) (definition, the 50 % cap); ch. 14, [Managing Incidents](https://sre.google/sre-book/managing-incidents/) (roles, the incident state document); ch. 15, [Postmortem Culture: Learning from Failure](https://sre.google/sre-book/postmortem-culture/); appendix D, [Example Postmortem](https://sre.google/sre-book/example-postmortem/).
+- B. Beyer, N. R. Murphy, D. K. Rensin, K. Kawahara, S. Thorne (eds.). [*The Site Reliability Workbook*](https://sre.google/workbook/table-of-contents/). O'Reilly, 2018. Ch. 6, [Eliminating Toil](https://sre.google/workbook/eliminating-toil/); ch. 9, [Incident Response](https://sre.google/workbook/incident-response/); ch. 10, [Postmortem Culture: Learning from Failure](https://sre.google/workbook/postmortem-culture/).
+- J. Allspaw. [Blameless PostMortems and a Just Culture](https://www.etsy.com/codeascraft/blameless-postmortems/). Etsy Code as Craft, 2012.
+- N. Forsgren, J. Humble, G. Kim. *Accelerate: The Science of Lean Software and DevOps*. IT Revolution, 2018. Ch. 2 (time to restore service among the four key metrics).
+- J. H. Saltzer, M. D. Schroeder. [The Protection of Information in Computer Systems](https://doi.org/10.1109/PROC.1975.9939). Proceedings of the IEEE, 63(9), 1975. §I.A.3 (design principles, least privilege).
+- Kubernetes documentation: [Secrets](https://kubernetes.io/docs/concepts/configuration/secret/); [Good practices for Kubernetes Secrets](https://kubernetes.io/docs/concepts/security/secrets-good-practices/); [Encrypting confidential data at rest](https://kubernetes.io/docs/tasks/administer-cluster/encrypt-data/). Accessed October 2026.
+- OWASP. [Secrets Management Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Secrets_Management_Cheat_Sheet.html).
+- S. Chacon, B. Straub. [*Pro Git*](https://git-scm.com/book/en/v2), 2nd ed. Apress, 2014 (CC BY-NC-SA). §7.6 (rewriting history) and the `git log -S` option.
+- Z. Newman, J. S. Meyers, S. Torres-Arias. [Sigstore: Software Signing for Everybody](https://doi.org/10.1145/3548606.3560596). ACM CCS, 2022.
+- Sigstore documentation: [cosign](https://docs.sigstore.dev/cosign/signing/overview/) (keyless signing, verification by identity); [Cosign v3 is now available](https://blog.sigstore.dev/cosign-3-0-available/), October 2025. Accessed October 2026.
+- [SLSA specification v1.2](https://slsa.dev/spec/v1.2/): [build track basics](https://slsa.dev/spec/v1.2/build-track-basics) (levels L0–L3); [announcement of v1.2 and the source track](https://slsa.dev/blog/2025/11/announce-slsa-v1.2), November 2025.
+- ISO/IEC 5962:2021, [SPDX specification](https://spdx.dev/use/specifications/). ECMA-424, [CycloneDX Bill of Materials specification](https://ecma-international.org/publications-and-standards/standards/ecma-424/), 1st ed., 2024.
+- Docker documentation: [build attestations](https://docs.docker.com/build/metadata/attestations/) (SBOM and provenance attestations, `mode=max`). GitHub documentation: [OpenID Connect in GitHub Actions](https://docs.github.com/en/actions/security-for-github-actions/security-hardening-your-deployments/about-security-hardening-with-openid-connect); [security hardening for GitHub Actions](https://docs.github.com/en/actions/security-for-github-actions/security-guides/security-hardening-for-github-actions) (pinning actions to a commit SHA). Accessed October 2026.
+- NVD. [CVE-2021-44228](https://nvd.nist.gov/vuln/detail/CVE-2021-44228) (Log4Shell). CISA. [Known Exploited Vulnerabilities Catalog](https://www.cisa.gov/known-exploited-vulnerabilities-catalog).
+- A. Basiri, N. Behnam, R. de Rooij, L. Hochstein, L. Kosewski, J. Reynolds, C. Rosenthal. [Chaos Engineering](https://doi.org/10.1109/MS.2016.60). IEEE Software, 33(3), 2016. And [Principles of Chaos Engineering](https://principlesofchaos.org/).

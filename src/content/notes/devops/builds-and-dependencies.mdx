@@ -1,0 +1,511 @@
+---
+title: Builds and dependencies
+description: "How source becomes an artifact: a build as a graph of targets, make with its rules, timestamps and parallel jobs, content-hash caching, dependency ranges resolved into lockfiles, reproducible builds, and how artifacts are versioned and stored."
+course: devops
+section: Build and Ship
+order: 3
+status: published
+tags: [build-systems, make, dag, incremental-builds, content-addressing, bazel, remote-cache, semver, dependency-resolution, lockfiles, reproducible-builds, supply-chain, artifacts, versioning]
+prerequisites: [The shell and text tools, "Git: the object model and workflows", "Modules, packages and environments"]
+---
+
+import BuildGraph from '../../../components/figures/builds-and-dependencies/BuildGraph.astro';
+
+The [previous note](/notes/devops/git) made a commit the unit of change: an exact, named tree of source files. Source files are not yet something a machine can run or a user can install. Between the two sits the **build**: compiling, linking, bundling, packing, and fetching the code of other people that the project depends on. This note asks how a build tool decides what to redo after a change, why the answer "whatever is older than its inputs" is cheap but fragile, how version ranges of dependencies become one exact set of versions, and what it takes for two builds of the same commit to produce the same bytes. The output of a build, an **artifact** with a version, is what the rest of the section ships.
+
+**Conventions.** Commands were run on macOS 26.5 (arm64) on 23 October 2026 with Apple's GNU Make 3.81, Apple clang 21, Python 3.14.7 and Git 2.47; current Linux distributions ship GNU Make 4.4, which behaves the same in everything shown except where noted. Every listing in this note is a real session.
+
+## Baseline: a build script
+
+The first build of a project is a shell script that runs every step in order:
+
+```bash
+#!/bin/bash
+set -e
+mkdir -p build
+cc -O2 -c -o build/eval.o src/eval.c
+cc -O2 -c -o build/parse.o src/parse.c
+cc -O2 -c -o build/main.o src/main.c
+cc -o build/calc build/eval.o build/main.o build/parse.o
+```
+
+It is correct, because it redoes everything, and that is also its problem. A change to one file of a thousand recompiles all thousand. The steps run one after another although the three compilations are independent. The order is written by hand, so adding a file means finding the right place for it, and a step that someone moves too early reads stale outputs. And the script cannot answer the question a developer asks after every edit: what is the least work that brings the outputs up to date?
+
+## A build is a graph of targets
+
+A build tool replaces the script with a description of what depends on what. Each **target** is a file to produce (or an action to perform), each has **prerequisites**, the files it is made from, and a **recipe**, the commands that make it. Prerequisites are targets themselves, so the description is a directed graph, and it must be acyclic: a file cannot be needed to build itself. The tool runs the recipes in a topological order, any order in which every target comes after its prerequisites.
+
+The running example is a small calculator in C: `parse.c` splits a line such as `3 + 4` into operands and an operator, `eval.c` applies the operator, and `main.c` reads lines and prints results. `main.c` includes both headers, `parse.c` and `eval.c` include their own. The graph has five source files, three object files, the program `calc` and a `test` that runs it:
+
+<BuildGraph />
+
+1. A developer edits the header `eval.h`.
+2. Every object file whose source includes it is out of date: `eval.o` and `main.o`. `parse.o` does not depend on it and is kept.
+3. The program is relinked from the two new objects and the old `parse.o`.
+4. The test runs against the new program.
+
+<aside class="callout"><strong>Key idea.</strong> Describe the build as a graph from inputs to outputs, and let the tool work out the rest. After a change, only the targets reachable from the changed files can be affected: that set is the least work. Targets that do not depend on each other can be built at the same time. The whole question of a build tool is then how it decides that an input has changed: by its modification time, as make does, or by a hash of its contents, as Bazel does.</aside>
+
+## make: rules and timestamps
+
+GNU make reads the graph from a `Makefile` made of **rules** ([GNU Make manual, Rules](#references)):
+
+```make
+build/calc: build/eval.o build/main.o build/parse.o
+	cc -o build/calc build/eval.o build/main.o build/parse.o
+```
+
+The line before the colon names the target, the list after it the prerequisites, and the indented line, which must start with a tab, is the recipe. The rule for deciding what to do is short. To bring a target up to date, make first brings each of its prerequisites up to date, recursively; then it runs the target's recipe if the target does not exist or if any prerequisite has a later modification time than the target. Otherwise it leaves the target alone. Stuart Feldman wrote the first make in 1976 around exactly this rule ([Feldman, 1979](#references)), and every make since has kept it.
+
+The complete Makefile of the calculator is read line by line in the [Example](#example) at the end of the note. A first build runs every recipe; a second finds nothing to do; then we edit the header and ask make what it would rebuild:
+
+```console
+$ make
+mkdir -p build
+cc -MMD -MP -O2 -Wall -Wextra -c -o build/eval.o src/eval.c
+cc -MMD -MP -O2 -Wall -Wextra -c -o build/main.o src/main.c
+cc -MMD -MP -O2 -Wall -Wextra -c -o build/parse.o src/parse.c
+cc -o build/calc build/eval.o build/main.o build/parse.o
+$ make
+make: Nothing to be done for `all'.
+$ make test
+build/calc < tests/input.txt | diff - tests/expected.txt
+test passed
+$ echo '/* Operators: + - * / */' >> src/eval.h
+$ stat -f '%Sm %N' -t '%T' src/eval.h build/*.o build/calc
+04:31:28 src/eval.h
+04:31:26 build/eval.o
+04:31:27 build/main.o
+04:31:27 build/parse.o
+04:31:27 build/calc
+$ make -n
+cc -MMD -MP -O2 -Wall -Wextra -c -o build/eval.o src/eval.c
+cc -MMD -MP -O2 -Wall -Wextra -c -o build/main.o src/main.c
+cc -o build/calc build/eval.o build/main.o build/parse.o
+```
+
+The header is newer than `eval.o` and `main.o`, so both are recompiled; `parse.o` is newer than everything it depends on, so it is kept; and `calc` must be relinked because two of its prerequisites will be newer than it. That is exactly the rebuild set of the figure. `make -n` prints the recipes without running them, a cheap way to check a Makefile's graph.
+
+**How make knows about headers.** Nothing in `main.c`'s rule mentions `eval.h` by hand. The flags `-MMD -MP` make the compiler write, next to each object, a small makefile of the headers it actually read:
+
+```console
+$ cat build/main.d
+build/main.o: src/main.c src/parse.h src/eval.h
+src/parse.h:
+src/eval.h:
+```
+
+The Makefile includes these files, so the graph is completed by the compiler, which is the only program that really knows what a C file depends on. The empty rules for the headers (`-MP`) keep make from failing when a header is deleted. Without this, a hand-written list of headers is always one `#include` out of date, and the build silently reuses an object compiled against an old header.
+
+### What timestamps get wrong
+
+The modification time is a proxy for "the contents changed", and the proxy fails in both directions. It reports changes that did not happen:
+
+```console
+$ touch src/eval.h
+$ make
+cc -MMD -MP -O2 -Wall -Wextra -c -o build/eval.o src/eval.c
+cc -MMD -MP -O2 -Wall -Wextra -c -o build/main.o src/main.c
+cc -o build/calc build/eval.o build/main.o build/parse.o
+```
+
+Nothing in the header changed, and half the project was rebuilt. The same happens on a large scale after `git checkout` or `git stash`: Git writes the files it changes with the current time, so switching branches and back makes every touched file look new. Worse, the proxy can miss changes that did happen. This make compares times in whole seconds, so an edit made in the same second as the build is invisible:
+
+```console
+$ make > /dev/null; perl -pi -e "s/case '\\*':/case 'x': case '*':/" src/eval.c; make
+make: Nothing to be done for `all'.
+$ echo '6 x 7' | build/calc
+bad input: 6 x 7
+$ stat -f '%Fm %N' src/eval.c build/eval.o
+1792719095.900911904 src/eval.c
+1792719095.809431379 build/eval.o
+```
+
+The edit, which accepts `x` as a multiplication sign, came 0.09 seconds after `eval.o` was written, in the same second, and the program kept running the old code. Make 4.x on Linux uses the nanosecond timestamps of the file system and narrows this window, but the other failures remain: clocks that differ between a network file system and the machine running make, files restored from an archive with old times, and generated files whose generator rewrites them identically. Each of them is either a wasted rebuild or a stale output, and a stale output is a build that is wrong without saying so.
+
+## Phony targets
+
+Some targets are not files: `all`, `test`, `clean`. Make does not know that. If a file with the target's name exists, and the target has no prerequisites, the target is up to date and its recipe never runs. A one-rule makefile without the declaration shows it:
+
+```console
+$ touch clean
+$ make -f nophony.mk clean
+make: `clean' is up to date.
+$ make clean
+rm -rf build
+```
+
+The real Makefile declares `.PHONY: all test clean`, which tells make that these names are actions, always out of date, and the recipe runs even with a file `clean` present.
+
+## Parallel builds: `-j`
+
+Independent targets can be built at the same time. `make -j4` runs up to four recipes at once, choosing any target whose prerequisites are all done:
+
+```console
+$ make clean > /dev/null; time make -j1 > /dev/null
+
+real	0m0.111s
+user	0m0.083s
+sys	0m0.042s
+$ make clean > /dev/null; time make -j4 > /dev/null
+
+real	0m0.068s
+user	0m0.091s
+sys	0m0.046s
+```
+
+The speedup is bounded by the graph, not by the number of processors. Let $T_1$ be the total time of all recipes, the time with one job, and $T_\infty$ the time of the longest chain of dependent recipes, the **critical path**: no number of jobs can finish faster than that chain. With $p$ jobs, a greedy scheduler such as make's finishes in at most
+
+$$
+T_p \le \frac{T_1}{p} + T_\infty
+$$
+
+(Brent's bound): the work spread over $p$ workers, plus the chain that cannot be spread. Timed one at a time with `/usr/bin/time` on the same machine, each compilation takes about 20 ms and the link about 30 ms, so $T_1 \approx 3 \cdot 20 + 30 = 90$ ms and $T_\infty \approx 20 + 30 = 50$ ms: one compilation, then the link. Four jobs cannot do better than about 50 ms however many processors there are. The measured 111 and 68 ms also include starting make and creating the directory, and the parallel run is close to its limit. In a real project with thousands of files, $T_\infty$ is set by long chains such as code generation, then compilation, then linking a large binary, and shortening those chains is what speeds up the build. The same arithmetic returns for whole CI pipelines in the [continuous integration note](/notes/devops/continuous-integration#the-time-arithmetic-of-a-pipeline).
+
+Parallelism also tests the graph. A serial make visits prerequisites left to right, so a dependency that is missing from the Makefile can be satisfied by accident, because the step that produces the file happens to come earlier in the list. Under `-j` the two steps run at the same time, and the build fails at random. A build that only works with `-j1` has a wrong graph.
+
+## Content hashes instead of timestamps
+
+The fix for timestamps is to look at the contents. A **content-addressed build** gives every action a key, the hash of its command line and of the contents of all its inputs, and keeps a cache from keys to outputs. Before running an action, the tool computes the key; if the cache has it, the output is copied from the cache, and the action does not run. Bazel ([Bazel documentation, Remote caching](#references)), Buck2, Pants and Nix work this way. The idea fits in a short Python program for the same calculator, with the graph declared as a list of actions in dependency order:
+
+```python
+# A content-addressed build: an action runs only if no cached output exists for the hash of its command and inputs.
+import hashlib, pathlib, shutil, subprocess
+
+CACHE = pathlib.Path('.cache')
+ACTIONS = [  # (output, inputs, command): the build graph, declared explicitly
+    ('build/eval.o',  ['src/eval.c', 'src/eval.h'], 'cc -O2 -c -o build/eval.o src/eval.c'),
+    ('build/parse.o', ['src/parse.c', 'src/parse.h'], 'cc -O2 -c -o build/parse.o src/parse.c'),
+    ('build/main.o',  ['src/main.c', 'src/parse.h', 'src/eval.h'], 'cc -O2 -c -o build/main.o src/main.c'),
+    ('build/calc',    ['build/eval.o', 'build/main.o', 'build/parse.o'], 'cc -o build/calc build/eval.o build/main.o build/parse.o'),
+]
+
+def digest(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+pathlib.Path('build').mkdir(exist_ok=True)
+for out, inputs, cmd in ACTIONS:                       # already in dependency order
+    key = digest('\n'.join([cmd] + [digest(pathlib.Path(p).read_bytes()) for p in inputs]).encode())
+    cached = CACHE / key
+    if cached.exists():
+        shutil.copyfile(cached, out)
+        print(f'hit   {out:14} key {key[:12]}')
+    else:
+        subprocess.run(cmd, shell=True, check=True)
+        CACHE.mkdir(exist_ok=True)
+        shutil.copyfile(out, cached)
+        print(f'run   {out:14} key {key[:12]}  output {digest(pathlib.Path(out).read_bytes())[:12]}')
+pathlib.Path('build/calc').chmod(0o755)                # a copy from the cache is not executable
+```
+
+Run on the fresh project, then after the same three edits as before:
+
+```console
+$ python3.14 hashbuild.py
+run   build/eval.o   key 2a1097422cdc  output fa590a7d7951
+run   build/parse.o  key b3e9740416cb  output aca80f845bcc
+run   build/main.o   key d9e831d5d8c5  output 7290a32cc37c
+run   build/calc     key f30c0774722f  output 3e38c4584cef
+$ touch src/eval.h; python3.14 hashbuild.py
+hit   build/eval.o   key 2a1097422cdc
+hit   build/parse.o  key b3e9740416cb
+hit   build/main.o   key d9e831d5d8c5
+hit   build/calc     key f30c0774722f
+$ echo '/* Operators: + - * / */' >> src/eval.h; python3.14 hashbuild.py
+run   build/eval.o   key 8db202bd36de  output fa590a7d7951
+hit   build/parse.o  key b3e9740416cb
+run   build/main.o   key 97518ecdd122  output 7290a32cc37c
+hit   build/calc     key f30c0774722f
+$ perl -pi -e "s/case '\\*':/case 'x': case '*':/" src/eval.c; python3.14 hashbuild.py
+run   build/eval.o   key 43e4201326e2  output 503d76bf4ec4
+hit   build/parse.o  key b3e9740416cb
+hit   build/main.o   key 97518ecdd122
+run   build/calc     key de0f2ad9bbd4  output cb3f52f703fd
+$ echo '6 x 7' | build/calc
+42
+```
+
+Three properties show in the four runs:
+
+- **`touch` costs nothing.** The contents are the same, so every key is the same, and every action is a cache hit.
+- **Early cutoff.** Adding a comment to the header changes the inputs of `eval.o` and `main.o`, so both are recompiled, but the objects come out byte for byte as before (`fa590a7d7951` and `7290a32cc37c` again). The link's key depends on the objects' contents, not on their times, so the link is a hit: the change stops propagating as soon as an output turns out unchanged. Make would have relinked, and with it run every test downstream. [Mokhov, Mitchell and Peyton Jones (2018)](#references) name this property and classify build systems by whether they have it.
+- **No same-second blindness.** The behavioural edit changes `eval.c`'s contents, whatever the clock says.
+
+The cache is only as correct as the list of inputs. If a compile reads a header that the action does not declare, a change to that header does not change the key, and the cache returns a stale object, a worse failure than make's, because the stale output now arrives from a cache that every developer shares. Bazel therefore makes actions **hermetic**: each runs in a sandbox that contains only its declared inputs, so an undeclared one makes the action fail instead of silently being ignored, and the compiler, too, is a declared input with a version. In return, the cache can be shared. A **remote cache** keyed by these hashes lets a developer's laptop or a CI runner download the outputs that anyone else already built from the same inputs, and **remote execution** sends the actions themselves to a farm of machines. A change to one file in a repository of millions of lines then rebuilds only the actions downstream of it, once, for everyone ([Bazel documentation, Hermeticity](#references)).
+
+## Dependencies from outside: ranges and lockfiles
+
+Most of the code in a modern program comes from packages written by others, fetched from a registry: PyPI, npm, crates.io, Maven Central. A project declares what it needs as **version ranges**, and a **resolver** picks one exact version of each package so that every range in the whole graph is satisfied.
+
+Ranges mean something because of **semantic versioning** ([SemVer 2.0.0](#references)): a version `MAJOR.MINOR.PATCH` promises that a PATCH increase only fixes bugs, a MINOR increase adds features compatibly, and only a MAJOR increase may break callers. Under that promise, a range can accept everything that should be compatible. In npm's notation, which Cargo uses by default:
+
+| Range | Means | Accepts |
+| --- | --- | --- |
+| `^2.1.0` | same major version, at least 2.1.0 | 2.1.0 to 2.x, not 3.0.0 |
+| `~2.1.0` | same minor version, at least 2.1.0 | 2.1.0 to 2.1.x, not 2.2.0 |
+| `^0.3.1` | before 1.0 the minor version is the breaking one | 0.3.1 to 0.3.x |
+| `2.4.1` | exactly this version | 2.4.1 |
+
+Python's [PEP 440](#references) writes the same ideas as `>=2.1,<3` and `~=2.1.0`, as the [Python course](/notes/python/modules-and-packages#installing-packages-pip-and-uv) showed. A resolver for such ranges fits in forty lines of Python. It takes the newest version that fits the first unresolved range, adds that version's own dependencies to the list, and backtracks when a later range cannot be met:
+
+```python
+# A toy dependency resolver: semver ranges in, one exact version per package out, with backtracking.
+import json, sys
+
+def ver(s):                                    # '2.4.1' -> (2, 4, 1)
+    return tuple(int(x) for x in s.split('.'))
+
+def allows(rng, v):
+    """npm-style ranges: ^1.2.3 is >=1.2.3 <2.0.0 (^0.2.3 is <0.3.0); ~1.2.3 is >=1.2.3 <1.3.0."""
+    op, low = rng[0], ver(rng[1:])
+    if op == '^':
+        high = (low[0] + 1, 0, 0) if low[0] > 0 else (0, low[1] + 1, 0)
+    else:
+        high = (low[0], low[1] + 1, 0)
+    return low <= ver(v) < high
+
+INDEX = json.load(open(sys.argv[1]))           # {package: {version: {dependency: range}}}
+
+def resolve(wanted, chosen):
+    """wanted: list of (package, range, who asked); chosen: {package: version}."""
+    if not wanted:
+        return chosen
+    (pkg, rng, who), rest = wanted[0], wanted[1:]
+    if pkg in chosen:                          # already picked: it must satisfy this range too
+        return resolve(rest, chosen) if allows(rng, chosen[pkg]) else None
+    for v in sorted(INDEX[pkg], key=ver, reverse=True):   # newest first
+        if allows(rng, v):
+            deps = [(d, r, f'{pkg} {v}') for d, r in INDEX[pkg][v].items()]
+            found = resolve(rest + deps, {**chosen, pkg: v})
+            if found:
+                return found
+            print(f'  backtrack: {pkg} {v} (asked by {who}) leads to a conflict')
+    return None
+
+app = json.load(open(sys.argv[2]))             # the project's direct dependencies, as ranges
+lock = resolve([(p, r, 'app') for p, r in app.items()], {})
+print(json.dumps(dict(sorted(lock.items())), indent=1) if lock else 'no solution')
+```
+
+The toy index has `http` in five versions, and `auth` in two, of which the newer needs a newer `http` and a package `json`:
+
+```console
+$ cat index.json
+{
+ "http":  {"2.0.0": {}, "2.1.0": {}, "2.1.3": {}, "2.4.1": {}, "3.0.0": {}},
+ "auth":  {"1.2.0": {"http": "^2.0.0"}, "1.3.0": {"http": "^2.4.0", "json": "^1.1.0"}},
+ "json":  {"1.0.0": {}, "1.1.2": {}}
+}
+```
+
+The application needs `http` and `auth`, and both paths lead to `http`, a **diamond**:
+
+```console
+$ cat app.json
+{"http": "^2.1.0", "auth": "^1.2.0"}
+$ python3.14 resolve.py index.json app.json | tee lock.json
+{
+ "auth": "1.3.0",
+ "http": "2.4.1",
+ "json": "1.1.2"
+}
+$ cat app-tilde.json
+{"http": "~2.1.0", "auth": "^1.2.0"}
+$ python3.14 resolve.py index.json app-tilde.json
+  backtrack: auth 1.3.0 (asked by app) leads to a conflict
+{
+ "auth": "1.2.0",
+ "http": "2.1.3"
+}
+```
+
+With `^2.1.0` everything fits at the newest versions. With `~2.1.0` the application refuses `http` 2.4, the newest `auth` insists on it, and the resolver falls back to the older `auth`, which also drops `json` from the graph. Real resolvers search the same space with better algorithms (pip uses backtracking, uv and Poetry use PubGrub, which learns from each conflict), and the general problem is NP-complete ([Cox, 2016](#references)), but the shape is this one.
+
+The result of resolution depends on what the registry contains on the day it runs. A week later, `http` 2.5.0 is published:
+
+```console
+$ jq -c '.http += {"2.5.0": {}}' index.json > new.json && mv new.json index.json
+$ python3.14 resolve.py index.json app.json | diff lock.json -
+3c3
+<  "http": "2.4.1",
+---
+>  "http": "2.5.0",
+```
+
+Nothing in the project changed, and its build now contains different code. This is why the result of a resolution is written down. A **lockfile** (`uv.lock`, `package-lock.json`, `Cargo.lock`, `go.sum`) records the exact version of every package, direct and indirect, its source, and a hash of each file; an install from the lockfile reproduces the same set, and a downloaded file whose hash differs is rejected. The [Python course](/notes/python/modules-and-packages#lockfiles-and-reproducible-experiments) shows `uv.lock` in detail. The two files have different jobs: the ranges say what the code supports, the lockfile says what one build used. The lockfile is committed and changes only on purpose, in its own commit, usually opened as a pull request by a bot such as Dependabot or Renovate when a new version appears, so that the upgrade goes through the same tests as any other change.
+
+Ecosystems differ in one decision that shapes the problem. Python allows one version of a package per environment, so the diamond must agree. npm can install two versions side by side, each package seeing its own, which avoids conflicts at the price of duplicated code and two copies of any global state. Go takes a third path, **minimal version selection**: it picks the *oldest* version that satisfies every requirement, which is determined by the requirements alone and does not change when new versions are published, so Go needs a lockfile only for hashes ([Cox, 2018](#references)).
+
+## Reproducible builds
+
+A lockfile fixes the inputs. That does not yet make the output repeatable. A build is **reproducible** if, given the same source code, build environment and build instructions, any party can recreate bit-for-bit identical copies of the artifacts ([Reproducible Builds project, Definitions](#references)). Three things commonly break it.
+
+**Time.** A build that records when it happened differs every time it runs. The C macros `__DATE__` and `__TIME__` are the classic case:
+
+```console
+$ cat version.c
+#include <stdio.h>
+int main(void) { printf("calc, built %s %s\n", __DATE__, __TIME__); return 0; }
+$ cc -c -o a.o version.c; sleep 1; cc -c -o b.o version.c; shasum -a 256 a.o b.o
+81d60a37d8d6d3c9c08ea689ec6d3a26484d6c5945f23ae36df6f2372166eef1  a.o
+0133aceb22006455ee2069d0f8cd8724039d9b781b5399dc84beb7db5c41597c  b.o
+$ export SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)   # the time of the last commit
+$ echo $SOURCE_DATE_EPOCH
+1792670400
+$ cc -c -o c.o version.c; sleep 1; cc -c -o d.o version.c; shasum -a 256 c.o d.o
+6ba486070c407aaf8ad01a88e871c80391fc140ba88586a40fcac5258e00f1f9  c.o
+6ba486070c407aaf8ad01a88e871c80391fc140ba88586a40fcac5258e00f1f9  d.o
+```
+
+The convention `SOURCE_DATE_EPOCH` ([Reproducible Builds, SOURCE_DATE_EPOCH specification](#references)) gives tools one timestamp to use instead of the clock, usually the time of the last commit, which belongs to the source. GCC, Clang, and many archivers and documentation tools honour it; the program linked from `c.o` prints `calc, built Oct 22 2026 12:00:00`, the commit's time, on every rebuild.
+
+**Order and metadata.** An archive records the order in which files were added, their modification times, and the owner's account. A tool that adds files in the order the file system lists them, stamps them with their current times and writes the time into the gzip header gives a new archive every run. `package.py` packs the same `dist/` folder both ways; the reproducible mode sorts the names, sets every time to `SOURCE_DATE_EPOCH`, clears the owner and writes no timestamp into the gzip header:
+
+```console
+$ find dist -type f
+dist/bin/calc
+dist/share/README
+$ python3.14 package.py default; sleep 1; python3.14 package.py default
+default 626585c6a91ed567 1759 bytes
+default dfb689c90f01b336 1759 bytes
+$ export SOURCE_DATE_EPOCH=1792670400
+$ python3.14 package.py reproducible; touch dist/bin/calc; python3.14 package.py reproducible
+reproducible 8ed98cea04ac6e10 1587 bytes
+reproducible 8ed98cea04ac6e10 1587 bytes
+```
+
+Two default runs a second apart already differ; the reproducible ones agree even after a file's time changed. The same problem hides in build files: GNU make 3.82 to 4.2 returned `$(wildcard src/*.c)` in directory order, which differs between file systems, and so linked objects in a different order on different machines; the Makefile in the [Example](#example) wraps it in `$(sort …)`. Iteration over hash tables, whose order may vary from run to run, is the same trap inside a program.
+
+**Environment.** The absolute path of the build directory ends up in debug information and in error messages; the user name, the host name, the locale and the time zone end up in generated files; and the compiler version changes the code. The cures are to strip or remap paths (`-ffile-prefix-map`), to fix the locale and time zone, and to treat the toolchain as a pinned input, which is what a container image of the build environment does, as the [next note](/notes/devops/container-images) shows.
+
+**Why it matters.** A reproducible build makes the artifact checkable. If anyone who builds the tagged source gets the same hash as the published binary, the binary contains nothing that is not in the source. Two attacks show what that check is for. In the SolarWinds compromise, disclosed in December 2020, attackers did not change the source repository: malware on the build server inserted a backdoor into the product as it was compiled, and the company's own signed updates carried it to its customers ([CISA, 2021](#references)). In the xz-utils backdoor, found in March 2024 (CVE-2024-3094), the malicious build script was present only in the release tarballs, not in the Git repository, so a build from Git and a build from the tarball would have differed ([Freund, 2024](#references)). An independent rebuild that compares hashes catches both kinds. The [last note of the course](/notes/devops/incidents-and-security#the-supply-chain-sboms-signatures-and-slsa) builds the rest of the defence: bills of materials, signatures, and signed provenance graded by the levels of SLSA.
+
+## Artifacts and versioning
+
+An **artifact** is a build output kept for later: a binary, a wheel, a JAR, a tarball, or, from the [next note](/notes/devops/container-images) on, a container image. Three properties make it useful:
+
+- **Immutable and identified.** An artifact with a version is never rebuilt or overwritten. Its identity is its hash, and a registry or artifact repository (PyPI, Maven Central, Nexus, Artifactory, an OCI registry) stores it under its name, version and checksum.
+- **Traceable.** It records where it came from: the commit, the lockfile, the builder. The OCI image format has standard annotations for exactly this, as the next note shows.
+- **Built once.** The artifact that passed the tests is the artifact that is deployed. Rebuilding it for production, with whatever versions the registry offers that day, ships code that was never tested; the [continuous delivery note](/notes/devops/continuous-delivery#one-artifact-many-environments) builds on this rule.
+
+Libraries carry semantic versions, because their users need the compatibility promise. Services that are deployed rather than installed are often versioned by the commit, which is unique and leads back to the source. `git describe` combines both: the nearest tag, the number of commits since it, and the abbreviated commit name:
+
+```console
+$ git describe --tags
+v1.4.0-2-g0ecda82
+$ git checkout -q v1.4.0 && git describe --tags && git checkout -q main
+v1.4.0
+$ echo wip >> notes.txt; git describe --tags --dirty
+v1.4.0-2-g0ecda82-dirty
+$ git rev-parse --short=12 HEAD
+0ecda825d1a6
+```
+
+`v1.4.0-2-g0ecda82` is two commits after the tag `v1.4.0`, at commit `0ecda82` (the `g` stands for Git). A build from a working tree with uncommitted changes is marked `-dirty`, a version that no commit can reproduce and that a release pipeline should refuse. SemVer reserves the suffix after `+` for build metadata (`1.4.0+0ecda82`), which does not affect version ordering.
+
+<aside class="callout"><strong>Check yourself.</strong> (1) In the calculator, which targets does make rebuild after an edit to `parse.h`, and which does a content-hash build rebuild if the edit only adds a comment? (2) A Makefile works with `make` and fails about one time in five with `make -j8`, always with "No such file or directory" for a generated header. What is wrong? (3) A build takes 40 minutes with one job. Its longest chain of dependent steps takes 12 minutes. What is the shortest possible time with 8 jobs, and what does Brent's bound guarantee? (4) The lockfile pins `http` 2.4.1, and `pyproject.toml` asks for `>=2.1,<3`. A security fix is released as 2.4.2. What must happen for the service to get it? (5) Two people build the same tag and get different hashes. Name three places to look.<details><summary>Answers</summary>(1) `parse.h` is included by `parse.c` and `main.c`, so make recompiles `parse.o` and `main.o` and relinks `calc`; `test` then runs again. A content-hash build recompiles the same two objects, finds them byte for byte unchanged, and stops: the link and the test are cache hits. (2) A target that uses the generated header does not list it, or the rule that generates it, as a prerequisite. In a serial build the generator happens to run first; in parallel the compilation sometimes starts before it. The fix is the missing edge in the graph. (3) At least 12 minutes, the critical path. Brent's bound gives at most $40/8 + 12 = 17$ minutes for a greedy scheduler. (4) The range already allows 2.4.2, but the lockfile pins 2.4.1, so nothing changes until the lockfile is updated (`uv lock --upgrade-package http`), committed, tested and released. (5) Time (embedded dates, archive mtimes, gzip headers), order (directory listing, hash-table iteration, wildcard expansion), environment (build path, user, locale, time zone, toolchain version).</details></aside>
+
+## What changed
+
+| | Build script (the baseline) | make | Content-addressed build (Bazel style) |
+| --- | --- | --- | --- |
+| What is rebuilt after a change | everything | targets older than an input | actions whose input hashes changed, cut off when an output is unchanged |
+| How a change is detected | not at all | modification times | hashes of contents |
+| Order of steps | written by hand | derived from the graph | derived from the graph |
+| Parallelism | none | `-j`, bounded by the critical path | local jobs and remote execution |
+| Shared between machines | no | no | a remote cache keyed by hashes |
+| Undeclared inputs | irrelevant | stale outputs | a failed action in the sandbox |
+| External dependencies | whatever is installed | whatever is installed | pinned and hashed |
+
+## Limitations
+
+- **make's language is old and terse.** Variables are expanded in two different ways (`=` and `:=`), recipes are shell lines run one by one, tabs are significant, and recursive makefiles that call make in each subdirectory split the graph and lose the global view ([Miller, 1998](#references)). Large C and C++ projects therefore generate their build files with CMake or Meson and run them with Ninja, which does nothing but execute a graph fast.
+- **Content hashing costs.** Hashing every input, declaring every dependency and running in sandboxes is work, and Bazel-style systems pay off for large repositories and many developers more than for a small service.
+- **Lockfiles fix versions, not behaviour.** A pinned package can still fetch data at run time, and a package's install script can run arbitrary code at install time; lockfiles with hashes stop a changed file, not a malicious one that was locked in.
+- **Reproducibility is a spectrum.** Bit-for-bit identity needs every tool in the chain to cooperate, and some (code signing, profile-guided optimization, nondeterministic linkers) need extra work. Many projects aim first for builds that are functionally the same, and use bit-for-bit reproducibility where the supply-chain check matters most.
+- **Language ecosystems differ.** Each has its own resolver, lockfile and registry; this note shows the common shape, not the details of npm, Cargo, Maven or uv.
+
+## What you should remember
+
+- A build is a directed acyclic graph of targets, prerequisites and recipes. After a change, only targets reachable from the changed inputs need rebuilding.
+- make rebuilds a target that is missing or older than any prerequisite. Timestamps are cheap and wrong in both directions: `touch` and `git checkout` cause needless rebuilds, and same-second edits or skewed clocks cause stale outputs.
+- `.PHONY` declares targets that are actions; `-MMD -MP` lets the compiler supply header dependencies; `-j` runs independent recipes in parallel, and the critical path bounds the speedup: $T_p \le T_1/p + T_\infty$.
+- Content-addressed builds key each action by the hash of its command and inputs, which gives early cutoff and shareable remote caches, and requires hermetic actions with declared inputs.
+- Ranges say what the code supports; a lockfile says what one build used, with hashes. Resolution changes when the registry changes, so the lockfile is committed and updated on purpose.
+- A build is reproducible if the same source, environment and instructions give identical bytes. Time, order and environment break it; `SOURCE_DATE_EPOCH`, sorting and pinned toolchains fix it. Independent rebuilds catch tampered builders and tampered release tarballs.
+- An artifact is built once, identified by its hash and version, traceable to its commit, and promoted unchanged.
+
+## Example
+
+The complete Makefile of the calculator, the one that produced every make session above:
+
+```make
+# Build the calculator in build/, test it, clean up. GNU make 3.81 or later.
+CC       = cc
+CFLAGS   = -O2 -Wall -Wextra
+CPPFLAGS = -MMD -MP
+BUILD    = build
+SRCS     := $(sort $(wildcard src/*.c))
+OBJS     := $(SRCS:src/%.c=$(BUILD)/%.o)
+
+.PHONY: all test clean
+
+all: $(BUILD)/calc
+
+$(BUILD)/calc: $(OBJS)
+	$(CC) -o $@ $^
+
+$(BUILD)/%.o: src/%.c | $(BUILD)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
+
+$(BUILD):
+	mkdir -p $@
+
+test: $(BUILD)/calc
+	$(BUILD)/calc < tests/input.txt | diff - tests/expected.txt
+	@echo "test passed"
+
+clean:
+	rm -rf $(BUILD)
+
+-include $(OBJS:.o=.d)
+```
+
+- **`CC`, `CFLAGS`, `CPPFLAGS`.** The conventional variable names for the compiler, its options and the preprocessor's options. make's built-in rules use the same names, and a user can override any of them on the command line (`make CC=gcc CFLAGS=-O0`) without editing the file.
+- **`SRCS := $(sort $(wildcard src/*.c))`.** Every C file in `src/`, sorted so that the list, and with it the link order, is the same on every file system. `:=` expands the right-hand side once, when the line is read; `=` would expand it again at every use.
+- **`OBJS := $(SRCS:src/%.c=$(BUILD)/%.o)`.** A substitution reference: each `src/name.c` becomes `build/name.o`. Adding a source file adds an object without touching the Makefile.
+- **`.PHONY: all test clean`.** These three are actions, not files, and always run when asked for.
+- **`all: $(BUILD)/calc`.** The first target is the default, so `make` alone means `make all`.
+- **`$(BUILD)/calc: $(OBJS)` and its recipe.** The link. `$@` is the target, `$^` all prerequisites, so the recipe is `cc -o build/calc build/eval.o build/main.o build/parse.o`. The recipe line starts with a tab.
+- **`$(BUILD)/%.o: src/%.c | $(BUILD)`.** A pattern rule: any `build/X.o` is made from `src/X.c`. `$<` is the first prerequisite. The `| $(BUILD)` is an order-only prerequisite: the directory must exist before compiling, but a newer directory time, which changes whenever a file is added to it, must not make every object out of date.
+- **`$(BUILD):`.** Creates the output directory.
+- **`test`.** Depends on the program, so `make test` builds it first; the recipe compares its output with the expected one, and a difference makes `diff`, and with it make, exit with an error. The `@` hides the echo command itself, printing only its output.
+- **`clean`.** Removes every output; `rm -rf` succeeds even if there is nothing to remove.
+- **`-include $(OBJS:.o=.d)`.** Reads the dependency files that the compiler wrote with `-MMD -MP`. The `-` ignores files that do not exist yet, as on the first build.
+
+## Next
+
+The build now produces a tested artifact, but only a binary for one operating system that still needs the right libraries, the right interpreter and the right configuration on the machine where it runs. The [next note](/notes/devops/container-images) packages the program together with its whole file tree into a container image: layers that are content-addressed exactly like the actions of this note, a manifest that names them, and a registry that stores them by digest.
+
+## References
+
+- HSE University, Faculty of Computer Science. *Инструменты промышленной разработки* (tools of industrial software development), course wiki at [wiki.cs.hse.ru](http://wiki.cs.hse.ru/). Build systems and the start of CI/CD.
+- MIT, *The Missing Semester of Your CS Education* (2026). [Packaging and Shipping Code](https://missing.csail.mit.edu/2026/shipping-code/) (dependencies and environments, artifacts, releases and versioning, reproducibility).
+- Free Software Foundation. [*GNU Make Manual*](https://www.gnu.org/software/make/manual/make.html): §4 Writing Rules (rules, phony targets, order-only prerequisites), §5.4 Parallel Execution, §10.5 Pattern Rules, §10.5.3 Automatic Variables.
+- S. I. Feldman. [Make — a program for maintaining computer programs](https://doi.org/10.1002/spe.4380090402). *Software: Practice and Experience*, 9(4), 255–265, 1979.
+- P. Miller. [Recursive Make Considered Harmful](https://aegis.sourceforge.net/auug97.pdf). *AUUGN*, 19(1), 14–25, 1998.
+- A. Mokhov, N. Mitchell, S. Peyton Jones. [Build systems à la carte](https://doi.org/10.1145/3236774). *Proceedings of the ACM on Programming Languages*, 2(ICFP), 2018. (Minimality, early cutoff, and the classification of make, Shake and Bazel.)
+- R. P. Brent. [The parallel evaluation of general arithmetic expressions](https://doi.org/10.1145/321812.321815). *Journal of the ACM*, 21(2), 201–206, 1974. (The bound $T_p \le T_1/p + T_\infty$.)
+- Bazel documentation: [Remote caching](https://bazel.build/remote/caching), [Hermeticity](https://bazel.build/basics/hermeticity).
+- T. Preston-Werner. [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
+- npm documentation: [semver ranges](https://github.com/npm/node-semver#ranges) (caret and tilde ranges). Cargo Book: [Specifying dependencies](https://doc.rust-lang.org/cargo/reference/specifying-dependencies.html).
+- [PEP 440 — Version Identification and Dependency Specification](https://peps.python.org/pep-0440/).
+- R. Cox. [Version SAT](https://research.swtch.com/version-sat). 2016. (Dependency resolution with version ranges is NP-complete.)
+- R. Cox. [Minimal Version Selection](https://research.swtch.com/vgo-mvs). 2018.
+- N. Weizenbaum. [PubGrub: next-generation version solving](https://nex3.medium.com/pubgrub-2fb6470504f). 2018.
+- Reproducible Builds project: [Definitions](https://reproducible-builds.org/docs/definition/), [SOURCE_DATE_EPOCH specification](https://reproducible-builds.org/specs/source-date-epoch/), [Archive metadata](https://reproducible-builds.org/docs/archives/).
+- C. Lamb, S. Zacchiroli. [Reproducible builds: increasing the integrity of software supply chains](https://doi.org/10.1109/MS.2021.3073045). *IEEE Software*, 39(2), 62–70, 2022.
+- CISA. [Emergency Directive 21-01 and supplemental guidance: SolarWinds Orion code compromise](https://www.cisa.gov/news-events/directives/ed-21-01-mitigate-solarwinds-orion-code-compromise). 2020–2021.
+- A. Freund. [backdoor in upstream xz/liblzma leading to ssh server compromise](https://www.openwall.com/lists/oss-security/2024/03/29/4). oss-security mailing list, 29 March 2024. [CVE-2024-3094](https://nvd.nist.gov/vuln/detail/CVE-2024-3094).
+- Git documentation: [git-describe](https://git-scm.com/docs/git-describe).
+- B. Beyer, C. Jones, J. Petoff, N. R. Murphy (eds.). *Site Reliability Engineering*. O'Reilly, 2016. [Chapter 8: Release Engineering](https://sre.google/sre-book/release-engineering/) (hermetic builds, building once).

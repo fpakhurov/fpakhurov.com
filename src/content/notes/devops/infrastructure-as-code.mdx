@@ -1,0 +1,350 @@
+---
+title: Infrastructure as code
+description: "Describing infrastructure in files that a tool makes true: declarative against imperative, the state file, plan and apply as a diff between desired and real, drift and idempotence, OpenTofu and Terraform, configuration management, and immutable infrastructure."
+course: devops
+section: Infrastructure
+order: 8
+status: published
+tags: [infrastructure-as-code, declarative, idempotence, state, plan, drift, opentofu, terraform, hcl, modules, ansible, configuration-management, immutable-infrastructure]
+prerequisites: [Networking for services, "Git: the object model and workflows", Builds and dependencies]
+---
+
+import PlanDiff from '../../../components/figures/infrastructure-as-code/PlanDiff.astro';
+
+The [previous note](/notes/devops/networking-for-services) followed a request through DNS records, certificates, a reverse proxy, a load balancer and a pool of backends. All of those are objects that someone created: a record in a DNS zone, a virtual machine, a firewall rule, a bucket for logs. A service of modest size has hundreds of them, in two or three environments that should be alike. This note asks how to describe them so that they can be reviewed like code, created again from nothing, and changed without surprises: as files that state what should exist, read by a tool that works out what to do.
+
+**Conventions.** Shell sessions were run with GNU Bash 3.2 on macOS and Python 3.14.7 on 23 October 2026. OpenTofu and Ansible were not installed on the test machine: their configurations in this note are written against their documentation (OpenTofu 1.13, released 21 October 2026; ansible-core 2.21), checked for syntax where a parser was available, and not executed. Their output is described in prose, not quoted.
+
+## Baseline: a console and a script of commands
+
+The first infrastructure of a project is made by hand, in the web console of a cloud provider: click "create instance", fill in a form, copy the address into the DNS zone. It works, and it leaves nothing behind but the result. Nobody can review the change before it happens, nobody can tell later why a firewall rule exists, and building a second environment means repeating the clicks from memory, never quite the same way. Servers made like this, each slightly different and impossible to recreate, are called **snowflakes**.
+
+The next step is a script of commands: `create-instance`, `create-record`, `open-port`, run in order. It records the steps, but it describes *actions*, and actions depend on where they start from. Here is the problem in miniature, with two shell commands that create a directory and add a line to a configuration file:
+
+```console
+$ mkdir logs
+$ mkdir logs
+mkdir: logs: File exists
+$ mkdir -p logs; echo "exit status $?"
+exit status 0
+$ echo "max_connections = 100" >> app.conf
+$ echo "max_connections = 100" >> app.conf
+$ wc -l < app.conf
+       2
+$ grep -qxF "workers = 4" app.conf || echo "workers = 4" >> app.conf
+$ grep -qxF "workers = 4" app.conf || echo "workers = 4" >> app.conf
+$ cat app.conf
+max_connections = 100
+max_connections = 100
+workers = 4
+```
+
+Run twice, `mkdir` fails the second time and `echo >>` silently duplicates the line. `mkdir -p` and the `grep ... ||` guard are different: they check whether the result already holds and act only if it does not, so running them twice leaves the same result as running them once. That property is **idempotence**: applying an operation $n \ge 1$ times has the same effect as applying it once. A script of `create` commands is not idempotent. Run again, it creates a second machine; stopped halfway by an error, it leaves half an environment and no record of which half; and deleting a line from it deletes nothing in the cloud.
+
+## Declarative against imperative
+
+An **imperative** description lists the steps: create this, then change that. A **declarative** description states the result: these machines, these records, these rules should exist, with these settings. A tool compares the description with what exists and computes the steps itself. The [build note](/notes/devops/builds-and-dependencies#a-build-is-a-graph-of-targets) met the same idea in `make`: the Makefile declares targets and their inputs, and `make` decides which commands to run. A declarative tool is idempotent by construction: when what exists already matches the description, there is nothing to do.
+
+<aside class="callout"><strong>Key idea.</strong> Infrastructure as code keeps three pictures of the same infrastructure: the **configuration**, files in Git that say what should exist; the **state**, the tool's record of which real object it created for each part of the configuration; and **reality**, read through the provider's API. A **plan** is the difference between the configuration and reality, reached through the state; **apply** carries out the plan and records the result. Every change then goes through a reviewed commit and a plan that a person reads before anything happens, and running the tool again on an unchanged configuration produces an empty plan.</aside>
+
+## Configuration, state and reality
+
+Why does the tool need a state at all, when it could ask the provider what exists? Because the provider's API does not know which of its objects belong to this configuration. A configuration names a resource by an **address** of its own, such as `aws_s3_bucket.logs`; the provider names the object by an ID it chose, such as an instance ID `i-0a1b2c...` or a generated name. The state is the map from addresses to IDs, together with the last known attributes of each object. It answers three questions that nothing else can:
+
+1. **Which object to compare with.** To check `aws_instance.web`, the tool must know which of the thousands of instances in the account it is.
+2. **What to destroy.** A resource deleted from the configuration leaves no trace in the files. Only the state still lists it, so only the state reveals that a real object must go.
+3. **In what order.** To destroy objects whose configuration is gone, the tool needs the dependencies between them, which the state records.
+
+Producing a plan takes three steps. The tool reads the configuration and evaluates it (variables, references between resources), reads the state, and **refreshes**: for every object in the state, it asks the provider's API for the object's current attributes. Then it compares each resource of the configuration with its real object and assigns one of five actions:
+
+| Symbol | Action | When |
+| --- | --- | --- |
+| `+` | create | in the configuration, not in the state (or its object no longer exists) |
+| `~` | update in place | an attribute differs and the API can change it on a live object |
+| `-/+` | replace | an attribute differs that cannot be changed on a live object, such as a bucket's name or a machine's disk image |
+| `-` | destroy | in the state, not in the configuration |
+| | no-op | configuration and reality agree |
+
+Replacement is the action to read twice: it destroys an object and creates another, and anything stored in the old one, such as data on a disk or objects in a bucket, does not move to the new one.
+
+<PlanDiff />
+
+1. Read the configuration: what should exist.
+2. Read the state: which real object stands behind each address.
+3. Refresh: read every object through the API. Someone has repointed the `www` record by hand.
+4. Compare: the expiry changes in place, the manual edit is reverted, the queue is created, the VM that left the file is destroyed.
+5. Apply: the plan becomes API calls, in an order that respects dependencies.
+6. Write the new state, with its serial number increased by one.
+
+**Drift** is a difference between reality and the state that the tool did not make: an edit in the console during an incident, a provider default that changed, an object deleted by another script. The refresh finds it, and the next plan proposes to undo it, which is right when the edit was a mistake and wrong when it was a fix that nobody wrote down. Either the configuration is changed to match the fix, or the edit is reverted. Teams detect drift by running a plan on a schedule: `tofu plan -detailed-exitcode` exits with 0 when there is nothing to do, 1 on an error and 2 when there are changes, so a scheduled CI job can report status 2 as drift.
+
+**Worked example.** A toy planner of 50 lines shows the whole loop: a dictionary plays the provider, another the state, and a third the configuration.
+
+```python
+import itertools
+
+cloud = {}                        # the provider: real objects by ID
+ids = itertools.count(101)
+
+def plan(desired, state):
+    """Compare the configuration with reality, reached through the state's IDs."""
+    actions = []
+    for addr, want in desired.items():
+        obj = cloud.get(state.get(addr))         # refresh: read the real object
+        if obj is None:
+            actions.append(("+", addr, want))
+        elif obj["name"] != want["name"]:        # a name cannot change in place
+            actions.append(("-/+", addr, want))
+        elif obj != want:
+            diff = ", ".join(f"{k}: {obj.get(k)} -> {v}" for k, v in want.items() if obj.get(k) != v)
+            actions.append(("~", addr, diff))
+    actions += [("-", addr, None) for addr in state if addr not in desired]
+    return actions
+
+def apply(actions, state):
+    for op, addr, arg in actions:
+        if op in ("-", "-/+"):
+            del cloud[state.pop(addr)]
+        if op in ("+", "-/+"):
+            state[addr] = next(ids)
+            cloud[state[addr]] = dict(arg)
+        if op == "~":
+            cloud[state[addr]] = dict(desired[addr])
+
+def show(title, actions):
+    print(f"{title}:" + (" no changes" if not actions else ""))
+    for op, addr, arg in actions:
+        print(f"  {op:>3} {addr}" + (f"  {arg}" if op == "~" else ""))
+
+desired = {
+    "bucket.logs": {"name": "web-logs", "expire_days": 30},
+    "record.www":  {"name": "www", "target": "lb-1.example.net"},
+}
+state = {}                                     # address -> ID of the real object
+
+show("plan 1", p := plan(desired, state)); apply(p, state)
+print("  state:", state)
+show("plan 2", plan(desired, state))           # idempotent: nothing to do
+cloud[state["record.www"]]["target"] = "lb-2.example.net"   # drift: edited by hand
+show("plan 3", p := plan(desired, state)); apply(p, state)
+desired["bucket.logs"]["name"] = "web-logs-v2"              # a change that forces replacement
+del desired["record.www"]                                   # a resource removed from the file
+show("plan 4", p := plan(desired, state)); apply(p, state)
+print("  state:", state, " cloud:", cloud)
+```
+
+```console
+$ python3.14 toyplan.py
+plan 1:
+    + bucket.logs
+    + record.www
+  state: {'bucket.logs': 101, 'record.www': 102}
+plan 2: no changes
+plan 3:
+    ~ record.www  target: lb-2.example.net -> lb-1.example.net
+plan 4:
+  -/+ bucket.logs
+    - record.www
+  state: {'bucket.logs': 103}  cloud: {103: {'name': 'web-logs-v2', 'expire_days': 30}}
+```
+
+The first plan creates both objects, and the state records their IDs. The second plan is empty: the operation is idempotent. After the hand edit, the third plan reverts the drift. In the fourth, the renamed bucket is replaced, with a new ID, 103, and the record, which no longer appears in the configuration, is destroyed; the planner knew about it only through the state. A real tool adds what the toy leaves out: a dependency graph between resources, providers for hundreds of APIs, and a lock so that two people cannot apply at once.
+
+## OpenTofu and Terraform
+
+**Status, October 2026.** Terraform, written by HashiCorp since 2014, is the tool that made this model common. In August 2023 HashiCorp moved Terraform from the open-source Mozilla Public License 2.0 to the Business Source License 1.1, starting with version 1.6: the source stays readable and free to use in production, except to offer a product that competes with HashiCorp's own; IBM, which completed its purchase of HashiCorp in February 2025, is now the licensor. A group of companies and users forked the last open version as **OpenTofu**, a Linux Foundation project under MPL 2.0, whose first stable release, 1.6.0, came out in January 2024. The two share the language, the provider protocol and most of their behaviour, and a configuration written for one usually runs on the other; they have since added different features, for example encryption of the state in OpenTofu 1.7 (April 2024). The current releases are OpenTofu 1.13.2 and Terraform 1.17.0, both of 21 October 2026. This note uses OpenTofu and its command `tofu`; the commands of `terraform` have the same names.
+
+The language is **HCL**, and a configuration is a directory of `.tf` files with five kinds of blocks.
+
+- **Providers** are plugins that translate resources into API calls of one platform: a cloud provider, a DNS service, Kubernetes, GitHub. A `required_providers` block names each one by a source address and a version range. `tofu init` downloads them and records the exact versions and their hashes in `.terraform.lock.hcl`, a lockfile in the sense of the [build note](/notes/devops/builds-and-dependencies#dependencies-from-outside-ranges-and-lockfiles), committed to Git.
+- **Resources**, `resource "TYPE" "NAME" { ... }`, are the objects the configuration manages; `TYPE.NAME` is the address. **Data sources**, `data "TYPE" "NAME"`, read objects that the configuration does not manage, such as the ID of a shared network.
+- **Variables** are the inputs of a configuration, **locals** named expressions, **outputs** the values it reports.
+- A reference such as `aws_s3_bucket.logs.id` in another resource is an edge of a **dependency graph**: the bucket is created first, and destroyed last. The tool walks the graph, running up to 10 independent operations at once by default.
+- **Modules** are directories of `.tf` files called with inputs, `module "NAME" { source = "...", ... }`, and they are how one description serves several environments: the same module with `environment = "staging"` and with `environment = "prod"`.
+
+**Remote state and locking.** A state file on one laptop serves one person. A team keeps the state in a **backend**, such as an object-storage bucket, and the backend takes a **lock** for the duration of a plan or apply, so that two applies cannot interleave their calls and their state writes. Since OpenTofu 1.10 and Terraform 1.10, the S3 backend can lock with a lock file written by a conditional write in the bucket itself (`use_lockfile`), where it used to need a separate DynamoDB table. The state contains every attribute of every object, including database passwords and private keys when resources create them, in plain text unless it is encrypted, so access to the state bucket is access to those secrets; the state is never committed to Git.
+
+**The workflow.** A change is a commit to the configuration, opened as a merge request. CI runs `tofu plan -out=plan.bin` and posts the plan for review, the [continuous-integration note](/notes/devops/continuous-integration) describes such a pipeline; after approval, `tofu apply plan.bin` applies exactly the plan that was reviewed, and refuses if the state has changed since the plan was made. An agent that applies whatever the main branch says, and keeps applying it, is the GitOps style of the [delivery note](/notes/devops/continuous-delivery#one-artifact-many-environments); the [Kubernetes notes](/notes/devops/kubernetes-in-practice) build such an agent.
+
+## Configuration management and provisioning
+
+OpenTofu **provisions**: it creates machines, networks, records and buckets through the providers' APIs. What happens *inside* a machine (packages, files, users, services) is **configuration management**, the job of tools such as Ansible, Puppet, Chef and Salt, which predate the cloud.
+
+**Ansible** is agentless: it connects to each machine over SSH, from a list of hosts called the **inventory**, and runs **tasks** grouped in **playbooks** written in YAML. Each task calls a **module**, and the modules are written to be idempotent: they read the current situation, change it only if it differs from the request, and report `ok` (nothing to do) or `changed`. A playbook for the web servers of the previous note:
+
+```yaml
+- name: Configure the web servers
+  hosts: web
+  become: true
+  tasks:
+    - name: Install nginx
+      ansible.builtin.apt:
+        name: nginx
+        state: present
+        update_cache: true
+
+    - name: Write the site configuration
+      ansible.builtin.template:
+        src: site.conf.j2
+        dest: /etc/nginx/conf.d/site.conf
+        mode: "0644"
+      notify: Reload nginx
+
+    - name: Keep nginx running and start it at boot
+      ansible.builtin.service:
+        name: nginx
+        state: started
+        enabled: true
+
+  handlers:
+    - name: Reload nginx
+      ansible.builtin.service:
+        name: nginx
+        state: reloaded
+```
+
+`hosts: web` selects the group `web` of the inventory, and `become: true` runs the tasks as root. `state: present` asks for the package to be installed, not for an installation to run: on a machine where nginx is already installed, the task reports `ok`. The `template` task renders `site.conf.j2` and writes it only if the content differs; when it does write, it **notifies** the handler, which reloads nginx once at the end of the play, however many tasks notified it. The first run on a fresh machine reports all three tasks as changed and runs the handler; a second run reports them as `ok` and changes nothing. (The file parses as YAML; it was not run against machines here.) Idempotence is a property of each module, not of Ansible as a whole: `ansible.builtin.command` runs its command on every run unless it is told, with `creates:`, which file shows that the work is done.
+
+The two kinds of tool overlap at the edges, and the split is common: OpenTofu creates the machines, then Ansible configures them. Ansible pushes changes when someone runs it; Puppet and Chef run an agent on every machine that pulls its configuration and converges on it every half hour or so, which also repairs drift inside the machines.
+
+## Immutable infrastructure
+
+Configuration management changes servers that keep running for months, and every change applied to a live server is a chance for it to differ from its neighbours: a package upgrade that failed on one machine, a file edited by hand during an incident. The alternative is never to change a running server at all. **Immutable infrastructure** builds a complete image, a virtual-machine image or a [container image](/notes/devops/container-images), with the application and its configuration inside; it deploys a change by starting new machines from a new image, moving traffic to them, and destroying the old ones. A server that is never modified cannot drift, every running copy of a version is identical, and a rollback is the previous image. Configuration management does not disappear: it moves into the build of the image, where it runs once and its result is tested.
+
+The two styles are sometimes called **pets** and **cattle**: a pet server has a name, is nursed back to health when it is ill and is missed when it is gone; cattle are numbered, alike, and replaced when one fails. Immutable infrastructure turns servers into cattle. It needs everything that the previous notes built: an automated build that produces images, a deployment that moves traffic gradually, and health checks and draining so that old instances leave without dropping requests. Data must live outside the replaced machines, in databases, volumes and object storage, which is one reason the [next note](/notes/devops/cloud-building-blocks) separates compute from storage. Kubernetes, in the section after it, applies the same idea to containers and runs the reconciliation of this note continuously.
+
+<aside class="callout"><strong>Check yourself.</strong> (1) A colleague deletes a resource block from a configuration and runs a plan. What does the plan propose, and how does the tool know about an object that the files no longer mention? (2) During an incident someone raised a database's storage limit in the console. Tomorrow's scheduled plan proposes to lower it again. What are the two correct responses, and which is wrong? (3) Why is `echo "workers = 4" >> app.conf` not idempotent, and how does Ansible's `lineinfile` module avoid the problem? (4) A plan shows `-/+` for a database instance because its engine version changed in a way that cannot be applied in place. What should the reviewer ask before approving?<details><summary>Answers</summary>(1) It proposes to destroy the object. The state still maps the deleted address to the object's ID, so the tool knows the object exists and belongs to this configuration. (2) Either write the new limit into the configuration, so that the plan becomes empty, or decide that the edit should not stay and apply the plan. Applying the plan without deciding, and so silently undoing a fix made during an incident, is wrong. (3) Each run appends another copy of the line, so the result depends on how many times it ran. `lineinfile` first searches for a line that matches (a fixed line or a regular expression) and writes only when it is missing or different, so a second run reports `ok`. (4) Replacement destroys the old instance and its data. The reviewer should ask whether the data is backed up and how it reaches the new instance, or whether the change can be made in place, for example by an upgrade the provider supports, or in steps.</details></aside>
+
+## What changed
+
+| Problem of hand-made infrastructure | Mechanism | Where it lives |
+| --- | --- | --- |
+| No record or review of changes | configuration in Git, plans in merge requests | the repository and CI |
+| A script is not idempotent | declarative description; the tool computes the actions | OpenTofu or Terraform |
+| Which real object is which | the state: address to ID and last attributes | a remote backend with a lock |
+| Hand edits go unnoticed | refresh and drift detection by scheduled plans | CI, `-detailed-exitcode` |
+| Environments diverge | modules with variables per environment | module directories |
+| Servers drift internally | idempotent configuration management, then immutable images | Ansible, image builds |
+
+## Limitations
+
+- The plan is a prediction. An apply can still fail halfway, on a quota, a permission or an API error, and leave some objects changed and others not; the state records what happened, and the next plan continues from there.
+- The state is precious. A lost or corrupted state leaves objects that the tool no longer knows, which must be brought back with `tofu import`; a stale lock blocks every change until it is released by hand. Renaming a resource in the configuration looks like a destroy and a create unless a `moved` block says it is the same object.
+- The tool sees only what it manages. Objects created by hand, by other configurations or by the provider itself are invisible to it, so "the plan is empty" does not mean "the account is as described".
+- Providers are thick translations of large APIs, and their bugs and defaults become the configuration's behaviour; a provider upgrade can change a plan without any change to the files.
+- Secrets in the state, and the need for a lock, make the backend a sensitive and shared dependency; long chains of dependent configurations, one reading the outputs of another, make changes slow to propagate.
+
+## What you should remember
+
+- Imperative scripts list actions and break when run twice or from an unexpected start; a declarative description states the result, and the tool computes the actions, which makes it idempotent.
+- Three pictures: the configuration (what should exist), the state (address to real ID, last attributes), and reality (read by refresh). The plan is their difference: `+` create, `~` update, `-/+` replace, `-` destroy.
+- Only the state reveals what to destroy when a resource leaves the files. Keep it in a remote backend with a lock, restrict access to it, and never commit it.
+- Drift is reality changed behind the tool's back; scheduled plans with `-detailed-exitcode` find it, and a person decides whether to adopt or revert it.
+- OpenTofu (MPL 2.0, Linux Foundation) is the open fork of Terraform (BSL 1.1 since 1.6, now IBM); both use HCL, providers, resources, variables, modules and the same plan/apply workflow.
+- Provisioning creates machines and networks; configuration management (Ansible: SSH, playbooks, idempotent modules reporting `ok` or `changed`) shapes what is inside. Immutable infrastructure replaces machines instead of changing them.
+
+## Example
+
+A configuration for the bucket that keeps the access logs of the service: versioned, with logs deleted after 30 days, in one of two environments, with its state in a remote backend that locks. It is written for OpenTofu 1.13 and the AWS provider 6.x against their documentation and was not executed here, since running it needs a cloud account.
+
+```hcl
+terraform {
+  required_version = ">= 1.10"
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 6.0"
+    }
+  }
+  backend "s3" {
+    bucket       = "example-tofu-state"
+    key          = "web/logs.tfstate"
+    region       = "eu-central-1"
+    use_lockfile = true
+  }
+}
+
+provider "aws" {
+  region = var.region
+}
+
+variable "region" {
+  type    = string
+  default = "eu-central-1"
+}
+
+variable "environment" {
+  type = string
+  validation {
+    condition     = contains(["staging", "prod"], var.environment)
+    error_message = "The environment must be staging or prod."
+  }
+}
+
+locals {
+  tags = {
+    service     = "web"
+    environment = var.environment
+    managed-by  = "opentofu"
+  }
+}
+
+resource "aws_s3_bucket" "logs" {
+  bucket = "example-web-logs-${var.environment}"
+  tags   = local.tags
+}
+
+resource "aws_s3_bucket_versioning" "logs" {
+  bucket = aws_s3_bucket.logs.id
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+resource "aws_s3_bucket_lifecycle_configuration" "logs" {
+  bucket = aws_s3_bucket.logs.id
+  rule {
+    id     = "expire-old-logs"
+    status = "Enabled"
+    filter {}
+    expiration {
+      days = 30
+    }
+  }
+}
+
+output "logs_bucket" {
+  value = aws_s3_bucket.logs.bucket
+}
+```
+
+- `terraform { ... }` holds settings of the tool itself; OpenTofu keeps the block's name for compatibility. `required_version` refuses to run with an OpenTofu older than 1.10, the first with `use_lockfile`.
+- `required_providers` asks for the AWS provider from the registry address `hashicorp/aws`, at any 6.x version (`~> 6.0` allows 6.1 and 6.9 but not 7.0). `tofu init` picks one and writes it with its hashes into `.terraform.lock.hcl`.
+- `backend "s3"` stores the state as the object `web/logs.tfstate` in an existing bucket, `example-tofu-state`, and locks it with a lock file next to it. The state bucket is created once, by hand or by a separate configuration: a configuration cannot store its state in a bucket it has yet to create.
+- `provider "aws"` configures the plugin: the region comes from a variable. Credentials are not in the file; the provider reads them from the environment of the machine that runs `tofu`.
+- `variable "region"` has a default; `variable "environment"` has none, so it must be given, as `-var environment=prod` or in a `.tfvars` file per environment. The `validation` block rejects any other value before a plan is made.
+- `locals { tags = ... }` defines tags once, to put on every resource, so that the bill and the console show which service and environment an object belongs to.
+- `resource "aws_s3_bucket" "logs"`: the address is `aws_s3_bucket.logs`. Its name is built from the variable, `example-web-logs-prod` in production; bucket names are global across all accounts, which is why it carries a prefix.
+- `aws_s3_bucket_versioning.logs` and `aws_s3_bucket_lifecycle_configuration.logs` are separate resources that configure the bucket. Each refers to `aws_s3_bucket.logs.id`, which makes the bucket a dependency: it is created first.
+- The lifecycle `rule` applies to all objects (an empty `filter {}`) and expires them 30 days after creation. Because versioning is on, an expired object becomes a noncurrent version rather than vanishing; a complete configuration would add a `noncurrent_version_expiration` block to delete those too.
+- `output "logs_bucket"` prints the bucket's name after apply and makes it readable by other configurations.
+
+**The plan, described.** With `-var environment=prod` and an empty state, `tofu plan` lists the three resources, each prefixed with `+`. It shows the attributes the file sets, such as `bucket = "example-web-logs-prod"` and the tags, and marks those that the provider assigns, such as the bucket's ARN, as known only after apply. It ends with the summary "3 to add, 0 to change, 0 to destroy". After the apply, a second plan reports no changes. Changing `days = 30` to `days = 90` gives one resource marked `~`, updated in place: "0 to add, 1 to change, 0 to destroy". Changing the bucket's name gives `-/+` for the bucket, with a note that the name forces replacement, and replacements of the two resources that refer to it; the apply would then fail on deleting the old bucket if it still holds logs, unless the resource sets `force_destroy`, which is exactly the kind of line a reviewer should look for.
+
+## Next
+
+The configuration above named a region, a bucket and an object store as if their meaning were obvious. A cloud offers dozens of such building blocks: several kinds of compute, of storage and of network, an identity system that decides who may call which API, and prices that differ by an order of magnitude between choices. The [next note](/notes/devops/cloud-building-blocks) goes through them, independent of any one provider.
+
+## References
+
+- K. Morris. *Infrastructure as Code: Dynamic Systems for the Cloud Age*, 2nd ed. O'Reilly, 2020. Principles of infrastructure as code, stacks and environments, and immutable servers.
+- OpenTofu. [Documentation: the OpenTofu language, state, backends, the `plan` and `apply` commands](https://opentofu.org/docs/). Version 1.13, 2026. Pages on [state](https://opentofu.org/docs/language/state/), [the S3 backend](https://opentofu.org/docs/language/settings/backends/s3/) and [state encryption](https://opentofu.org/docs/language/state/encryption/).
+- OpenTofu. [Release notes of 1.6.0 (January 2024), 1.7.0 (April 2024) and 1.10.0 (June 2025)](https://github.com/opentofu/opentofu/releases).
+- HashiCorp. [HashiCorp adopts Business Source License](https://www.hashicorp.com/en/blog/hashicorp-adopts-business-source-license). Blog post, 10 August 2023. The current terms are in the [LICENSE file of the Terraform repository](https://github.com/hashicorp/terraform/blob/main/LICENSE).
+- HashiCorp. [Terraform documentation: resource behaviour, `-detailed-exitcode`, `moved` blocks](https://developer.hashicorp.com/terraform/docs). 2026.
+- Red Hat. [Ansible documentation: playbooks, idempotency, handlers](https://docs.ansible.com/ansible/latest/playbook_guide/index.html). ansible-core 2.21, 2026.
+- M. Fowler. [SnowflakeServer](https://martinfowler.com/bliki/SnowflakeServer.html) (2012) and [PhoenixServer](https://martinfowler.com/bliki/PhoenixServer.html) (2012); K. Morris, [ImmutableServer](https://martinfowler.com/bliki/ImmutableServer.html) (2013).
+- B. Beyer, C. Jones, J. Petoff, N. R. Murphy (eds.). [Site Reliability Engineering](https://sre.google/sre-book/table-of-contents/). O'Reilly, 2016. Ch. 7 (the evolution of automation at Google).
+- B. Beyer et al. (eds.). [The Site Reliability Workbook](https://sre.google/workbook/table-of-contents/). O'Reilly, 2018. Ch. 14 (configuration design and best practices).
+- MIT. [The Missing Semester of Your CS Education](https://missing.csail.mit.edu/2026/shipping-code/), 2026. Lecture "Packaging and Shipping Code" (configuration, reproducibility).
+- HSE University, Faculty of Computer Science. *Инструменты промышленной разработки* (Industrial development tools), [course wiki](http://wiki.cs.hse.ru/). Lectures on virtualization and the cloud.

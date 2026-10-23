@@ -4,6 +4,17 @@ Notable changes to the site, newest first. Each entry gives the date, what chang
 
 ## 2026-10-23
 
+- **A new course: DevOps.** It has 16 notes in five sections, in English and Russian, and covers how software gets from a commit to a reliable service. It builds on Computer Architecture and Operating Systems and on Python.
+  - **Foundations:** what DevOps is (the value stream, Little's law, the DORA metrics, why small batches lower risk), the shell and text tools, Git as an object graph and its workflows.
+  - **Build and ship:** builds as dependency graphs and reproducible builds, container images (the OCI layout, layer caching, multi-stage builds, digests), continuous integration, and continuous delivery with deployment strategies, canary statistics and expand/contract migrations.
+  - **Infrastructure:** the path of an HTTPS request through DNS, TLS, proxies and load balancers; infrastructure as code with OpenTofu/Terraform; cloud building blocks.
+  - **Orchestration:** Kubernetes as reconciliation, and Kubernetes in practice.
+  - **Reliability:** observability, SLOs and burn-rate alerting, resilience and capacity (retries, backoff, Little's law, the utilization curve), incidents and operational security.
+
+  Scope draws on two HSE courses («Инструменты промышленной разработки» and DevOps), MIT's Missing Semester, Helsinki's DevOps with Docker and Kubernetes, and Google's SRE books. The site holds the notes only; each note ends with an Example, one realistic artifact read line by line. Shell, Git and make sessions were run and show real output; container, Kubernetes, Terraform and CI configurations were validated against their schemas and are marked as not executed. 24 figures.
+  - **Course graph:** on phones, an edge that skips rows now runs down the lane between the two columns instead of through the cards between.
+  - **Parity script:** `ru_parity.py` no longer reads a `$` inside inline code as math.
+
 - **NLP figures: five labels fixed.** In the ROUGE overlap figure, the score header ran past the right edge. On phones:
   - the byte row in "From bytes to cleaned units" ran past the edge;
   - the rotated tokens in the BPE compression chart overlapped each other and the row above;

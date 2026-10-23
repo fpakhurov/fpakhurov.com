@@ -1,0 +1,357 @@
+---
+title: SLOs, error budgets and alerting
+section: Reliability
+description: "How reliable a service should be and when to wake someone up: SLIs, SLOs and SLAs, availability arithmetic for nines and for serial and parallel dependencies, the error budget and its policy, and multi-window, multi-burn-rate alerts derived and checked on numbers."
+course: devops
+order: 13
+status: published
+tags: [sre, sli, slo, sla, availability, error-budget, burn-rate, alerting, prometheus, on-call]
+prerequisites: [Observability, Continuous delivery and deployment]
+---
+
+import BudgetBurn from '../../../components/figures/slos-and-alerting/BudgetBurn.astro';
+
+The [previous note](/notes/devops/observability) gave us numbers about what users experience: the fraction of requests that fail and the quantiles of their latency. A number is not yet a decision. Is 0.3 % of failed checkouts acceptable? Should someone be woken up at 03:00 because the p99 rose from 300 to 450 ms? This note answers with the method of Google's site reliability engineering: choose an indicator, set an explicit objective for it, treat the gap between the objective and perfection as a budget, and alert on how fast the budget is being spent. Most of the arithmetic is small, and all of it is computed here.
+
+**Notation.** An objective is a fraction $S$, such as $S = 0.999$ ("three nines"). Its **error budget** is $1 - S$. $T$ is the length of the window over which the objective is measured, 30 days ($720$ hours, $43{,}200$ minutes) unless stated otherwise. $A$ is an availability, the probability that a component works at a random moment.
+
+## Baseline: alert on everything, promise 100 %
+
+A team without objectives tends toward two habits. The first is to aim for 100 % reliability: every failure is a failure of the team, every deploy a risk, and the safest week is one with no changes. The second is to alert on every number that looks unusual: CPU above 80 %, a disk at 85 %, a pod restart, any 5xx at all.
+
+Both break quickly.
+
+- **100 % is the wrong target.** Users reach the service through home Wi-Fi, mobile networks and their own devices, which fail far more often than once in ten thousand requests. They cannot tell 99.99 % from 100 %. Each extra nine costs roughly ten times more engineering, and a team that forbids risk also forbids the changes users are waiting for ([Beyer et al., 2016, ch. 3](#references)).
+- **Cause-based alerts are noisy and incomplete.** CPU at 80 % often harms nobody, so the alert teaches people to ignore alerts; and the outage that matters, say an expired certificate, may not move any of the watched numbers.
+
+What is missing is a statement of how reliable the service must be, measured the way users experience it.
+
+## SLI, SLO and SLA
+
+Three terms, each built on the previous one ([Beyer et al., 2016, ch. 4](#references)):
+
+- A **service level indicator (SLI)** is a measured quantity of the service's behaviour. The most useful form is a ratio of good events to valid events, so that it lies between 0 and 1:
+  - availability: requests that did not fail with a 5xx, divided by all requests;
+  - latency: requests served faster than 300 ms, divided by all requests;
+  - freshness, for a data pipeline: reads that returned data less than 10 minutes old, divided by all reads.
+- A **service level objective (SLO)** is a target for an SLI over a window: "99.9 % of checkout requests succeed, measured over a rolling 30 days"; "99 % of checkout requests complete in under 300 ms". A service usually has two to four SLOs; more dilute attention.
+- A **service level agreement (SLA)** is a contract with consequences, usually money back, if a level is missed. It is written by lawyers and sales, and it is set looser than the SLO, so that the team reacts to an SLO miss long before the SLA is in danger.
+
+Three choices in defining an SLI decide whether it means anything ([Beyer et al., 2018, ch. 2](#references); [Hidalgo, 2020](#references)):
+
+1. **Where it is measured.** At the load balancer it includes the service's crashes and network; at the client (real-user monitoring) it includes everything the user sees, but also the user's bad Wi-Fi. Server-side measurement from the previous note, at the load balancer or gateway, is the usual compromise.
+2. **What counts as valid.** A `400 Bad Request` caused by a malformed client request is not the service's failure and is usually excluded; health checks and synthetic probes are excluded from the denominator.
+3. **What counts as good.** A latency SLI needs a threshold ("faster than 300 ms") rather than a mean, because the mean hides the tail.
+
+<aside class="callout"><strong>Key idea.</strong> An SLO below 100 % defines how much unreliability is acceptable. That remainder, the **error budget**, is a resource like money: it can be spent on risky deploys, experiments and maintenance, and when it runs out, the team spends its time on reliability instead. Alerts then follow from the budget: page a person when the budget is being spent so fast that it will run out soon, and not otherwise.</aside>
+
+## Availability arithmetic
+
+### Nines into minutes
+
+An availability objective $S$ allows the service to be failing for a fraction $1 - S$ of the time. Over a window of $T$ minutes that is $(1 - S)\,T$ minutes; for 30 days, $T = 30 \times 24 \times 60 = 43{,}200$ minutes, and for a 365-day year, $525{,}600$ minutes.
+
+| SLO | Error budget | Per 30 days | Per year |
+| --- | --- | --- | --- |
+| 99 % | 1 % | 432 min (7.2 h) | 87.6 h |
+| 99.5 % | 0.5 % | 216 min (3.6 h) | 43.8 h |
+| 99.9 % | 0.1 % | 43.2 min | 8.76 h |
+| 99.95 % | 0.05 % | 21.6 min | 4.38 h |
+| 99.99 % | 0.01 % | 4.32 min | 52.6 min |
+| 99.999 % | 0.001 % | 25.9 s | 5.26 min |
+
+Each nine divides the budget by ten. At 99.99 %, one rollback that takes five minutes spends more than the whole month; at 99.999 %, no human can react in time, so only automation can defend the objective. When the SLI counts requests rather than minutes, the budget is a number of requests: at 99.9 % and 10 million requests a month, 10,000 may fail.
+
+### Dependencies in series
+
+A checkout succeeds only if the checkout service, the authentication service, the database and the payment provider all work. If they fail independently with availabilities $A_1, \dots, A_n$, the probability that all of them work at once is the product:
+
+$$
+\boxed{A_{\text{serial}} = \prod_{i=1}^{n} A_i}
+$$
+
+The step that makes it true is independence: $P(\text{all up}) = P(\text{1 up}) \cdots P(n \text{ up})$ only when the events are independent ([the probability course](/notes/probability/conditional-probability-and-bayes#independence)). With $A = 0.9995, 0.999, 0.9999, 0.999$:
+
+$$
+A_{\text{serial}} = 0.9995 \times 0.999 \times 0.9999 \times 0.999 = 0.997402,
+$$
+
+99.74 %, or 112 minutes of failure per 30 days, worse than any single part. For availabilities close to 1 the unavailabilities simply add: writing $A_i = 1 - u_i$, the product is $1 - \sum u_i$ plus terms of order $u_i u_j$, so $1 - (0.0005 + 0.001 + 0.0001 + 0.001) = 0.9974$, wrong only in the sixth digit. Two practical consequences:
+
+- A service cannot be more available than the product of its **hard** dependencies, those without which it fails. A 99.99 % objective on top of a 99.9 % database is unreachable.
+- The way out is to make dependencies **soft**: if the recommendation service is down, the checkout still works without recommendations. The [next note](/notes/devops/resilience-and-capacity) builds this.
+
+### Redundancy in parallel
+
+Two replicas behind a load balancer fail together only if both fail. If each fails independently with probability $1 - A$, both fail with probability $(1 - A)^2$, and in general
+
+$$
+\boxed{A_{\text{parallel}} = 1 - \prod_{i=1}^{n} (1 - A_i)}
+$$
+
+Two replicas at 99.5 % give $1 - 0.005^2 = 0.999975$, 99.9975 %; three give $1 - 0.005^3 = 99.9999875\,\%$. Redundancy is how reliable systems are built from unreliable parts. Two caveats keep the formula honest:
+
+- **The redundant pair sits in series with whatever is not redundant.** Behind one load balancer at 99.95 %, the pair contributes $0.9995 \times 0.999975 = 0.999475$: the single load balancer dominates.
+- **Failures are often correlated.** The same bad configuration pushed to both replicas, the same zone losing power, the same expired certificate. Suppose each replica has an independent unavailability of 0.4 % and both share a common-mode unavailability of 0.1 %, such as deploys that break both. Then $A = (1 - 0.001)(1 - 0.004^2) = 0.99898$: the pair is slightly worse than 99.9 %, and no number of replicas can lift it above the 99.9 % that the common-mode failures leave. This is why the [delivery note](/notes/devops/continuous-delivery) rolls changes out gradually and why replicas go into different zones.
+
+## The error budget and its policy
+
+The error budget turns the SLO into a quantity that can be planned. At 99.9 % over 30 days it is 43.2 minutes of complete outage, or 0.1 % of requests, spent however it happens: one long outage, many short ones, or a constant trickle of errors.
+
+A budget is only useful with an agreed **error budget policy**, written down before it is needed and signed by the product and engineering leads. The example policy in the SRE workbook ([Beyer et al., 2018, appendix B](#references)) has three parts, here paraphrased:
+
+1. **While the service is within its SLO**, releases proceed under the normal process.
+2. **If the budget for the last four weeks is exhausted**, all changes stop except fixes for urgent problems and security, until the service is back within its SLO. Reliability work takes priority where a bug or a procedure caused the overrun; feature work may continue when the cause was outside the team's control, such as a company-wide network outage.
+3. **If a single incident consumes more than 20 % of the four-week budget**, it gets a postmortem with at least one top-priority action item.
+
+The policy is explicitly not a punishment. Its value is that it settles in advance the recurring argument between shipping faster and shipping safer: while there is budget, ship; when there is none, fix. It also gives the deployment practices of the [delivery note](/notes/devops/continuous-delivery) a measure: a canary that burns budget is rolled back, and a team that never touches its budget is probably moving too slowly.
+
+## Alerting on symptoms, not causes
+
+An alert is a request for a person's attention. The SRE book's criteria for one that **pages**, that is, interrupts someone immediately ([Beyer et al., 2016, ch. 6](#references)):
+
+- it detects a condition that is **urgent** and **user-visible**, now or soon;
+- a person can **act** on it, and the action needs intelligence, not a script;
+- it is **new**, not the tenth repeat of a known issue.
+
+A **symptom** is what users experience: errors, latency, missing data. A **cause** is something internal that may produce symptoms: high CPU, a full disk, a restarted pod, a slow replica. Symptoms make good pages because they always matter and they catch causes nobody anticipated. Causes belong on dashboards, to explain a symptom once it appears, or in tickets when they predict a future symptom with certainty: a disk that fills in four days at the current rate deserves a ticket, not a page at 03:00.
+
+The SLO is the precise version of "user-visible symptom". The question for an alert becomes: **is the error budget being spent fast enough to need a person now?**
+
+## Burn rate
+
+The **burn rate** $b$ is how fast the budget is being spent, relative to the rate that would use exactly all of it by the end of the window:
+
+$$
+b = \frac{\text{observed error rate}}{1 - S}.
+$$
+
+At $S = 99.9\,\%$, an error rate of 0.1 % is a burn rate of 1 (the budget lasts exactly the window), 1.44 % is a burn rate of 14.4, and a total outage, 100 % errors, is a burn rate of 1,000. At burn rate $b$ the whole budget lasts $T/b$: 30 days at $b = 1$, 50 hours at $b = 14.4$, 43 minutes at $b = 1{,}000$.
+
+Over a window of length $w$, a burn rate $b$ consumes a fraction of the total budget equal to
+
+$$
+\boxed{f = \frac{b\,w}{T}},
+$$
+
+because the errors in the window are $b(1 - S)$ per unit of time times $w$, and the whole budget is $(1 - S)\,T$.
+
+## Multi-window, multi-burn-rate alerts
+
+The SRE workbook builds the recommended alert in six steps, each fixing a defect of the previous one ([Beyer et al., 2018, ch. 5](#references)). The workbook judges each by four properties: **precision** (pages are real), **recall** (real problems page), **detection time** and **reset time** (how soon the alert stops after the problem does). The short version of the path:
+
+1. **Error rate above the SLO over a short window** ("errors over 10 minutes at or above 0.1 %"): fast detection, terrible precision. It fires on an event that spends $10 / 43{,}200 = 0.023\,\%$ of the monthly budget, so a service meeting its objective pages many times a month.
+2. **A longer window**, such as 36 hours: better precision, but slow to detect, and once it fires it keeps firing for up to 36 hours after the problem ends.
+3. **Requiring the condition to hold for a duration**: a short, total outage never pages at all.
+4. **Alerting on a burn rate** over one window, with the threshold chosen from how much budget is acceptable to lose before someone looks.
+5. **Several burn rates**, a fast one that pages and a slow one that opens a ticket.
+6. **Each burn-rate condition over two windows**, a long one and a short one; this is the recommended form.
+
+### Deriving the thresholds
+
+Choose, for each alert, the fraction $f$ of the 30-day budget that may be spent before it fires and the window $w$ over which to measure. Solving $f = b\,w/T$ for $b$:
+
+$$
+b = \frac{f\,T}{w}.
+$$
+
+The workbook's choices, with $T = 720$ hours:
+
+| Budget spent | Long window | Burn rate $b = fT/w$ | Error rate at 99.9 % | Short window | Response |
+| --- | --- | --- | --- | --- | --- |
+| 2 % | 1 h | $0.02 \times 720 / 1 = 14.4$ | 1.44 % | 5 min | page |
+| 5 % | 6 h | $0.05 \times 720 / 6 = 6$ | 0.6 % | 30 min | page |
+| 10 % | 3 d (72 h) | $0.10 \times 720 / 72 = 1$ | 0.1 % | 6 h | ticket |
+
+The workbook's example rules add a second ticket condition, 10 % over 24 h, which is $b = 0.10 \times 720 / 24 = 3$ with a 2 h short window; the [Example](#example) uses both.
+
+**Why the alert fires exactly at the budget fraction.** Let the error rate jump from almost 0 to a constant $e$ above the threshold at time 0. Over the long window $w$, the measured average after a time $t < w$ is $e\,t/w$, and it crosses the threshold $b(1-S)$ at
+
+$$
+t^* = \frac{b\,(1 - S)\,w}{e}.
+$$
+
+The budget spent by then is $e\,t^*$ divided by the whole budget $(1-S)\,T$:
+
+$$
+\frac{e\,t^*}{(1 - S)\,T} = \frac{b\,w}{T} = f.
+$$
+
+The error rate cancels: **whatever the error rate, a step change is detected after exactly 2 % of the budget is gone**, as long as it is above 1.44 % at all. A worse incident is detected sooner, because it spends the 2 % sooner.
+
+**Why the short window.** After the incident ends, the 1-hour average stays above the threshold for most of an hour, so a one-window alert would keep paging long after the rollback. The short window, $1/12$ of the long one in the workbook, falls below the threshold within about 5 minutes of the end, and the alert requires both. The short window also keeps the long one from firing on an incident that already ended an hour ago.
+
+### Checking them on numbers
+
+For the 1-hour, 14.4× rule at $S = 99.9\,\%$, the formula $t^* = 0.0144\,\text{h}/e$ gives:
+
+| Error rate $e$ | 1-hour rule fires after | Budget spent | 5-minute window crosses after |
+| --- | --- | --- | --- |
+| 100 % (total outage) | 0.86 min (52 s) | 2.00 % | 4.3 s |
+| 12 % | 7.2 min | 2.00 % | 36 s |
+| 5 % | 17.3 min | 2.00 % | 86 s |
+| 2 % | 43.2 min | 2.00 % | 216 s |
+| 1 % | never (burn rate 10 is below 14.4) | | |
+
+An error rate of 1 % is a burn rate of 10, which would empty the budget in three days; the 6-hour, 6× rule catches it after $0.006 \times 6 / 0.01 = 3.6$ hours, when 5 % is spent. Slower burns are left to tickets.
+
+A minute-by-minute computation of one month makes this concrete. The service has a background error rate of 0.01 % (burn rate 0.1). On day 9 at 14:02 a bad deploy makes 12 % of requests fail until it is rolled back at 14:31. From day 18 to day 23 a slow leak makes 0.15 % fail (burn rate 1.5). The four rules of the Example, evaluated every minute, behave as follows:
+
+- The 1-hour rule pages at **14:09**, 7.2 minutes after the start, as derived; the 6-hour rule follows at 14:19. The incident costs $0.12 \times 29 / 43.2 = 8.1\,\%$ of the budget; the 1-hour condition clears at 14:34, three minutes after the rollback, thanks to its 5-minute window, and the 6-hour condition at 14:58, thanks to its 30-minute one.
+- The slow leak never pages: burn rate 1.5 is far below 6. The 3-day, 1× rule opens a ticket after **1.9 days** of the leak, which costs 25 % of the budget over its five days.
+- At the end of the window, **58.6 %** of the budget is left.
+
+<BudgetBurn />
+
+The figure shows the budget falling. The steep drop on day 9 is the incident: large, fast, and caught by a page within minutes. The long slope from day 18 is the leak: it costs three times as much, but slowly enough that a ticket during working hours is the right response. Without the ticket rule it would never have been noticed; without the burn-rate logic it would have paged someone at night for something that could wait until morning.
+
+<aside class="callout"><strong>Check yourself.</strong> (1) A service has an SLO of 99.95 % over 30 days. How many minutes of complete outage does the budget allow? (2) Three hard dependencies have availabilities 99.9 %, 99.9 % and 99.99 %. What is the best availability the service can promise? (3) With an SLO of 99.9 % over 30 days, which burn rate spends 5 % of the budget in 6 hours, and what error rate is that? (4) An outage makes every request fail. How soon does the 1-hour, 14.4× rule fire, and why does the 5-minute window not delay it?<details><summary>Answers</summary>(1) $0.0005 \times 43{,}200 = 21.6$ minutes. (2) $0.999 \times 0.999 \times 0.9999 = 0.9979$, about 99.79 %, 90.7 minutes a month; any higher promise depends on making a dependency soft or redundant. (3) $b = 0.05 \times 720 / 6 = 6$, an error rate of $6 \times 0.1\,\% = 0.6\,\%$. (4) The 1-hour average reaches $1.44\,\%$ after $0.0144$ hours, about 52 s; the 5-minute average reaches it after $0.0144 \times 5$ minutes, about 4 s, so by the time the long window fires the short one has long been above the threshold.</details></aside>
+
+## Alert fatigue and paging
+
+Every page has a cost. The SRE book estimates that one incident, with its analysis, remediation and follow-up, takes about six hours, and concludes that an on-call engineer can handle at most two incidents in a 12-hour shift; it also caps on-call work at 25 % of an engineer's time and operational work as a whole at 50 % ([Beyer et al., 2016, ch. 11](#references)). Typical response expectations are five minutes for user-facing services and thirty for less critical ones. Beyond those limits the cost is **alert fatigue**: people who are paged too often, especially for things that need no action, start acknowledging pages without reading them, and the one real page is lost among the false ones.
+
+The practices that keep pages rare:
+
+- **Page only on SLO burn.** Everything else is a ticket (handled within a working day) or a dashboard. Delete alerts that nobody acted on in the last few months.
+- **One incident, one page.** The Prometheus **Alertmanager** groups related alerts (all pods of one service), suppresses dependent ones with **inhibition** (no "high latency" page while a "database down" page is firing) and holds back notifications during planned work with **silences**.
+- **A runbook for every page.** The alert's annotations link to a page that says what the alert means, how to confirm it and the first steps of mitigation.
+- **Review the pages.** A weekly look at what paged, whether it was actionable, and which alerts to tune or remove. A page that keeps recurring for a known cause is toil, which the [last note](/notes/devops/incidents-and-security) addresses.
+
+## What changed
+
+| | Alert on everything, aim for 100 % (the baseline) | SLOs, error budgets and burn-rate alerts |
+| --- | --- | --- |
+| How reliable to be | as reliable as possible | an explicit SLO per user journey, below 100 % |
+| What a failure costs | blame, and a freeze on change | budget spent; the policy says what happens when it runs out |
+| Release speed | argued case by case | ship while there is budget, fix when there is none |
+| What pages | causes: CPU, disks, restarts | symptoms: the budget burning at 14.4× or 6× |
+| A total outage | detected when someone notices | paged after 52 s, when 2 % of the budget is gone |
+| A slow leak | missed, or a page at night | a ticket after 1.9 days |
+| Dependencies | ignored in the promise | serial availabilities multiply; redundancy and soft dependencies raise them |
+
+## Limitations
+
+- **An SLO is only as good as its SLI.** A 99.9 % success ratio measured at the load balancer says nothing about a correct-looking page with wrong prices, or a mobile client that cannot connect at all. Choosing SLIs is product work, not just engineering.
+- **Low traffic breaks ratios.** With 50 requests an hour, one failure is 2 % and fires a 14.4× alert. Low-traffic services need synthetic traffic, longer windows, or alerts on absolute counts.
+- **Independence is an assumption.** The availability formulas assume independent failures; real failures share deploys, zones, configuration and people, and the true availability of a redundant system is usually set by its common-mode failures.
+- **Windows have edges.** A calendar month resets the budget on the first; a rolling window does not but makes the policy harder to plan around. Thresholds derived for 30 days must be recomputed for other windows.
+- **Not covered:** SLOs for batch pipelines and data correctness, latency SLOs evaluated with histograms over long windows, and the tooling (Sloth, Pyrra, OpenSLO) that generates rules like the Example from a short SLO definition.
+
+## What you should remember
+
+- SLI: a ratio of good to valid events. SLO: a target for it over a window. SLA: a contract, looser than the SLO.
+- The error budget is $1 - S$: 43.2 minutes per 30 days at 99.9 %; each nine divides it by ten.
+- Serial: $A = \prod A_i$, unavailabilities add. Parallel: $A = 1 - \prod (1 - A_i)$, if failures are independent, which they often are not.
+- An error budget policy, agreed in advance, decides what happens when the budget runs out.
+- Page on symptoms the user sees, not on internal causes; every page must be urgent and actionable.
+- Burn rate $b$ = error rate / $(1 - S)$; a window $w$ at rate $b$ spends $f = bw/T$ of the budget, so $b = fT/w$: 14.4 for 2 % in 1 h, 6 for 5 % in 6 h, 1 for 10 % in 3 days.
+- A step change is detected exactly when the chosen fraction $f$ is spent; the short window ($w/12$) makes the alert stop soon after the problem does.
+- Two incidents per 12-hour shift is the most a person can handle well; fewer pages are better pages.
+
+## Example
+
+A Prometheus rule file for the checkout SLO: 99.9 % of requests succeed over 30 days. It follows the structure of the workbook's recommended alert. Not executed here; written against the Prometheus 3.x documentation on recording and alerting rules and checked to be valid YAML.
+
+```yaml
+groups:
+  - name: checkout-slo-recording
+    interval: 30s
+    rules:
+      - record: job:slo_errors_per_request:ratio_rate5m
+        expr: |
+          sum by (job) (rate(http_requests_total{job="checkout", code=~"5.."}[5m]))
+          /
+          sum by (job) (rate(http_requests_total{job="checkout"}[5m]))
+      - record: job:slo_errors_per_request:ratio_rate30m
+        expr: |
+          sum by (job) (rate(http_requests_total{job="checkout", code=~"5.."}[30m]))
+          /
+          sum by (job) (rate(http_requests_total{job="checkout"}[30m]))
+      - record: job:slo_errors_per_request:ratio_rate1h
+        expr: |
+          sum by (job) (rate(http_requests_total{job="checkout", code=~"5.."}[1h]))
+          /
+          sum by (job) (rate(http_requests_total{job="checkout"}[1h]))
+      - record: job:slo_errors_per_request:ratio_rate2h
+        expr: |
+          sum by (job) (rate(http_requests_total{job="checkout", code=~"5.."}[2h]))
+          /
+          sum by (job) (rate(http_requests_total{job="checkout"}[2h]))
+      - record: job:slo_errors_per_request:ratio_rate6h
+        expr: |
+          sum by (job) (rate(http_requests_total{job="checkout", code=~"5.."}[6h]))
+          /
+          sum by (job) (rate(http_requests_total{job="checkout"}[6h]))
+      - record: job:slo_errors_per_request:ratio_rate1d
+        expr: |
+          sum by (job) (rate(http_requests_total{job="checkout", code=~"5.."}[1d]))
+          /
+          sum by (job) (rate(http_requests_total{job="checkout"}[1d]))
+      - record: job:slo_errors_per_request:ratio_rate3d
+        expr: |
+          sum by (job) (rate(http_requests_total{job="checkout", code=~"5.."}[3d]))
+          /
+          sum by (job) (rate(http_requests_total{job="checkout"}[3d]))
+
+  - name: checkout-slo-alerts
+    rules:
+      - alert: CheckoutErrorBudgetBurn
+        expr: |
+          (
+              job:slo_errors_per_request:ratio_rate1h{job="checkout"} > (14.4 * 0.001)
+            and
+              job:slo_errors_per_request:ratio_rate5m{job="checkout"} > (14.4 * 0.001)
+          )
+          or
+          (
+              job:slo_errors_per_request:ratio_rate6h{job="checkout"} > (6 * 0.001)
+            and
+              job:slo_errors_per_request:ratio_rate30m{job="checkout"} > (6 * 0.001)
+          )
+        labels:
+          severity: page
+        annotations:
+          summary: "Checkout is spending its 30-day error budget at 6x or faster"
+          runbook_url: https://runbooks.example.com/checkout/error-budget-burn
+      - alert: CheckoutErrorBudgetBurnSlow
+        expr: |
+          (
+              job:slo_errors_per_request:ratio_rate1d{job="checkout"} > (3 * 0.001)
+            and
+              job:slo_errors_per_request:ratio_rate2h{job="checkout"} > (3 * 0.001)
+          )
+          or
+          (
+              job:slo_errors_per_request:ratio_rate3d{job="checkout"} > 0.001
+            and
+              job:slo_errors_per_request:ratio_rate6h{job="checkout"} > 0.001
+          )
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Checkout will exhaust its error budget before the window ends"
+          runbook_url: https://runbooks.example.com/checkout/error-budget-burn
+```
+
+Read line by line:
+
+- `groups` hold rules that Prometheus evaluates together, in order, at the group's `interval` (here every 30 s; the default is the global `evaluation_interval`).
+- Each `record` rule evaluates its `expr` and stores the result as a new series under the given name. The name follows the convention `level:metric:operations`: aggregated by `job`, the metric is "SLO errors per request", the operation a ratio of rates over 5 minutes. Recording the ratios once makes the alert expressions cheap and identical to what a dashboard shows.
+- Each `expr` is the error-ratio query of the [previous note](/notes/devops/observability#reading-rate-and-histogram_quantile) over one window: the rate of 5xx responses divided by the rate of all responses, summed over pods. There is one rule per window the alerts need: 5 min, 30 min, 1 h, 2 h, 6 h, 1 day and 3 days.
+- The `alert` rule `CheckoutErrorBudgetBurn` is the paging rule. `job:...:ratio_rate1h{job="checkout"} > (14.4 * 0.001)` keeps the series only where the 1-hour error ratio exceeds 14.4 times the budget $1 - S = 0.001$, that is 1.44 %. `and` keeps a series from the left side only if a series with the same labels exists on the right side, so both windows must be above the threshold. `or` combines the 1-hour and 6-hour conditions: either one firing fires the alert.
+- There is no `for:` clause. The long window already requires the burn to last, and the short window already makes the alert stop soon after the burn does; waiting longer would only delay detection.
+- `labels: severity: page` is what the Alertmanager routes on: `page` goes to the on-call phone, `ticket` to the team's queue. `annotations` are text for the person who receives it, including the runbook link.
+- `CheckoutErrorBudgetBurnSlow` is the ticket rule: 3× over a day (10 % of the budget) or 1× over three days (also 10 %), each confirmed by a window one twelfth as long.
+- A 3-day `rate` reads three days of samples of every matching series at each evaluation. It is the most expensive rule in the file; large setups compute long windows from shorter recorded rates, or evaluate them less often.
+
+## Next
+
+We now know when a service is failing too fast and who should hear about it. The next question is how to make it fail less in the first place. A service depends on others that will be slow or down at the worst moment, and on capacity that runs out under load. The [next note](/notes/devops/resilience-and-capacity) covers the mechanisms that contain such failures, timeouts, retries with backoff, circuit breakers and load shedding, and the queueing arithmetic that says how much load a service can take before its latency explodes.
+
+## References
+
+- B. Beyer, C. Jones, J. Petoff, N. R. Murphy (eds.). [*Site Reliability Engineering*](https://sre.google/sre-book/table-of-contents/). O'Reilly, 2016. Ch. 3, [Embracing Risk](https://sre.google/sre-book/embracing-risk/) (the cost of nines, error budgets); ch. 4, [Service Level Objectives](https://sre.google/sre-book/service-level-objectives/); ch. 6, [Monitoring Distributed Systems](https://sre.google/sre-book/monitoring-distributed-systems/) (symptoms and causes, what makes a good page); ch. 11, [Being On-Call](https://sre.google/sre-book/being-on-call/) (six hours per incident, two incidents per shift, the 25 % and 50 % limits).
+- B. Beyer, N. R. Murphy, D. K. Rensin, K. Kawahara, S. Thorne (eds.). [*The Site Reliability Workbook*](https://sre.google/workbook/table-of-contents/). O'Reilly, 2018. Ch. 2, [Implementing SLOs](https://sre.google/workbook/implementing-slos/) (SLI specification and implementation); ch. 5, [Alerting on SLOs](https://sre.google/workbook/alerting-on-slos/) (the six approaches, table 5-8, the example rules); appendix B, [Example Error Budget Policy](https://sre.google/workbook/error-budget-policy/).
+- A. Hidalgo. *Implementing Service Level Objectives*. O'Reilly, 2020.
+- Prometheus documentation: [recording rules](https://prometheus.io/docs/prometheus/latest/configuration/recording_rules/) (the `level:metric:operations` naming); [alerting rules](https://prometheus.io/docs/prometheus/latest/configuration/alerting_rules/); [operators](https://prometheus.io/docs/prometheus/latest/querying/operators/) (`and`, `or`, label matching); [Alertmanager](https://prometheus.io/docs/alerting/latest/alertmanager/) (grouping, inhibition, silences). Accessed October 2026.

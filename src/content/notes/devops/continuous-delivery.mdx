@@ -1,0 +1,370 @@
+---
+title: Continuous delivery and deployment
+description: "How a tested artifact reaches users safely: delivery against deployment, promoting one immutable image through environments, recreate, rolling, blue-green and canary releases with their failures and rollbacks, judging a canary statistically, feature flags, expand/contract migrations, and small batches."
+course: devops
+section: Build and Ship
+order: 6
+status: published
+tags: [continuous-delivery, continuous-deployment, environments, promotion, gitops, rolling-update, blue-green, canary, feature-flags, database-migrations, expand-contract, rollback, roll-forward, dora, argo-rollouts]
+prerequisites: [Continuous integration, Container images, Hypothesis tests and A/B testing]
+---
+
+import DeployStrategies from '../../../components/figures/continuous-delivery/DeployStrategies.astro';
+import CanaryDecision from '../../../components/figures/continuous-delivery/CanaryDecision.astro';
+
+The [previous note](/notes/devops/continuous-integration) ended with a digest: an image of `calc` that passed every test of the pipeline and carries the tag `main`. Tests run on a copy of the world, though, and the only proof that a release works is production: real traffic, real data, real scale. This note is about the last step, which is where most outages begin. It separates delivery from deployment, follows one artifact through environments, compares the ways of replacing a running version with a new one by what fails and how each is undone, works out how much traffic a canary needs before its error rate means anything, and changes a database schema under a running service without stopping it.
+
+**Conventions.** Promotion and the database migration are real sessions (Git 2.47, Python 3.14.7 with SQLite 3.53 on 23 October 2026). The canary statistics are computed exactly from the binomial distribution, on toy traffic numbers. The Argo Rollouts manifests of the Example are written against version 1.10.1 (October 2026) and validated against its published schemas, but not run.
+
+## Baseline: release night
+
+The traditional release collects weeks of changes, freezes the code, and installs the new version during a maintenance window: stop the service, replace it, migrate the database, start it, test by hand, and either declare success or spend the rest of the night restoring the old version from backups. Everything about it makes failures likely and expensive. A release with hundreds of changes is likely to contain a bad one, and when it fails nobody knows which. The procedure runs a few times a year, so it is never practised. The downtime is planned in, and an undo means restoring data. Teams that release this way release less often to reduce the pain, which makes each release larger, which makes it riskier.
+
+## Delivery and deployment
+
+Two terms, often confused, name two levels of automation ([Humble and Farley, 2010](#references); [Fowler, 2013](#references)):
+
+- **Continuous delivery**: every change that passes the pipeline is *releasable*. It sits as an artifact that could go to production at the push of a button, and the decision to push is a business decision, taken as often as wanted.
+- **Continuous deployment**: every change that passes the pipeline *is released* to production, automatically, with no human step.
+
+Both require the same machinery: an automated pipeline, an artifact built once, deployments that are routine and reversible. Continuous deployment additionally requires that the pipeline's checks, and the checks during rollout, are trusted enough to replace a person's judgement. Many teams deploy continuously to staging and deliver continuously to production.
+
+<aside class="callout"><strong>Key idea.</strong> Make releasing boring by making it small, frequent and reversible. Build one immutable artifact and promote it through environments without rebuilding. Replace running versions gradually, expose a new version to a small share of traffic first, and decide from measurements, with enough traffic to tell a bad release from noise, whether to continue or to roll back. Keep every step reversible, including the database schema, by making each version compatible with the one before it.</aside>
+
+## One artifact, many environments
+
+An **environment** is a running copy of the system with its own configuration and data: typically development, staging (a production-like environment for final checks), and production. The rule of the [build note](/notes/devops/builds-and-dependencies#artifacts-and-versioning) applies with full force here: the artifact that reaches production is the one that was tested, identified by its digest, and **promotion** means pointing the next environment at the same digest. What differs between environments is configuration (addresses of databases, credentials, sizes, feature-flag defaults), and it comes from the environment, through variables or mounted files, not from the image ([The Twelve-Factor App, III: Config](#references)). An image with a production URL baked into it cannot be tested in staging; an image rebuilt for production was never tested at all.
+
+The state of each environment, which digest it runs, is itself worth versioning. In the **GitOps** style, a repository holds one file per environment, a deployment is a commit to it, and an agent in each environment applies whatever the repository says (the [infrastructure-as-code note](/notes/devops/infrastructure-as-code) and the [Kubernetes note](/notes/devops/kubernetes) build the agents). A throwaway repository of this kind, with the digests of the two images built by hand in the [image note](/notes/devops/container-images#what-an-image-is):
+
+```console
+$ cat environments/production.env
+IMAGE=registry.example.com/team/calc@sha256:cf856bfec9cae6fff4ca8d306740c4e8ba1e3668e56e431e76e18cbc4ec5234f
+$ NEW=sha256:1d23a475efdea570c193adcfd05cfdbdeb5c64b6e203fabd84de91f1621608bf   # passed CI
+$ sed -i '' "s|@sha256:.*|@$NEW|" environments/staging.env && git commit -qam 'staging: calc 1d23a475efde'
+$ cp environments/staging.env environments/production.env && git commit -qam 'production: promote 1d23a475efde from staging'
+$ git revert --no-edit HEAD | head -1
+[main c05d843] Revert "production: promote 1d23a475efde from staging"
+$ git log --format='%h %ad %s' --date=format:'%H:%M'
+c05d843 11:20 Revert "production: promote 1d23a475efde from staging"
+6c66f70 11:00 production: promote 1d23a475efde from staging
+231b1b6 10:00 staging: calc 1d23a475efde
+e072a1a 09:00 staging, production: calc cf856bfec9ca
+$ cat environments/production.env environments/staging.env
+IMAGE=registry.example.com/team/calc@sha256:cf856bfec9cae6fff4ca8d306740c4e8ba1e3668e56e431e76e18cbc4ec5234f
+IMAGE=registry.example.com/team/calc@sha256:1d23a475efdea570c193adcfd05cfdbdeb5c64b6e203fabd84de91f1621608bf
+```
+
+The new image went to staging at 10:00 and was promoted to production at 11:00 by copying the very same digest; twenty minutes later production was rolled back with `git revert`, while staging kept the new version for investigation. The log answers the questions that matter during an incident: what runs where, since when, who changed it, and what the previous state was. Rolling back is the same operation as deploying, which is the property that makes it safe to do under stress.
+
+## Replacing a running version
+
+Every strategy answers the same question: while version 1 is serving users, how does version 2 take over? They differ in capacity needed, in how many users meet a bad version, in whether two versions run at the same time, and in how fast the change can be undone.
+
+<DeployStrategies />
+
+1. **Recreate**: version 1 is stopped, then version 2 is started; between the two, nothing serves.
+2. **Rolling**: instances are replaced a batch at a time, so the share of version 2 climbs in steps while both versions serve.
+3. **Blue-green**: version 2 runs in full beside version 1 and takes all traffic at one switch; version 1 stays idle, ready to take it back.
+4. **Canary**: version 2 gets a small share of traffic, which grows step by step while its measurements are checked; a bad canary is stopped while it serves a few percent.
+
+### Recreate
+
+Stop every instance of version 1, then start version 2. It is the only strategy in which the two versions never run at the same time, which is what it is for: a version that holds an exclusive resource, or a schema change that the old version cannot survive. The cost is downtime, equal to the time to stop, start and warm up. **What fails**: if version 2 does not start, the outage continues until someone notices. **Rollback**: recreate version 1, a second outage.
+
+### Rolling update
+
+Replace instances a few at a time: start some of version 2, wait until they report ready, send them traffic, stop as many of version 1, repeat. Kubernetes Deployments do this by default, with two parameters: `maxSurge`, how many instances above the desired count may exist during the update, and `maxUnavailable`, how many below it are allowed; both default to 25% ([Kubernetes documentation, Deployments](#references)). With 20 instances, `maxSurge: 25%` and `maxUnavailable: 0`, five new instances start, and each time one is ready an old one stops, so capacity never drops below 20.
+
+The **readiness check** is what makes a rolling update safe: an instance receives traffic only after it answers its health endpoint, and the rollout stops advancing if new instances never become ready. **What fails**: a version that starts and reports ready but is wrong, returning errors or wrong answers, is rolled out to everyone at the speed of the rollout, unless something watches its metrics. During the rollout both versions serve, so they must be compatible: the same API for clients, the same database schema, and sessions or messages that either version can read. **Rollback**: a rolling update back to version 1, which takes as long as the update did.
+
+### Blue-green
+
+Run two complete environments, blue (current) and green (new). Deploy version 2 to green, test it there with production configuration but no users, then switch the router, load balancer or DNS record so that all traffic goes to green at once ([Fowler, 2010](#references)). Blue stays running, idle, for a while. **What fails**: whatever the tests in green could not reproduce, now for all users at once: load, real data, real clients. The switch itself must handle long-lived connections, which stay on blue until they close. The two environments usually share the database, so the schema must still suit both versions. It needs twice the capacity during the switch. **Rollback**: switch back, in seconds, as long as blue is still there and its state is still valid.
+
+### Canary
+
+Send a small share of traffic to version 2, the **canary**, compare its measurements with those of version 1, and increase the share in steps (for example 5%, 25%, 50%, 100%) if they look the same ([Sato, 2014](#references); [Beyer et al., 2018, chapter 16](#references)). The name comes from the birds that miners took underground to detect gas before it reached them. **What fails**: problems that a small share of traffic does not reveal within the observation window: a slow memory leak, a bug that only some customers trigger, an error rate too small to measure on few requests, which the next section quantifies. A canary that is compared with the old fleet rather than with an equal, freshly started group of version 1 is compared with machines that differ in more than the version: warm caches, uptime, location. The practice of automated canary analysis, as in Netflix's and Google's Kayenta, compares the canary with a **baseline** of the old version started at the same time and of the same size, so that the version is the only difference ([Graff and Sanden, 2018](#references)). **Rollback**: route the canary's share back to version 1. It is fast, and only the canary's few percent of users met the bad version.
+
+### Judging a canary on a small sample
+
+Suppose `calc` serves 200 requests per second, and the stable version's error rate, measured over the previous week, is $p_0 = 0.2\%$. A canary at 5% receives 10 requests per second, $n = 6{,}000$ in a ten-minute step. The question at the end of the step is whether the canary's error count $X$ is consistent with $p_0$, or whether the release is worse. This is a [hypothesis test](/notes/probability/hypothesis-tests#the-logic-of-a-test): under the null hypothesis that the canary is as good as the stable version, each request fails independently with probability $p_0$, and
+
+$$
+X \sim \mathrm{Bin}(6000,\ 0.002), \qquad \mathbb E X = 12, \qquad \mathrm{sd}(X) = \sqrt{6000 \cdot 0.002 \cdot 0.998} = 3.46 .
+$$
+
+The canary shows 21 errors. Under the null hypothesis, $P(X \ge 21) = 0.0115$: unlikely, but not impossible. A rule decided before the step is better than a judgement after it. Fail the canary if $X \ge c$, with $c$ the smallest count for which a good release is failed by chance at most 5% of the time:
+
+$$
+P(X \ge 18 \mid p_0) = 0.063, \qquad P(X \ge 19 \mid p_0) = 0.037 \quad\Rightarrow\quad c = 19 .
+$$
+
+That fixes the false alarms. The other error matters as much: a release that *doubles* the error rate, to $p_1 = 0.4\%$, gives $X \sim \mathrm{Bin}(6000, 0.004)$ with mean 24, and the rule catches it with probability $P(X \ge 19 \mid p_1) = 0.872$, the **power**:
+
+<CanaryDecision />
+
+1. The distribution of the error count if the canary is as good as the stable version: mean 12.
+2. The distribution if the release doubles the error rate: mean 24.
+3. The threshold $c = 19$: a good release lands at or above it 3.7% of the time (a false alarm), a doubling release lands below it 12.8% of the time (a miss).
+
+Smaller canaries see less. At 1% for the same ten minutes, $n = 1{,}200$ and the expected count is 2.4; the same 5% rule fails a canary at 6 errors and catches a doubling only with probability 0.35, worse than a coin. How large must the sample be? With the [normal approximation](/notes/probability/central-limit-theorem) to the error rate $\hat p = X/n$, a one-sided test at level $\alpha$ rejects when
+
+$$
+\hat p \ge p_0 + z_{1-\alpha} \sqrt{\frac{p_0 (1 - p_0)}{n}} .
+$$
+
+For power $1 - \beta$ against $p_1$, this threshold must lie $z_{1-\beta}$ standard errors below $p_1$:
+
+$$
+\begin{aligned}
+p_0 + z_{1-\alpha} \sqrt{\frac{p_0 q_0}{n}} &= p_1 - z_{1-\beta} \sqrt{\frac{p_1 q_1}{n}} \qquad (q = 1 - p) \\
+\sqrt{n}\, (p_1 - p_0) &= z_{1-\alpha} \sqrt{p_0 q_0} + z_{1-\beta} \sqrt{p_1 q_1} \\
+n &= \left( \frac{z_{1-\alpha} \sqrt{p_0 q_0} + z_{1-\beta} \sqrt{p_1 q_1}}{p_1 - p_0} \right)^{2} .
+\end{aligned}
+$$
+
+With $\alpha = 0.05$ ($z = 1.645$), power 0.9 ($z = 1.282$), $\sqrt{p_0 q_0} = 0.0447$ and $\sqrt{p_1 q_1} = 0.0631$:
+
+$$
+n = \left( \frac{1.645 \cdot 0.0447 + 1.282 \cdot 0.0631}{0.002} \right)^{2} = \left( \frac{0.1544}{0.002} \right)^{2} = 77.2^2 \approx 5{,}960 ,
+$$
+
+about ten minutes at 10 requests per second, consistent with the exact power of 0.87 at 6,000 requests. To detect a 50% increase instead of a doubling ($p_1 = 0.3\%$), the same formula asks for about 20,600 requests, three and a half times as many: the required sample grows roughly with one over the square of the effect. The same scaling sets a floor on zero-error canaries. If a canary serves $n$ requests without a single error, the 95% upper confidence bound on its error rate is about $3/n$ (the **rule of three**, from $(1 - p)^n = 0.05$); after 1,200 requests that is 0.25%, so even a perfect-looking 1% canary cannot show that it is no worse than the stable version's 0.2%.
+
+Three more traps from the [probability course](/notes/probability/hypothesis-tests) apply directly. **Peeking**: checking the canary every minute and failing it at the first scary count raises the false-alarm rate far above 5%, so the decision is made at fixed points, or with a sequential test built for repeated looks. **Many metrics**: a canary judged on twenty metrics at 5% each fails a good release often unless the thresholds account for the number of comparisons. **The model**: requests are not independent coin flips, because errors cluster by user, by endpoint and in time, which inflates the variance; comparing against a simultaneous baseline of the same size controls for much of this.
+
+### Feature flags
+
+A **feature flag** is a condition in the code, `if flags.enabled("new-parser", user)`, whose value comes from a configuration service at run time ([Hodgson, 2017](#references)). It separates two events that the other strategies tie together: **deployment**, putting new code on the servers, and **release**, letting users run it. New code can be deployed dark, switched on for the team, then for 1% of users, then for everyone, and switched off in seconds without a deployment. A flag works per user, so a percentage rollout by flag is a canary on users rather than on requests, and the same statistics apply. The OpenFeature specification standardizes the interface between code and flag providers.
+
+**What fails**: every flag doubles the number of configurations the code can be in, and old flags left in the code become paths that nobody tests. The classic failure is Knight Capital in August 2012: a deployment missed one of eight servers, a repurposed flag switched on retired code on that server, and the firm lost more than 460 million dollars in about 45 minutes ([SEC, 2013](#references)). Flags need owners and expiry dates, and removing a flag is part of finishing the feature. **Rollback**: switch the flag off, the fastest undo there is, for problems inside the flagged code.
+
+## Database migrations: expand and contract
+
+Every strategy except recreate runs two versions at once, and the database is shared. A migration that renames a column breaks whichever version does not expect it, and a rollback of the code cannot undo a migration that dropped data. The way out is to split every incompatible change into steps that are each compatible with the version before and after: **expand** the schema so that it serves both versions, migrate the code and the data, then **contract** it once nothing uses the old form (the parallel change of [Sato, 2014](#references); [Ambler and Sadalage, 2006](#references)).
+
+Renaming `history.expr` to `history.expression` takes three deployments. The program below runs the steps on SQLite, with three versions of the code: `v1` uses `expr`, `v2` writes both columns and reads the new one with a fallback, `v3` uses only `expression`. At each phase the versions that a rolling update would run side by side each write a row and read every row back:
+
+```python
+# Rename history.expr to history.expression while old and new versions of the service run side by side.
+import sqlite3
+
+db = sqlite3.connect(':memory:')
+db.execute('CREATE TABLE history (id INTEGER PRIMARY KEY, expr TEXT, value REAL)')
+
+VERSIONS = {  # how each version of the code writes a row and reads the expressions back
+    'v1': ('INSERT INTO history (expr, value) VALUES (:e, 42)', 'SELECT expr FROM history'),
+    'v2': ('INSERT INTO history (expr, expression, value) VALUES (:e, :e, 42)', 'SELECT COALESCE(expression, expr) FROM history'),
+    'v3': ('INSERT INTO history (expression, value) VALUES (:e, 42)', 'SELECT expression FROM history'),
+}
+
+def phase(title, *running, write=True):
+    print(title)
+    for v in running:
+        insert, select = VERSIONS[v]
+        try:
+            if write:
+                db.execute(insert, {'e': '6 * 7'})
+            rows = [r[0] for r in db.execute(select)]
+            print(f'  {v}: {"wrote a row, " if write else ""}reads {len(rows)} rows, {rows.count(None)} without an expression')
+        except sqlite3.Error as e:
+            print(f'  {v}: FAILS: {e}')
+
+phase('0. v1 runs; two rows written', 'v1', 'v1')
+db.execute('ALTER TABLE history ADD COLUMN expression TEXT')                  # expand
+phase('1. expand: column added; v1 and v2 run during the rollout', 'v1', 'v2')
+db.execute('UPDATE history SET expression = expr WHERE expression IS NULL')   # backfill (in batches on a big table)
+phase('2. backfill done; v2 and v3 run during the rollout', 'v2', 'v3')
+phase('   what v1 would read after a rollback', 'v1', write=False)
+db.execute('ALTER TABLE history DROP COLUMN expr')                            # contract
+phase('3. contract: old column dropped', 'v3', 'v2')
+```
+
+```console
+$ python3.14 expand_contract.py
+0. v1 runs; two rows written
+  v1: wrote a row, reads 1 rows, 0 without an expression
+  v1: wrote a row, reads 2 rows, 0 without an expression
+1. expand: column added; v1 and v2 run during the rollout
+  v1: wrote a row, reads 3 rows, 0 without an expression
+  v2: wrote a row, reads 4 rows, 0 without an expression
+2. backfill done; v2 and v3 run during the rollout
+  v2: wrote a row, reads 5 rows, 0 without an expression
+  v3: wrote a row, reads 6 rows, 0 without an expression
+   what v1 would read after a rollback
+  v1: reads 6 rows, 1 without an expression
+3. contract: old column dropped
+  v3: wrote a row, reads 7 rows, 0 without an expression
+  v2: FAILS: table history has no column named expr
+```
+
+1. **Expand.** Add the new column, nullable, before any code uses it. `v1` ignores it; `v2`, rolled out next, writes both columns, so rows from either version are readable by both, and a rollback from `v2` to `v1` is safe.
+2. **Backfill.** Once no `v1` is left, copy the old values into the new column. On a large table this runs in batches of a few thousand rows, so that no single statement holds locks for long.
+3. **Switch the reads.** `v3` uses only the new column and runs safely beside `v2`, whose fallback reads either. The rollback window narrows: back to `v2` is safe, back to `v1` is not, because `v1` reads only the old column and sees nothing in the row `v3` wrote.
+4. **Contract.** Drop the old column only when no running version, and no version one might roll back to, uses it. Dropped too early, as the last line shows, it breaks `v2` at once.
+
+The statements are the same in PostgreSQL, which adds its own rules for doing them without long locks: adding a nullable column, or one with a constant default, changes only the catalogue; an index on a live table is built with `CREATE INDEX CONCURRENTLY`; a `NOT NULL` constraint is added as a `CHECK` constraint marked `NOT VALID` and validated separately ([PostgreSQL documentation, ALTER TABLE](#references)). Migration tools (Alembic, Flyway, Liquibase) run such steps in order and record which have run, but the splitting into compatible steps is a design decision that no tool makes.
+
+## Rollback or roll forward
+
+When a release goes wrong, there are two ways out. **Rolling back** returns to the previous artifact, which is known to have worked; **rolling forward** releases a new fix through the pipeline. The first is usually faster and safer for mitigation, which is the first goal of an incident: stop the damage, then find the cause ([Beyer et al., 2016, chapter 14](#references)). The second is the right answer when going back is impossible or worse: a migration that cannot be reversed, a security fix that must not be undone, data written in a format the old version cannot read, an external side effect such as sent emails that a rollback does not unsend.
+
+The previous sections turn this into a design rule. Keep rollback always possible: compatible schema changes in expand/contract steps, the previous artifact still in the registry and in the environment's history, a rollback that is the same operation as a deployment. And keep roll-forward fast: a fix can only be rolled forward as fast as the pipeline of the [previous note](/notes/devops/continuous-integration#the-time-arithmetic-of-a-pipeline) runs, which is one more reason for a short critical path.
+
+## Deployment frequency and batch size
+
+The [opening note](/notes/devops/what-devops-is#how-delivery-is-measured-the-dora-metrics) introduced the DORA metrics and their finding that speed and stability go together, and [computed why](/notes/devops/what-devops-is#why-small-batches-lower-risk): a deployment of $k$ changes, each faulty with probability $p$, fails with probability $1 - (1 - p)^k$, rolls back its good changes with the bad one, and needs about $\log_2 k$ rounds of bisection to find the culprit. This note supplies the machinery that makes $k = 1$ affordable, and each piece moves a metric:
+
+- **Change lead time and deployment frequency.** Promotion of a tested digest by a commit, with no rebuild and no release window, makes a deployment a few minutes of automated work, so there is no reason to wait for a batch to fill up. What remains of the lead time is the critical path of the pipeline and the time a change waits for review and for the merge queue.
+- **Change fail rate.** Gradual exposure does not make a bad change less likely, but it lets a canary analysis or a readiness check stop it before it counts as a failed deployment for everyone, and a decision rule with a known false-alarm rate keeps good releases from being failed by noise.
+- **Failed deployment recovery time.** Recovery is as fast as the undo: a second outage for recreate, the length of a rollout for a rolling update, seconds for a blue-green switch back, a canary abort or a flag switched off. Expand/contract migrations are what keep these undos available.
+- **Deployment rework rate.** Unplanned fix-up deployments are the roll-forwards of the previous section. They drop when rollback is the cheap default and a fix can go through the normal pipeline instead of a hurried hotfix.
+
+The order of the section is therefore not an accident: a build graph that rebuilds only what changed, an image identified by its digest, a pipeline that tests it in minutes, and a rollout that exposes it gradually are, together, what lets a team deploy one change at a time.
+
+<aside class="callout"><strong>Check yourself.</strong> (1) A team rebuilds the image from the same commit for production "to be sure it is fresh". What can go wrong? (2) A rolling update of 10 instances with `maxSurge: 2` and `maxUnavailable: 0` is in progress, and the new version starts, passes its readiness check and returns errors on 30% of requests. What stops the rollout, and what is the share of traffic on the new version after the first batch? (3) A canary at 2% for 15 minutes on a service with 100 requests per second and a stable error rate of 0.5% shows 10 errors. Is that alarming? (4) A migration adds a `NOT NULL` column without a default, and the new code fills it. Why does the rolling update fail, and how should the change be split? (5) A team's failed deployment recovery time is 40 minutes, almost all of it a rolling update back to the previous version. Name two ways to shorten it.<details><summary>Answers</summary>(1) The rebuild can resolve different base images or dependencies (moved tags, new versions), so production runs bytes that were never tested; and the digest no longer links production to the CI run. Promote the tested digest. (2) Nothing: the new instances pass their readiness check, so the rollout continues until every instance runs the bad version. After the first batch, 2 of the 10 instances, about 20% of traffic, run it (briefly 2 of 12, while two old ones drain). Only something that watches the error rate, such as an automated analysis step, would stop it. (3) $n = 100 \cdot 0.02 \cdot 900 = 1{,}800$ requests, expected $1800 \cdot 0.005 = 9$ errors with sd $\sqrt{8.96} \approx 3$; 10 errors is well within chance, so not alarming, and also not much evidence that the canary is fine. (4) Old instances, still running during the rollout, insert rows without the column and fail the constraint. Add the column as nullable (expand), deploy code that fills it, backfill old rows, then add the constraint (validated separately), and only later rely on it. (5) Keep the previous version running and switch traffic back (blue-green), or expose the new version as a canary that is aborted by its analysis before it reaches everyone; for changes behind a feature flag, switch the flag off. All of them need a schema that both versions can use.</details></aside>
+
+## What changed
+
+| | Release night (the baseline) | Continuous delivery |
+| --- | --- | --- |
+| What is released | weeks of changes at once | one or a few changes, often |
+| What reaches production | a fresh build, installed by hand | the tested digest, promoted unchanged |
+| Downtime | planned into a window | none: rolling, blue-green or canary |
+| Who meets a bad version first | everyone | a canary's few percent, or no one with a flag |
+| How a bad version is noticed | by users and manual tests | by measurements during rollout, with a decision rule |
+| Database changes | a migration in the window | expand/contract steps, each compatible both ways |
+| Undo | restore from backups | revert the environment's state, shift traffic back, or switch a flag off |
+
+## Limitations
+
+- **Statistics need traffic.** Low-traffic services, rare endpoints and rare errors cannot be judged by a short canary; they need longer windows, synthetic traffic or acceptance of more risk.
+- **Not everything is reversible.** Data deleted, messages sent, payments made and schema contracted cannot be rolled back by redeploying, which is why the irreversible steps are separated and delayed.
+- **Two versions at once is a permanent constraint.** Rolling, blue-green and canary all assume that version $N$ and $N + 1$ can run together, which every API, message format and schema change must respect.
+- **Stateful systems are harder.** Databases, queues and caches themselves are upgraded with their own procedures (replication, failover), not with the strategies of stateless services.
+- **Tools move.** Argo Rollouts, Flagger, service meshes and cloud deployment services implement these strategies with different vocabularies; the versions here are those of October 2026.
+
+## What you should remember
+
+- Continuous delivery keeps every change releasable; continuous deployment releases every change automatically.
+- Build once, promote the same digest through environments, and keep configuration outside the image. Recording each environment's digest in Git makes deployment and rollback the same operation.
+- Recreate has downtime; rolling updates need readiness checks and version compatibility; blue-green switches all traffic at once with instant rollback at double capacity; canaries expose a small share and decide from measurements; feature flags separate deployment from release.
+- A canary is a hypothesis test. With $n$ requests and baseline rate $p_0$, fix a threshold in advance and check its power: $n = \bigl((z_{1-\alpha}\sqrt{p_0 q_0} + z_{1-\beta}\sqrt{p_1 q_1})/(p_1 - p_0)\bigr)^2$, about 6,000 requests to catch a doubling of a 0.2% error rate. Zero errors in $n$ requests bounds the rate only by about $3/n$.
+- Change schemas by expand and contract, so that every version runs against every schema it may meet, and drop the old form only after the rollback window has passed.
+- Prefer rollback to mitigate, roll forward when going back is impossible, and keep both fast.
+- Small batches, one change per deployment where possible, are what this machinery is for: cheap promotion, gradual exposure and fast undo improve every DORA metric.
+
+## Example
+
+A canary for `calc` with Argo Rollouts, a Kubernetes controller that adds canary and blue-green strategies to the Deployment of the [Kubernetes notes](/notes/devops/kubernetes): a `Rollout` with the steps of the canary, and an `AnalysisTemplate` that implements the decision rule of this note with two Prometheus queries ([Argo Rollouts documentation](#references)). Written for Argo Rollouts v1.10.1 and validated against its schemas, not run. It assumes that Prometheus collects a counter `http_requests_total` from every pod with the pod's labels attached; metrics and Prometheus are the subject of the [observability note](/notes/devops/observability).
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: calc
+spec:
+  replicas: 20
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      app: calc
+  template:
+    metadata:
+      labels:
+        app: calc
+    spec:
+      containers:
+        - name: calc
+          image: registry.example.com/team/calc@sha256:1d23a475efdea570c193adcfd05cfdbdeb5c64b6e203fabd84de91f1621608bf
+          ports:
+            - containerPort: 8000
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8000
+            periodSeconds: 5
+  strategy:
+    canary:
+      maxSurge: 1
+      maxUnavailable: 0
+      steps:
+        - setWeight: 5
+        - pause:
+            duration: 10m
+        - analysis:
+            templates:
+              - templateName: canary-errors
+            args:
+              - name: canary-hash
+                valueFrom:
+                  podTemplateHashValue: Latest
+        - setWeight: 25
+        - pause:
+            duration: 10m
+        - setWeight: 50
+        - pause:
+            duration: 10m
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: canary-errors
+spec:
+  args:
+    - name: canary-hash
+  metrics:
+    - name: enough-traffic
+      count: 1
+      successCondition: result[0] >= 6000
+      failureCondition: result[0] < 0
+      provider:
+        prometheus:
+          address: http://prometheus.monitoring.svc:9090
+          query: |
+            sum(increase(http_requests_total{app="calc", rollouts_pod_template_hash="{{args.canary-hash}}"}[10m]))
+    - name: errors
+      count: 1
+      successCondition: result[0] < 19
+      provider:
+        prometheus:
+          address: http://prometheus.monitoring.svc:9090
+          query: |
+            sum(increase(http_requests_total{app="calc", rollouts_pod_template_hash="{{args.canary-hash}}", code=~"5.."}[10m]))
+```
+
+- **`kind: Rollout`, `replicas`, `selector`, `template`.** The same fields as a Kubernetes Deployment: 20 pods of the template, found by the label `app: calc`. `revisionHistoryLimit` keeps the five previous versions available for rollback.
+- **`image: …@sha256:…`.** The promoted digest, never a tag, written by the promotion commit of the environments repository.
+- **`readinessProbe`.** A pod receives traffic only after `/healthz` answers, every 5 seconds; the rollout waits for readiness before it counts a pod.
+- **`strategy.canary`.** Without a traffic router, Argo Rollouts approximates weights with pod counts: 5% of 20 replicas is one canary pod beside 19 stable ones. `maxSurge: 1` and `maxUnavailable: 0` add the canary pod before removing a stable one, so capacity never drops.
+- **`steps`.** `setWeight: 5` starts the canary at 5%; `pause` holds it for ten minutes, the observation window of the statistics section; `analysis` runs the template once, at the end of the window, and the rollout continues only if it succeeds. The 25% and 50% steps follow; after the last step the rollout promotes the canary to 100%. A failed analysis aborts the rollout, which scales the canary down and returns all traffic to the stable pods: the rollback is automatic.
+- **`args` with `podTemplateHashValue: Latest`.** Passes the hash that Argo Rollouts puts in the label `rollouts-pod-template-hash` of the canary's pods, so that the queries count only the canary's requests.
+- **`metrics: enough-traffic`.** Counts the canary's requests over the window. With fewer than 6,000 the test has too little power to mean anything, so the result is neither success nor failure: `failureCondition` can never be true, which makes a low count **inconclusive**, and an inconclusive analysis pauses the rollout for a person to decide instead of promoting a release on too little evidence.
+- **`metrics: errors`.** Counts the canary's 5xx responses over the same window and succeeds only below 19, the threshold $c$ computed above for a 5% false-alarm rate and a power of 0.87 against a doubled error rate. A run with 19 or more errors fails the analysis and aborts the rollout.
+- **What the template does not do.** It compares against a fixed $p_0$ rather than a simultaneous baseline, and it judges one metric; a production setup adds latency and saturation metrics, and Argo Rollouts can start baseline pods next to the canary to compare the two directly.
+
+## Next
+
+The image is built, tested, and released safely, which ends the section on building and shipping. Every step so far assumed that the request reaches the right instance: a canary's 5% of traffic, a blue-green switch and a rolling update's readiness all depend on the network in front of the service. The [next note](/notes/devops/networking-for-services) follows a request from a name through DNS, TLS, proxies and load balancers to the instance that answers it.
+
+## References
+
+- HSE University, Faculty of Computer Science. *DevOps* course (4th year, Applied Mathematics and Informatics, taught with MTS): CI/CD and application deployment.
+- University of Helsinki. [*DevOps with Kubernetes*](https://devopswithkubernetes.com/) (mooc.fi, 2026): update strategies, canary releases and GitOps.
+- MIT, *The Missing Semester of Your CS Education* (2026). [Code Quality](https://missing.csail.mit.edu/2026/code-quality/) (continuous deployment) and [Packaging and Shipping Code](https://missing.csail.mit.edu/2026/shipping-code/) (releases).
+- J. Humble, D. Farley. *Continuous Delivery: Reliable Software Releases through Build, Test, and Deployment Automation*. Addison-Wesley, 2010. Chapters 5 (the deployment pipeline, building binaries once), 10 (deploying and releasing) and 12 (managing data).
+- M. Fowler. [ContinuousDelivery](https://martinfowler.com/bliki/ContinuousDelivery.html), 2013; [BlueGreenDeployment](https://martinfowler.com/bliki/BlueGreenDeployment.html), 2010.
+- D. Sato. [CanaryRelease](https://martinfowler.com/bliki/CanaryRelease.html), 2014; [ParallelChange](https://martinfowler.com/bliki/ParallelChange.html) (expand and contract), 2014.
+- P. Hodgson. [Feature Toggles (aka Feature Flags)](https://martinfowler.com/articles/feature-toggles.html). martinfowler.com, 2017. [OpenFeature specification](https://openfeature.dev/specification/).
+- S. W. Ambler, P. J. Sadalage. *Refactoring Databases: Evolutionary Database Design*. Addison-Wesley, 2006.
+- B. Beyer, C. Jones, J. Petoff, N. R. Murphy (eds.). *Site Reliability Engineering*. O'Reilly, 2016. [Chapter 8: Release Engineering](https://sre.google/sre-book/release-engineering/), [chapter 14: Managing Incidents](https://sre.google/sre-book/managing-incidents/), [chapter 27: Reliable Product Launches at Scale](https://sre.google/sre-book/reliable-product-launches/) (gradual rollouts, feature flags).
+- B. Beyer, N. R. Murphy, D. K. Rensin, K. Kawahara, S. Thorne (eds.). *The Site Reliability Workbook*. O'Reilly, 2018. [Chapter 16: Canarying Releases](https://sre.google/workbook/canarying-releases/).
+- M. Graff, C. Sanden. [Automated canary analysis at Netflix with Kayenta](https://netflixtechblog.com/automated-canary-analysis-at-netflix-with-kayenta-3260bc7acc69). Netflix Technology Blog, 2018.
+- N. Forsgren, J. Humble, G. Kim. *Accelerate: The Science of Lean Software and DevOps*. IT Revolution, 2018. Chapters 2 (measuring software delivery performance) and 4 (technical practices).
+- DORA. [DORA's software delivery performance metrics](https://dora.dev/guides/dora-metrics/), accessed October 2026 (the five metrics).
+- U.S. Securities and Exchange Commission. [In the Matter of Knight Capital Americas LLC](https://www.sec.gov/litigation/admin/2013/34-70694.pdf), Release No. 70694, 16 October 2013.
+- A. Wiggins. [The Twelve-Factor App](https://12factor.net/), III: Config.
+- Kubernetes documentation: [Deployments](https://kubernetes.io/docs/concepts/workloads/controllers/deployment/) (rolling update, `maxSurge`, `maxUnavailable`), [Liveness, readiness and startup probes](https://kubernetes.io/docs/concepts/configuration/liveness-readiness-startup-probes/).
+- Argo Rollouts documentation (v1.10): [Canary strategy](https://argo-rollouts.readthedocs.io/en/stable/features/canary/), [Analysis and progressive delivery](https://argo-rollouts.readthedocs.io/en/stable/features/analysis/), [Prometheus provider](https://argo-rollouts.readthedocs.io/en/stable/analysis/prometheus/).
+- PostgreSQL documentation: [ALTER TABLE](https://www.postgresql.org/docs/current/sql-altertable.html) (notes on adding columns and `NOT VALID` constraints), [CREATE INDEX: building indexes concurrently](https://www.postgresql.org/docs/current/sql-createindex.html#SQL-CREATEINDEX-CONCURRENTLY).
