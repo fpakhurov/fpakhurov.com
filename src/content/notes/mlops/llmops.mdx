@@ -1,0 +1,386 @@
+---
+title: LLMOps
+section: Operations
+description: "What operating changes when the model is a large language model behind an API or self-hosted: versioned prompts and models, evaluation in CI with paired intervals, judge gates, traces of chains and agents, guardrails, cost per request, caching, fallbacks and routing."
+course: mlops
+order: 13
+status: published
+tags: [llmops, prompt-versioning, model-versioning, evaluation-in-ci, regression-testing, llm-as-judge, tracing, opentelemetry, genai-semantic-conventions, guardrails, unit-economics, semantic-caching, routing, cascades, fallbacks]
+prerequisites: [Retraining and continual learning, LLM inference systems, LLM evaluation, Evaluating agents, Observability]
+---
+
+import LlmTrace from '../../../components/figures/llmops/LlmTrace.astro';
+
+The [previous note](/notes/mlops/continual-learning) kept a model current by retraining it: the team owned the data, the training and the weights, and a gate compared each new model with the old one. Many products built since 2023 own none of these. Their model is a large language model from a provider, reached through an API, or an open-weight model served by the team's own [inference engine](/notes/mlops/llm-inference-systems), and their behaviour is set by a prompt, retrieved context, tools and a few decoding parameters. Nothing is retrained, yet the system changes all the time: someone edits a prompt, the provider updates a model, an index is rebuilt, a tool's output format changes. This note is about operating such a system. It keeps the loop of the previous note and replaces its parts: what is versioned, how a change is evaluated before it ships, how a request is traced, what guards the input and the output, and what one request costs.
+
+**Conventions.** The harness and the trace of the [Example](#example) are a real Python program (3.14.7, NumPy 2.5.4, 23 October 2026) with a scripted stand-in for the model, so its numbers show the method, not the quality of any model. Prices are illustrative round numbers per million tokens, not any provider's list price. Attribute names follow the OpenTelemetry semantic conventions for generative AI as of October 2026, which are still marked *Development*. **Notation.** A *version* of the application is everything that decides an output: prompt template, model identifier, decoding parameters, tool definitions, retrieval index. $n$ is the number of evaluation items, $d_i$ the difference between two versions' scores on item $i$.
+
+## Baseline: a prompt string in the code
+
+The usual first version of an LLM feature is a string in the source code, a call to the provider's client with the model name `large-latest`, and a few manual tries in a notebook: five messages look right, it ships. It fails in four ways that a classical ML system would have caught.
+
+- **Nobody knows what changed.** A prompt edit goes out with an unrelated code change, without a review of its effect, and nothing records which prompt produced which answer.
+- **The model changes under the code.** An alias such as `large-latest` points to whichever snapshot the provider currently serves. When the provider moves it, behaviour changes with no change in the repository, and when a snapshot is retired, a migration is forced on the provider's schedule.
+- **Five examples measure nothing.** A prompt that fixes the case someone complained about may break three that nobody tried. The output is random at a nonzero temperature, so even the same five messages give different answers on another day.
+- **The bill and the latency are discovered, not designed.** A chain of calls with growing contexts costs and takes what it happens to cost and take.
+
+## What changes when the model is an LLM
+
+| | A trained model | An LLM application |
+| --- | --- | --- |
+| What a version is | weights from a training run | prompt, model identifier, parameters, tools, index |
+| Who changes it | the team, by retraining | the team, by editing text; the provider, by updating a model |
+| Ground truth | labels, often delayed | rarely any; rubrics, references, judges, people |
+| Determinism | same input, same output | sampled; even at temperature 0, outputs can depend on the batch |
+| One request | one forward pass | a chain or a loop of model calls, tools and retrieval |
+| Cost | fixed infrastructure | per token, per call, growing with context |
+| Failure modes | wrong predictions | also unparseable output, injected instructions, unsafe text |
+
+The loop of the previous note survives: version, evaluate, gate, roll out, monitor. Each step needs new machinery.
+
+<aside class="callout"><strong>Key idea.</strong> Treat everything that shapes an LLM's behaviour as a versioned artifact, and treat every change to it, by the team or by the provider, as a release. A release passes an evaluation set in CI with a paired comparison against the current version, slice by slice; in production every request leaves a trace with its versions, tokens, cost and latency per call. Without the versions the traces are unreadable, and without the evaluation the traces only show what went wrong after users saw it.</aside>
+
+## Prompt and model versioning
+
+The unit of a release is the tuple that decides an output: **prompt template version, model identifier, decoding parameters, tool definitions and retrieval index version**. It is the versioning-and-provenance discipline of [Kästner (2025, ch. 24)](#references) applied to artifacts that are text, and the release unit of the [LLM System Engineering course](#references). Practices that follow:
+
+- **Prompts live in version control**, as files reviewed like code, or in a prompt registry that gives each template a name and an immutable version and lets a deployment refer to it by label (`triage@2`, `triage@prod`). The template's content hash, printed by the Example as `sha256:ea33b0e1ec7b`, identifies it in logs regardless of where it is stored.
+- **Pin model snapshots.** Call the dated snapshot (`large-2026-08`), not the alias, and treat an upgrade as a change that must pass evaluation. Record the model that actually answered, which the API returns and which can differ from the one requested behind an alias or a fallback. Track the provider's deprecation dates as dependencies with an expiry.
+- **For self-hosted models, the weights are only part of the version.** The engine and its version, the quantization format, the parallelism layout and the kernels change outputs too. The [quantization note](/notes/nlp/quantization#weight-only-quantization-for-large-language-models) shows that a 4-bit model is a different model; it needs its own evaluation.
+- **Expect nondeterminism even at temperature 0.** An inference engine batches requests from many users, and kernels whose reduction order depends on the batch size produce slightly different numbers for the same request in a different batch. In one experiment, 1,000 completions of the same prompt at temperature 0 on a 235 B-parameter model gave 80 distinct texts, all identical for the first 102 tokens; batch-invariant kernels made all 1,000 identical, at some cost in speed ([He, 2025](#references)). For evaluation this means repeated trials, not a single run, and for debugging it means that a trace, not a replay, is the record of what happened.
+
+## Evaluation sets and evaluation in CI
+
+The instruments for scoring LLM outputs are covered elsewhere and are not repeated here: benchmarks, retrieval metrics, model judges and human preference in [LLM evaluation](/notes/nlp/llm-evaluation), and success rates, repeated trials and how many tasks an interval needs in [Evaluating agents](/notes/agents/evaluating-agents#how-many-tasks-intervals-for-a-success-rate). What operations adds is the **regression suite**: a fixed, versioned set of inputs with graders, run in CI on every change to any part of the release tuple, with a gate on its result ([HSE, 2026](#references)).
+
+**Where the items come from.** Production traces are the best source, because they are the real distribution: sample them, stratified by intent or route, and label or reference the sample. Add the cases of every incident (a regression test for each bug, as in software), adversarial inputs (injections, abuse, very long inputs) and the rare but expensive slices. Keep the suite stable between releases, so that numbers are comparable, and refresh it on a schedule, with the old and the new versions both scored on the new suite.
+
+**Graders, cheapest first.** A schema check (does the output parse, are the fields present), deterministic checks (the extracted order id equals the reference), then a model judge for what has no mechanical check, then people for a sample. The Example's task, routing customer messages, has a mechanical grader: the output must be JSON with the right intent and order id.
+
+**Repeated trials.** At the deployed temperature, each item is run $k$ times. The item's score is its pass rate over the trials; the [pass^k](/notes/agents/evaluating-agents#passk-success-in-all-of-k-trials) view, the share of items where all $k$ trials pass, measures consistency. In the Example, version 2 raises the mean pass rate from 0.796 to 0.867, and the share of items that pass all three trials from 0.513 to 0.673.
+
+### Comparing two versions on the same items
+
+Both versions are scored on the same items, and items differ in difficulty much more than versions do. A paired comparison removes that shared difficulty. With $a_i$ and $b_i$ the scores of the old and new version on item $i$ and $d_i = b_i - a_i$:
+
+$$
+\begin{aligned}
+\operatorname{Var}(\bar d) &= \frac{\operatorname{Var}(b_i - a_i)}{n} && \text{the } d_i \text{ are independent across items} \\
+&= \frac{\operatorname{Var}(a_i) + \operatorname{Var}(b_i) - 2\operatorname{Cov}(a_i, b_i)}{n}. && \text{variance of a difference}
+\end{aligned}
+$$
+
+Unpaired, the covariance term is missing; when hard items are hard for both versions it is positive and large. On the Example's 150 items, the paired standard error of the difference is 0.0198 and the unpaired one 0.0258. The unpaired analysis would need $(0.0258 / 0.0198)^2 = 1.70$ times as many items for the same precision. The interval itself is best taken from a **paired bootstrap** that resamples items, keeping each item's two scores together (the [bootstrap](/notes/probability/confidence-intervals-and-bootstrap#the-bootstrap), with items as the unit, as [Evaluating agents](/notes/agents/evaluating-agents#how-many-tasks-intervals-for-a-success-rate) insists): $+0.071$ with 95 % interval $[+0.031, +0.109]$.
+
+**The gate** has the same shape as the retraining gate of the previous note: ship if the lower bound of the overall difference is above a margin ($-0.02$ here) **and** no important slice gets worse by more than a tolerance. In the Example, version 2 is better overall, clearly so, and it is blocked:
+
+| slice | version 1 | version 2 | change | 95 % interval |
+| --- | --- | --- | --- | --- |
+| order status | 0.900 | 0.956 | +0.056 | [−0.000, +0.111] |
+| refund | 0.656 | 0.822 | +0.167 | [+0.089, +0.256] |
+| return | 0.711 | 0.922 | +0.211 | [+0.144, +0.289] |
+| cancel | 0.889 | 0.767 | **−0.122** | [−0.233, −0.022] |
+| other | 0.822 | 0.867 | +0.044 | [−0.000, +0.100] |
+
+The new few-shot examples fixed the confusion between refunds and returns and broke cancellations. Thirty items per slice give wide intervals, but this one excludes zero. An average hides exactly the kind of regression that a user of that slice will notice; the gate's decision is "fix the cancellation examples and run again", not "ship the better average".
+
+**Cost of the suite.** 150 items, 3 trials and 2 versions are 900 calls per CI run. Two habits keep it affordable: cache the old version's outputs, keyed by the full release tuple, the input and the trial number, so that only the changed version is rerun; and run the full suite on changes to prompts, models and indexes, a smaller smoke set on unrelated code changes.
+
+## A model as judge at the gate
+
+When an output has no mechanical check, a long answer or a summary, the gate uses a **judge**: a model that compares the new version's answer with the old one's for the same input, with a rubric, both orders to cancel position bias, and a pinned judge model and prompt so that the measuring instrument does not drift between runs ([Zheng et al., 2023](#references)). How well judges agree with people, and how to make them agree better, is in [A model as judge](/notes/nlp/llm-evaluation#a-model-as-judge). What the gate needs from that measurement is one number: the judge's accuracy $\alpha$ on pairs where people agree which answer is better.
+
+A judge with $\alpha < 1$ shrinks every difference towards 50 %. Suppose the new version truly wins a fraction $w$ of the pairs and the judge picks the true winner with probability $\alpha$, independently of which version that is. The judge reports a win when it is right about a true win or wrong about a true loss:
+
+$$
+\begin{aligned}
+w_{\text{obs}} &= \alpha\, w + (1 - \alpha)(1 - w) = (1 - \alpha) + (2\alpha - 1)\, w, \\
+\Rightarrow\quad w &= \frac{w_{\text{obs}} - (1 - \alpha)}{2\alpha - 1}, \qquad
+\operatorname{SE}(w) = \frac{\operatorname{SE}(w_{\text{obs}})}{2\alpha - 1}.
+\end{aligned}
+$$
+
+On numbers: a judge validated at $\alpha = 0.8$ prefers the new version on 224 of 400 pairs, $w_{\text{obs}} = 0.56$. Then $w = (0.56 - 0.2)/0.6 = 0.60$; the standard error of the observed rate is $\sqrt{0.56 \cdot 0.44 / 400} = 0.0248$, and of the corrected one $0.0248/0.6 = 0.0414$. The one-sided 95 % lower bound is $0.60 - 1.645 \times 0.0414 = 0.532$, above one half, so the gate passes. Two consequences. A weak judge needs many more pairs: at $\alpha = 0.6$ the standard error is five times that of the observed rate, and 25 times as many pairs give the same precision. And the correction assumes the judge errs symmetrically; a judge that prefers longer answers errs in favour of whichever version is more verbose, and no formula removes that. Ties, which judges produce often, are counted separately and reported.
+
+## Tracing chains and agents
+
+One request to an LLM application is a tree of operations: an agent step, one or more model calls, retrievals and tool calls, a guardrail. A **trace** records it as spans with a shared trace id and parent links, exactly as the traces of the [observability note](/notes/devops/observability#traces-spans-and-context-propagation). What is specific is the attributes: which prompt version and model, how many tokens went in, came from the cache and came out, why generation stopped, and when the first token arrived.
+
+<LlmTrace />
+
+1. **The agent span** is the root. Its duration is what the user waited.
+2. **A small model classifies the message.** Of its 1,450 input tokens, 1,200, the system prompt and the few-shot examples, are read from the provider's [prompt cache](/notes/agents/context-and-memory#prompt-caching-as-economics), which costs a tenth of the input price.
+3. **A tool call** looks the order up: 180 ms and no tokens. Tool spans are where external failures show.
+4. **The large model writes the reply.** It waits 450 ms for the first token and then produces the other 179 at 10 ms each: $450 + 179 \times 10 = 2{,}240$ ms. This one span is 76 % of the latency and 98 % of the cost.
+5. **A guardrail** checks the reply before it is sent (the next section). It is an application span, not a model call.
+
+**The OpenTelemetry semantic conventions for generative AI** give these spans common names, so that a trace from any framework reads the same in any backend ([OpenTelemetry, 2026](#references)). As of October 2026 they live in their own repository, `open-telemetry/semantic-conventions-genai`, created in May 2026 when they moved out of the main semantic conventions, and every part of them is still at stability level *Development*: names can change between releases, and instrumentation should pin the version it implements. The parts used here:
+
+- **Span names** `{gen_ai.operation.name} {gen_ai.request.model}` for a model call (`chat large-2026-08`), `execute_tool {gen_ai.tool.name}` for a tool and `invoke_agent {gen_ai.agent.name}` for an agent; model calls are spans of kind `CLIENT`, tool executions `INTERNAL`.
+- **Attributes** `gen_ai.operation.name` and `gen_ai.provider.name` (required); `gen_ai.request.model` and `gen_ai.response.model`, which differ when an alias or a fallback answered; `gen_ai.prompt.name` and `gen_ai.prompt.version`, which link a span to the versioned prompt; `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens` and `gen_ai.usage.cache_read.input_tokens`, where the input total includes the cached tokens; `gen_ai.response.finish_reasons`; and `gen_ai.response.time_to_first_chunk`, in seconds, for streamed responses.
+- **Content is opt-in.** The messages, the system instructions and the tool definitions (`gen_ai.input.messages`, `gen_ai.output.messages`, `gen_ai.system_instructions`, `gen_ai.tool.definitions`) are recorded only if the application enables it, since they contain users' data. Where they are recorded, they inherit the access rules and retention limits of personal data, the subject of the [next note](/notes/mlops/responsible-ml).
+
+Traces serve four purposes beyond debugging one request. **Cost attribution**: tokens and prices per span, summed by route, prompt version, customer or feature. **Latency budgets**: which span holds the time, and whether TTFT or decoding dominates, the [metrics](/notes/mlops/llm-inference-systems#metrics-ttft-tpot-throughput-and-goodput) of the inference note. **Failure diagnosis**: whether a bad answer started at retrieval, in the assembled prompt, in the model's use of the context or in a tool's error, a taxonomy that the evaluation set should mirror. **New evaluation items**: traces of failures and complaints become regression cases. Sampling follows the observability note's [tail sampling](/notes/devops/observability#traces-spans-and-context-propagation): keep every trace with an error, a guardrail block or an unusual cost, and a fraction of the rest.
+
+## Guardrails
+
+A guardrail is a check outside the model that runs on its input or output and can block, rewrite or route a request ([Rebedea et al., 2023](#references)). The common ones:
+
+- **On the input**: detection of prompt injection and jailbreaks, removal or masking of personal data before it reaches a provider, limits on topics the product will handle, and limits on input length. Injection is the hardest, and the structural defences of [Agent security](/notes/agents/agent-security#defences-in-layers), least privilege, sandboxing and data-flow control, matter more than any detector.
+- **On the output**: schema validation with a retry or a repair step, a moderation classifier for unsafe content, such as Llama Guard, an LLM fine-tuned to label a conversation against a policy taxonomy ([Inan et al., 2023](#references)); a groundedness check that the answer is supported by the retrieved passages of a [RAG](/notes/nlp/rag) system; and rules, such as never stating a refund amount that the tool did not return.
+
+A guardrail is a classifier and has both error rates, and the rarer the thing it guards against, the more its alarms are false. Take a moderation check with a true-positive rate of 0.95 and a false-positive rate of 0.02, on traffic where 0.5 % of outputs are actually unsafe. The share of blocked outputs that are really unsafe is
+
+$$
+\text{PPV} = \frac{0.95 \times 0.005}{0.95 \times 0.005 + 0.02 \times 0.995} = \frac{0.00475}{0.00475 + 0.0199} = 0.193 .
+$$
+
+At 40,000 requests a day, it blocks 190 of the 200 unsafe outputs and 796 safe ones: four in five blocks are wrong, and each is a user who got no answer. A guardrail therefore gets an evaluation set of its own, with both kinds of examples, and a place in the release tuple: a stricter threshold is a change like a prompt edit. It also costs latency on every request (75 ms in the trace) and money if it is a model call; checks that can run in parallel with generation, or on a streamed answer as it is produced, hide some of the latency.
+
+## Cost and latency per request: unit economics
+
+Every model call is billed by its tokens. For one call with $t_{\text{in}}$ input tokens of which $t_{\text{c}}$ are read from the cache, $t_{\text{out}}$ output tokens, prices $p_{\text{in}}$ and $p_{\text{out}}$ per token and a cache discount $\rho$:
+
+$$
+\boxed{\;c = (t_{\text{in}} - t_{\text{c}})\,p_{\text{in}} + t_{\text{c}}\,\rho\,p_{\text{in}} + t_{\text{out}}\,p_{\text{out}}\;}
+$$
+
+and a request costs the sum over its calls. For the traced request, with $\rho = 0.1$:
+
+$$
+\begin{aligned}
+\text{small model:}\quad & (250 \times 0.20 + 1{,}200 \times 0.02 + 22 \times 0.80) / 10^6 = 91.6 / 10^6 = 0.0000916 \text{ dollars}, \\
+\text{large model:}\quad & (800 \times 3 + 1{,}800 \times 0.3 + 180 \times 15) / 10^6 = 5{,}640 / 10^6 = 0.00564 \text{ dollars}, \\
+\text{request:}\quad & 0.0057316 \text{ dollars}.
+\end{aligned}
+$$
+
+At 40,000 requests a day that is \$229 a day, about \$6,900 a month. Three things follow from the arithmetic. **Output tokens dominate** for the large model: they are 180 of 2,780 tokens and 48 % of its cost, because their price is five times the input price. **The cache matters**: without it the large call would cost $(2{,}600 \times 3 + 180 \times 15)/10^6 = 0.0105$ dollars, 86 % more. **The expensive call is where to save**: a shorter reply, a smaller model when it suffices (the routing below), or a cache hit that skips it.
+
+**Latency** follows the same tree. Calls in sequence add, calls in parallel take the maximum, and within one streamed call the [end-to-end latency](/notes/mlops/llm-inference-systems#metrics-ttft-tpot-throughput-and-goodput) is TTFT plus $(m - 1)$ times TPOT for $m$ output tokens. The request above takes $410 + 180 + 2{,}240 + 75 = 2{,}905$ ms of work and 25 ms of gaps between spans: 2,930 ms.
+
+**The tail.** Mean cost per request hides what matters for an agent, whose number of steps varies: a few requests that loop for 30 steps can cost more than thousands of simple ones ([Evaluating agents](/notes/agents/evaluating-agents#cost-aware-evaluation-and-pareto-fronts) compares agents by cost for this reason). Operate on the distribution: report p50 and p99 of cost per request, cap steps and tokens per request, alert on the cost per request as on a latency objective, and compute **cost per successful task**, the cost divided by the success rate, which is the number that a product's price must cover.
+
+## Caching
+
+Three caches save model calls, at three levels.
+
+- **Exact response cache**: the same request, in full, gets the stored answer. Correct only if the key holds everything the answer depends on, the whole release tuple included, the condition of the [prediction cache](/notes/mlops/serving-models#caching-predictions) of the serving note; and only for requests where a repeated answer is acceptable, which excludes most sampled generation.
+- **Prompt (prefix) caching**: the provider or the engine reuses the attention keys and values of a prefix it has seen, so repeated system prompts and documents cost less and arrive sooner. Its mechanism is in [Prefix caching](/notes/mlops/llm-inference-systems#prefix-caching), its pricing and the rule "stable parts first" in [Prompt caching, as economics](/notes/agents/context-and-memory#prompt-caching-as-economics).
+- **Semantic cache**: embed the request, look up the nearest cached request, and return its answer if the similarity is above a threshold ([Bang, 2023](#references)). It catches paraphrases that an exact cache misses, and it can return the answer to a different question.
+
+The semantic cache is a trade-off with two numbers: the hit rate $h$ and the share $f$ of hits whose cached answer is wrong for the new request. With an embedding lookup of cost $c_e$ and a model call of cost $c_m$, the expected cost per request and the share of wrong answers it adds are
+
+$$
+c = c_e + (1 - h)\, c_m, \qquad \text{wrong answers from the cache} = h\, f .
+$$
+
+With $c_m = 0.0057$ dollars from the trace, $c_e = 0.00002$ and $h = 0.30$, a request costs $0.00002 + 0.7 \times 0.0057 = 0.00401$ dollars, 30 % less. If $f = 0.05$, then 1.5 % of all answers are answers to another question, which for a support assistant ("cancel my order" served the answer to "can I change my order?") may cost more than the saving. A lower threshold raises both $h$ and $f$, so the threshold is chosen on a labelled set of request pairs, like any classifier's. The key must also include the user's scope: an answer that depends on a user's own data must never be served to another user.
+
+## Fallbacks and routing
+
+**Fallbacks.** Provider APIs return rate-limit errors, time out and have outages. The client handles them as any dependency, with timeouts, retries with backoff and jitter, and a circuit breaker, as in [Resilience and capacity](/notes/devops/resilience-and-capacity#retries-backoff-and-jitter), then falls back: to another region or provider serving the same model, to a smaller model, or to a non-LLM answer such as a search result or a handover to a person. A fallback model is a different model: it must pass the same evaluation suite, and its share of traffic, visible in `gen_ai.response.model`, is a metric with an alert, as the [fallback rate](/notes/mlops/serving-models#fallbacks) of any model service is.
+
+**Routing.** Many requests do not need the largest model. A **router** sends each request to the cheapest model expected to answer it well, using rules (by route or input length) or a classifier trained on preference data ([Ong et al., 2024](#references)). A **cascade** tries the cheap model first and escalates when a check fails, a schema check, a verifier or the small model's own confidence ([Chen, Zaharia and Zou, 2023](#references), who report matching the best single model of their study at up to 98 % lower cost on their tasks).
+
+The arithmetic of a cascade, with cost $c_s$ for the small model, $c_L$ for the large one, and a share $a$ of requests accepted after the small model:
+
+$$
+\begin{aligned}
+\mathbb E[\text{cost}] &= c_s + (1 - a)\, c_L, \\
+\mathbb E[\text{quality}] &= a\, q_{s \mid \text{accepted}} + (1 - a)\, q_L .
+\end{aligned}
+$$
+
+With $c_s = 0.0004$ and $c_L = 0.0057$ dollars and $a = 0.7$: $0.0004 + 0.3 \times 0.0057 = 0.00211$ dollars, 63 % less than always calling the large model. The quality holds only if the check accepts the small model's answers that are as good as the large model's, $q_{s \mid \text{accepted}} \approx q_L$; a check that accepts bad answers moves the saving into the error rate. Escalated requests pay twice in latency, small call and large call in sequence, so the p99 latency rises while the mean cost falls. Routers and cascades are themselves part of the release tuple and pass through the same evaluation, with the quality measured per route.
+
+<aside class="callout"><strong>Check yourself.</strong> (1) A provider moves the alias your service calls to a new snapshot. What in this note would have caught a behaviour change before users did? (2) Two prompt versions are scored on 200 items; the scores have variance 0.10 each and covariance 0.07. What is the standard error of the paired difference, and of the unpaired one? (3) A judge with validated accuracy $\alpha = 0.75$ reports that the new version wins 54 % of 600 pairs. What is the corrected win rate, and does a one-sided 95 % bound clear 50 %? (4) A call has 4,000 input tokens of which 3,000 are cached, and 400 output tokens, at \$3 and \$15 per million with a cache discount of 0.1. What does it cost, and what fraction is output? (5) Why must the key of a semantic cache include the user, and what does that do to its hit rate?<details><summary>Answers</summary>(1) Pinning the snapshot, so that the alias move is not picked up silently, and running the evaluation suite on the new snapshot as on any release; in production, `gen_ai.response.model` in the traces shows which model answered. (2) Paired: $\sqrt{(0.10 + 0.10 - 0.14)/200} = \sqrt{0.0003} = 0.0173$. Unpaired: $\sqrt{0.20/200} = 0.0316$, almost twice as large. (3) $w = (0.54 - 0.25)/0.5 = 0.58$; $\operatorname{SE}(w_{\text{obs}}) = \sqrt{0.54 \cdot 0.46/600} = 0.0203$, $\operatorname{SE}(w) = 0.0407$, bound $0.58 - 0.067 = 0.513$: it clears 50 %, barely. (4) $(1{,}000 \times 3 + 3{,}000 \times 0.3 + 400 \times 15)/10^6 = (3{,}000 + 900 + 6{,}000)/10^6 = 0.0099$ dollars; output is $6{,}000/9{,}900 = 61\,\%$. (5) An answer built from one user's data (their order, their account) is wrong and a privacy breach for another user. Scoping the key per user, or caching only answers that depend on shared content, lowers the hit rate to what repeats within that scope.</details></aside>
+
+## What changed
+
+| | A prompt string in the code (the baseline) | An operated LLM application |
+| --- | --- | --- |
+| What a release is | whatever is deployed | a versioned tuple: prompt, pinned model, parameters, tools, index |
+| A provider's model update | changes behaviour silently | a release, evaluated before it is adopted |
+| Testing a change | five examples by hand | a regression suite in CI, repeated trials, a paired interval |
+| The Example's version 2 | shipped: it looks better | blocked: +0.071 overall, −0.122 on cancellations |
+| Judging free text | reading outputs | a validated judge, corrected for its accuracy |
+| A slow or wrong answer | a complaint | a trace with versions, tokens, cost and latency per span |
+| Cost | the monthly invoice | \$0.0057 per request, 98 % of it in one span |
+| Unsafe input and output | trust the model | guardrails with measured error rates |
+| Saving money | not at all | prompt caches, semantic caches, routing and cascades, each with its error |
+
+## Limitations
+
+- **Scripted model.** The harness's stand-in has error rates chosen to show the method; a real model's errors are correlated across items and trials in ways no script captures, and its outputs have to be graded rather than looked up.
+- **Evaluation sets age.** Users find new requests, and a suite built last quarter misses them. Without sampling fresh traces into the suite, a passing gate becomes a ritual.
+- **Judges and guardrails are models too.** They drift with their own versions, share the biases of the models they check, and can be attacked by the same inputs.
+- **The conventions are moving.** The GenAI semantic conventions were still at *Development* stability in October 2026; attribute names used here can change.
+- **Not covered:** fine-tuning and its operations (the previous note's loop applies, with the weights back in the team's hands), prompt optimization by search, online evaluation with A/B tests of prompts (the method of [Rolling out models](/notes/mlops/rolling-out-models)), and the security of the supply chain of models and tools.
+
+## What you should remember
+
+- An LLM application's version is a tuple: prompt, pinned model snapshot, decoding parameters, tools, index. Every change to it, including the provider's, is a release.
+- Outputs vary even at temperature 0, because kernels need not be batch-invariant; evaluate with repeated trials and keep traces as the record.
+- Gate releases with a regression suite in CI: paired comparison on the same items (the covariance term removes item difficulty), a bootstrap over items, and slice checks that can block a better average.
+- A judge of accuracy $\alpha$ reports $w_{\text{obs}} = (1 - \alpha) + (2\alpha - 1)w$; correct for it and divide the standard error by $2\alpha - 1$.
+- Trace every request: a span per model call, tool and guardrail, named and attributed by the OpenTelemetry GenAI conventions (dated, still Development in October 2026), with content capture opt-in.
+- A guardrail's alarms are mostly false when the problem is rare; measure both error rates.
+- Cost per call is $(t_{\text{in}} - t_{\text{c}})p_{\text{in}} + t_{\text{c}}\rho p_{\text{in}} + t_{\text{out}}p_{\text{out}}$; manage the distribution and the cost per successful task, not the mean.
+- Semantic caches trade hit rate against wrong answers; cascades cost $c_s + (1 - a)c_L$ and are only as good as their acceptance check.
+
+## Example
+
+A regression-evaluation harness for the routing step of a support assistant: two versions of the prompt, a scripted stand-in for the model, 150 evaluation items, three trials per item, a paired bootstrap interval, slice checks and a gate, followed by the trace of one request with its cost. The stand-in reads its behaviour from per-slice probabilities, with random numbers shared by both versions for the same item and trial, so that hard items are hard for both, as they are for real models. Python 3.14.7 and NumPy 2.5.4; it runs in under a second.
+
+```python
+"""A regression-evaluation harness for two prompt versions, with a scripted stand-in for the model."""
+import json, hashlib
+import numpy as np
+
+INTENTS = ["order_status", "refund", "return", "cancel", "other"]
+PROMPTS = {  # the artifacts under test: a prompt is versioned like code
+    "triage@1": "Classify the customer message and extract the order id.",
+    "triage@2": "Return JSON {\"intent\": one of " + "|".join(INTENTS)
+                + ", \"order_id\": string or null}. Examples: ...",
+}
+for name, text in PROMPTS.items():
+    print(f"{name}  sha256:{hashlib.sha256(text.encode()).hexdigest()[:12]}")
+
+# ---- the evaluation set: 150 messages, 30 per intent, half of them with an order id ----
+rng = np.random.default_rng(0)
+items = []
+for k in range(150):
+    intent = INTENTS[k % 5]
+    oid = f"A{rng.integers(10000, 99999)}" if k % 2 == 0 else None
+    items.append({"id": k, "intent": intent, "order_id": oid})
+
+# ---- a scripted stand-in for the model: per-slice error rates that depend on the prompt ----
+P_INTENT = {"triage@1": {"order_status": .93, "refund": .80, "return": .78, "cancel": .90, "other": .85},
+            "triage@2": {"order_status": .96, "refund": .92, "return": .91, "cancel": .76, "other": .90}}
+P_FORMAT = {"triage@1": 0.07, "triage@2": 0.01}           # chance that the output is not valid JSON
+
+def model(prompt, item, trial):
+    fmt = np.random.default_rng([int(prompt[-1]), item["id"], trial]).random()
+    r = np.random.default_rng([item["id"], trial]).random(2)  # shared by both prompts: hard items stay hard
+    if fmt < P_FORMAT[prompt]:
+        return "Sure! The intent is probably a refund."      # prose instead of JSON
+    intent = item["intent"] if r[0] < P_INTENT[prompt][item["intent"]] else \
+        INTENTS[(INTENTS.index(item["intent"]) + 1 + int(r[0] * 10) % 4) % 5]  # a wrong intent
+    oid = item["order_id"] if r[1] < 0.97 else None
+    return json.dumps({"intent": intent, "order_id": oid})
+
+def grade(output, item):
+    try:
+        out = json.loads(output)
+    except json.JSONDecodeError:
+        return False
+    return out.get("intent") == item["intent"] and out.get("order_id") == item["order_id"]
+
+TRIALS = 3                                                    # the deployed temperature is 0.7
+score = {p: np.array([[grade(model(p, it, t), it) for t in range(TRIALS)] for it in items])
+         for p in PROMPTS}
+per_item = {p: s.mean(1) for p, s in score.items()}          # the unit of resampling is the item
+for p in PROMPTS:
+    print(f"{p}: pass rate {per_item[p].mean():.3f}, all {TRIALS} trials pass on {score[p].all(1).mean():.3f} of items")
+
+d = per_item["triage@2"] - per_item["triage@1"]
+boot = rng.integers(0, len(items), size=(10_000, len(items)))
+lo, hi = np.percentile(d[boot].mean(1), [2.5, 97.5])
+print(f"difference @2 - @1: {d.mean():+.3f}, 95% paired bootstrap interval [{lo:+.3f}, {hi:+.3f}]")
+sd_paired, sd_unpaired = d.std(ddof=1), np.sqrt(per_item["triage@1"].var(ddof=1) + per_item["triage@2"].var(ddof=1))
+print(f"standard error: paired {sd_paired / np.sqrt(len(items)):.4f}, as if unpaired {sd_unpaired / np.sqrt(len(items)):.4f}")
+
+print("slice           @1     @2    change   95% interval")
+worst = 0.0
+for intent in INTENTS:
+    m = np.array([it["intent"] == intent for it in items])
+    a, b = per_item["triage@1"][m].mean(), per_item["triage@2"][m].mean()
+    worst = min(worst, b - a)
+    ds = d[m]; bs = ds[rng.integers(0, len(ds), size=(10_000, len(ds)))].mean(1)
+    l2, h2 = np.percentile(bs, [2.5, 97.5])
+    print(f"{intent:13s}  {a:.3f}  {b:.3f}  {b - a:+.3f}   [{l2:+.3f}, {h2:+.3f}]")
+gate = lo > -0.02 and worst > -0.05
+print(f"gate: overall lower bound {lo:+.3f} > -0.02 and worst slice {worst:+.3f} > -0.05 -> {'ship' if gate else 'block'}")
+
+# ---- one traced request through the deployed chain: spans with OpenTelemetry GenAI attribute names ----
+PRICE = {"small-2026-06": (0.20, 0.80), "large-2026-08": (3.00, 15.00)}  # $ per 1M tokens, in / out
+CACHED = 0.1                                                  # cached input tokens cost 0.1 of the input price
+spans = [  # (name, parent, start ms, duration ms, attributes)
+    ("invoke_agent support-triage", None, 0, 2930, {}),
+    ("chat small-2026-06", 0, 5, 410, {"gen_ai.request.model": "small-2026-06", "gen_ai.prompt.name": "triage",
+        "gen_ai.prompt.version": "2", "gen_ai.usage.input_tokens": 1450, "gen_ai.usage.cache_read.input_tokens": 1200,
+        "gen_ai.usage.output_tokens": 22, "gen_ai.response.finish_reasons": ["stop"]}),
+    ("execute_tool lookup_order", 0, 420, 180, {"gen_ai.tool.name": "lookup_order"}),
+    ("chat large-2026-08", 0, 605, 2240, {"gen_ai.request.model": "large-2026-08", "gen_ai.prompt.name": "reply",
+        "gen_ai.prompt.version": "5", "gen_ai.usage.input_tokens": 2600, "gen_ai.usage.cache_read.input_tokens": 1800,
+        "gen_ai.usage.output_tokens": 180, "gen_ai.response.time_to_first_chunk": 0.45,
+        "gen_ai.response.finish_reasons": ["stop"]}),
+    ("guardrail output_policy", 0, 2850, 75, {}),
+]
+total = 0.0
+print("span                              start   dur ms   cost $")
+for name, parent, start, dur, a in spans:
+    cost = 0.0
+    if name.startswith("chat"):
+        pin, pout = PRICE[a["gen_ai.request.model"]]
+        fresh = a["gen_ai.usage.input_tokens"] - a["gen_ai.usage.cache_read.input_tokens"]
+        cost = (fresh * pin + a["gen_ai.usage.cache_read.input_tokens"] * pin * CACHED
+                + a["gen_ai.usage.output_tokens"] * pout) / 1e6
+    total += cost
+    print(f"{'  ' if parent is not None else ''}{name:32s}{start:5d}  {dur:7d}   {cost:.6f}")
+print(f"request: {spans[0][3]} ms, ${total:.6f}; at 40,000 requests a day ${total * 40_000:,.0f} a day")
+```
+
+```text
+triage@1  sha256:645228e6c5cb
+triage@2  sha256:ea33b0e1ec7b
+triage@1: pass rate 0.796, all 3 trials pass on 0.513 of items
+triage@2: pass rate 0.867, all 3 trials pass on 0.673 of items
+difference @2 - @1: +0.071, 95% paired bootstrap interval [+0.031, +0.109]
+standard error: paired 0.0198, as if unpaired 0.0258
+slice           @1     @2    change   95% interval
+order_status   0.900  0.956  +0.056   [-0.000, +0.111]
+refund         0.656  0.822  +0.167   [+0.089, +0.256]
+return         0.711  0.922  +0.211   [+0.144, +0.289]
+cancel         0.889  0.767  -0.122   [-0.233, -0.022]
+other          0.822  0.867  +0.044   [-0.000, +0.100]
+gate: overall lower bound +0.031 > -0.02 and worst slice -0.122 > -0.05 -> block
+span                              start   dur ms   cost $
+invoke_agent support-triage         0     2930   0.000000
+  chat small-2026-06                  5      410   0.000092
+  execute_tool lookup_order         420      180   0.000000
+  chat large-2026-08                605     2240   0.005640
+  guardrail output_policy          2850       75   0.000000
+request: 2930 ms, $0.005732; at 40,000 requests a day $229 a day
+```
+
+Read part by part:
+
+- `PROMPTS` are the artifacts under test, and their content hashes are their identities. A one-character change gives a new hash, so a trace or a result that carries the hash can always be tied to the exact text.
+- `items` is the evaluation set: 150 messages, 30 per intent, half with an order id. In a real suite these are sampled from production traces and labelled; the structure, items with slices and references, is the same.
+- `model` is the stand-in. `fmt` decides, per version, whether the output is prose instead of JSON (7 % for version 1, which has no schema in the prompt, 1 % for version 2). `r` is drawn from the item and the trial only, so both versions see the same random numbers: an item that is hard for one is hard for the other, which is what makes the paired analysis pay.
+- `grade` is a mechanical grader: unparseable output fails, and so does a wrong intent or a wrong order id.
+- `per_item` averages the three trials per item, and `d[boot]` resamples items, never single trials, which keeps each item's two scores together: the paired bootstrap.
+- The standard-error line shows the covariance term at work: 0.0198 paired against 0.0258 unpaired.
+- The slice loop repeats the bootstrap within each intent; `worst` is the largest drop, and `gate` combines the overall non-inferiority bound with the slice tolerance.
+- `spans` is the trace of one request as an instrumentation would emit it, with the attribute names of the GenAI conventions. The cost of each `chat` span is the boxed formula with the token counts of its attributes; the guardrail is an application span with no tokens.
+
+## Next
+
+The guardrails and traces of this note already touched on what a model owes the people it serves: answers that are not unsafe, data that is not leaked. The [next note](/notes/mlops/responsible-ml) takes those obligations up properly, for any model in production: what it means for a model to be fair to groups of people and why the definitions conflict, how a model leaks its training data and how differential privacy bounds the leak, how model cards and datasheets document a model for the people accountable for it, what the EU AI Act requires and when, and how models are attacked.
+
+## References
+
+- C. Huyen. *Designing Machine Learning Systems*. O'Reilly, 2022. Ch. 9, continual learning and test in production, whose loop this note adapts; and the course it grew from, Stanford [CS329S](https://stanford-cs329s.github.io/).
+- HSE University. [*Инженерия LLM-систем*](https://github.com/xufana/llm-system-engineering) (Engineering of LLM systems), Faculty of Computer Science, 2026: evaluation design and evaluation in CI, observability of traces, unit economics.
+- HSE University. *Введение в MLOps* (master's programme «Машинное обучение в цифровом продукте», 2025/26): LLMOps basics.
+- C. Kästner. [*Machine Learning in Production: From Models to Products*](https://mlip-cmu.github.io/book/). MIT Press, 2025. Ch. 13, Planning for Operations; ch. 19, Testing and Experimenting in Production; ch. 24, Versioning, Provenance, and Reproducibility.
+- L. Zheng et al. [Judging LLM-as-a-Judge with MT-Bench and Chatbot Arena](https://arxiv.org/abs/2306.05685). NeurIPS Datasets and Benchmarks, 2023.
+- H. He and Thinking Machines Lab. [Defeating Nondeterminism in LLM Inference](https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/). 10 September 2025.
+- OpenTelemetry. [Semantic conventions for generative AI](https://github.com/open-telemetry/semantic-conventions-genai), repository `open-telemetry/semantic-conventions-genai`: `docs/gen-ai/client-inference.md` (inference spans and attributes), `docs/gen-ai/gen-ai-spans.md` (tool spans, content capture), `docs/gen-ai/gen-ai-agent-spans.md` (agent spans). Status *Development*; accessed 23 October 2026.
+- T. Rebedea, R. Dinu, M. Sreedhar, C. Parisien, J. Cohen. [NeMo Guardrails: A Toolkit for Controllable and Safe LLM Applications with Programmable Rails](https://arxiv.org/abs/2310.10501). EMNLP System Demonstrations, 2023.
+- H. Inan et al. [Llama Guard: LLM-based Input-Output Safeguard for Human-AI Conversations](https://arxiv.org/abs/2312.06674). 2023.
+- F. Bang. [GPTCache: An Open-Source Semantic Cache for LLM Applications Enabling Faster Answers and Cost Savings](https://aclanthology.org/2023.nlposs-1.24/). NLP-OSS workshop, 2023.
+- L. Chen, M. Zaharia, J. Zou. [FrugalGPT: How to Use Large Language Models While Reducing Cost and Improving Performance](https://arxiv.org/abs/2305.05176). 2023.
+- I. Ong et al. [RouteLLM: Learning to Route LLMs with Preference Data](https://arxiv.org/abs/2406.18665). 2024.

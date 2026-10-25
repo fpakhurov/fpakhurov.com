@@ -2,6 +2,19 @@
 
 Notable changes to the site, newest first. Each entry gives the date, what changed and why.
 
+## 2026-10-26
+
+- **A new course: MLOps, machine learning in production.** It has 16 notes in six sections, in English and Russian, and covers what it takes to keep a model working after the notebook. It builds on DevOps and Deep Learning.
+  - **ML systems:** what MLOps is (the lifecycle loop, hidden technical debt, maturity levels) and ML system design (framing, the metric chain from business to model, batch versus online prediction).
+  - **Data:** data pipelines (orchestration, idempotence, backfills), data quality and versioning (validation, lineage, DVC-style snapshots), features and training–serving skew (feature stores, point-in-time joins, leakage through time).
+  - **Training:** experiment tracking and the model registry, testing ML systems (data, model and infrastructure tests, the evaluation gate), distributed training (data, tensor and pipeline parallelism, all-reduce, sharding, the pipeline bubble).
+  - **Serving:** serving models (latency, throughput, dynamic batching, what GPU utilization means), LLM inference systems (prefill and decode, the KV cache, continuous batching, speculative decoding), rolling out models (shadow, canary, A/B tests and their sample sizes).
+  - **Operations:** monitoring and drift (PSI and KS and how both depend on the window), continual learning (retraining triggers, feedback loops, forgetting), LLMOps (prompts as code, traces, evaluation in production).
+  - **Responsibility and cost:** responsible ML (fairness metrics and their conflicts, privacy, model cards) and cost and efficiency (MFU, the cost of a token, the Pareto front of quality and price).
+
+  Scope draws on two HSE courses («Введение в MLOps» and «Эффективные системы глубинного обучения»), the HSE course on LLM systems engineering, CMU's Machine Learning in Production and Stanford's CS329S with Chip Huyen's book. Mixed precision, compression, quantization, agent evaluation and A/B statistics are linked to the courses that already explain them, not repeated. The site holds the notes only; each note ends with an Example. Python examples were run on 3.14.7 with NumPy, pandas and scikit-learn and show their real output; serving, orchestration and cluster configurations are marked as not executed. 24 figures.
+  - **Course graph:** an edge in the lane between the columns now keeps a few pixels toward the column it points to, so two lane edges no longer draw on top of each other.
+
 ## 2026-10-23
 
 - **A new course: DevOps.** It has 16 notes in five sections, in English and Russian, and covers how software gets from a commit to a reliable service. It builds on Computer Architecture and Operating Systems and on Python.

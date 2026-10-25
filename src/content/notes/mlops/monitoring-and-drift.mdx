@@ -1,0 +1,310 @@
+---
+title: Monitoring and drift
+description: "How to watch a deployed model: system, data, prediction and quality signals when labels arrive late, covariate, label and concept shift, the PSI, Kolmogorov–Smirnov, chi-square and MMD tests computed on synthetic shifts, and alert thresholds that keep false alarms rare."
+course: mlops
+section: Operations
+order: 11
+status: published
+tags: [monitoring, drift, distribution-shift, covariate-shift, label-shift, concept-drift, psi, kolmogorov-smirnov, chi-square, mmd, delayed-labels, alerting, false-alarms]
+prerequisites: [Rolling out models, Observability, Hypothesis tests and A/B testing]
+---
+
+import DriftDetection from '../../../components/figures/monitoring-and-drift/DriftDetection.astro';
+
+The [previous note](/notes/mlops/rolling-out-models) ended with a model that won its A/B test and now serves everyone. From that point there is no control group, and the conditions under which the model was trained and tested begin to age: users change, competitors change, upstream systems change their data, and an adversary changes on purpose. A model does not fail loudly when this happens; it keeps answering, a little worse each week. This note is about noticing. It sorts what to measure into the service, its inputs, its predictions and its quality, explains what can be measured before the labels arrive, separates three kinds of distribution shift by what each one breaks, and computes how the usual drift statistics behave on shifts of known size, including how often they raise an alarm when nothing has changed.
+
+**Conventions.** All numbers on drift statistics come from the program of the Example, a NumPy and SciPy simulation on synthetic Gaussian data (Python 3.14.7, SciPy 1.18, fixed seeds), or from exact formulas for the normal distribution.
+
+**Notation.** $x$ is a model's input, $y$ its label. $P_{\text{ref}}$ is the **reference** distribution, of the training data or of a recent period known to be good; $P_{\text{cur}}$ is the **current** distribution, of a window of production traffic. A reference sample has $n$ points and a current window $m$. $\Phi$ is the standard normal CDF.
+
+## Baseline: monitor the service, not the model
+
+The model service has the dashboards of the [observability note](/notes/devops/observability#what-to-measure-golden-signals-red-and-use): request rate, errors, latency percentiles, saturation, all green. Every month someone joins a sample of predictions with their labels and computes the accuracy. Here is what this setup misses. A partner changes the unit of the transaction amount from dollars to cents; every amount is now a hundred times larger, the fraud model's scores shift, and nothing errors. A holiday changes what people buy, and a demand model trained on ordinary weeks over-orders for a fortnight. Fraudsters learn which patterns the model flags and stop using them. In each case the service is healthy and the model is wrong, and the monthly accuracy reports it weeks after the damage, if the labels have arrived at all.
+
+<aside class="callout"><strong>Key idea.</strong> Monitor a model at four levels: the service, the distribution of its inputs, the distribution of its predictions, and its quality once labels arrive. Shift comes in kinds: in the inputs, in the label frequencies, or in the relationship between them, and only the last needs labels to be seen. Drift statistics compare a current window with a reference; their values depend on the window size as much as on the shift, so thresholds are set on effect sizes calibrated on periods with no shift, and alerts require persistence and relevance before anyone is paged.</aside>
+
+## What to monitor
+
+**1. The service.** The golden signals of the DevOps course, with [SLOs](/notes/devops/slos-and-alerting#sli-slo-and-sla) on latency and availability, and a few model-specific additions: the fallback rate of the [serving note](/notes/mlops/serving-models#fallbacks), the share of traffic per model version, the batch sizes and the queue time of the model server, GPU memory. These catch outages and overload, never a wrong answer.
+
+**2. The inputs.** For each feature: the schema and types, the share of missing values, the range, the number of distinct categories, and the distribution compared with the reference. These are the [validation checks of the data section](/notes/mlops/data-quality-and-versioning), run continuously on what the model actually receives; the ML Test Score lists them among its monitoring tests, together with checks that training and serving compute the same feature values ([Breck et al., 2017](#references)). Most alarms that look like drift are found here to be pipeline defects: a renamed column filled with nulls, a unit changed upstream, a default value of zero for a feature that failed to compute ([Huyen, 2022, ch. 8](#references)).
+
+**3. The predictions.** The distribution of scores, the share of each predicted class, the mean predicted probability. Predictions are one number or a short vector per request, available immediately, and they summarize everything the model sees: a shift in the inputs that matters to the model shows up in its outputs, while a shift in a feature the model ignores does not. A useful check for a calibrated classifier is the mean predicted probability against the observed rate of positives, once labels exist.
+
+**4. The quality.** Accuracy, AUC, calibration, error in the units of the business, computed on predictions joined with their labels. The difficulty is time. Clicks arrive within seconds, purchases within days, fraud chargebacks within weeks, loan defaults within months. If labels arrive after up to $d$ days, the quality of today's predictions is known only after $d$ days, and the quality of the last week is computed on the labels that have already arrived, which are biased towards the cases that resolve quickly. Three remedies: **proxies** that arrive faster (a quick refund as an early signal of fraud); **label sampling**, sending a random sample of predictions to human reviewers; and reporting quality by the date of the prediction, not the date of the label, so that a week's figure is updated as its labels mature.
+
+All four levels need the same raw material: a log of each prediction with the request identifier, the model version, the features as the model received them, and the output, kept so that the label can be joined later. The features as served, not as recomputed afterwards, are what a training–serving skew investigation needs ([features note](/notes/mlops/features-and-skew)). The log is personal data in most products, so its retention and access are designed, not left at the defaults; the [responsibility note](/notes/mlops/responsible-ml) returns to this.
+
+## Kinds of shift
+
+A model approximates a conditional distribution learned from a joint distribution of inputs and labels, which can be factored in two ways:
+
+$$
+P(x, y) = P(x)\,P(y \mid x) = P(y)\,P(x \mid y).
+$$
+
+Shift is a change of $P(x, y)$ between the reference and the present, and the factorization that stays fixed names its kind ([Quiñonero-Candela et al., 2009](#references); [Huyen, 2022, ch. 8](#references)).
+
+- **Covariate shift**: $P(x)$ changes, $P(y \mid x)$ does not. An app launches in a new country and its users are younger; for each kind of user, the probability of churning is the same as before. The model's rule is still right, but it is now applied more often where it saw little training data, so its average error can grow. It is visible in the inputs, without labels.
+- **Label shift** (prior shift): $P(y)$ changes, $P(x \mid y)$ does not. In flu season more of the people tested have flu, while the symptoms of flu are what they always were. A classifier's ranking of cases stays good, but its probabilities are miscalibrated. Bayes' rule gives the correction: the posterior odds scale by the ratio of the new prior odds to the old,
+  $$
+  \frac{p_{\text{new}}(y{=}1 \mid x)}{p_{\text{new}}(y{=}0 \mid x)} = \frac{p(y{=}1 \mid x)}{p(y{=}0 \mid x)} \cdot \frac{\pi_{\text{new}} / (1 - \pi_{\text{new}})}{\pi / (1 - \pi)} .
+  $$
+  A fraud model trained where 2% of transactions are fraud outputs 0.5 for some transaction; if the rate doubles to 4%, the odds are multiplied by $(0.04/0.96)/(0.02/0.98) = 2.04$, and the corrected probability is $2.04 / 3.04 = 0.67$ ([Saerens, Latinne and Decaestecker, 2002](#references)). Label shift shows in the distribution of predictions, and its size can be estimated without labels from the model's confusion matrix on validation data ([Lipton, Wang and Smola, 2018](#references)).
+- **Concept drift**: $P(y \mid x)$ changes. The same input now means something else: fraudsters abandon the patterns the model learned, a pandemic changes what a pattern of purchases says about a customer. Nothing in $P(x)$ need change, so no test on the inputs can detect it; only labels, or proxies for them, can.
+
+Shifts also differ in time: **sudden** (a release upstream, a new regulation), **gradual** (tastes, prices), and **recurring** (the hour of the day, weekends, seasons). A recurring shift is not a reason to alert: the reference for Saturday traffic is last Saturday, not last Tuesday.
+
+| | What changes | Visible without labels | What it breaks |
+| --- | --- | --- | --- |
+| Covariate shift | $P(x)$ | yes, in the inputs | accuracy where training data were thin |
+| Label shift | $P(y)$ | yes, in the predictions | calibration and thresholds |
+| Concept drift | $P(y \mid x)$ | no | the model's rule itself |
+| Pipeline defect | the features, not the world | yes, usually as a sudden jump | everything downstream of the feature |
+
+## Detecting drift: statistics on numbers
+
+A drift test compares a current window with the reference sample and returns a statistic, sometimes with a p-value. The behaviour of four common ones is worth knowing on numbers. The Example draws a reference of $n = 5{,}000$ values from $N(0, 1)$ and current windows from $N(\delta, 1)$, a shift of $\delta$ standard deviations, with $m = 1{,}000$ or $20{,}000$, 400 times for each setting.
+
+### PSI: the population stability index
+
+Cut the reference into $k$ bins, usually at its deciles, so that each holds a share $e_i = 1/k$ of it, and let $a_i$ be the share of the current window in bin $i$. The **population stability index** is
+
+$$
+\mathrm{PSI} = \sum_{i=1}^{k} (a_i - e_i) \ln \frac{a_i}{e_i} = \sum_i a_i \ln \frac{a_i}{e_i} + \sum_i e_i \ln \frac{e_i}{a_i},
+$$
+
+the [Kullback–Leibler divergence](/notes/generative-models/entropy-and-divergences#kullbackleibler-divergence) in both directions between the binned distributions. A bin with no current values makes it infinite, so empty bins are clipped to a small share. It comes from credit scoring, whose convention reads a PSI below 0.1 as stable, 0.1 to 0.25 as a moderate shift and above 0.25 as a large one ([Siddiqi, 2006](#references)).
+
+**What PSI does with a mean shift.** Between $N(0, 1)$ and $N(\delta, 1)$ each KL divergence is $\delta^2/2$, so the unbinned version of PSI is exactly $\delta^2$. Decile bins lose a little of it: the exact binned value is 0.0024 at $\delta = 0.05$, 0.0383 at $\delta = 0.2$ (96% of $\delta^2$), 0.238 at $\delta = 0.5$ and 0.926 at $\delta = 1$. PSI grows with the square of the shift: a shift of a fifth of a standard deviation, which moves every prediction that depends on the feature, scores 0.04, far below the "moderate" threshold of 0.1, which needs $\delta = 0.32$.
+
+**What PSI does when nothing changes.** Sampling noise alone makes PSI positive. For small differences, $\ln(a/e) \approx (a - e)/e$, so $\mathrm{PSI} \approx \sum_i (a_i - e_i)^2/e_i$, a chi-square statistic divided by the sample size. Each current share $a_i$ varies around its bin's true mass with variance about $e_i(1 - e_i)/m$, and the true masses differ from $1/k$ because the bin edges were estimated from $n$ reference points, which contributes a similar term with $n$. Summing over the bins,
+
+$$
+\mathbb E[\mathrm{PSI}] \approx (k - 1)\Big(\frac{1}{n} + \frac{1}{m}\Big).
+$$
+
+With ten bins and $n = 5{,}000$, that is 0.047 for windows of $m = 200$, 0.011 for $m = 1{,}000$ and 0.0036 for $m = 5{,}000$; the simulation gives 0.048, 0.011 and 0.004. At $m = 200$, 3.2% of windows exceed 0.1 with no shift at all. PSI is not comparable between windows of different sizes, and a small window can reach the "moderate" threshold by chance.
+
+### The Kolmogorov–Smirnov test
+
+The two-sample **Kolmogorov–Smirnov** statistic is the largest vertical distance between the empirical CDFs of the two samples,
+
+$$
+D = \sup_x \bigl\lvert F_{\text{ref}}(x) - F_{\text{cur}}(x) \bigr\rvert .
+$$
+
+If both samples come from the same continuous distribution, $\sqrt{nm/(n + m)}\,D$ has approximately the Kolmogorov distribution, whose 95th percentile is 1.358, so the test at level 0.05 rejects when
+
+$$
+D > 1.358 \sqrt{\frac{n + m}{n m}} .
+$$
+
+For $n = 5{,}000$ that critical value is 0.047 with $m = 1{,}000$ and 0.021 with $m = 20{,}000$. For a mean shift of a normal distribution, the CDFs are farthest apart halfway between the means, and $D = 2\Phi(\delta/2) - 1 \approx 0.40\,\delta$ for small $\delta$: 0.020 at $\delta = 0.05$, 0.197 at $\delta = 0.5$.
+
+So the same shift is "significant" or not depending on the window. In the simulation, a shift of 0.05 standard deviations is detected in 21% of windows of 1,000 and in 77% of windows of 20,000; a shift of 0.1 in 70% and 100%. A service that tests hourly windows of a million requests finds every feature drifting all the time, because a p-value measures the evidence that the distributions differ, not whether the difference matters. The [probability note](/notes/probability/hypothesis-tests#what-a-p-value-is-not) makes the same point about effect sizes. The remedies are to compare windows of a fixed size, or to threshold the statistic $D$ itself, an effect size, rather than its p-value.
+
+### Chi-square for categories
+
+For a categorical feature, the counts of each category in the reference and in the current window form a contingency table, and the chi-square test of independence asks whether the shares differ. Device types in a reference week, 60% mobile, 30% desktop and 10% tablet over 10,000 sessions, against 65.5%, 26% and 8.5% over 2,000 sessions today, give $\chi^2 = 21.2$ with 2 degrees of freedom, $p = 2.5 \times 10^{-5}$. The test can be applied to a numeric feature after binning it, but it loses power: on the deciles, it detected the shift of 0.1 standard deviations in 51% of windows of 1,000, against 70% for the KS test on the raw values. Rare categories need merging, since the approximation fails for expected counts below about five.
+
+### MMD: many features at once
+
+*Optional depth: a multivariate test. The rest of the note does not depend on it.*
+
+Univariate tests look at one feature at a time and miss changes in how features relate. In the Example, two features keep their $N(0, 1)$ marginals while their correlation goes from 0 to 0.8: the KS tests on each feature give $p = 0.17$ and $0.15$, nothing to see. The **maximum mean discrepancy** compares whole distributions through a kernel $k$, here the Gaussian $k(u, v) = \exp(-\gamma \lVert u - v \rVert^2)$:
+
+$$
+\mathrm{MMD}^2(P, Q) = \mathbb E\, k(x, x') + \mathbb E\, k(y, y') - 2\, \mathbb E\, k(x, y), \qquad x, x' \sim P, \ y, y' \sim Q .
+$$
+
+For such a characteristic kernel it is zero only if $P = Q$ ([Gretton et al., 2012](#references)). It is estimated without bias from the two samples, with the diagonal terms left out, the same estimator as the [Kernel Inception Distance](/notes/generative-models/fid#kernel-inception-distance-an-unbiased-alternative) of the Generative Models course. Its null distribution is obtained by a **permutation test**: pool the two samples, split them at random many times, and see how often the statistic of a random split reaches the observed one. On the correlated pair, $\mathrm{MMD}^2 = 0.031$, larger than for all 300 random splits, so $p = 1/301 = 0.0033$, the smallest value 300 permutations can give. The cost is quadratic in the sample size, and the bandwidth $\gamma$ matters; the median of the pairwise squared distances is the usual default.
+
+<DriftDetection />
+
+1. The reference $N(0, 1)$ and a current distribution shifted by half a standard deviation, with the decile bins of the reference: the current distribution has 37% of its mass in the two right-most bins, where the reference has 20%.
+2. PSI against the size of the shift: a line of slope 2 on the logarithmic axes, since it grows as $\delta^2$. It passes its own noise level for windows of 1,000 at $\delta = 0.11$ and the "moderate" threshold of 0.1 only at $\delta = 0.32$.
+3. The KS statistic against the shift: slope 1, since it grows as $\delta$. It passes the 5% critical value at $\delta = 0.12$ for windows of 1,000 and at $\delta = 0.054$ for windows of 20,000.
+
+### What "Failing Loudly" found
+
+Rabanser, Günnemann and Lipton compared combinations of dimensionality reduction and two-sample tests on image datasets with synthetic shifts of many kinds and sizes ([Rabanser et al., 2019](#references)). Their best performer across shifts was the simplest to deploy: take the softmax outputs of a trained classifier, the model's own predictions, and run a univariate KS test on each class probability with a Bonferroni correction (**black-box shift detection**). Multivariate tests such as MMD on a learned low-dimensional representation did comparably well; tests on raw high-dimensional inputs did poorly. They also found that detection needs many more samples for subtle shifts than for large ones, and that a detected shift is not necessarily a harmful one, which a classifier trained to tell reference from current data helps to characterize. In practice this is an argument for monitoring the prediction distribution first and using input statistics to diagnose what changed.
+
+## Alert thresholds and false alarms
+
+A drift test has a false-alarm rate, and a monitoring system runs thousands of them. Two hundred features, each tested on hourly windows at $\alpha = 0.05$, make 4,800 tests per day and, with no drift at all, about 240 alarms. A team that receives 240 alerts a day stops reading them, which is the [alert fatigue of the SLO note](/notes/devops/slos-and-alerting#alert-fatigue-and-paging). The rules that keep alarms rare and meaningful:
+
+- **Threshold an effect size, calibrated on quiet periods.** Compute the statistic, PSI or $D$, on windows of the production size over a stretch known to be normal, and set the threshold at a high percentile of those values, such as the 99th. This builds the noise level of the window size into the threshold, which neither a p-value nor a fixed 0.1 does.
+- **Require persistence.** Alert only when $r$ consecutive windows exceed the threshold. With independent windows at a 1% exceedance rate each, three in a row happen with probability $10^{-6}$; over 4,800 feature-hours a day that is one false alarm per 208 days, against 48 a day for single windows.
+- **Weight by relevance.** Drift in a feature the model barely uses changes nothing; drift in its most important feature, or in the predictions, matters at once. Alerts go to people for the predictions, the quality metrics and the important features; drift in the rest is recorded for diagnosis.
+- **Correct for many tests** when p-values are used: Bonferroni at $\alpha/m$ for a few tests, false-discovery-rate control for many ([multiple comparisons](/notes/probability/hypothesis-tests#multiple-comparisons)).
+- **Use the right reference.** For recurring patterns, compare with the same hour and weekday, or with a rolling recent window; for a model that was retrained, with the data it was trained on.
+
+The decision that follows an alert, retrain, roll back, fix a pipeline or accept the change, is the subject of the [next note](/notes/mlops/continual-learning).
+
+<aside class="callout"><strong>Check yourself.</strong> (1) A spam filter's inputs and predictions show no drift, but users report more spam getting through. Which kind of shift is this, and why did the monitoring not see it? (2) A model trained with 10% positives outputs 0.3 for a case; the positive rate in production has fallen to 5%. What is the corrected probability? (3) An hourly drift check uses PSI on windows of 300 requests with ten bins and a reference of 10,000. About how large is PSI with no shift at all? (4) A KS test on windows of 500,000 requests flags a feature every hour, with $D \approx 0.004$. Is this drift worth acting on? (5) Two features both keep their distributions, but their correlation changes sign. Which tests can detect it?<details><summary>Answers</summary>(1) Concept drift: spammers changed their messages so that the same features now go with a different label, $P(y \mid x)$ changed. With $P(x)$ and the predictions unchanged, only labels (user reports) can show it. (2) The odds $0.3/0.7 = 0.429$ are multiplied by $(0.05/0.95)/(0.1/0.9) = 0.474$, giving $0.203$, a probability of $0.203/1.203 = 0.169$. (3) $(10 - 1)(1/10{,}000 + 1/300) = 0.031$, a third of the 0.1 threshold from noise alone. (4) Probably not: with $n$ and $m$ that large, the critical value is tiny and any difference is significant; $D = 0.004$ corresponds to a mean shift of about 0.01 standard deviations. Threshold the effect size, calibrated on quiet periods, instead. (5) Not univariate tests on each feature. A multivariate test such as MMD on the pair, or a classifier trained to tell reference from current samples, or a test on the model's predictions if the model uses the interaction.</details></aside>
+
+## What changed
+
+| | Monitoring the service only (the baseline) | Monitoring the model |
+| --- | --- | --- |
+| What is measured | rate, errors, latency | also inputs, predictions and quality, from one prediction log |
+| When a wrong model is noticed | at the monthly accuracy report, or never | within hours for input and prediction shifts; as labels arrive for concept drift |
+| Delayed labels | ignored | proxies, label sampling, quality by prediction date |
+| Kinds of shift | not distinguished | covariate, label and concept shift, and pipeline defects, each with its own signal |
+| Statistics | none | PSI, KS, chi-square, MMD, with their sensitivity to window size known |
+| Thresholds | "PSI above 0.1" | effect sizes calibrated on quiet windows of the same size |
+| Alerts | every test that fires | persistent and relevant changes only: one false alarm in months instead of 240 a day |
+
+## Limitations
+
+- **Drift is not harm.** A detected shift may not affect accuracy at all, and a harmful change (concept drift) may show no shift in the inputs. Quality metrics on labels remain the ground truth, however late.
+- **The reference ages too.** A reference from training is the wrong baseline a year later, and a rolling reference adapts to slow drift and stops seeing it. Both are kept, for different questions.
+- **High-dimensional inputs** such as text and images need a representation (embeddings, the model's own outputs) before any test, and the test is only as good as the representation.
+- **Correlated windows.** Consecutive windows of real traffic are not independent, so persistence rules give fewer independent chances than the arithmetic assumes; calibrating on real quiet periods accounts for this.
+- **Feedback.** A model that shapes its own inputs, such as a recommender, makes its input distribution partly a consequence of itself, and drift can be self-inflicted.
+
+## What you should remember
+
+- Monitor four levels: the service, the inputs, the predictions and the quality. Log each prediction with its model version and the features as served, so that labels can be joined later.
+- Covariate shift changes $P(x)$, label shift $P(y)$, concept drift $P(y \mid x)$; only the last is invisible without labels. Under label shift, correct probabilities by multiplying the odds by the ratio of prior odds.
+- PSI is the symmetric KL divergence of binned shares; for a mean shift it grows as $\delta^2$ (0.04 at $\delta = 0.2$), and with no shift it averages $(k - 1)(1/n + 1/m)$, 0.047 for windows of 200.
+- The KS statistic $D$ grows as about $0.4\,\delta$; its 5% critical value is $1.358\sqrt{(n + m)/(nm)}$, so large windows make tiny shifts significant. Threshold effect sizes, not p-values.
+- Chi-square tests categorical shares; MMD with a permutation test detects joint changes that univariate tests miss.
+- "Failing Loudly": testing the model's predictions with KS and a Bonferroni correction detected shifts best.
+- Calibrate thresholds on quiet windows, require persistence, weight by relevance: three consecutive 1% exceedances turn 48 false alarms a day into one in seven months.
+
+## Example
+
+The program runs the four tests on synthetic data. Part 1 shifts one feature's mean by $\delta$ standard deviations, for windows of 1,000 and 20,000, and reports the average PSI and KS statistic over 400 repetitions with their exact population values in parentheses, and the share of repetitions in which the KS test and the chi-square test on deciles reject at 5%. Part 2 measures PSI with no shift. Part 3 changes only the correlation of two features. Part 4 tests a categorical feature. It runs in about 40 seconds.
+
+```python
+# Drift tests on synthetic shifts of increasing size: PSI, Kolmogorov-Smirnov, chi-square and MMD.
+import numpy as np
+from scipy import stats
+
+rng = np.random.default_rng(42)
+N_REF = 5_000
+
+def bins(ref):
+    edges = np.quantile(ref, np.linspace(0, 1, 11))      # decile bins of the reference
+    edges[0], edges[-1] = -np.inf, np.inf
+    return edges
+
+def psi(ref, cur, eps=1e-4):
+    edges = bins(ref)
+    e = np.histogram(ref, edges)[0] / len(ref)
+    a = np.histogram(cur, edges)[0] / len(cur)
+    e, a = np.clip(e, eps, None), np.clip(a, eps, None)
+    return np.sum((a - e) * np.log(a / e))
+
+def chi2_p(ref, cur):
+    edges = bins(ref)
+    return stats.chi2_contingency([np.histogram(ref, edges)[0], np.histogram(cur, edges)[0]])[1]
+
+print(f'1. one feature shifts by delta standard deviations; reference n = {N_REF:,}; 400 repetitions per row')
+print('   delta   n_cur   PSI mean (pop.)    KS D mean (pop.)   KS rejects   chi2 rejects')
+for n_cur in [1_000, 20_000]:
+    for d in [0.0, 0.05, 0.1, 0.2, 0.5, 1.0]:
+        rows = []
+        for _ in range(400):
+            ref, cur = rng.standard_normal(N_REF), rng.standard_normal(n_cur) + d
+            ks = stats.ks_2samp(ref, cur)
+            rows.append((psi(ref, cur), ks.statistic, ks.pvalue < 0.05, chi2_p(ref, cur) < 0.05))
+        r = np.array(rows).mean(0)
+        a = np.diff(stats.norm.cdf(stats.norm.ppf(np.linspace(0, 1, 11)) - d))
+        pop_psi, pop_ks = np.sum((a - 0.1) * np.log(a / 0.1)), 2 * stats.norm.cdf(d / 2) - 1
+        print(f'   {d:5.2f}  {n_cur:6,}   {r[0]:.4f} ({pop_psi:.4f})   {r[1]:.4f} ({pop_ks:.4f})   {r[2]:9.2f}   {r[3]:10.2f}')
+
+ref = rng.standard_normal(N_REF)
+print('\n2. no shift at all: PSI from sampling noise alone, 2,000 repetitions')
+for n_cur in [200, 1_000, 5_000]:
+    null = np.array([psi(ref, rng.standard_normal(n_cur)) for _ in range(2_000)])
+    print(f'   n_cur {n_cur:5,}: mean {null.mean():.4f} (formula {(10 - 1) * (1 / 5_000 + 1 / n_cur):.4f}), '
+          f'99th percentile {np.quantile(null, 0.99):.4f}, share above 0.1: {np.mean(null > 0.1):.3f}')
+
+print('\n3. a joint shift: two features keep N(0, 1) marginals, their correlation goes from 0 to 0.8')
+n = 500
+x_ref = rng.standard_normal((n, 2))
+cov = [[1, 0.8], [0.8, 1]]
+x_cur = rng.multivariate_normal([0, 0], cov, n)
+print('   KS p per feature:', ', '.join(f'{stats.ks_2samp(x_ref[:, j], x_cur[:, j]).pvalue:.2f}' for j in range(2)))
+
+def mmd2(x, y, gamma):                                    # unbiased estimate of MMD^2, Gaussian kernel
+    z = np.vstack([x, y])
+    k = np.exp(-gamma * ((z[:, None, :] - z[None, :, :]) ** 2).sum(-1))
+    m = len(x)
+    kxx, kyy, kxy = k[:m, :m], k[m:, m:], k[:m, m:]
+    return (kxx.sum() - np.trace(kxx)) / (m * (m - 1)) + (kyy.sum() - np.trace(kyy)) / (m * (m - 1)) - 2 * kxy.mean()
+
+z = np.vstack([x_ref, x_cur])
+gamma = 1 / np.median(((z[:, None] - z[None]) ** 2).sum(-1))   # median heuristic for the bandwidth
+stat = mmd2(x_ref, x_cur, gamma)
+perm = []
+for _ in range(300):
+    idx = rng.permutation(2 * n)
+    perm.append(mmd2(z[idx[:n]], z[idx[n:]], gamma))
+print(f'   MMD^2 = {stat:.4f}, permutation p = {(1 + np.sum(np.array(perm) >= stat)) / 301:.4f}')
+
+print('\n4. a categorical feature: device type shares')
+ref_counts = np.array([6_000, 3_000, 1_000])              # mobile, desktop, tablet in the reference week
+cur_counts = np.array([1_310, 520, 170])                   # this day
+chi2, p, _, _ = stats.chi2_contingency([ref_counts, cur_counts])
+print(f'   shares {np.round(ref_counts / ref_counts.sum(), 3)} -> {np.round(cur_counts / cur_counts.sum(), 3)}: chi2 = {chi2:.1f}, p = {p:.1e}')
+```
+
+```console
+$ python3.14 drift_tests.py
+1. one feature shifts by delta standard deviations; reference n = 5,000; 400 repetitions per row
+   delta   n_cur   PSI mean (pop.)    KS D mean (pop.)   KS rejects   chi2 rejects
+    0.00   1,000   0.0104 (0.0000)   0.0294 (0.0000)        0.04         0.04
+    0.05   1,000   0.0131 (0.0024)   0.0377 (0.0199)        0.21         0.12
+    0.10   1,000   0.0209 (0.0096)   0.0551 (0.0399)        0.70         0.51
+    0.20   1,000   0.0504 (0.0383)   0.0934 (0.0797)        1.00         0.99
+    0.50   1,000   0.2501 (0.2377)   0.2070 (0.1974)        1.00         1.00
+    1.00   1,000   0.9446 (0.9261)   0.3912 (0.3829)        1.00         1.00
+    0.00  20,000   0.0023 (0.0000)   0.0140 (0.0000)        0.06         0.05
+    0.05  20,000   0.0045 (0.0024)   0.0264 (0.0199)        0.77         0.50
+    0.10  20,000   0.0115 (0.0096)   0.0450 (0.0399)        1.00         1.00
+    0.20  20,000   0.0410 (0.0383)   0.0848 (0.0797)        1.00         1.00
+    0.50  20,000   0.2397 (0.2377)   0.2010 (0.1974)        1.00         1.00
+    1.00  20,000   0.9288 (0.9261)   0.3853 (0.3829)        1.00         1.00
+
+2. no shift at all: PSI from sampling noise alone, 2,000 repetitions
+   n_cur   200: mean 0.0482 (formula 0.0468), 99th percentile 0.1152, share above 0.1: 0.032
+   n_cur 1,000: mean 0.0114 (formula 0.0108), 99th percentile 0.0262, share above 0.1: 0.000
+   n_cur 5,000: mean 0.0042 (formula 0.0036), 99th percentile 0.0087, share above 0.1: 0.000
+
+3. a joint shift: two features keep N(0, 1) marginals, their correlation goes from 0 to 0.8
+   KS p per feature: 0.17, 0.15
+   MMD^2 = 0.0313, permutation p = 0.0033
+
+4. a categorical feature: device type shares
+   shares [0.6 0.3 0.1] -> [0.655 0.26  0.085]: chi2 = 21.2, p = 2.5e-05
+```
+
+- **The rows with $\delta = 0$** are the false alarms: the KS and chi-square tests reject in 4% to 6% of windows, as a 5% test should, while PSI is already 0.010 at $m = 1{,}000$ and 0.002 at $m = 20{,}000$, the noise floor of the formula, with no shift at all.
+- **Sampled against exact values.** The sampled PSI is the exact value plus about the noise floor: at $\delta = 0.1$ and $m = 1{,}000$, $0.0096 + 0.0108 = 0.0204$, against 0.0209 sampled. The sampled $D$ is above the population $D$ for the same reason; for large shifts both converge to the exact values.
+- **Power depends on the window.** For $\delta = 0.05$ the KS test rejects in 21% of windows of 1,000 and in 77% of windows of 20,000, while the shift, and its effect on the model, is the same. For $\delta \ge 0.2$ both window sizes detect it every time. The chi-square test on deciles is consistently less sensitive than KS on the raw values for a location shift.
+- **Part 2** confirms the noise formula and gives the calibrated thresholds directly: for windows of 1,000, a PSI above 0.026 happens in 1% of quiet windows; for windows of 200, a PSI above 0.115 does, more than the conventional 0.1.
+- **Part 3**: the univariate tests see nothing in a pair of features whose correlation went from 0 to 0.8; MMD rejects with the smallest p-value 300 permutations can produce.
+- **Part 4**: the change in device shares, about five percentage points of mobile, is highly significant on 2,000 sessions. Whether it matters is a separate question: if the model's error is the same on every device, it does not.
+
+## Next
+
+Monitoring says that something has changed and, with labels, how much the model has lost. What to do about it is the next question: retrain on a schedule or when triggered, on which data, how to evaluate the retrained model against the current one, and how far to go towards a model that learns continuously. The [next note](/notes/mlops/continual-learning) is about retraining and continual learning.
+
+## References
+
+- HSE University. *Введение в MLOps* (master's programme «Машинное обучение в цифровом продукте», 2025/26): monitoring ML in production.
+- C. Huyen. *Designing Machine Learning Systems*. O'Reilly, 2022. Chapter 8: data distribution shifts and monitoring (covariate, label and concept shift; detecting shifts; monitoring and observability). Stanford [CS329S](https://stanford-cs329s.github.io/).
+- C. Kästner. *Machine Learning in Production: From Models to Products*. MIT Press, 2025: the chapters on data quality, on drift, and on operating a model in production; course [17-445/645](https://mlip-cmu.github.io/), Carnegie Mellon University, spring 2025.
+- HSE University. [*LLM System Engineering*](https://github.com/xufana/llm-system-engineering) (2026): observability.
+- S. Rabanser, S. Günnemann, Z. C. Lipton. [Failing Loudly: An Empirical Study of Methods for Detecting Dataset Shift](https://arxiv.org/abs/1810.11953). NeurIPS 2019.
+- J. Quiñonero-Candela, M. Sugiyama, A. Schwaighofer, N. D. Lawrence (eds.). *Dataset Shift in Machine Learning*. MIT Press, 2009.
+- M. Saerens, P. Latinne, C. Decaestecker. [Adjusting the Outputs of a Classifier to New a Priori Probabilities: A Simple Procedure](https://doi.org/10.1162/089976602753284446). Neural Computation 14(1), 2002.
+- Z. C. Lipton, Y.-X. Wang, A. Smola. [Detecting and Correcting for Label Shift with Black Box Predictors](https://arxiv.org/abs/1802.03916). ICML 2018.
+- A. Gretton, K. M. Borgwardt, M. J. Rasch, B. Schölkopf, A. Smola. [A Kernel Two-Sample Test](https://jmlr.org/papers/v13/gretton12a.html). Journal of Machine Learning Research 13, 2012.
+- N. Siddiqi. *Credit Risk Scorecards: Developing and Implementing Intelligent Credit Scoring*. Wiley, 2006 (the population stability index and its conventional thresholds).
+- J. Gama, I. Žliobaitė, A. Bifet, M. Pechenizkiy, A. Bouchachia. [A Survey on Concept Drift Adaptation](https://doi.org/10.1145/2523813). ACM Computing Surveys 46(4), 2014.
+- E. Breck, S. Cai, E. Nielsen, M. Salib, D. Sculley. The ML Test Score: A Rubric for ML Production Readiness and Technical Debt Reduction. IEEE International Conference on Big Data, 2017 (the monitoring tests).

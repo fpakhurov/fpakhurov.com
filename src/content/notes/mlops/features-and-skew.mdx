@@ -1,0 +1,278 @@
+---
+title: Features and training–serving skew
+description: "Why a feature can take one value in training and another in serving: skew from code paths, data and time, point-in-time correct joins that keep the future out of training rows, logging served features, and feature stores with offline and online stores."
+course: mlops
+section: Data
+order: 4
+status: published
+tags: [features, training-serving-skew, point-in-time-join, time-travel, leakage, merge-asof, feature-logging, feature-store, feast, materialization, online-store, offline-store]
+prerequisites: [Data pipelines and orchestration, "Data quality, validation and versioning", "Data, features and leakage"]
+---
+
+import SkewPaths from '../../../components/figures/features-and-skew/SkewPaths.astro';
+import PointInTime from '../../../components/figures/features-and-skew/PointInTime.astro';
+
+The [previous note](/notes/mlops/data-quality-and-versioning) ended with data that is validated against a schema and stored as an immutable, versioned snapshot. A model does not read that data directly. It reads **features**, numbers computed from the data, and it reads them twice: once over the whole history, to build a training set, and once per request, when it serves. If the two computations disagree, the model is trained on one world and asked questions about another, and no amount of validation of the raw data will notice. This note names the ways the two computations drift apart, works out the join that keeps information from the future out of a training row, and describes the systems, feature logging and feature stores, built to make the two computations one.
+
+**Conventions.** The join examples are real runs (Python 3.14.7, pandas 3.1.0, scikit-learn 1.9.1, 23 October 2026) on synthetic data with fixed seeds. The Feast definitions are written against the documentation of Feast 0.67.0, the current release in October 2026, and were checked for Python syntax but not run.
+
+## Baseline: compute the features twice
+
+A team builds a churn model. A data scientist writes a SQL query over the warehouse that computes, for every customer and every month, the number of support cases in the last 30 days, joins it with whether the customer left in the following month, and trains a model on the result. The model scores well, and the team ships it. Serving needs the same feature for one customer in milliseconds, which the warehouse cannot provide, so an engineer reimplements "cases in the last 30 days" in the service, in another language, against the live cases database.
+
+Both implementations are correct by their authors' reading of the definition, and they disagree. The SQL counts cases by the day they were closed, the service by the day they were opened. The SQL treats a customer with no cases as 0, the service, when its lookup times out, as missing, which the model's preprocessing fills with the training mean. The warehouse table that the SQL read was rebuilt last night, so the training row for 1 March counts cases that were filed on 20 March. The offline metric was computed on the SQL values; the model in production sees the service values. Nothing crashes, and the model is quietly worse than anyone measured.
+
+## What training–serving skew is
+
+Google's *Rules of Machine Learning* define **training–serving skew** as a difference between performance during training and performance during serving, and list three causes: a discrepancy between how data is handled in the training and serving pipelines, a change in the data between training and serving, and a feedback loop between the model and the system ([Zinkevich, rules 29–37](#references)). The second cause, a world that changes after training, is drift, the subject of the [monitoring note](/notes/mlops/monitoring-and-drift); the third is taken up in the [note on retraining](/notes/mlops/continual-learning#feedback-loops). This note is about the first, in its sharpest form: for one and the same example, the value of a feature that the model saw in training differs from the value it receives in serving. It enters in three ways ([Breck et al., 2019](#references), section 4).
+
+<SkewPaths />
+
+1. **Training**: a batch job computes the features over the history in the warehouse and joins them with labels.
+2. **Serving**: a service computes the same features for one live request.
+3. **Code skew**: the two implementations treat a missing value, a unit or an edge case differently.
+4. **Data skew**: the two paths read different sources, or the same source in different states.
+5. **Time skew**: a training row picks up a value that was not yet known at prediction time.
+6. **The cure for all three**: log the features as the model received them and train on the logs, or derive both paths from one definition.
+
+### Skew from code paths
+
+Two implementations of one feature diverge for ordinary reasons: a different library for tokenizing text, lower-casing in one path and not the other, seconds against milliseconds, `float64` in a notebook and `float32` in the service, a null that becomes 0 in SQL and `NaN` in pandas. Each difference is small and plausible, and each changes what the model receives. Breck et al. describe a production incident of this kind at Google ([2019](#references), example 1.1): a refactoring of the serving stack introduced a bug that set one integer feature to −1 for a slice of traffic, because the remote call that computed it now failed and returned an error value. The model kept predicting, a little worse on that slice. Since served examples were logged and became the next day's training data, the next model was trained on the −1 values too, and the error persisted until someone found it, much later, by looking for the value whose frequency had changed the most. The ML Test Score paper adds a second common case: a new feature is computed in serving from live behaviour, but for training it has to be [backfilled](/notes/mlops/data-pipelines#backfills) from stored data by an entirely separate code path ([Breck et al., 2017](#references), test Monitor 3).
+
+### Skew from data
+
+Even with one implementation, the two paths can read different inputs. History is backfilled from a source with different coverage than the live stream; training uses a sample of logs and the sampling is biased; a lookup that succeeds offline times out online and falls back to a default; a join in the warehouse drops rows that the service keeps. Breck et al. call the resulting difference between the training and serving distributions of a feature **distribution skew** ([2019](#references), section 4). It is detected by comparing distributions, which the [data-quality note](/notes/mlops/data-quality-and-versioning) does for every batch and the [monitoring note](/notes/mlops/monitoring-and-drift) does continuously.
+
+### Skew from time
+
+The subtlest kind needs no bug at all. A training row stands for a prediction made at a moment $t$, but its features are computed later, when the training set is built, from tables that kept changing after $t$. Breck et al. call it **time travel** ([2019](#references), section 4): if the feature "clicks on this ad" is read from a database when the training data is generated, it includes clicks that happened after the impression was served, so the training data show higher click counts than serving ever sees. Rule 31 of Zinkevich makes the same point for any joined table that changes between training and serving. Time skew is the [leakage from the future](/notes/ml/data-features-and-leakage#target-leakage) of the Machine Learning course in its production form: "aggregates that include the future" there are an aggregate computed tonight for a prediction made last month here.
+
+<aside class="callout"><strong>Key idea.</strong> A feature has one definition and one value per entity and moment. Every training row must receive the value that the serving path would have produced for that entity at that moment, using only information available then. Get there by computing both paths from one definition, by joining history point-in-time correctly on the time each value became known, or simplest of all, by logging the values that serving actually used and training on those.</aside>
+
+## Point-in-time correct joins
+
+A training set is built from two tables. The **label table** (in Feast's vocabulary, the entity data frame) has one row per prediction: an entity key, such as a user, a prediction time $t$, and the label. The **feature table** has one row per change of a feature value: the entity key, the value, and a timestamp $\tau$. The join rule is:
+
+$$
+x(e, t) = v_k, \qquad k = \max \{\, j : e_j = e,\ \tau_j \le t \,\},
+$$
+
+the last value of entity $e$ whose timestamp is at or before the prediction time. Two details decide whether it is correct.
+
+- **Which timestamp.** $\tau$ must be the moment the value became *available to the serving path*, not the moment of the event it describes. A day's case count computed by a job that finishes at 03:00 the next morning is available at 03:00, and a prediction at 01:00 must not see it. Feast's point-in-time join compares the prediction time with a source's event timestamp; the optional created timestamp, the time a row was written, only decides between rows with the same event timestamp. So the event timestamp itself must be the moment the value became available, or training rows see values that did not yet exist when their prediction was made ([Feast documentation, point-in-time joins](#references)).
+- **How old is too old.** If the last value is weeks old, serving would probably have had nothing, or a default. A **time to live** (TTL) bounds the look-back: no value with $\tau_k \lt t - \mathrm{TTL}$ is joined, and the feature is missing instead, as it would be in serving.
+
+A random train–test split hides time skew as well, since a model evaluated on rows from the middle of the history can use what it learned from later rows; the split itself must follow time, as the [validation note](/notes/ml/validation-and-overfitting#splits-that-match-deployment) argues. The figure shows the join for one user.
+
+<PointInTime />
+
+1. The feature "open support cases" of user 7, each value stamped with the day it became known. The user leaves on 30 March, five days after four cancellation requests raised the count to 6.
+2. Three prediction times, with the label: did the user leave within 30 days?
+3. The point-in-time join takes the last value known at each time: 1, 2 and 1.
+4. A naive join on the user key takes today's value, 6, for every row.
+
+In pandas, the point-in-time join is `merge_asof`, which for every left row takes the last right row whose key is at or before the left key, within groups given by `by`:
+
+```python
+import pandas as pd
+
+features = pd.DataFrame({'user': 7, 'ts': pd.to_datetime(['2026-01-04', '2026-01-21', '2026-02-15', '2026-03-06', '2026-03-25']),
+                         'open_cases': [1, 2, 1, 2, 6]})
+labels = pd.DataFrame({'user': 7, 'ts': pd.to_datetime(['2026-01-15', '2026-02-01', '2026-03-01']), 'churned': [0, 0, 1]})
+pit = pd.merge_asof(labels, features, on='ts', by='user', direction='backward')
+naive = labels.merge(features.tail(1)[['user', 'open_cases']], on='user')
+print(pit.assign(naive=naive.open_cases))
+```
+
+```console
+$ python toy.py
+   user         ts  churned  open_cases  naive
+0     7 2026-01-15        0           1      6
+1     7 2026-02-01        0           2      6
+2     7 2026-03-01        1           1      6
+```
+
+The naive column is wrong in an instructive way. Every row gets 6, a value that exists only because the user was about to leave; in a training set of thousands of users, high case counts line up with leaving perfectly, and the model learns a rule that serving can never use, because at serving time the requests have not been filed yet. The Example section runs this on 3,000 synthetic users: the naive join promises an AUC of 0.908, the point-in-time join measures 0.631, and the naive model, once served, catches a quarter as many leavers as its offline test said it would.
+
+Three variants of the mistake are common enough to name. Joining on the date of a daily snapshot whose values were computed at the *end* of that day gives each prediction the events of the rest of its day. Joining with the current version of a dimension table, a customer's present address or plan, gives every historical row today's attributes. And computing an aggregate such as "average order value of the customer" once over the whole table puts all of the customer's future orders into every past row. `merge_asof` requires both tables sorted by the time key; `allow_exact_matches=False` excludes values stamped exactly at $t$, for the convention that a value stamped at $t$ is not yet usable at $t$, and `tolerance` implements the TTL.
+
+## Log what you serve
+
+The most robust way to make training values equal to serving values is not to compute them twice. Rule 29 of Zinkevich: save the set of features used at serving time, and pipe them to a log to use them at training time; do it at least for a sample, so that consistency can be checked. The rule reports that the YouTube home page switched to logging features at serving time and saw significant quality improvements and a reduction in code complexity ([Zinkevich, rule 29](#references)). A logged feature vector is, by construction, exactly what the model received, at exactly the moment it received it. Labels arrive later and are joined on a request identifier, which is a plain key join, with no time logic at all.
+
+Logging has two costs. A new feature has no logged history: it is either computed for past rows by a backfill, which brings back a second code path and the time question, or the team waits weeks while the log accumulates. And logs grow with traffic, so they are sampled, which can bias them.
+
+Logging also gives the test that the ML Test Score calls "training and serving are not skewed" ([Breck et al., 2017](#references), test Monitor 3): for a sample of logged requests, recompute the features with the training pipeline, join on the request identifier, and compare value by value. The useful numbers are the share of features that show any skew and, per feature, the share of examples that differ. Breck et al. found this test to be perhaps the most important and least implemented one in their survey of 36 teams at Google: this kind of error caused production issues across many teams, and yet few had a check for it.
+
+## Feature stores
+
+A **feature store** turns "one definition, two paths" into infrastructure. The idea was popularized by Uber's Michelangelo platform in 2017, whose shared store held about 10,000 features, computed in Spark and Hive for training and copied to Cassandra for low-latency reads at prediction time, with the stated purpose that the same data is used for training and serving ([Hermann and Del Balso, 2017](#references)). The pattern since then, in open-source systems such as Feast and in the managed stores of the cloud platforms, has the same parts ([Huyen, 2022](#references), chapter 10):
+
+- **Feature definitions** in a registry: the entity key, the value and its type, the timestamp column, the source, the transformation, an owner. Models refer to features by name, which also makes them reusable across teams.
+- An **offline store**: the full history of every feature value with its timestamps, in a warehouse, a data lake or columnar files. It serves training: given a label table, it performs the point-in-time join, with TTLs, for all requested features at once.
+- An **online store**: only the latest value per entity, in a key–value store such as Redis, DynamoDB or Cassandra, read in a few milliseconds at serving time.
+- **Materialization**: a scheduled job that copies the latest values from the offline store into the online store, or a streaming job that writes fresh values to both. Its schedule sets the **freshness** of a feature: a nightly materialization means serving sees values up to a day old, and the point-in-time join must then use the time a value reached the online store, not the time it was computed, or training sees fresher values than serving did.
+- **On-demand features**: functions of the request itself, such as the distance between a user and a shop, computed at serving time by the same function the training pipeline calls.
+
+A store removes the second implementation and the time bug by construction, but not every source of skew: a feature computed by a streaming job for serving and by a batch job for training is once again two code paths, and a backfill of a new feature reads history that may not match what serving would have seen. The feature store also becomes a dependency on the critical path of every prediction, with its own latency and availability budget.
+
+In Feast 0.67 (October 2026), the feature of the figure would be declared in Python:
+
+```python
+from datetime import timedelta
+from feast import Entity, FeatureView, Field, FileSource
+from feast.types import Int64
+
+user = Entity(name="user", join_keys=["user_id"])
+
+cases_source = FileSource(
+    path="data/user_cases.parquet",          # the offline history: one row per user and snapshot
+    timestamp_field="event_timestamp",         # when the value became known
+    created_timestamp_column="created",        # when the row was written, for deduplication
+)
+
+user_cases = FeatureView(
+    name="user_cases",
+    entities=[user],
+    ttl=timedelta(days=2),                     # no value older than two days at prediction time
+    schema=[Field(name="open_cases", dtype=Int64)],
+    source=cases_source,
+)
+```
+
+`feast apply` registers the definitions. Training calls `store.get_historical_features(entity_df=labels, features=["user_cases:open_cases"])`, where `labels` has the columns `user_id` and `event_timestamp`: Feast looks backward from each row's timestamp up to the TTL and returns the point-in-time join. `store.materialize_incremental(end_date=now)` copies the values that are newer than the previous materialization into the online store, and serving calls `store.get_online_features(features=[...], entity_rows=[{"user_id": 7}])` for the latest value. One definition serves both paths; the only time-related decision left to the team is the schedule of materialization.
+
+<aside class="callout"><strong>Check yourself.</strong> (1) A training set is built on 1 June from a table of "days since last login" refreshed nightly, for predictions made on the first of each month. Which kind of skew is this, and what is the fix? (2) A feature is computed by a job that runs at 02:00 for the previous day and is stamped with that day's date at 00:00. Predictions are made all day. What does a `merge_asof` on the stamp let a 10:00 prediction see, and how should the value be stamped? (3) A team logs served feature vectors for 1% of requests. Which test does this enable, and why is a 1% sample enough for it? (4) The online store is materialized nightly, but the offline store's point-in-time join uses the time a value was computed. Which way does the error go?<details><summary>Answers</summary>(1) Time skew: every row gets the value as of 1 June, so a user who stopped logging in in April looks inactive in the row for 1 March, too. Keep the daily snapshots and join each row on its own prediction time, or log the value at prediction time. (2) It is stamped 00:00 of day $d$ but describes all of day $d$, so a prediction at 10:00 on day $d$ sees the full day, including the 14 hours after it. Stamp the value with the time it became available, 02:00 on day $d + 1$; then the 10:00 prediction gets the value for day $d - 1$, as serving would. (3) The skew test: recompute those requests' features with the training pipeline and compare them with the logged values. A sample suffices because the test looks for systematic differences, which show up in a large share of examples; 1% of a busy service is still many thousands of requests a day. (4) Training is too optimistic: training rows see values up to a day fresher than serving had at the same moment. Stamp values with the time they reached the online store.</details></aside>
+
+## What changed
+
+| | Two implementations (the baseline) | One definition, point-in-time history |
+| --- | --- | --- |
+| Feature code | written once for SQL, again for the service | one definition, or served values logged and reused |
+| Training values | computed from today's tables | the value known at each prediction time, within a TTL |
+| Timestamps | the event's date | the time a value became available to serving |
+| Evaluation split | random | by time, after the training period |
+| Detecting skew | users notice | logged values recomputed and compared, distributions monitored |
+| Serving reads | an ad hoc lookup | an online store kept fresh by materialization |
+
+## Limitations
+
+- **Point-in-time correctness needs timestamps that tell the truth.** If the source does not record when a value changed, or overwrote old values in place, the history cannot be reconstructed, and only logging from now on helps.
+- **Logging cannot create history.** New features need a backfill, which reintroduces a second code path, or a wait.
+- **A feature store is a system to run.** It adds a dependency to every prediction and a materialization pipeline that can fall behind; a team with one model and batch predictions usually does not need one.
+- **Skew is not drift.** Equal code and correct joins guarantee that training sees what serving would have seen then; they do not stop the world from changing afterwards, which the [monitoring note](/notes/mlops/monitoring-and-drift) watches for.
+- **Tools move.** Feast's API and the managed feature stores change between releases; the details here are those of October 2026.
+
+## What you should remember
+
+- Training–serving skew is a difference between what a model saw in training and what it receives in serving for the same example. It comes from two implementations (code), different sources or states of the data (data), and values computed after the moment of prediction (time).
+- A point-in-time join gives each training row the last value with $\tau \le t$, where $\tau$ is the time the value became available to serving, bounded by a TTL. In pandas it is `merge_asof(..., direction='backward')`; in Feast, `get_historical_features`.
+- A naive join on the entity key gives every past row today's value, and with it the future: in the Example, an offline AUC of 0.908 that is really 0.631.
+- Logging the features that serving used and training on them removes skew by construction; recomputing a logged sample and comparing it is the skew test that teams most often lack.
+- A feature store holds one definition per feature, an offline store of history for point-in-time joins, an online store of latest values, and the materialization between them, whose schedule sets freshness.
+
+## Example
+
+The program below builds a churn data set the way the baseline team did and the way this note recommends, trains the same model on both, and then scores the naively trained model on the values serving would actually give it. Three thousand synthetic users each have a hidden risk; the riskier ones open more support cases and leave sooner, and every user who leaves opens a burst of cases in the seven days before. The feature is the number of cases in the 30 days up to a day, the label whether the user leaves within 30 days of a prediction made on the first of each month.
+
+```python
+# A churn model trained on a naive join (the current feature table) and on a point-in-time join (merge_asof).
+import numpy as np
+import pandas as pd
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import recall_score, roc_auc_score
+
+rng = np.random.default_rng(0)
+U, D = 3000, 181                                   # users; days from 1 January to 30 June 2026
+day0 = pd.Timestamp('2026-01-01')
+risk = rng.normal(size=U)                          # hidden propensity to leave
+churn = rng.exponential(1 / (0.004 * np.exp(0.8 * risk))).astype(int)   # day the user leaves
+
+# Daily support cases: a base rate that grows with risk, plus a burst in the 7 days before leaving.
+days = np.arange(D)
+rate = 0.03 * np.exp(0.5 * risk)[:, None] * np.ones(D)
+rate[(days >= churn[:, None] - 7) & (days < churn[:, None])] += 0.4
+cases = rng.poisson(rate)
+t30 = np.cumsum(cases, axis=1)
+t30[:, 30:] -= t30[:, :-30]                        # cases in the 30 days up to and including day d
+
+# The offline feature table: one row per user and day while the user is active,
+# stamped with the moment the value becomes known, the end of that day.
+u, d = np.nonzero(days[None, :] < churn[:, None])
+features = pd.DataFrame({'user': u, 'ts': day0 + pd.to_timedelta(d + 1, 'D'), 'cases_30d': t30[u, d]})
+
+# The labels: on the first day of each month, every active user; positive if the user leaves within 30 days.
+rows = []
+for m in range(2, 7):
+    t = pd.Timestamp(2026, m, 1)
+    k = (t - day0).days
+    for user in np.nonzero(churn > k)[0]:
+        rows.append((user, t, int(churn[user] < k + 30)))
+labels = pd.DataFrame(rows, columns=['user', 'ts', 'churned'])
+
+# Naive join: each label row gets the user's latest feature value, today's value.
+latest = features.sort_values('ts').groupby('user').tail(1)[['user', 'cases_30d']]
+naive = labels.merge(latest, on='user', how='left')
+# Point-in-time join: the last value known at or before the prediction time.
+pit = pd.merge_asof(labels.sort_values('ts'), features.sort_values('ts'), on='ts', by='user', direction='backward')
+
+print(f'{len(features):,} feature rows, {len(labels):,} label rows, {labels.churned.mean():.1%} positive')
+for name, df in [('naive', naive), ('point-in-time', pit)]:
+    m = df.churned == 1
+    print(f'{name:>14}: mean cases_30d {df.cases_30d[m].mean():.2f} for leavers, {df.cases_30d[~m].mean():.2f} for stayers')
+
+def split(df):                                      # train on February to April, test on May and June
+    tr, te = df[df.ts < '2026-05-01'], df[df.ts >= '2026-05-01']
+    return tr[['cases_30d']], tr.churned, te[['cases_30d']], te.churned
+
+for name, df in [('naive', naive), ('point-in-time', pit)]:
+    Xtr, ytr, Xte, yte = split(df)
+    model = LogisticRegression().fit(Xtr, ytr)
+    p = model.predict_proba(Xte)[:, 1]
+    thr = np.quantile(p, 0.9)                       # flag the top 10% of the test month for the retention team
+    print(f'{name:>14} offline: AUC {roc_auc_score(yte, p):.3f}, recall in the top 10% {recall_score(yte, p >= thr):.3f}')
+    if name == 'naive':
+        naive_model, naive_thr = model, thr
+
+# Serving: the naive model is scored on the values serving actually has, the point-in-time ones.
+_, _, Xs, ys = split(pit)
+ps = naive_model.predict_proba(Xs)[:, 1]
+print(f'  naive served: AUC {roc_auc_score(ys, ps):.3f}, recall at the offline threshold {recall_score(ys, ps >= naive_thr):.3f}, '
+      f'flagged {np.mean(ps >= naive_thr):.1%} of users')
+```
+
+```console
+$ python pit_join.py
+369,480 feature rows, 10,042 label rows, 11.1% positive
+         naive: mean cases_30d 4.03 for leavers, 1.46 for stayers
+ point-in-time: mean cases_30d 1.54 for leavers, 0.83 for stayers
+         naive offline: AUC 0.908, recall in the top 10% 0.767
+ point-in-time offline: AUC 0.631, recall in the top 10% 0.367
+  naive served: AUC 0.631, recall at the offline threshold 0.184, flagged 6.3% of users
+```
+
+- **The simulation.** `churn` is drawn from an exponential distribution whose rate grows with the hidden risk, so riskier users leave sooner; many never leave within the six months. `rate` is the expected number of cases per user and day, with 0.4 added in the week before leaving: the cancellation requests of the figure.
+- **The rolling count.** A cumulative sum along the days minus the same sum shifted by 30 days gives, for every user and day, the cases in the 30 days ending that day, without a loop.
+- **The feature table.** One row per user and active day, 369,480 in all, stamped `day0 + d + 1`: the count for day $d$ is known only once day $d$ has ended. This stamp is what makes the join correct; stamping it with day $d$ itself would let a prediction at midnight see the whole of that day.
+- **The labels.** 10,042 rows, one per active user on 1 February, 1 March, 1 April, 1 May and 1 June; 11.1% of them leave within 30 days.
+- **The naive join** merges on `user` alone with the last row of each user: for a user who left, that row is the day before leaving, with the burst in it. The leakage is visible before any model is trained: leavers average 4.03 cases against 1.46 for stayers.
+- **The point-in-time join** is the `merge_asof` of the previous section, now for all users at once. Leavers still have more cases, 1.54 against 0.83, because riskier users file more and some bursts have started by the prediction time; that is the honest signal.
+- **The split** is by time: February to April for training, May and June for testing, as the model will be used.
+- **Offline results.** Trained and evaluated on naive features, the model reaches an AUC of 0.908 and finds 76.7% of the leavers among the 10% of users it ranks highest. Trained and evaluated point-in-time correctly, the same model reaches 0.631 and 36.7%. The difference is not a better model; it is the future.
+- **Served.** The last block scores the naively trained model on the values serving actually has. With a single feature, a logistic regression ranks users the same way whatever its coefficients, so its AUC equals the honest 0.631. What breaks is everything calibrated on the leaky values: the threshold chosen offline for "the top 10%" now flags only 6.3% of users, and the model catches 18.4% of leavers instead of the 76.7% the retention team was promised, half of what the honestly trained model finds with its own threshold. With more features the ranking would degrade too, because the weights themselves were fitted to a relation between cases and leaving that serving never shows.
+
+## Next
+
+With features that mean the same thing in training and in serving, a training run consumes a well-defined input. The next question is the run itself: which code, data, configuration and environment produced a given model, whether running it again gives the same model, and how the chosen model is recorded, versioned and handed to deployment. The [next note](/notes/mlops/experiments-and-registry) covers experiment tracking, reproducibility and the model registry.
+
+## References
+
+- HSE University. *Введение в MLOps* (master's programme «Машинное обучение в цифровом продукте», 2025/26): data versioning and ML pipelines.
+- C. Kästner. *Machine Learning in Production: From Models to Products*. MIT Press, 2025. [Chapter 10: Deploying a Model](https://mlip-cmu.github.io/book/10-deploying-a-model.html) (feature encoding during training and inference, feature stores). Course [17-445/645, spring 2025](https://mlip-cmu.github.io/).
+- C. Huyen. *Designing Machine Learning Systems*. O'Reilly, 2022. Chapters 5 (feature engineering, data leakage), 7 (batch and online features) and 10 (feature stores). Stanford [CS 329S: Machine Learning Systems Design](https://stanford-cs329s.github.io/).
+- M. Zinkevich. [Rules of Machine Learning: Best Practices for ML Engineering](https://developers.google.com/machine-learning/guides/rules-of-ml). Google, accessed October 2026. Training–serving skew, rules 29–37.
+- E. Breck, N. Polyzotis, S. Roy, S. E. Whang, M. Zinkevich. [Data Validation for Machine Learning](https://mlsys.org/Conferences/2019/doc/2019/167.pdf). SysML, 2019. Example 1.1 and section 4 (feature skew, time travel, distribution skew, scoring/serving skew).
+- E. Breck, S. Cai, E. Nielsen, M. Salib, D. Sculley. [The ML Test Score: A Rubric for ML Production Readiness and Technical Debt Reduction](https://research.google/pubs/the-ml-test-score-a-rubric-for-ml-production-readiness-and-technical-debt-reduction/). IEEE Big Data, 2017. Test Monitor 3 and section VII.
+- J. Hermann, M. Del Balso. [Meet Michelangelo: Uber's Machine Learning Platform](https://www.uber.com/blog/michelangelo-machine-learning-platform/). Uber Engineering, 5 September 2017.
+- Feast documentation (v0.67, October 2026): [Point-in-time joins](https://docs.feast.dev/getting-started/concepts/point-in-time-joins), [Feature view](https://docs.feast.dev/getting-started/concepts/feature-view).
+- pandas documentation: [`pandas.merge_asof`](https://pandas.pydata.org/docs/reference/api/pandas.merge_asof.html).

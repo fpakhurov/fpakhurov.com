@@ -1,0 +1,303 @@
+---
+title: Data pipelines and orchestration
+description: "How raw events become reliable daily datasets: batch against streaming, ETL against ELT, a pipeline as a graph of tasks, idempotent tasks over date partitions, backfills, late data and watermarks, orchestrators as of October 2026, and data contracts."
+course: mlops
+section: Data
+order: 2
+status: published
+tags: [data-pipelines, batch, streaming, etl, elt, dag, orchestration, idempotence, partitioning, backfill, late-data, watermarks, label-delay, airflow, dagster, prefect, data-contracts]
+prerequisites: [Designing an ML system, Data frames with pandas, Builds and dependencies]
+---
+
+import PipelineDag from '../../../components/figures/data-pipelines/PipelineDag.astro';
+
+The [previous note](/notes/mlops/ml-system-design) designed the fraud check and listed its data: payments from the checkout, authorisations from the card network, chargebacks that arrive weeks later, and the decisions of fraud analysts. Each comes from a different system, at its own pace, sometimes late and sometimes twice. A model can only be as reproducible as the data it was trained on, and those data are produced by code that runs every day, for years, against inputs that change. This note builds that code: it compares batch and streaming processing, describes a pipeline as a graph of tasks, makes each task safe to run any number of times, and handles the two facts that make data pipelines harder than build pipelines: data arrive late, and the same day must sometimes be processed again.
+
+## Baseline: a cron job that appends
+
+The first pipeline is usually a script that runs every night at 00:30 from `cron`. It asks the payments database for the rows of "yesterday", computed from the clock, and appends them to a file or a table that the training job reads. It works on the first night. Then:
+
+- **A retry duplicates.** The job fails halfway through the night because the database is restarted, and someone runs it again. The rows written before the failure are now there twice. The same script run twice on 1 October appended 300 rows each time and left 600: every payment of the day is counted twice, the fraud rate is unchanged and the volume has doubled.
+- **Late data are lost.** Payments recorded after 00:30 with a timestamp of the previous day, because a terminal was offline or a queue was slow, are never picked up: the next run asks for its own "yesterday".
+- **The past cannot be redone.** A bug in the currency conversion is found a month later. Fixing the code fixes tomorrow, but the thirty days already appended are wrong, and the script cannot be told to process 3 October again, because it only knows "yesterday".
+- **Nobody knows what the training job read.** The file grows in place, so the training set of last Tuesday's model no longer exists.
+
+Each failure has a known fix, and together they define how a data pipeline should be built.
+
+## Batch and streaming
+
+Data are processed in one of two ways ([Kleppmann, 2017, chapters 10 and 11](#references); [Huyen, 2022, chapter 3](#references)).
+
+- **Batch processing** reads a bounded set of data, such as all payments of one day, computes a result and writes it, typically on a schedule. It is simple to reason about and to rerun, and its results are as fresh as its schedule: a daily job gives data up to a day old.
+- **Stream processing** handles an unbounded sequence of events as they arrive, from a log such as Kafka, and keeps results up to date within seconds. It is needed when freshness is a requirement, such as the card-history features of the design note, which must be at most 60 seconds old. It is harder: state must be kept across events, results must be correct when events arrive out of order, and reprocessing means replaying the log.
+
+The two coexist in most ML systems. Training reads history and runs in batch. Some features need streaming, and then the same feature is computed twice, by a batch job for training and by a stream job for serving, which is a classic source of the training–serving skew of the [features note](/notes/mlops/features-and-skew). Two architectures address the duplication: the **Lambda architecture** keeps both paths and merges their results, and the **Kappa architecture** keeps only the stream and reprocesses by replaying the log from the beginning through a new version of the job ([Kreps, 2014](#references)). The modern synthesis treats a batch as a stream that ends: the same program, run over a bounded or an unbounded input ([Akidau et al., 2015](#references)).
+
+## ETL and ELT
+
+A pipeline that copies data from operational systems into an analytical store does three things: **extract** from the source, **transform** (clean, join, aggregate) and **load** into the destination. The order matters.
+
+- **ETL** transforms before loading, so the destination holds only cleaned data. It was the norm when storage was expensive. Its weakness for ML is that the raw data are gone: a new feature, or a fix to a transformation, cannot be applied to the past.
+- **ELT** loads raw data first, unchanged, into cheap storage (a data lake of files in object storage, or a warehouse), and transforms inside the destination. The raw zone is the source of truth: it is append-only and never edited, and every clean table is a function of it that can be recomputed.
+
+ML pipelines are ELT by necessity, because the questions asked of the data change after it is collected. The rule that follows is the most important one in this note: **never modify raw data; derive everything from it with code that can be run again.**
+
+## A pipeline is a graph of tasks
+
+A pipeline is a set of **tasks**, each a step that reads some datasets and writes others, with **dependencies** between them: a task runs only after the tasks whose outputs it reads have succeeded. The dependencies form a directed acyclic graph, the same structure as the [build graph](/notes/devops/builds-and-dependencies#a-build-is-a-graph-of-targets) of the DevOps course and the [CI pipeline](/notes/devops/continuous-integration#a-pipeline-is-a-graph-of-jobs), with one difference: the graph is run again and again, once per period, and each run processes its own slice of data.
+
+<PipelineDag />
+
+1. **The graph.** Raw payments land by arrival date; a task builds one clean partition per event date; validation, features and the training set follow; chargebacks join the training set once their labels have matured.
+2. **Daily runs.** The run at 00:30 of each day rebuilds the partitions of the last three event dates, because events for them may still arrive. The counts are those of the Example: the partition of 1 October grows from 270 to 294 to 299 rows over three runs.
+3. **A partition becomes final** when it leaves the window: after two days of lateness, 1 October is final with 299 rows, 2 October with 299.
+4. **A re-run changes nothing.** Running the 5 October schedule again with the same inputs writes byte-identical partitions.
+5. **A backfill** on 9 October rebuilds 1–4 October from all the raw data that have arrived by then, picking up the events that were more than two days late: every day now has 300 rows.
+
+Every run of the graph is identified by a **logical date**: the period of data it is responsible for, not the moment it happens to execute. The run for 1 October may execute on 2 October at 00:30, or again on 9 October in a backfill, and must produce the same result from the same inputs either way. Making the logical date a parameter, instead of reading the clock, is what turns "yesterday" into "the data of 1 October" and makes the rest of this note possible.
+
+## Idempotent tasks over date partitions
+
+A task is **idempotent** if running it twice with the same inputs leaves the same state as running it once. Retries, re-runs and backfills are then safe, which is the property that the baseline lacked. The pattern that achieves it has four rules ([Beauchemin, 2018](#references); [Kleppmann, 2017, chapter 10](#references)).
+
+1. **Partition outputs by logical date.** Each run writes exactly one partition, such as `clean/date=2026-10-01/`, named by the date of the events it holds, not by when it ran.
+2. **Overwrite, never append.** A run replaces its whole partition. Running it again replaces it again with the same content; the duplicate rows of the baseline cannot occur.
+3. **Write atomically.** Readers must see either the old partition or the new one, never half of one. On a file system, write to a temporary name and rename it, since a rename within one file system is atomic; in a warehouse, write a staging table and swap it in, or delete and insert inside one transaction.
+4. **Be a function of the inputs.** No clock (use the logical date), no unseeded randomness, no dependence on the order in which rows were read (sort the output), and deduplicate by a key, because most message systems deliver **at least once**: under failure they send some events twice rather than lose them.
+
+The four rules make each partition a pure function of its input partitions and of the code: $\text{partition}(d) = f_{\text{code}}(\text{raw inputs for } d)$. That is the same idea as a reproducible build, where the output is a function of the sources and the toolchain, and it allows the same trick: a content hash of a partition identifies it, and an unchanged hash after a re-run proves that nothing changed, as the [next note](/notes/mlops/data-quality-and-versioning) uses for versioning. Idempotence at the level of a task is the data counterpart of the [idempotency keys](/notes/devops/resilience-and-capacity#idempotency-keys) that make retried requests safe in a service.
+
+## Backfills
+
+A **backfill** runs a pipeline for a range of past logical dates: after a bug fix, after a new column is added, after late data arrive, or to build history for a new feature. With idempotent tasks over date partitions, a backfill is just the normal run with older dates. Without them, it is a hand-written migration of a live table, which is how the baseline's currency bug stays in the data for good.
+
+Three cautions apply.
+
+- **Order and dependencies.** A backfill of 30 days of the clean partitions must be followed by a backfill of everything downstream of them, in dependency order: the features, the training sets and possibly the models trained on them. An orchestrator that knows the graph can do this; a script cannot.
+- **Cost and load.** Thirty days processed at once can overload the source database or the cluster. Orchestrators limit how many runs of a backfill execute concurrently.
+- **What was known at the time.** Recomputing a feature for 3 October with today's data can leak information that did not exist on 3 October, such as a chargeback that arrived later. Backfilled training data must be **point-in-time correct**, which is the subject of the [features note](/notes/mlops/features-and-skew).
+
+## Late data and watermarks
+
+Every event has two times: the **event time**, when it happened (the payment was made), and the **processing time**, when the pipeline sees it. The gap between them is the arrival delay, and it has a distribution: most events arrive within seconds, some after a terminal reconnects hours later, a few after days. A pipeline that groups by event time must decide when a period's data are complete enough to act on.
+
+A **watermark** is that decision made explicit: a moving claim that no more events with an event time before $W$ are expected ([Akidau et al., 2015](#references)). A stream processor emits a window's result when the watermark passes the window's end, and handles events that arrive after the watermark ("late data") with a rule: drop them, or update the result within an **allowed lateness**. A batch pipeline does the same thing with dates: it rebuilds each day's partition for $L$ more days, then declares it final, and corrects the rare later arrivals by backfill.
+
+The choice of $L$ trades freshness for completeness, and it can be computed from the delay distribution. In the Example, 90% of events arrive on their event day, 8% one day later, 1.5% two days later and 0.5% three days later. A partition built on the morning after holds 90% of its events; waiting one more day gives $90 + 8 = 98\%$; two days, $99.5\%$; three, $100\%$. The Example uses $L = 2$: each day is final after two days of lateness with about 99.5% of its events (299 of 300), and the backfill recovers the rest.
+
+### Labels arrive later than features
+
+For a fraud model the slowest data are the labels. A chargeback is filed days to months after the payment, so the label of a recent payment is not yet known, and "no chargeback yet" is not the same as "legitimate". Suppose, for illustration, that 50% of chargebacks arrive within 30 days, 80% within 60 and 95% within 90. A training set that includes payments from the last 30 days counts at least half of their fraud as legitimate. If the true fraud rate is 0.2%, the observed rate in those weeks is at most 0.1%, the model learns that recent patterns are safe, and the most recent fraud, the kind it most needs to learn, is the most under-labelled.
+
+The pipeline must therefore know the **label maturity** of every example. The usual remedies: train only on payments older than a maturity window (90 days here, with 95% of labels in), at the cost of a model that is three months behind; use faster partial labels, such as analyst decisions, for recent data; or model the delay and weight recent examples accordingly. Whichever is chosen, it is a property of the pipeline, decided once and recorded, not a choice made silently by the date range of a query.
+
+## Orchestrators
+
+An **orchestrator** runs the graph: it schedules runs by logical date, starts each task when its dependencies have succeeded, retries failures, records what ran with which parameters, and offers backfills, alerts and a view of the history. Three open-source orchestrators dominate Python data and ML pipelines in October 2026, with different central abstractions ([Apache Airflow documentation](#references); [Dagster documentation](#references); [Prefect documentation](#references)).
+
+- **Apache Airflow** (3.3.2, September 2026) describes a pipeline as a DAG of tasks defined in Python, run by a scheduler and executed by workers. Each run has a logical date and a data interval, available to tasks as context variables such as `ds`. Airflow 3 changed a default that matters for idempotence: a cron schedule such as `@daily` now uses a trigger timetable, so the run that starts at midnight on 2 October has the logical date 2 October and an empty data interval, where Airflow 2 gave it the logical date 1 October and the interval of 1 October. A task that processes "the data of `ds`" therefore processes a different day after an upgrade unless it says which day it means. Backfills are created by the scheduler, `airflow backfill create --dag-id payments --from-date 2026-10-01 --to-date 2026-10-04`, with a choice of whether to rerun dates that already succeeded.
+- **Dagster** (1.13, October 2026) is centred on **assets**, the datasets a pipeline produces, rather than on tasks: one declares each asset, the code that computes it and the assets it depends on, and the graph follows. Partitions, such as one per day, are part of an asset's definition, so "rebuild the clean payments of 1–4 October and everything downstream" is a native operation, and data-quality checks can be attached to assets.
+- **Prefect** (3.9, October 2026) turns ordinary Python functions into **flows** and **tasks** with decorators, with retries, caching of task results by a key computed from their inputs, and deployments that run flows on a schedule or on events. It is closest to plain Python and the least prescriptive about partitions.
+
+ML-specific platforms (Kubeflow Pipelines, and pipelines inside managed ML services) run the same kind of graph with containers as tasks and add the tracking of models and metrics, which the [experiments note](/notes/mlops/experiments-and-registry) covers. What no orchestrator does is make a task idempotent. It will happily retry a task that appends, and backfill a task that reads the clock. The rules of the previous sections are the task author's job; the orchestrator only makes them pay off.
+
+## Data contracts
+
+The pipeline depends on producers it does not control: the checkout team owns the payments table, the card network owns the format of authorisations. When a producer renames a column, changes a unit or starts sending a field as text, the pipeline, and every model downstream of it, breaks or, worse, keeps running on wrong data. A **data contract** is an explicit agreement between a producer and its consumers about a dataset, kept in version control and checked automatically. It covers:
+
+- **Schema:** the fields, their types and whether they may be null.
+- **Semantics:** what each field means, including units and time zones: `amount` in euros with two decimals, `event_time` in UTC.
+- **Quality:** the expectations that the [next note](/notes/mlops/data-quality-and-versioning) turns into tests: uniqueness of `id`, ranges, allowed values.
+- **Service level:** when a partition is complete and how fresh the data are.
+- **Ownership and change rules:** who owns the data, who consumes it, which changes are compatible (adding an optional field) and which break consumers (renaming, retyping, changing units) and therefore need a new version and a deprecation period.
+
+A contract for the clean payments of the Example, in YAML. It is written in the spirit of the Open Data Contract Standard (ODCS, version 3.2.0 of September 2026, maintained by the Bitol project of the Linux Foundation), but with simplified fields of its own; it is not a valid ODCS document and was checked only as YAML:
+
+```yaml
+dataset: clean_payments
+version: 1.2.0                      # semantic version: a breaking change bumps the major number
+owner: risk-data@shop.example.com
+consumers: [fraud-training, fraud-features, finance-losses-report]
+partitioning: {key: date, granularity: day, timezone: UTC}
+service_level:
+  first_version: "D+1 00:45 UTC"    # built from what arrived by the end of the event day
+  final: "D+3 00:45 UTC"            # after two days of allowed lateness
+  completeness_at_final: 0.995      # share of the day's events expected by then
+schema:
+  - {name: id, type: string, nullable: false, unique: true}
+  - {name: time, type: timestamp, nullable: false, description: "event time of the payment, UTC"}
+  - {name: amount_eur, type: decimal(12,2), nullable: false, description: "amount in euros, not cents", range: [0.01, 20000]}
+compatibility:
+  allowed_without_new_major: [add nullable column, widen a range after review]
+  breaking: [rename or remove column, change type, change unit or time zone, change partition key]
+```
+
+Each line answers a question that would otherwise be answered by a broken model. `consumers` lists every declared user, which turns the undeclared-consumer debt of the [first note](/notes/mlops/what-mlops-is#undeclared-consumers) into a list someone maintains: a breaking change requires telling each of them. `service_level` puts the watermark of this note in writing, with the completeness the delay distribution supports. `amount_eur` states the unit in the name and in the description, the kind of fact whose silent change caused week 5 of the first note's Example. `compatibility` separates changes that a producer may make alone from those that need a new major version, the same rule as [semantic versioning](/notes/devops/builds-and-dependencies#dependencies-from-outside-ranges-and-lockfiles) of packages. The contract is enforced twice: in the producer's CI, where a change to the schema is checked against the rules before it merges, and at ingestion, where every partition is validated before anyone reads it.
+
+<aside class="callout"><strong>Key idea.</strong> Keep raw data immutable and derive everything from it with tasks that are pure functions of their inputs: one partition per logical date, overwritten atomically, deduplicated by key, with no clock and no randomness. Then retries, re-runs and backfills are the same safe operation, late data are handled by rebuilding a window of recent partitions until a watermark declares them final, and an orchestrator can run, retry and backfill the graph. Contracts with producers make the inputs as explicit as the code.</aside>
+
+<aside class="callout"><strong>Check yourself.</strong> (1) A task writes its output with `INSERT INTO features SELECT ...` for the rows of its logical date. Is it idempotent? How would you make it so? (2) Arrival delays are 70% same day, 20% next day, 8% after two days and 2% after three. What lateness gives at least 97% completeness, and how fresh is a final partition then? (3) A team upgrades from Airflow 2 to Airflow 3 and its daily features look shifted by one day. What changed? (4) The upstream team wants to send amounts in cents to save a multiplication. Under the contract above, is that allowed, and what must happen? (5) Why can a model trained on the last four weeks of payments underestimate fraud even if every pipeline task is correct?<details><summary>Answers</summary>(1) No: a second run inserts the rows again. Delete the partition's rows and insert them in one transaction, or write a new partition and swap it in atomically, and deduplicate by key. (2) Two days of lateness: $70 + 20 + 8 = 98\%$ after two days, against 90% after one. A final partition is then three days old. (3) The default timetable: in Airflow 3 a cron schedule's run at midnight on day $d$ has the logical date $d$, not $d - 1$, so tasks that process the data of `ds` now process the day that has just started. Say explicitly which day a task processes, or switch to the data-interval timetable. (4) No: a change of unit is breaking. It needs a new major version (for example a new field `amount_cents` or a new dataset), notice to every listed consumer, and a period in which both are produced. (5) Because labels are immature: chargebacks for recent payments have not arrived, so recent fraud is labelled as legitimate. Train on matured payments only, or correct for the delay.</details></aside>
+
+## What changed
+
+| | Cron job that appends (baseline) | Idempotent pipeline over partitions |
+| --- | --- | --- |
+| Raw data | read once, not kept | landed unchanged, never edited, the source of truth |
+| A run's scope | "yesterday" from the clock | a logical date, passed as a parameter |
+| Writing | append to one growing table | overwrite one partition, atomically |
+| Retry after a failure | duplicates rows | rewrites the same bytes |
+| Late events | lost | picked up by rebuilding a window; watermark declares finality |
+| Fixing the past | impossible or a manual migration | a backfill, downstream tasks in dependency order |
+| Labels | whatever has arrived | used only once mature, or corrected for delay |
+| Producers | change formats without notice | bound by a versioned contract with listed consumers |
+
+## Limitations
+
+- **Idempotence has a boundary.** A task that sends an email, charges a card or calls an external API cannot be made idempotent by overwriting a partition; it needs idempotency keys on the other side, or must be kept out of re-runnable pipelines.
+- **Partitioning by date is not always natural.** Slowly changing tables (customer profiles), global aggregates and graphs do not split by day; they are snapshotted whole, which is expensive for large data.
+- **Watermarks are estimates.** A delay distribution measured last month can change: a partner's outage can delay a day's data by a week. Final partitions need monitoring of late arrivals, and the contract must say how corrections are made.
+- **Streaming needs its own machinery.** Exactly-once results in a stream processor depend on checkpointing and transactional sinks, which this note does not cover; the batch rules here are the reference that a stream job must reproduce.
+- **Versions move.** Airflow, Dagster and Prefect release often, and their defaults change, as the Airflow 3 timetable shows; the versions named are those of October 2026.
+
+## What you should remember
+
+- Batch processing reads bounded data on a schedule; stream processing updates results as events arrive. Training is batch; some features need streams; computing a feature both ways risks skew.
+- ELT keeps raw data unchanged and derives the rest; never modify raw data.
+- A pipeline is a graph of tasks run once per logical date. The logical date is a parameter, not the clock.
+- Idempotent tasks: one partition per logical date, overwrite, write atomically (temporary file and rename), no clock or unseeded randomness, sorted output, deduplicate by key. Then retries, re-runs and backfills are safe.
+- Late data: rebuild a window of recent partitions, declare finality with a watermark chosen from the delay distribution (90%, 98%, 99.5%, 100% after 0–3 days in the Example), and correct the rest by backfill.
+- Labels for fraud arrive late; train on matured examples or model the delay.
+- Orchestrators (Airflow 3.3, Dagster 1.13, Prefect 3.9 in October 2026) schedule, retry and backfill the graph, but do not make tasks idempotent. Airflow 3 changed what `ds` means for cron schedules.
+- A data contract fixes schema, semantics and units, quality, service level, ownership, consumers and the rules for breaking changes.
+
+## Example
+
+The program below is a complete small pipeline with the rules of this note. A simulated upstream delivers 1,500 payments with event dates 1–5 October into a raw zone partitioned by **arrival** date, with realistic flaws: 10% of events arrive one to three days late, and 1% are delivered twice. One task builds the clean partition of an event date; the daily schedule rebuilds the last three event dates; a re-run and a backfill follow.
+
+```python
+"""An idempotent daily pipeline: raw payment events, landed by arrival date, become one clean partition per event date."""
+import hashlib
+import json
+import os
+import random
+import sys
+from datetime import date, timedelta
+from pathlib import Path
+
+ROOT = Path(sys.argv[1])                     # a scratch directory
+RAW, CLEAN = ROOT / 'raw', ROOT / 'clean'
+LATENESS = 2                                 # days we wait for late events before a partition is final
+
+
+def land_raw_events():
+    """Simulate the upstream: 300 payments a day on 1-5 October, delivered at least once, some days late."""
+    rnd = random.Random(42)
+    for k in range(1500):
+        day = date(2026, 10, 1) + timedelta(days=k // 300)
+        event = {'id': f'p{k:05d}', 'time': f'{day}T{rnd.randrange(24):02d}:{rnd.randrange(60):02d}',
+                 'amount_cents': rnd.randrange(100, 50_000)}
+        delay = rnd.choices([0, 1, 2, 3], weights=[90, 8, 1.5, 0.5])[0]
+        copies = 2 if rnd.random() < 0.01 else 1              # at-least-once delivery duplicates 1%
+        arrived = RAW / f'arrival_date={day + timedelta(days=delay)}'
+        arrived.mkdir(parents=True, exist_ok=True)
+        with open(arrived / 'events.jsonl', 'a') as f:
+            f.write((json.dumps(event) + '\n') * copies)
+
+
+def build_partition(ds: date, today: date) -> str:
+    """Task: the clean partition for event date ds, from every raw file that arrived before `today`.
+    Deterministic in (inputs, code): no clock, no randomness, sorted output, written atomically."""
+    events = {}
+    for k in range(LATENESS + 2):                              # late events land up to a few days after ds
+        arrival = ds + timedelta(days=k)
+        path = RAW / f'arrival_date={arrival}' / 'events.jsonl'
+        if arrival < today and path.exists():
+            for line in path.read_text().splitlines():
+                e = json.loads(line)
+                if e['time'].startswith(str(ds)):
+                    events[e['id']] = e                        # deduplicate by event id
+    rows = ''.join(f"{e['id']},{e['time']},{e['amount_cents'] / 100:.2f}\n" for e in sorted(events.values(), key=lambda e: e['id']))
+    out = CLEAN / f'date={ds}'
+    out.mkdir(parents=True, exist_ok=True)
+    tmp = out / 'data.csv.tmp'
+    tmp.write_text('id,time,amount_eur\n' + rows)
+    os.replace(tmp, out / 'data.csv')                          # atomic: readers see the old or the new file
+    return f'{len(events):>3} rows  sha256 {hashlib.sha256((out / "data.csv").read_bytes()).hexdigest()[:12]}'
+
+
+def run(today: date):
+    """The run at 00:30 of `today`: rebuild every partition still inside the lateness window."""
+    for k in range(LATENESS, -1, -1):
+        ds = today - timedelta(days=k + 1)
+        if ds >= date(2026, 10, 1):
+            final = ' final' if k == LATENESS else ''
+            print(f'  {ds}: {build_partition(ds, today)}{final}')
+
+
+land_raw_events()
+for d in range(2, 6):
+    today = date(2026, 10, d)
+    print(f'run of {today}')
+    run(today)
+print('re-run of 2026-10-05 (nothing new has arrived)')
+run(date(2026, 10, 5))
+print('backfill of 1-4 October on 9 October')
+for d in range(1, 5):
+    print(f'  2026-10-0{d}: {build_partition(date(2026, 10, d), date(2026, 10, 9))}')
+```
+
+```console
+$ python3 pipeline.py lake
+run of 2026-10-02
+  2026-10-01: 270 rows  sha256 06428d1107f3
+run of 2026-10-03
+  2026-10-01: 294 rows  sha256 77969fce0e57
+  2026-10-02: 270 rows  sha256 2e08fd594b5a
+run of 2026-10-04
+  2026-10-01: 299 rows  sha256 4b033381a930 final
+  2026-10-02: 296 rows  sha256 2882145c8aa8
+  2026-10-03: 272 rows  sha256 4962d855180d
+run of 2026-10-05
+  2026-10-02: 299 rows  sha256 197765d8a7c8 final
+  2026-10-03: 296 rows  sha256 7ea68afe5bf7
+  2026-10-04: 272 rows  sha256 4cfb99c186e1
+re-run of 2026-10-05 (nothing new has arrived)
+  2026-10-02: 299 rows  sha256 197765d8a7c8 final
+  2026-10-03: 296 rows  sha256 7ea68afe5bf7
+  2026-10-04: 272 rows  sha256 4cfb99c186e1
+backfill of 1-4 October on 9 October
+  2026-10-01: 300 rows  sha256 ff62e1fe7f9e
+  2026-10-02: 300 rows  sha256 73faffb0dd38
+  2026-10-03: 300 rows  sha256 5dff8c59b9d6
+  2026-10-04: 300 rows  sha256 67b6404cc432
+```
+
+Reading it part by part:
+
+- **`land_raw_events`** plays the upstream. Each payment gets an event time on its day, an amount in cents (the producer's unit) and an arrival delay drawn with weights 90, 8, 1.5 and 0.5 for 0–3 days. It is written into the raw zone under its **arrival** date, appended, never edited: the raw zone is a log of what arrived when. One payment in a hundred is written twice, as an at-least-once queue would.
+- **`build_partition(ds, today)`** is the task, and both of its parameters are explicit: `ds` is the logical date, the event date the partition is for, and `today` stands for the run's moment, which only determines which arrival folders exist yet (in a real system, which files are present). It reads every arrival folder that can hold events of `ds`, keeps the events whose event time falls on `ds`, and deduplicates them in a dictionary keyed by `id`.
+- **The output** is sorted by `id`, converted to euros, and written to `data.csv.tmp`, then renamed over `data.csv` with `os.replace`, which is atomic on the same file system: a reader never sees half a file. The function returns the row count and the first 12 hex digits of the SHA-256 of the bytes written, a fingerprint of the partition.
+- **`run(today)`** is the schedule: at 00:30 of each day it rebuilds the partitions of the last `LATENESS + 1 = 3` event dates, oldest first, and marks the oldest as final.
+- **The daily runs.** The partition of 1 October is built three times, with 270, 294 and 299 rows, as late events arrive; its hash changes each time because its content does. The 270 rows of the first run are the 90% that arrived on the day. On 4 October it leaves the window as final with 299 of its 300 payments, the 99.5% the delay distribution predicts. The duplicates never show: every count is of distinct payments.
+- **The re-run.** Running the 5 October schedule again rewrites the three partitions, and all three hashes are identical to the first run's. That is idempotence, checked byte for byte. With the baseline's append, the same re-run would have doubled them.
+- **The backfill.** On 9 October the task is run for 1–4 October with everything that has arrived. Each day now has all 300 payments, including the one per day that was three days late. Only the partitions whose inputs changed get new hashes: had nothing arrived late for 1 October, its hash would have stayed `4b033381a930`, and every consumer could tell that its data had not changed.
+
+The program is small, and every orchestrator in the previous section would run it the same way: the task as a unit with `ds` as its parameter, the schedule as a daily trigger, the window as three runs per day or one run that writes three partitions, the backfill as a range of logical dates. The properties that made the re-run harmless and the backfill correct are in the task, not in the scheduler.
+
+## Next
+
+The pipeline now delivers one clean, reproducible partition per day, and its hashes say when a partition changed. It does not say whether the data are right: a partition can be built perfectly from inputs in the wrong units, with a join that started to miss rows, or with a new category nobody expected. The [next note](/notes/mlops/data-quality-and-versioning) adds tests on the data themselves, at the gates of the pipeline, and turns the content hashes into versions that a model can name as its training data.
+
+## References
+
+- M. Kleppmann. *Designing Data-Intensive Applications*. O'Reilly, 2017. Chapters 10 (batch processing: immutable inputs, derived outputs) and 11 (stream processing: event time, late events, exactly-once).
+- C. Huyen. *Designing Machine Learning Systems*. O'Reilly, 2022. Chapter 3 (data engineering fundamentals: batch and stream processing, ETL and ELT); and the course [Stanford CS329S: Machine Learning Systems Design](https://stanford-cs329s.github.io/).
+- C. Kästner. [*Machine Learning in Production: From Models to Products*](https://mlip-cmu.github.io/book/). MIT Press, 2025. Chapters 11 (automating the pipeline), 16 (data quality) and 17 (pipeline quality); and the course [CMU 17-445/645 Machine Learning in Production](https://mlip-cmu.github.io/), spring 2025.
+- HSE University. *Введение в MLOps* (Introduction to MLOps), master's programme «Машинное обучение в цифровом продукте», 2025/26: ML orchestration and pipelines.
+- T. Akidau, R. Bradshaw, C. Chambers, S. Chernyak, R. J. Fernández-Moctezuma, R. Lax, S. McVeety, D. Mills, F. Perry, E. Schmidt, S. Whittle. [The Dataflow Model: A Practical Approach to Balancing Correctness, Latency, and Cost in Massive-Scale, Unbounded, Out-of-Order Data Processing](https://doi.org/10.14778/2824032.2824076). *Proceedings of the VLDB Endowment* 8(12), 2015 (event time, processing time, watermarks, allowed lateness).
+- J. Kreps. [Questioning the Lambda Architecture](https://www.oreilly.com/radar/questioning-the-lambda-architecture/). O'Reilly Radar, 2014 (the Kappa architecture).
+- M. Beauchemin. [Functional Data Engineering: a modern paradigm for batch data processing](https://maximebeauchemin.medium.com/functional-data-engineering-a-modern-paradigm-for-batch-data-processing-2327ec32c42a). 2018 (pure tasks, immutable partitions, idempotent overwrites).
+- Apache Airflow documentation, version 3.3.2: [Backfill](https://airflow.apache.org/docs/apache-airflow/stable/core-concepts/backfill.html), [Timetables](https://airflow.apache.org/docs/apache-airflow/stable/authoring-and-scheduling/timetable.html) (`create_cron_data_intervals`, trigger and data-interval timetables), [Templates reference](https://airflow.apache.org/docs/apache-airflow/stable/templates-ref.html) (`ds`, `logical_date`, data intervals).
+- Dagster documentation (1.13): [Assets](https://docs.dagster.io/guides/build/assets), [Partitioning assets](https://docs.dagster.io/guides/build/partitions-and-backfills).
+- Prefect documentation (3.9): [Flows and tasks](https://docs.prefect.io/v3/concepts/flows), [Caching](https://docs.prefect.io/v3/concepts/caching).
+- Bitol project, Linux Foundation AI & Data. [Open Data Contract Standard](https://github.com/bitol-io/open-data-contract-standard), version 3.2.0, September 2026.

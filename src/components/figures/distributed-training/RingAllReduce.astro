@@ -1,0 +1,161 @@
+---
+import Figure from '../Figure.astro';
+import Badge from '../seqflow/Badge.astro';
+import Stepper from '../seqflow/Stepper.astro';
+import { pageLang } from '../../../utils/lang';
+
+const ru = pageLang(Astro.url) === 'ru';
+
+// Ring all-reduce on n = 4 workers. Each worker cuts its gradient into n chunks. In each of the n - 1 steps of
+// reduce-scatter, worker i sends one chunk to worker i + 1, which adds it to its own copy; in each of the n - 1 steps
+// of all-gather, worker i sends a finished chunk to worker i + 1, which stores it. A cell shows how many workers'
+// gradients its chunk already contains. The simulation is the one of the Example section of the note.
+const n = 4;
+type State = number[][][];                          // state[w][c] = sorted list of workers whose chunk c is summed in
+let state: State = Array.from({ length: n }, (_, w) => Array.from({ length: n }, () => [w]));
+const clone = (s: State) => s.map((r) => r.map((c) => [...c]));
+const panels: { state: State; fresh: [number, number][]; label: string; labelRu: string }[] = [{ state: clone(state), fresh: [], label: 'start', labelRu: 'начало' }];
+let sentChunks = Array(n).fill(0);
+for (let s = 0; s < n - 1; s++) {
+  const msgs = Array.from({ length: n }, (_, i) => ({ i, c: (((i - s) % n) + n) % n, data: [...state[i][(((i - s) % n) + n) % n]] }));
+  const fresh: [number, number][] = [];
+  for (const m of msgs) {
+    const dst = (m.i + 1) % n;
+    state[dst][m.c] = [...new Set([...state[dst][m.c], ...m.data])].sort();
+    fresh.push([dst, m.c]);
+    sentChunks[m.i]++;
+  }
+  panels.push({ state: clone(state), fresh, label: `RS ${s + 1}`, labelRu: `RS ${s + 1}` });
+}
+// after reduce-scatter, worker i holds the complete sum of chunk i + 1
+for (let i = 0; i < n; i++) if (state[i][(i + 1) % n].length !== n) throw new Error('reduce-scatter incomplete');
+for (let s = 0; s < n - 1; s++) {
+  const msgs = Array.from({ length: n }, (_, i) => ({ i, c: (((i + 1 - s) % n) + n) % n, data: [...state[i][(((i + 1 - s) % n) + n) % n]] }));
+  const fresh: [number, number][] = [];
+  for (const m of msgs) {
+    const dst = (m.i + 1) % n;
+    if (m.data.length !== n) throw new Error('all-gather sends an unfinished chunk');
+    state[dst][m.c] = [...m.data];
+    fresh.push([dst, m.c]);
+    sentChunks[m.i]++;
+  }
+  panels.push({ state: clone(state), fresh, label: `AG ${s + 1}`, labelRu: `AG ${s + 1}` });
+}
+if (!state.every((r) => r.every((c) => c.length === n))) throw new Error('all-reduce incomplete');
+// every worker sends 2(n - 1) chunks of size S / n, that is 2(n - 1)/n of its gradient
+if (!sentChunks.every((k) => k === 2 * (n - 1))) throw new Error(`chunks sent ${sentChunks}`);
+if (panels.length !== 2 * n - 1) throw new Error('panels');
+
+const t = ru
+  ? {
+      title: 'Кольцевая полная редукция (all-reduce) на четырёх видеокартах',
+      rows: 'видеокарты', cols: 'части градиента',
+      steps: [
+        'начало: каждая видеокарта режет свой градиент на 4 части; в каждой клетке — 1 слагаемое',
+        'reduce-scatter, шаг 1: каждая отправляет одну часть правому соседу, тот прибавляет её к своей',
+        'reduce-scatter, шаг 2: дальше по кольцу идут уже частичные суммы из двух слагаемых',
+        'reduce-scatter, шаг 3: у каждой видеокарты одна часть полностью сложена из всех четырёх',
+        'all-gather, шаг 1: готовые части идут по кольцу и записываются поверх',
+        'all-gather, шаг 2',
+        'all-gather, шаг 3: все видеокарты держат полную сумму; каждая отправила 6 частей по S/4',
+      ],
+      desc: 'Слева кольцо из четырёх видеокарт W0→W1→W2→W3→W0. Справа семь таблиц 4 на 4: строки — видеокарты, столбцы — части градиента, число в клетке — сколько градиентов уже сложено в этой части. В начале везде 1. За три шага reduce-scatter у каждой видеокарты одна часть доходит до 4, за три шага all-gather четвёрки расходятся по всем клеткам.',
+    }
+  : {
+      title: 'Ring all-reduce on four GPUs',
+      rows: 'GPUs', cols: 'gradient chunks',
+      steps: [
+        'start: each GPU cuts its gradient into 4 chunks; every cell holds 1 term',
+        'reduce-scatter, step 1: every GPU sends one chunk to its right neighbour, which adds it to its own',
+        'reduce-scatter, step 2: partial sums of two terms move on around the ring',
+        'reduce-scatter, step 3: every GPU holds one chunk summed over all four',
+        'all-gather, step 1: finished chunks travel around the ring and overwrite the copies',
+        'all-gather, step 2',
+        'all-gather, step 3: every GPU holds the full sum; each sent 6 chunks of S/4',
+      ],
+      desc: 'On the left, a ring of four GPUs W0→W1→W2→W3→W0. On the right, seven 4 by 4 tables: rows are GPUs, columns are gradient chunks, and the number in a cell is how many gradients that chunk already sums. At the start every cell is 1. After three reduce-scatter steps each GPU has one chunk at 4; after three all-gather steps the fours have spread to every cell.',
+    };
+const id = 'ring-all-reduce';
+const caption = ru
+  ? `Числа в клетках — сколько из ${n} градиентов уже сложено в эту часть у этой видеокарты; янтарная рамка — часть, полученная на этом шаге. На каждом шаге каждая видеокарта отправляет одну часть размера S/${n} правому соседу и одну получает от левого, так что все каналы кольца заняты одновременно. За ${n - 1} шага reduce-scatter (RS) и ${n - 1} шага all-gather (AG) каждая отправляет 2(${n} − 1) = ${2 * (n - 1)} частей, то есть 2(n − 1)/n · S = ${(2 * (n - 1)) / n} S, сколько бы видеокарт ни было в кольце.`
+  : `The number in a cell is how many of the ${n} gradients are already summed into that chunk on that GPU; an amber frame marks a chunk received in that step. In every step each GPU sends one chunk of size S/${n} to its right neighbour and receives one from its left, so all links of the ring are busy at once. Over ${n - 1} reduce-scatter (RS) and ${n - 1} all-gather (AG) steps each GPU sends 2(${n} − 1) = ${2 * (n - 1)} chunks, that is 2(n − 1)/n · S = ${(2 * (n - 1)) / n} S, whatever the number of GPUs in the ring.`;
+
+interface L { cls: string; W: number; H: number; cell: number; ring: { cx: number; cy: number; r: number }; pos: (k: number) => [number, number]; wide: boolean }
+const layouts: L[] = [
+  { cls: 'fig-wide', W: 760, H: 200, cell: 19, ring: { cx: 74, cy: 104, r: 48 }, pos: (k) => [168 + k * 84, 74], wide: true },
+  { cls: 'fig-narrow seq-narrow', W: 360, H: 556, cell: 23, ring: { cx: 180, cy: 78, r: 50 }, pos: (k) => [44 + (k % 3) * 108, 196 + Math.floor(k / 3) * 116], wide: false },
+];
+for (const L of layouts) {
+  const [, yLast] = L.pos(panels.length - 1);
+  if (yLast + n * L.cell + 30 > L.H) throw new Error(`panels below the viewBox at ${L.W}`);
+  const [xl] = L.pos(L.wide ? panels.length - 1 : 2);
+  if (xl + n * L.cell > L.W - 4) throw new Error(`panels overflow at ${L.W}`);
+  if (L.wide && L.pos(0)[0] - 26 < L.ring.cx + L.ring.r + 20) throw new Error('ring overlaps the first panel');
+  for (let k = 1; k < panels.length; k++) {
+    const [a] = L.pos(k - 1), [b, yb] = L.pos(k), [, ya] = L.pos(k - 1);
+    if (ya === yb && a + n * L.cell + 8 > b) throw new Error('panels overlap');
+  }
+}
+const node = (L: L, w: number): [number, number] => {
+  const a = -Math.PI / 2 + (w * 2 * Math.PI) / n;
+  return [L.ring.cx + L.ring.r * Math.cos(a), L.ring.cy + L.ring.r * Math.sin(a)];
+};
+const arc = (L: L, w: number) => {
+  const a0 = -Math.PI / 2 + (w * 2 * Math.PI) / n + 0.42, a1 = -Math.PI / 2 + ((w + 1) * 2 * Math.PI) / n - 0.42;
+  const r = L.ring.r;
+  return `M ${L.ring.cx + r * Math.cos(a0)} ${L.ring.cy + r * Math.sin(a0)} A ${r} ${r} 0 0 1 ${L.ring.cx + r * Math.cos(a1)} ${L.ring.cy + r * Math.sin(a1)}`;
+};
+---
+
+<Figure id={id} title={t.title} caption={caption}>
+  {layouts.map((L) => (
+    <svg class={L.cls} viewBox={`0 0 ${L.W} ${L.H}`} role="img" aria-labelledby={`${id}-${L.W}-t ${id}-${L.W}-d`}>
+      <title id={`${id}-${L.W}-t`}>{t.title}</title>
+      <desc id={`${id}-${L.W}-d`}>{t.desc}</desc>
+      {Array.from({ length: n }, (_, w) => <path class="f-line f-muted" d={arc(L, w)} marker-end="url(#f-arrow-muted)" />)}
+      {Array.from({ length: n }, (_, w) => {
+        const [x, y] = node(L, w);
+        return (
+          <g>
+            <circle cx={x} cy={y} r="16" style="fill: var(--fig-blue); fill-opacity: 0.16; stroke: var(--fig-blue); stroke-width: 1.4" />
+            <text class="f-small" x={x} y={y + 4.5} text-anchor="middle" style="font-weight: 650">{`W${w}`}</text>
+          </g>
+        );
+      })}
+      {panels.map((p, k) => {
+        const [x0, y0] = L.pos(k);
+        return (
+          <g data-s={String(k + 1)}>
+            <text class="f-small" x={x0 + (n * L.cell) / 2} y={y0 - 10} text-anchor="middle" style="font-weight: 650">{ru ? p.labelRu : p.label}</text>
+            {p.state.map((row, w) => row.map((c, ci) => {
+              const done = c.length === n;
+              const fresh = p.fresh.some(([fw, fc]) => fw === w && fc === ci);
+              return (
+                <g>
+                  <rect x={x0 + ci * L.cell} y={y0 + w * L.cell} width={L.cell} height={L.cell}
+                    style={`fill: ${done ? 'var(--fig-green)' : 'var(--fig-blue)'}; fill-opacity: ${done ? 0.45 : 0.06 + 0.1 * c.length}; stroke: ${fresh ? 'var(--fig-amber)' : 'var(--line)'}; stroke-width: ${fresh ? 2.4 : 1}`} />
+                  <text class="f-small" x={x0 + ci * L.cell + L.cell / 2} y={y0 + w * L.cell + L.cell / 2 + 4.5} text-anchor="middle">{c.length}</text>
+                </g>
+              );
+            }))}
+            {(L.wide ? k === 0 : k % 3 === 0) && Array.from({ length: n }, (_, w) => (
+              <text class="f-small f-t-muted" x={x0 - 4} y={y0 + w * L.cell + L.cell / 2 + 4.5} text-anchor="end">{`W${w}`}</text>
+            ))}
+          </g>
+        );
+      })}
+      {L.wide
+        ? <g>
+            <text class="f-small f-t-muted" x={L.pos(0)[0]} y={L.pos(0)[1] + n * L.cell + 22}>{`${t.cols} →`}</text>
+            <Badge x={L.pos(1)[0] - 6} y={L.pos(1)[1] - 30} n={2} />
+            <Badge x={L.pos(4)[0] - 6} y={L.pos(4)[1] - 30} n={5} />
+          </g>
+        : <g>
+            <text class="f-small f-t-muted" x={L.pos(0)[0]} y={L.pos(6)[1] + n * L.cell + 24}>{`${t.cols} →`}</text>
+            <Badge x={L.pos(1)[0] - 14} y={L.pos(1)[1] - 15} n={2} />
+            <Badge x={L.pos(4)[0] - 14} y={L.pos(4)[1] - 15} n={5} />
+          </g>}
+    </svg>
+  ))}
+  <Stepper steps={t.steps} />
+</Figure>

@@ -1,0 +1,148 @@
+---
+import Figure from '../Figure.astro';
+import { pageLang } from '../../../utils/lang';
+
+const ru = pageLang(Astro.url) === 'ru';
+
+// The serving cost model of the note's Example, recomputed: Llama 3 shapes (8B, 70B), three precisions, three GPUs,
+// 1, 2, 4 or 8 GPUs per replica, batch caps 1 to 256, requests of 1,000 input and 250 output tokens at 20 requests a second,
+// replicas sized to stay below 70 % busy. Each configuration that fits in memory is a point (time per output token, cost).
+const MODELS: Record<string, [number, number, number]> = { '8B': [8.0e9, 32, 1024], '70B': [70.6e9, 80, 1024] };
+const BYTES: Record<string, number> = { bf16: 2.0, fp8: 1.0, int4: 0.53 };
+const GPUS: Record<string, [number, number, number, number, number]> = { // GB, GB/s, bf16 TFLOPS, fp8 TFLOPS, $ per hour
+  L4: [24, 300, 121, 242, 0.8], A100: [80, 2039, 312, 312, 2.0], H100: [80, 3350, 989, 1979, 3.0] };
+const IN = 1000, OUT = 250, ETA_MEM = 0.8, ETA_FLOP = 0.5, TP_EFF = 0.9, STEP_FIXED = 2e-3, ALLREDUCE = 20e-6, LOAD = 20, MAX_UTIL = 0.7, SLO = 50;
+interface Cfg { model: string; prec: string; gpu: string; g: number; k: number; tpot: number; cost: number }
+function evaluate(model: string, prec: string, gpu: string, g: number, k: number): Cfg | null {
+  const [P, L, dkv] = MODELS[model];
+  const [mem, bw, f16, f8, price] = GPUS[gpu];
+  if (prec === 'fp8' && gpu === 'A100') return null;
+  const tp = g > 1 ? TP_EFF : 1;
+  const flops = (prec === 'fp8' ? f8 : f16) * 1e12 * g * tp * ETA_FLOP;
+  const band = bw * 1e9 * g * tp * ETA_MEM;
+  const weights = P * BYTES[prec], kvToken = 2 * L * dkv * 2;
+  if (weights + k * (IN + OUT) * kvToken > 0.9 * mem * 1e9 * g) return null;
+  const ctx = IN + OUT / 2;
+  const step = Math.max((weights + k * ctx * kvToken) / band, (k * 2 * P) / flops) + STEP_FIXED + (g > 1 ? 2 * L * ALLREDUCE : 0);
+  const gpuS = (2 * P * IN) / flops + (OUT * step) / k;
+  const replicas = Math.ceil((LOAD * gpuS) / MAX_UTIL);
+  return { model, prec, gpu, g, k, tpot: 1e3 * step, cost: ((replicas * g * price) / 3600 / LOAD) * 1000 };
+}
+const configs: Cfg[] = [];
+for (const m of Object.keys(MODELS)) for (const p of Object.keys(BYTES)) for (const gp of Object.keys(GPUS)) for (const g of [1, 2, 4, 8]) for (const k of [1, 4, 16, 64, 256]) {
+  const c = evaluate(m, p, gp, g, k); if (c) configs.push(c);
+}
+const front = (cs: Cfg[]) => cs.filter((c) => !cs.some((o) => o.tpot <= c.tpot && o.cost <= c.cost && (o.tpot < c.tpot || o.cost < c.cost))).sort((a, b) => a.tpot - b.tpot);
+const fronts = { '8B': front(configs.filter((c) => c.model === '8B')), '70B': front(configs.filter((c) => c.model === '70B')) };
+const cheapest = (m: string) => configs.filter((c) => c.model === m && c.tpot <= SLO).sort((a, b) => a.cost - b.cost || a.tpot - b.tpot)[0];
+const best8 = cheapest('8B'), best70 = cheapest('70B'), base = evaluate('70B', 'bf16', 'H100', 2, 1)!;
+// The numbers printed by the Example.
+if (configs.length !== 252 || fronts['8B'].length !== 8 || fronts['70B'].length !== 6) throw new Error(`CostFront: ${configs.length} configs, fronts ${fronts['8B'].length}, ${fronts['70B'].length}`);
+if (best8.prec !== 'fp8' || best8.gpu !== 'H100' || best8.g !== 1 || best8.k !== 256 || Math.abs(best8.cost - 0.0417) > 1e-4 || Math.abs(best8.tpot - 19.1) > 0.05) throw new Error('CostFront: 8B choice');
+if (best70.prec !== 'fp8' || best70.g !== 8 || best70.k !== 256 || Math.abs(best70.cost - 0.3333) > 1e-4 || Math.abs(best70.tpot - 13.7) > 0.05) throw new Error('CostFront: 70B choice');
+if (Math.abs(base.cost - 21.0) > 1e-9 || Math.abs(base.tpot - 34.5) > 0.05) throw new Error('CostFront: baseline');
+
+const X0 = 2, X1 = 200, Y0 = 0.02, Y1 = 100;
+const lg = Math.log10;
+const usd = (v: number) => `$${v < 1 ? v.toFixed(3) : v.toFixed(2)}`;
+const t = ru
+  ? { title: 'Задержка и стоимость: 252 конфигурации инференса', x: 'мс на выходной токен (лог. шкала)', y: '$ за 1000 запросов (лог.)', slo: 'SLO: 50 мс',
+      l8: `8B, fp8, 1 × H100: ${usd(best8.cost)}`, l70: `70B, fp8, 8 × H100: ${usd(best70.cost)}`, lb: `70B, bf16, батч 1: ${usd(base.cost)}`,
+      n8: `8B: ${usd(best8.cost)}`, n70: `70B: ${usd(best70.cost)}`, nb: `батч 1: ${usd(base.cost)}`,
+      leg: ['8B', '70B', 'фронт Парето'],
+      desc: 'Точечная диаграмма в логарифмических осях: время на выходной токен от 2 до 200 мс и стоимость от 2 центов до 100 долларов за 1000 запросов. Синие точки — конфигурации модели 8B, красные — 70B; ступенчатые линии соединяют их фронты Парето. Вертикальный пунктир на 50 мс — SLO. Отмечены самые дешёвые конфигурации в пределах SLO: 8B за $0.042 и 70B за $0.333, и исходная конфигурация 70B в bf16 на батче 1 за $21.' }
+  : { title: 'Latency against cost: 252 serving configurations', x: 'ms per output token (log scale)', y: '$ per 1,000 requests (log)', slo: 'SLO: 50 ms',
+      l8: `8B, fp8, 1 × H100: ${usd(best8.cost)}`, l70: `70B, fp8, 8 × H100: ${usd(best70.cost)}`, lb: `70B, bf16, batch 1: ${usd(base.cost)}`,
+      n8: `8B: ${usd(best8.cost)}`, n70: `70B: ${usd(best70.cost)}`, nb: `batch 1: ${usd(base.cost)}`,
+      leg: ['8B', '70B', 'Pareto front'],
+      desc: 'A scatter plot on logarithmic axes: time per output token from 2 to 200 ms and cost from 2 cents to 100 dollars per 1,000 requests. Blue dots are configurations of the 8B model, red dots of the 70B model; step lines join their Pareto fronts. A dashed vertical line at 50 ms is the SLO. Marked are the cheapest configurations within it, 8B at $0.042 and 70B at $0.333, and the starting configuration, 70B in bf16 at batch 1, at $21.' };
+const tone: Record<string, string> = { '8B': 'blue', '70B': 'red' };
+
+interface Layout { cls: string; W: number; H: number; box: [number, number, number, number]; wide: boolean }
+const layouts: Layout[] = [
+  { cls: 'fig-wide', W: 760, H: 380, box: [70, 50, 740, 320], wide: true },
+  { cls: 'fig-narrow', W: 360, H: 400, box: [52, 56, 346, 330], wide: false },
+];
+const CH = 6.5;
+const plots = layouts.map((L) => {
+  const [x0, y0, x1, y1] = L.box;
+  const sx = (v: number) => x0 + ((lg(v) - lg(X0)) / (lg(X1) - lg(X0))) * (x1 - x0);
+  const sy = (v: number) => y1 - ((lg(v) - lg(Y0)) / (lg(Y1) - lg(Y0))) * (y1 - y0);
+  for (const c of configs) if (c.tpot < X0 || c.tpot > X1 || c.cost < Y0 || c.cost > Y1) throw new Error('CostFront: a point leaves the plot');
+  const stairs = (f: Cfg[]) => f.map((c, i) => (i === 0 ? `M ${sx(c.tpot)} ${sy(c.cost)}` : `H ${sx(c.tpot)} V ${sy(c.cost)}`)).join(' ');
+  const pts = configs.map((c) => ({ c, x: sx(c.tpot), y: sy(c.cost) }));
+  // Labels sit in empty parts of the plot; a leader line joins each to its ring.
+  type Lab = { x: number; y: number; text: string; anchor: 'start' | 'end'; c: Cfg };
+  const labels: Lab[] = L.wide
+    ? [{ x: sx(best8.tpot) + 12, y: sy(best8.cost) + 5, text: t.l8, anchor: 'start', c: best8 },
+       { x: x0 + 235, y: y1 - 22, text: t.l70, anchor: 'end', c: best70 },
+       { x: sx(base.tpot) - 12, y: y0 + 18, text: t.lb, anchor: 'end', c: base }]
+    : [{ x: sx(best8.tpot) + 12, y: sy(best8.cost) + 5, text: t.n8, anchor: 'start', c: best8 },
+       { x: x0 + 118, y: y1 - 8, text: t.n70, anchor: 'end', c: best70 },
+       { x: sx(base.tpot) - 12, y: y0 + 14, text: t.nb, anchor: 'end', c: base }];
+  const leaders = labels.map((b) => {
+    const px = sx(b.c.tpot), py = sy(b.c.cost), lx = b.anchor === 'start' ? b.x - 3 : b.x + 3, ly = b.y - 4;
+    const d = Math.hypot(px - lx, py - ly);
+    return d > 14 ? `M ${lx} ${ly} L ${px + ((lx - px) * 8) / d} ${py + ((ly - py) * 8) / d}` : '';
+  });
+  for (const b of labels) {
+    const w = b.text.length * CH, l = b.anchor === 'start' ? b.x : b.x - w;
+    if (l < x0 + 2 || l + w > L.W - 4 || b.y - 11 < y0 || b.y + 3 > y1) throw new Error(`CostFront: label "${b.text}" leaves the plot at ${L.W}`);
+    for (const p of pts) if (p.x > l - 4 && p.x < l + w + 4 && p.y > b.y - 15 && p.y < b.y + 7) throw new Error(`CostFront: label "${b.text}" covers a point at ${L.W}`);
+  }
+  return { L, sx, sy, pts, labels, leaders, stairs };
+});
+const id = 'cost-front';
+---
+
+<Figure
+  id={id}
+  title={t.title}
+  caption={ru
+    ? 'Модель стоимости из раздела «Пример»: формы Llama 3 8B и 70B, веса в bf16, fp8 или int4, GPU L4, A100 или H100 (паспортные значения пропускной способности памяти и производительности; иллюстративные цены $0.80, $2 и $3 за час), от 1 до 8 GPU на реплику, предел батча от 1 до 256. Нагрузка 20 запросов в секунду по 1000 входных и 250 выходных токенов; число реплик выбрано так, чтобы каждая была занята не более чем на 70%. Шаг декодирования — максимум из времени чтения весов и кэша (80% пропускной способности) и времени арифметики (50% пика) плюс 2 мс накладных расходов. Ступеньки стоимости — целые числа реплик.'
+    : 'The cost model of the Example: Llama 3 8B and 70B shapes, bf16, fp8 or int4 weights, L4, A100 or H100 GPUs (datasheet bandwidth and arithmetic; illustrative prices of $0.80, $2 and $3 an hour), 1 to 8 GPUs per replica, batch caps from 1 to 256. The load is 20 requests a second of 1,000 input and 250 output tokens, with enough replicas that none is more than 70 % busy. A decode step takes the longer of reading the weights and caches (at 80 % of bandwidth) and the arithmetic (at 50 % of peak), plus 2 ms of overhead. The steps in cost are whole numbers of replicas.'}
+>
+  {plots.map(({ L, sx, sy, pts, labels, leaders, stairs }) => {
+    const [x0, y0, x1, y1] = L.box;
+    const xt = L.wide ? [2, 5, 10, 20, 50, 100, 200] : [2, 10, 50, 200];
+    return (
+      <svg class={L.cls} viewBox={`0 0 ${L.W} ${L.H}`} role="img" aria-labelledby={`${id}-${L.W}-t ${id}-${L.W}-d`}>
+        <title id={`${id}-${L.W}-t`}>{t.title}</title>
+        <desc id={`${id}-${L.W}-d`}>{t.desc}</desc>
+        {[{ v: 0.1, s: '0.1' }, { v: 1, s: '1' }, { v: 10, s: '10' }, { v: 100, s: '100' }].map(({ v, s }) => (
+          <g>
+            <path class="f-grid" d={`M ${x0} ${sy(v)} H ${x1}`} />
+            <text class="f-note" x={x0 - 8} y={sy(v) + 5} text-anchor="end">{s}</text>
+          </g>
+        ))}
+        {xt.map((v) => (
+          <g>
+            <path class="f-axis" d={`M ${sx(v)} ${y1} v 5`} />
+            <text class="f-note" x={sx(v)} y={y1 + 20} text-anchor="middle">{String(v)}</text>
+          </g>
+        ))}
+        <path class="f-axis" d={`M ${x0} ${y0} V ${y1} H ${x1}`} />
+        <text class="f-note" x={x1} y={y1 + 42} text-anchor="end">{t.x}</text>
+        <text class="f-note" x={x0} y={y0 - 12}>{t.y}</text>
+        <path class="f-thin f-muted f-dash" d={`M ${sx(SLO)} ${y0} V ${y1}`} />
+        <text class="f-small f-t-muted" x={sx(SLO) + 6} y={y0 + 14}>{t.slo}</text>
+        {pts.map((p) => <circle cx={p.x} cy={p.y} r="3" style={`fill: var(--fig-${tone[p.c.model]}); fill-opacity: 0.35`} />)}
+        <path class="f-line f-blue" d={stairs(fronts['8B'])} />
+        <path class="f-line f-red" d={stairs(fronts['70B'])} />
+        {[best8, best70].map((c) => <circle cx={sx(c.tpot)} cy={sy(c.cost)} r="7" style={`fill: none; stroke: var(--fig-${tone[c.model]}); stroke-width: 2`} />)}
+        <circle cx={sx(base.tpot)} cy={sy(base.cost)} r="7" style="fill: none; stroke: var(--muted); stroke-width: 2" />
+        {leaders.map((d) => d && <path class="f-thin f-muted" d={d} />)}
+        {labels.map((b, i) => <text class={`f-small ${i === 0 ? 'f-t-blue' : i === 1 ? 'f-t-red' : 'f-t-muted'} f-halo`} x={b.x} y={b.y} text-anchor={b.anchor}>{b.text}</text>)}
+        {t.leg.map((name, i) => {
+          const lx = L.wide ? x0 + 260 + i * 80 : x0 + i * 70, ly = L.wide ? y0 - 12 : y0 - 32;
+          return (
+            <g>
+              {i < 2 ? <circle cx={lx + 6} cy={ly - 4} r="4" style={`fill: var(--fig-${i === 0 ? 'blue' : 'red'}); fill-opacity: 0.6`} /> : <path class="f-line" d={`M ${lx} ${ly - 4} h 14`} />}
+              <text class="f-small f-t-muted" x={lx + 18} y={ly}>{name}</text>
+            </g>
+          );
+        })}
+      </svg>
+    );
+  })}
+</Figure>

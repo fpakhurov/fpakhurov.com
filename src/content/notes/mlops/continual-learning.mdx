@@ -1,0 +1,396 @@
+---
+title: Retraining and continual learning
+section: Operations
+description: "How a deployed model keeps up with a changing world: retraining on a schedule, on a trigger or on demand, stateless retraining against stateful fine-tuning, delayed and selective labels, degenerate feedback loops, evaluation gates, and catastrophic forgetting, all computed on simulations."
+course: mlops
+order: 12
+status: published
+tags: [continual-learning, retraining, triggers, stateful-training, feedback-loops, popularity-bias, delayed-labels, selective-labels, evaluation-gate, champion-challenger, catastrophic-forgetting]
+prerequisites: [Monitoring and drift, "Experiments, reproducibility and the model registry", Rolling out models]
+---
+
+import RetrainingLoop from '../../../components/figures/continual-learning/RetrainingLoop.astro';
+import FeedbackLoop from '../../../components/figures/continual-learning/FeedbackLoop.astro';
+
+The [previous note](/notes/mlops/monitoring-and-drift) built the instruments that tell us a deployed model is going stale: drift statistics on its inputs, performance on the labels that arrive later, and alerts on both. An alert is not a fix. The fix for a model that the world has moved away from is a new model, trained on newer data, checked, and rolled out without breaking anything. This note is about that loop: when to run it, whether to train from scratch or continue from the current weights, what the labels it learns from really are, how a model can corrupt its own future training data, and how a pipeline that retrains automatically is kept from shipping a broken model.
+
+**Conventions.** Every number in the note comes from the simulations of the [Example](#example), run with Python 3.14.7, NumPy 2.5.4 and scikit-learn 1.9.1 on 23 October 2026, with fixed seeds; the only exception is the small demonstration of catastrophic forgetting, a separate run of scikit-learn's `MLPClassifier` with the same versions. The data are synthetic, so the numbers show mechanisms, not the behaviour of any real product. **Notation.** $w$ is a week, $T$ a retraining interval, $C$ the cost of one retraining, $n$ the size of a held-out set. Accuracy is the fraction of correct predictions; a "point" is one percentage point of it.
+
+## Baseline: train once, deploy forever
+
+The simplest operating model trains a model, deploys it and leaves it. It works for as long as the world that produced the training data stays the same, and no longer.
+
+To see how fast that breaks, take a stream with **concept drift**: the inputs $x \in \mathbb R^5$ are drawn from the same standard normal distribution every week, but the rule that turns them into labels changes. The true decision boundary turns by 0.08 radians a week, and in week 18 one feature reverses its effect, as when a competitor's launch flips what a discount means to customers. Each week brings 2,000 examples. A logistic regression trained on weeks 0–3 and served from week 5 on:
+
+| week | 5 | 10 | 16 | 18 | 22 | 28 |
+| --- | --- | --- | --- | --- | --- | --- |
+| static model | 0.843 | 0.770 | 0.700 | 0.553 | 0.479 | 0.402 |
+
+Before week 18 it loses 1.43 points a week; after it, the model is worse than a coin. Nothing in its inputs would have warned anyone: $P(x)$ never changed, so a drift test on the features, the main instrument of the previous note, stays silent throughout. Only labels reveal a change in $P(y \mid x)$.
+
+<aside class="callout"><strong>Key idea.</strong> A deployed model is a snapshot of the past. Keeping it useful is a loop, not a release: log what the model saw and did, wait for the labels, measure, decide to retrain, train a challenger, and let it replace the champion only after it has beaten it on the same held-out data. The loop has its own failure modes, and the worst of them come from the model itself: it decides which labels exist and what future training data looks like.</aside>
+
+## The retraining loop
+
+<RetrainingLoop />
+
+1. **Serve.** The current model, the *champion*, answers requests.
+2. **Log.** Every input and prediction is stored with a request id. Without this log there is nothing to retrain on and no way to tell later what the model saw; it is also where the [features of training and serving](/notes/mlops/features-and-skew) are kept identical.
+3. **Join labels.** The outcome arrives later, a click within seconds, a repaid loan within months, and is joined to the logged prediction by id.
+4. **Monitor.** Drift on inputs and predictions, accuracy on the labels that have arrived, cost and latency, as in the [previous note](/notes/mlops/monitoring-and-drift).
+5. **Trigger.** Something decides that it is time to retrain (the next section).
+6. **Retrain.** A pipeline, the same [orchestrated pipeline](/notes/mlops/data-pipelines) that produced the champion, trains a *challenger* on newer data.
+7. **Gate.** The challenger is compared with the champion on the same held-out data; it is promoted only if it is not worse ([below](#evaluation-gates-champion-against-challenger)).
+8. **Roll out.** The promoted model is registered with its lineage in the [model registry](/notes/mlops/experiments-and-registry) and reaches traffic through shadow and canary stages, exactly as any other model in [Rolling out models](/notes/mlops/rolling-out-models).
+
+## When to retrain
+
+There are three kinds of trigger, and mature systems use all three ([Huyen, 2022, ch. 9](#references)).
+
+- **On a schedule.** Retrain every night, week or month. Simple, predictable in cost, and easy to staff: everyone knows when a new model arrives. Its weakness is that the schedule knows nothing about the world: it retrains a model that is still fine, and it waits a whole period after a sudden change.
+- **On a trigger.** Retrain when monitoring says so: accuracy on the newest labels below a floor, a drift statistic above a threshold, a new data partition of sufficient size, or an upstream change such as a new feature or a schema revision. Cheaper when the world is calm and faster when it is not, but only as good as the signal. Here a drift trigger on $x$ would never fire.
+- **On demand.** A person asks for it: a known event (a holiday season, a new market), an incident, a fixed bug in a feature. The pipeline must be runnable by one command, which is the real test of whether it is automated at all.
+
+On the drifting stream, three policies over weeks 5–29:
+
+| policy | retrains | mean accuracy | week 18 | week 28 |
+| --- | --- | --- | --- | --- |
+| static | 0 | 0.621 | 0.553 | 0.402 |
+| weekly, 4-week window | 25 | 0.818 | 0.708 | 0.842 |
+| on trigger: newest accuracy below 0.80 | 6 | 0.794 | 0.705 | 0.791 |
+
+The trigger buys nearly nine tenths of the improvement with a quarter of the retrains. It pays twice for being reactive: it lets the model decay to the floor before acting, and at the week-18 change it retrains on a window that still mixes the old concept with the new one. Two weeks of bad accuracy right after week 18 are paid by **every** policy: labels arrive with a delay, so no retraining can learn the new concept before its labels exist. That delay, not the schedule, sets the fastest possible reaction.
+
+### How often: retraining cost against decay
+
+When the decay is gradual, the interval can be chosen on numbers. Suppose the excess cost of a stale model grows linearly with its age $\tau$ since the last retraining, at $a\,\tau$ dollars per week, and each retraining costs $C$ (compute, evaluation, a person's review). Over one cycle of length $T$:
+
+$$
+\begin{aligned}
+\text{cost of one cycle} &= C + \int_0^{T} a\,\tau \, d\tau = C + \frac{a T^2}{2}, \\
+\text{cost per week} &= \frac{C}{T} + \frac{a T}{2} && \text{divide by the cycle length } T, \\
+\frac{d}{dT}\Big(\frac{C}{T} + \frac{a T}{2}\Big) &= -\frac{C}{T^2} + \frac{a}{2} = 0 && \text{the minimum, since the second derivative } 2C/T^3 > 0, \\
+\Rightarrow\quad \boxed{\,T^* = \sqrt{\frac{2C}{a}}\,}, &\quad \text{cost per week at } T^*: \sqrt{2aC}.
+\end{aligned}
+$$
+
+At the optimum the two terms are equal: as much is spent on retraining as is lost to staleness. To put numbers on it, take the static model's decay of 1.43 points a week, and suppose 200,000 predictions a week where each error costs \$0.50. One point of accuracy is then 2,000 errors, \$1,000 a week, so $a = 1.43 \times 1{,}000 = 1{,}430$ dollars per week per week. With $C = 2{,}000$ dollars per retraining:
+
+$$
+T^* = \sqrt{\frac{2 \times 2{,}000}{1{,}430}} = \sqrt{2.80} = 1.67 \text{ weeks}, \qquad \sqrt{2 \times 1{,}430 \times 2{,}000} = 2{,}392 \text{ dollars a week}.
+$$
+
+Weekly retraining costs $2{,}000 + 1{,}430/2 = 2{,}715$ dollars a week, monthly (four weeks) $500 + 2{,}860 = 3{,}360$. The square root makes the choice forgiving near the optimum and unforgiving far from it: halving $C$ by automating the review shortens $T^*$ only by a factor $\sqrt 2$. The formula covers gradual decay only. A sudden change, like week 18, is not a slope; it is what triggers are for.
+
+## Stateless retraining and stateful training
+
+How the challenger is trained is a second choice, independent of when ([Huyen, 2022, ch. 9](#references)).
+
+- **Stateless retraining** trains from scratch on a window of data: the last four weeks, the last year, or everything with older data down-weighted. Each model is a pure function of a data snapshot, the code version and a seed, which makes it reproducible and easy to audit. The cost is compute, paid again on the whole window each time, and a window length to choose: long windows are stable but slow to forget the old concept, short ones adapt but are noisy.
+- **Stateful training** (fine-tuning, warm starting) continues from the champion's weights on only the data that arrived since. It costs a fraction of the compute, so it can run daily or hourly, and it adapts as fast as the learning rate allows. The model is then a function of its whole history of updates, so reproducing it means replaying the chain from the last full training.
+
+On the stream, a stochastic-gradient logistic regression updated with five passes over each newly labelled week, against the weekly stateless retraining:
+
+| week | 16 | 18 | 19 | 22 | 23 | 24 | mean, weeks 5–29 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| weekly, stateless | 0.857 | 0.708 | 0.700 | 0.830 | 0.633 | 0.854 | 0.818 |
+| stateful | 0.865 | 0.709 | 0.692 | 0.851 | 0.422 | 0.868 | 0.826 |
+
+Stateful training is better most weeks: it is not anchored to four weeks of the old concept, so it recovers from the week-18 change faster: 0.851 against 0.830 in week 22. Week 23 shows its risk. That week the training data had a bug, labels joined to the wrong rows (shifted by one), which the [Example](#example) injects on purpose. The stateless model trained on a whole window of bad labels dropped to 0.633; the stateful one took five passes over a week of noise and dropped to 0.422, because the update moved weights that had taken weeks to learn. Both recovered the following week, the stateless one because the next window was clean, the stateful one because the next clean update repaired it. A stateful system cannot simply be rolled back to "the same model on fixed data"; it can only be rolled back to a checkpoint, which is why stateful pipelines keep checkpoints of every promoted model and run a stateless full retraining periodically, as a reset ([Huyen, 2022, ch. 9](#references)).
+
+### Catastrophic forgetting, in brief
+
+A network fine-tuned only on new data does not merely add knowledge; gradient steps on the new data can overwrite what it knew about inputs that the new data does not cover. This is **catastrophic forgetting** ([McCloskey and Cohen, 1989](#references)). A small demonstration: two tasks on the plane, task A on points centred at $(2, 0)$ with label $x_2 > 0$, task B on points centred at $(-2, 0)$ with label $x_2 < 0$. One network with 32 hidden units, trained on both together, gets 0.974 on A and 0.970 on B: there is no conflict. Trained on A (1.000) and then fine-tuned for 30 epochs on B alone, it scores 0.999 on B and **0.372** on A. Mixing in a 20 % replay of A's data during the fine-tuning keeps A at 0.930 with B at 0.987.
+
+The remedies are the same in production as in research: **replay** a sample of older data in every fine-tuning batch ([Rolnick et al., 2019](#references)); **regularize** the weights that mattered for old data, as elastic weight consolidation does ([Kirkpatrick et al., 2017](#references)); and **evaluate on old slices**, not only on the newest week, so that forgetting shows up at the gate. The difference between forgetting and adaptation is a question of intent: the stream above *wants* the old concept forgotten, a seasonal product wants last December remembered.
+
+## Delayed and biased labels
+
+The labels the loop learns from are neither immediate nor a fair sample.
+
+**Delay.** Some labels are **natural**: the system observes the outcome without anyone labelling it, a click or a purchase, and the time to observe it is the *feedback loop length* ([Huyen, 2022, ch. 4](#references)). Clicks arrive in seconds; whether a recommended item was returned arrives in weeks; a chargeback on a fraudulent payment, or the repayment of a loan, in months. Until the label arrives, the model's accuracy on recent traffic is unknown, and every retraining learns from data at least one delay old. In the simulation the delay is one week after the week ends: at the start of week $w$ the newest labelled week is $w - 2$, which is why the week-18 change hurt for two weeks under every policy. Two practical consequences: monitor proxies that arrive sooner (the prediction distribution, early labels such as "clicked" before "bought"), and count labels only for windows that are mature, the **label maturity** of [Labels arrive later than features](/notes/mlops/data-pipelines#labels-arrive-later-than-features), or a fraud rate computed over the last week will look falsely low because most of its chargebacks have not arrived yet.
+
+**Selection.** Labels exist only for what the system let happen. A rejected loan applicant never gets the chance to repay, so the training data holds outcomes only for approved applicants; a recommender learns click rates only for the items it showed. This is the **selective labels** problem ([Lakkaraju et al., 2017](#references)): a model retrained on its own approvals learns about the people it already approves and nothing about the ones it rejects. If decisions are randomized with a known probability $\pi(x) > 0$ of acting, an outcome can be reweighted by the inverse of that probability, and its average is unbiased:
+
+$$
+\mathbb E\!\left[\frac{y\,\mathbb 1\{\text{acted}\}}{\pi(x)}\right]
+= \mathbb E_x\!\left[\frac{\mathbb E[y \mid x]\,\pi(x)}{\pi(x)}\right] = \mathbb E[y],
+$$
+
+using that whether the system acted depends only on $x$ and the randomization, not on the unseen outcome. The condition $\pi(x) > 0$ is the point: inverse propensity weighting can only recover what was explored. A system that never acts on some inputs has no data about them, which is the next section in a different form.
+
+## Feedback loops
+
+A model whose predictions influence the data it is later trained on has a **feedback loop** ([Sculley et al., 2015](#references)). Some are benign. A **degenerate** feedback loop is one in which the model's outputs make the next training data confirm those outputs, so that early errors become permanent ([Huyen, 2022, ch. 8](#references)). Recommendation is the standard example: items that are shown get clicks, items that get clicks are ranked higher, items ranked higher are shown.
+
+The Example simulates it. A catalogue has 100 items whose true click probabilities are mostly low ($0.01 + 0.09u^2$, $u$ uniform). At launch every item is shown 10 times; then each of 60 days brings 500 sessions, each shown a slate of 5 items. Three ranking policies, averaged over 20 random seeds:
+
+- **Popularity**: rank by clicks so far. The 10 launch impressions decide the first ranking, and the ranking decides all later impressions.
+- **Greedy click rate**: rank by the estimated click rate $(c_i + 0.4)/(s_i + 10)$, with $c_i$ clicks and $s_i$ shows of item $i$ and a prior equal to the catalogue's typical rate.
+- **Exploration**: the greedy ranking, but in a fifth of the sessions the last slot goes to a random item outside the top five.
+
+<FeedbackLoop />
+
+| policy | ranked slate, % of the best, day 10 | day 59 | clicks per session, % of the best, last 10 days | clicks that went to the 5 launch leaders |
+| --- | --- | --- | --- | --- |
+| popularity | 75.1 | 75.1 | 75.7 | 99.7 % |
+| greedy click rate | 90.4 | 92.6 | 93.2 | 45.0 % |
+| exploration | 92.7 | 98.4 | 96.8 | 31.4 % |
+
+Ranking by popularity never changes its mind: whatever luck put an item in the top five at launch keeps it there, and the logs it produces, where 99.7 % of all clicks went to those five items, would teach any model retrained on them that they are the best items. That is the degenerate loop: the training data is a record of the previous model's decisions. The greedy click-rate ranking is subtler. It corrects items it **overrates**, because showing them produces data that lowers their estimate, but it can never correct items it **underrates**, because it stops showing them and so gets no data to change its mind; it settles at 92.6 %. Exploration spends one slot in twenty-five on random items and pays for it at first: over the first ten days it collects 82.2 % of the best possible clicks against 83.0 % for the greedy ranking. Over the last ten it collects 96.8 % against 93.2 %, because it finds the good items the greedy ranking has stopped looking at.
+
+How to recognize and break such loops ([Chaney et al., 2018](#references); [Huyen, 2022, ch. 8](#references)):
+
+- **Measure concentration**: the share of impressions or clicks going to the top items, the number of distinct items shown, the popularity of what is recommended against the popularity of the catalogue. A loop shows up as concentration that rises with every retraining.
+- **Explore on purpose**, with a small, known randomization (an exploration slot, a randomized ranking for a share of traffic), and log the probabilities, so that the logs support the inverse propensity estimates above.
+- **Keep a holdout of traffic** that the model does not influence, a small share served by a random or a fixed policy, as the clean reference for evaluation.
+- **Remove position effects** from the training signal: an item clicked in the first slot says less about its quality than one clicked in the fifth. The [rules of ML](#references) of Zinkevich make the point that positional features must be handled separately at training and at serving.
+
+## Evaluation gates: champion against challenger
+
+A pipeline that retrains automatically will one day train a bad model: a broken join, a corrupted partition, a library upgrade, a hyperparameter typo. The gate is the step that keeps that model out of production, and it is the reason automatic retraining is safe at all ([Baylor et al., 2017](#references); [Breck et al., 2017](#references)). The [testing note](/notes/mlops/testing-ml-systems#is-the-model-good-enough-to-replace-the-current-one) introduced these checks as quality gates and showed why [slices](/notes/mlops/testing-ml-systems#slices-and-regressions-on-slices) need a paired test; in a continual loop they run on every retraining, with no person in between. A gate is a set of checks that the challenger must pass on data it was not trained on:
+
+1. **Absolute floors**: accuracy (or AUC, or calibration error) on a fixed held-out set above a minimum, to catch a model that is broken outright.
+2. **Non-regression against the champion**, on the **same** held-out examples, with a margin and a confidence bound.
+3. **Slices**: the same comparison on important subgroups (regions, new users, the old season), so that an average gain does not hide a slice that got worse, and so that forgetting shows.
+4. **Operational checks**: model size, latency on the target hardware, and the input schema.
+
+A challenger that passes is registered and enters the [rollout](/notes/mlops/rolling-out-models): the offline gate decides whether a model may face traffic, the online stages decide whether it stays.
+
+### The paired comparison
+
+Two models scored on the same $n$ items can be compared more precisely than two independent samples allow, because most items are answered the same way by both and carry no information about the difference. Let $b$ be the number of items only the champion gets right and $c$ the number only the challenger gets right. Each item contributes a difference $D_i \in \{-1, 0, +1\}$ (challenger minus champion), so
+
+$$
+\begin{aligned}
+d &= \frac{1}{n}\sum_i D_i = \frac{c - b}{n}, \\
+\operatorname{Var}(D_i) &= \mathbb E[D_i^2] - d^2 = \frac{b + c}{n} - d^2 && \text{since } D_i^2 = 1 \text{ exactly on the } b + c \text{ discordant items}, \\
+\operatorname{SE}(d) &= \sqrt{\frac{\operatorname{Var}(D_i)}{n}} = \frac{1}{n}\sqrt{b + c - \frac{(c - b)^2}{n}}.
+\end{aligned}
+$$
+
+Only the discordant items enter; this is the logic of McNemar's test and of the paired comparison in [Comparing two models on one test set](/notes/probability/confidence-intervals-and-bootstrap#comparing-two-models-on-one-test-set). The gate of the Example promotes the challenger when the one-sided 95 % lower bound $d - 1.645\,\operatorname{SE}(d)$ is above $-0.02$, that is, unless there is evidence it is more than two points worse; and when its accuracy is at least 0.60. On a held-out quarter of the newest week, $n = 500$:
+
+- **Week 8**: $b = 2$, $c = 9$, so $d = +0.014$, $\operatorname{SE} = \sqrt{11 - 49/500}/500 = 0.0066$, and the bound is $0.014 - 0.011 = +0.003$: promoted.
+- **Week 23**, the week of the shifted labels: $b = 155$, $c = 53$, $d = -0.204$, $\operatorname{SE} = \sqrt{208 - 20.8}/500 = 0.0274$, the bound $-0.249$, and the challenger's accuracy is 0.606: kept out. The champion stays, and the gated policy serves 0.815 that week, where the ungated weekly retraining fell to 0.633.
+
+The gate promoted 24 of 25 challengers and its mean accuracy, 0.823, is the best of the stateless policies. It works here because the held-out quarter came through a clean path while the bug was in the training job's join. A held-out set produced by the same broken code would have rated the broken challenger well; checks on the data itself, such as the label rate and the join cardinality of [Data quality, validation and versioning](/notes/mlops/data-quality-and-versioning), run **before** training, are the defence against that.
+
+<aside class="callout"><strong>Check yourself.</strong> (1) In the cost model, retraining costs \$800 and the stale model's excess cost grows by \$200 a week every week. What is the best interval, and what does it cost per week? (2) A fraud model's labels (chargebacks) arrive up to 60 days after a payment. A dashboard shows the fraud rate of last week's payments at a third of its usual level. What is the likeliest explanation? (3) A challenger and a champion are scored on 1,000 held-out items: 40 are right only for the champion, 52 only for the challenger. Does the gate of this note promote the challenger? (4) Why does the greedy click-rate ranking fix overrated items but not underrated ones?<details><summary>Answers</summary>(1) $T^* = \sqrt{2 \times 800 / 200} = \sqrt 8 = 2.83$ weeks, at $\sqrt{2 \times 200 \times 800} = 566$ dollars a week. (2) The labels are immature: most chargebacks for last week have not arrived yet. Compare windows only after they have had the full 60 days, or compare at equal age. (3) $d = 12/1{,}000 = 0.012$, $\operatorname{SE} = \sqrt{92 - 144/1{,}000}/1{,}000 = 0.0096$, the bound $0.012 - 0.0158 = -0.004 > -0.02$: promoted (there is no evidence that it is worse; there is no evidence that it is better either). (4) An overrated item is shown, and the clicks it fails to get lower its estimate. An underrated item is not shown, so no new data arrives to raise its estimate: errors that suppress exposure suppress their own correction.</details></aside>
+
+## What changed
+
+| | Train once, deploy forever (the baseline) | A continual training loop |
+| --- | --- | --- |
+| When a new model appears | never | on a schedule, on a trigger, or on demand |
+| Detecting a changed concept | impossible: inputs look the same | accuracy on joined, delayed labels |
+| Accuracy on the drifting stream | 0.621 on average, 0.402 at the end | 0.818 weekly, 0.826 stateful, 0.823 gated |
+| How often | not a question | $T^* = \sqrt{2C/a}$ for gradual decay; triggers for sudden change |
+| A broken training run | not possible, nor any new run | caught by the gate: 0.815 instead of 0.633 |
+| What the model learns from | a fixed dataset | data shaped by its own decisions, needing exploration and holdouts |
+| Recommendations | not updated | 75.1 % of the best slate by popularity, 98.4 % with exploration |
+
+## Limitations
+
+- **Simulations, not measurements.** The stream, the costs and the catalogue are synthetic; real decay is rarely linear and real labels are noisier. The mechanisms carry over; the numbers do not.
+- **The gate needs a clean and representative held-out set.** It is data like any other: it ages, it can be produced by the same broken code as the training data, and it must be refreshed and validated.
+- **Triggers inherit the blind spots of monitoring.** A trigger on input drift misses concept drift, and a trigger on labels is as late as the labels.
+- **Exploration has a cost and needs consent.** Showing random items costs clicks, and in lending or medicine, randomized decisions raise ethical and legal questions that a click-through rate does not.
+- **Not covered:** online learning that updates on every event, bandit algorithms beyond ε-greedy (Thompson sampling, upper confidence bounds), counterfactual evaluation of new policies from logged data, and the infrastructure of streaming feature pipelines.
+
+## What you should remember
+
+- A deployed model decays as the world changes; concept drift is invisible in the inputs and visible only in labels.
+- Retrain on a schedule for predictability, on a trigger for economy, on demand for events; label delay sets the fastest reaction of all of them.
+- For gradual decay, $T^* = \sqrt{2C/a}$: the retraining cost and the staleness cost are equal at the optimum.
+- Stateless retraining is reproducible and expensive; stateful training is cheap and fast but carries its history, including bad updates. Keep checkpoints and reset periodically with a full retraining.
+- Fine-tuning on new data can erase old skills; replay old data and evaluate old slices.
+- Labels are delayed and selected by the model's own decisions. Inverse propensity weighting needs a known, nonzero chance of acting.
+- A degenerate feedback loop turns early errors into permanent ones; measure concentration, explore deliberately and keep untouched holdout traffic.
+- An automatic retraining pipeline is safe only behind a gate: floors, a paired comparison with the champion on the same items, slices, and operational checks.
+
+## Example
+
+The whole note in one program: the drifting stream with five policies, the evaluation gate, and the feedback-loop simulation. Part 2 implements its own `mulberry32` generator so that the figure above, written in TypeScript, recomputes the same numbers; it uses only uniform draws and arithmetic, so both languages produce identical sequences. Run with Python 3.14.7, NumPy 2.5.4 and scikit-learn 1.9.1; it takes about 6 seconds.
+
+```python
+"""Retraining on a drifting stream, an evaluation gate, and a feedback loop in a recommender."""
+import numpy as np
+from sklearn.linear_model import LogisticRegression, SGDClassifier
+
+# ---- Part 1: a stream whose concept drifts while P(x) stays fixed ----
+WEEKS, N, D, DELAY, FIRST, BUG = 30, 2000, 5, 1, 5, 23
+rng = np.random.default_rng(0)
+
+def concept(week):
+    a = 0.08 * week                                  # the true boundary turns 0.08 rad a week
+    beta = 3 * np.array([np.cos(a), np.sin(a), 0.5, -0.5, 0.0])
+    if week >= 18:
+        beta[2] = -beta[2]                           # week 18: feature 2 reverses its effect
+    return beta
+
+X = [rng.normal(size=(N, D)) for _ in range(WEEKS)]
+Y = [(rng.random(N) < 1 / (1 + np.exp(-x @ concept(w)))).astype(int) for w, x in enumerate(X)]
+fit = lambda xs, ys: LogisticRegression().fit(np.vstack(xs), np.concatenate(ys))
+acc = lambda m, x, y: float((m.predict(x) == y).mean())
+
+def gate(champion, challenger, x, y, margin=0.02, floor=0.60):
+    """Promote if the challenger is not worse than the champion by more than the margin."""
+    a, b = champion.predict(x) == y, challenger.predict(x) == y
+    n = len(y); only_champ = int((a & ~b).sum()); only_chal = int((~a & b).sum())
+    d = (only_chal - only_champ) / n                 # accuracy difference, paired
+    se = np.sqrt(only_chal + only_champ - (only_chal - only_champ) ** 2 / n) / n
+    ok = d - 1.645 * se > -margin and b.mean() >= floor
+    return ok, d, se, only_champ, only_chal, float(b.mean())
+
+static = fit(X[0:4], Y[0:4])
+sgd = SGDClassifier(loss="log_loss", alpha=1e-4, learning_rate="constant", eta0=0.01, random_state=0)
+for _ in range(5):
+    sgd.partial_fit(np.vstack(X[0:4]), np.concatenate(Y[0:4]), classes=[0, 1])
+trig, champ = static, static
+rows, retrains, promoted, log = [], 0, 0, []
+for w in range(FIRST, WEEKS):
+    newest = w - 1 - DELAY                           # the newest week whose labels have arrived
+    window = range(newest - 3, newest + 1)
+    # in week BUG the training job joins labels to the wrong rows (shifted by one); the gate holdout is unaffected
+    lab = (lambda v: np.roll(Y[v], 1)) if w == BUG else (lambda v: Y[v])
+    weekly = fit([X[v] for v in window], [lab(v) for v in window])
+    if w > FIRST:
+        for _ in range(5):
+            sgd.partial_fit(X[newest], lab(newest))
+    if acc(trig, X[newest], Y[newest]) < 0.80:       # trigger: accuracy on the newest labels below 0.80
+        trig, retrains = weekly, retrains + 1
+    cut = 3 * N // 4                                 # the gate holds out a quarter of the newest week
+    chal = fit([X[v] for v in window if v != newest] + [X[newest][:cut]],
+               [lab(v) for v in window if v != newest] + [lab(newest)[:cut]])
+    ok, d, se, b, c, ca = gate(champ, chal, X[newest][cut:], Y[newest][cut:])
+    if ok:
+        champ, promoted = chal, promoted + 1
+    if w in (8, 20, BUG) or not ok:
+        log.append(f"week {w}: champion-only {b}, challenger-only {c}, d = {d:+.3f} +- {1.645 * se:.3f}, challenger {ca:.3f} -> {"promote" if ok else "keep"}")
+    rows.append([acc(m, X[w], Y[w]) for m in (static, weekly, sgd, trig, champ)])
+R = np.array(rows)
+print("week   static  weekly  stateful  triggered  gated")
+for i, w in enumerate(range(FIRST, WEEKS)):
+    if w % 3 == 1 or w in (FIRST, 18, 19, BUG, BUG + 1):
+        print(f"{w:4d}   " + "  ".join(f"{v:6.3f}" for v in R[i]))
+print("mean   " + "  ".join(f"{v:6.3f}" for v in R.mean(0)))
+print(f"retrains: weekly {WEEKS - FIRST}, triggered {retrains}; gate promoted {promoted} of {WEEKS - FIRST}")
+print("\n".join(log))
+slope = np.polyfit(range(FIRST, 18), R[: 18 - FIRST, 0], 1)[0]
+print(f"static model before week 18: accuracy changes by {100 * slope:+.2f} points a week")
+
+# ---- Part 2: a feedback loop; mulberry32 so that the figure can recompute it exactly ----
+def mulberry32(seed):
+    state = seed & 0xFFFFFFFF
+    def rnd():
+        nonlocal state
+        state = (state + 0x6D2B79F5) & 0xFFFFFFFF
+        t = state
+        t = ((t ^ (t >> 15)) * (t | 1)) & 0xFFFFFFFF
+        t ^= (t + (((t ^ (t >> 7)) * (t | 61)) & 0xFFFFFFFF)) & 0xFFFFFFFF
+        return ((t ^ (t >> 14)) & 0xFFFFFFFF) / 4294967296
+    return rnd
+
+M, K, DAYS, USERS, LAUNCH, EPS, SEEDS = 100, 5, 60, 500, 10, 0.2, 20
+
+def simulate(policy, seed):
+    rnd = mulberry32(seed)
+    q = []
+    for _ in range(M):
+        r = rnd(); q.append(0.01 + 0.09 * r * r)     # true click probabilities, most items poor
+    oracle = sum(sorted(q, reverse=True)[:K])
+    clicks, shows = [0] * M, [0] * M
+    for i in range(M):                               # launch: every item shown LAUNCH times
+        for _ in range(LAUNCH):
+            shows[i] += 1; clicks[i] += rnd() < q[i]
+    leaders = sorted(range(M), key=lambda i: (-clicks[i], i))[:K]
+    quality, ctr = [], []
+    for day in range(DAYS):
+        if policy == "popularity":
+            ranked = sorted(range(M), key=lambda i: (-clicks[i], i))[:K]
+        else:                                        # estimated click rate, prior mean 0.04
+            ranked = sorted(range(M), key=lambda i: (-(clicks[i] + 0.4) / (shows[i] + 10), i))[:K]
+        rest = [i for i in range(M) if i not in ranked]
+        day_clicks = 0
+        for _ in range(USERS):
+            slate = ranked
+            if policy == "explore" and rnd() < EPS:  # one slot in five sessions goes to a random item
+                slate = ranked[:K - 1] + [rest[int(rnd() * (M - K))]]
+            for i in slate:
+                shows[i] += 1
+                if rnd() < q[i]:
+                    clicks[i] += 1; day_clicks += 1
+        quality.append(sum(q[i] for i in ranked) / oracle)
+        ctr.append(day_clicks / USERS / oracle)
+    return quality, ctr, sum(clicks[i] for i in leaders) / sum(clicks)
+
+print("\npolicy       ranked slate as % of the best one      clicks, % of best   clicks to launch leaders")
+print("             day 0   day 10  day 30  day 59         last 10 days")
+for policy in ("popularity", "ctr", "explore"):
+    runs = [simulate(policy, s) for s in range(1, SEEDS + 1)]
+    Q = np.mean([r[0] for r in runs], axis=0); C = np.mean([r[1] for r in runs], axis=0)
+    lead = np.mean([r[2] for r in runs])
+    print(f"{policy:11s}  " + "  ".join(f"{100 * Q[d]:5.1f}" for d in (0, 10, 30, 59))
+          + f"          {100 * C[-10:].mean():5.1f}              {100 * lead:5.1f}")
+```
+
+```text
+week   static  weekly  stateful  triggered  gated
+   5    0.843   0.843   0.841   0.843   0.842
+   7    0.829   0.845   0.856   0.829   0.844
+  10    0.770   0.841   0.860   0.770   0.841
+  13    0.758   0.837   0.848   0.818   0.838
+  16    0.700   0.857   0.865   0.796   0.856
+  18    0.553   0.708   0.709   0.705   0.708
+  19    0.521   0.700   0.692   0.681   0.700
+  22    0.479   0.830   0.851   0.785   0.825
+  23    0.461   0.633   0.422   0.633   0.815
+  24    0.481   0.854   0.868   0.854   0.853
+  25    0.439   0.837   0.854   0.824   0.836
+  28    0.402   0.842   0.844   0.791   0.842
+mean    0.621   0.818   0.826   0.794   0.823
+retrains: weekly 25, triggered 6; gate promoted 24 of 25
+week 8: champion-only 2, challenger-only 9, d = +0.014 +- 0.011, challenger 0.882 -> promote
+week 20: champion-only 3, challenger-only 21, d = +0.036 +- 0.016, challenger 0.728 -> promote
+week 23: champion-only 155, challenger-only 53, d = -0.204 +- 0.045, challenger 0.606 -> keep
+static model before week 18: accuracy changes by -1.43 points a week
+
+policy       ranked slate as % of the best one      clicks, % of best   clicks to launch leaders
+             day 0   day 10  day 30  day 59         last 10 days
+popularity    75.1   75.1   75.1   75.1           75.7               99.7
+ctr           75.1   90.4   92.5   92.6           93.2               45.0
+explore       75.1   92.7   97.4   98.4           96.8               31.4
+```
+
+Read part by part:
+
+- `concept(week)` is the drift. The coefficient vector turns by 0.08 radians a week in the plane of the first two features and the third flips sign in week 18. `X` is drawn from the same normal distribution every week, so only $P(y \mid x)$ moves.
+- `DELAY = 1` and `newest = w - 1 - DELAY`: at the start of week $w$, labels exist up to week $w - 2$. Every policy trains only on those, which is why week 18 and 19 are bad for all of them.
+- `weekly` is stateless retraining on the last four labelled weeks; `sgd` is stateful, five passes of `partial_fit` over each newly labelled week on top of its previous weights; `trig` is replaced by the weekly model only when its accuracy on the newest labelled week falls below 0.80; `champ` is the gated policy.
+- `lab` injects the bug of week 23: labels shifted by one row against their inputs, the effect of a join on a misaligned key. The gate's held-out quarter `X[newest][cut:]`, `Y[newest][cut:]` is taken from the correctly joined data.
+- `gate` is the paired comparison derived above: `only_champ` and `only_chal` are $b$ and $c$, `d - 1.645 * se > -margin` is the one-sided non-inferiority bound, and `floor` is the absolute minimum.
+- The week-8 line shows a typical promotion (11 discordant items out of 500), the week-20 line a large improvement after the concept change, the week-23 line the broken challenger kept out.
+- `np.polyfit` fits a line to the static model's accuracy in weeks 5–17: the slope of $-1.43$ points a week is the decay rate $a$ of the cost model.
+- In part 2, `mulberry32` is the generator of the figure's TypeScript code, written with explicit 32-bit masks; `r * r` rather than `r ** 2` keeps the arithmetic identical in both languages.
+- `ranked` is the top five by clicks (`popularity`) or by the smoothed click rate; the `(-score, i)` keys break ties by item index, as the figure does. `quality` scores the ranked slate against the oracle's, without the explored slot; `ctr` counts all clicks, so the cost of exploration is included.
+- `leaders` are the five most-clicked items right after launch; under the popularity policy they keep 99.7 % of all clicks for the 60 days.
+
+## Next
+
+The models of this note learn: they are retrained, fine-tuned and gated by the team that owns them. Many applications today run a model that the team does not train at all: a large language model behind a provider's API or a self-hosted open-weight model, steered by prompts, retrieval and tools. Its behaviour changes when a prompt, a model version or a tool changes, it has no labels, and every request has a price. The [next note](/notes/mlops/llmops) adapts the loop to that setting: versioned prompts and models, evaluation sets that run in CI, a model as judge at the gate, traces of chains and agents, guardrails, caching, routing and the cost of a request.
+
+## References
+
+- C. Huyen. *Designing Machine Learning Systems*. O'Reilly, 2022. Ch. 4 (natural labels and feedback loop length), ch. 8 (degenerate feedback loops), ch. 9 (continual learning: stateless retraining and stateful training, triggers, how often to retrain). The course it grew from: Stanford [CS329S Machine Learning Systems Design](https://stanford-cs329s.github.io/).
+- C. Kästner. [*Machine Learning in Production: From Models to Products*](https://mlip-cmu.github.io/book/). MIT Press, 2025. Ch. 11, Automating the Pipeline; ch. 13, Planning for Operations; ch. 19, Testing and Experimenting in Production. Course: [CMU 17-445/645](https://mlip-cmu.github.io/), spring 2025.
+- D. Sculley et al. [Hidden Technical Debt in Machine Learning Systems](https://papers.nips.cc/paper/2015/hash/86df7dcfd896fcaf2674f757a2463eba-Abstract.html). NeurIPS, 2015. Hidden feedback loops.
+- D. Baylor et al. [TFX: A TensorFlow-Based Production-Scale Machine Learning Platform](https://doi.org/10.1145/3097983.3098021). KDD, 2017. Model validation before serving.
+- E. Breck, S. Cai, E. Nielsen, M. Salib, D. Sculley. [The ML Test Score: A Rubric for ML Production Readiness and Technical Debt Reduction](https://research.google/pubs/the-ml-test-score-a-rubric-for-ml-production-readiness-and-technical-debt-reduction/). IEEE Big Data, 2017.
+- M. Zinkevich. [Rules of Machine Learning: Best Practices for ML Engineering](https://developers.google.com/machine-learning/guides/rules-of-ml). Google, accessed October 2026. Rules on feedback loops and positional features.
+- A. J. B. Chaney, B. M. Stewart, B. E. Engelhardt. [How Algorithmic Confounding in Recommendation Systems Increases Homogeneity and Decreases Utility](https://arxiv.org/abs/1710.11214). RecSys, 2018.
+- H. Lakkaraju, J. Kleinberg, J. Leskovec, J. Ludwig, S. Mullainathan. [The Selective Labels Problem: Evaluating Algorithmic Predictions in the Presence of Unobservables](https://doi.org/10.1145/3097983.3098066). KDD, 2017.
+- M. McCloskey, N. J. Cohen. [Catastrophic Interference in Connectionist Networks: The Sequential Learning Problem](https://www.sciencedirect.com/science/article/pii/S0079742108605368). *Psychology of Learning and Motivation* 24, 1989.
+- J. Kirkpatrick et al. [Overcoming Catastrophic Forgetting in Neural Networks](https://arxiv.org/abs/1612.00796). PNAS, 2017.
+- D. Rolnick, A. Ahuja, J. Schwarz, T. Lillicrap, G. Wayne. [Experience Replay for Continual Learning](https://arxiv.org/abs/1811.11682). NeurIPS, 2019.
+- J. Gama, I. Žliobaitė, A. Bifet, M. Pechenizkiy, A. Bouchachia. [A Survey on Concept Drift Adaptation](https://doi.org/10.1145/2523813). *ACM Computing Surveys* 46(4), 2014.

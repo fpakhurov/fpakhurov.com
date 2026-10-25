@@ -1,0 +1,354 @@
+---
+title: LLM inference systems
+description: "How engines serve large language models: prefill against decode and why decode is memory-bound, the size of the KV cache, continuous batching, PagedAttention, prefix caching, speculative decoding with its exact acceptance rule, the latency metrics, and the engines of 2026."
+course: mlops
+section: Serving
+order: 9
+status: published
+tags: [llm-inference, kv-cache, prefill, decode, roofline, continuous-batching, orca, pagedattention, vllm, prefix-caching, speculative-decoding, ttft, tpot, goodput, sglang, tensorrt-llm, llama-cpp]
+prerequisites: [Serving models, GPT and autoregressive language modeling, Quantization]
+---
+
+import PrefillDecode from '../../../components/figures/llm-inference-systems/PrefillDecode.astro';
+import ContinuousBatching from '../../../components/figures/llm-inference-systems/ContinuousBatching.astro';
+
+The [previous note](/notes/mlops/serving-models) served models whose answer is one forward pass, and its batcher grouped passes of equal cost. A large language model answers with one forward pass per generated token, so a request is a loop of tens to thousands of passes, and requests in the same batch need different numbers of them. Each sequence also keeps a cache of keys and values that grows by one position per token and can outgrow the weights. This note explains what an inference engine does about it: why the first token and the following ones are limited by different resources, how large the cache is, how a scheduler that works one step at a time keeps the GPU full, how the cache is stored in pages and shared between requests, how a small model can propose tokens that the large one checks without changing its output distribution, and which numbers describe the result.
+
+**Conventions.** Model shapes are those of Qwen3-8B, from its `config.json` on the Hugging Face Hub (accessed October 2026). Hardware numbers are those of an NVIDIA H100 SXM from its datasheet: 80 GB of HBM3 at 3.35 TB/s, and 989 TFLOP/s of dense BF16 arithmetic. The scheduler of the Example is a NumPy simulation with a cost model built from these numbers, run with Python 3.14.7; nothing in this note ran on a GPU, and the engine versions are those of October 2026.
+
+**Notation.** $P$ is the number of parameters; $L$ the number of Transformer blocks (layers); $H_q$ and $H_{kv}$ the numbers of query heads and of key–value heads; $d_h$ the dimension of one head; $n$ the number of tokens in a sequence; $b$ the number of sequences in a batch.
+
+## Baseline: one request at a time, then padded batches
+
+The simplest server calls the generation loop of the [GPT note](/notes/nlp/gpt#decoding-turning-probabilities-into-text) for each request: run the model on the prompt, sample a token, append it, run again, until an end token or a length limit. One request at a time leaves the GPU almost idle, as the next section computes. The obvious repair is the batching of the previous note: collect 32 requests, pad them to the same length, generate for all of them at once. It fails in three ways. Requests finish at different times, so a batch runs until its longest output is done, and the slots of the requests that finished early compute padding. A request that arrives while a batch runs waits for the whole batch, possibly for a minute. And the server reserves cache memory for every sequence at the maximum length it might reach, so most of the memory holds nothing, and the batch is smaller than the GPU could take.
+
+<aside class="callout"><strong>Key idea.</strong> Generation has two phases with opposite limits. Prefill processes the prompt in one pass and is limited by arithmetic; decode produces one token per pass, reads every weight and the whole KV cache each time, and is limited by memory bandwidth. Decode is made efficient by running many sequences per step, and the number that fit is set by the KV cache. So an engine schedules at the granularity of one step, admitting and retiring sequences after every iteration (continuous batching); stores the cache in fixed-size blocks allocated on demand (PagedAttention); reuses the cache of shared prefixes; and can spend idle arithmetic on checking several drafted tokens per pass (speculative decoding) without changing the distribution of the output.</aside>
+
+## Prefill and decode
+
+Generating a reply to a prompt of $n$ tokens has two phases.
+
+1. **Prefill.** The model runs once over all $n$ prompt tokens in parallel, as in training. It computes the key and value vectors of every prompt position in every layer, stores them in the **KV cache**, and produces the distribution of the first output token.
+2. **Decode.** Each further step feeds only the newest token. Its query attends to the cached keys and values of all earlier positions; its own key and value are appended to the cache; out comes the distribution of the next token. One step, one token per sequence.
+
+<PrefillDecode />
+
+1. The prompt enters as $n$ tokens at once.
+2. Prefill runs all of them through the model in one pass and writes their keys and values into the cache, one column per position and layer.
+3. The last position's output gives the first generated token.
+4. A decode step processes only the newest token: its query reads the whole cache, and its key and value are appended.
+5. The step repeats, one token and one cache column at a time, until an end token or the length limit.
+
+The two phases are limited by different resources, which the [roofline model](/notes/acos/data-level-parallelism#the-roofline-model-arithmetic-or-memory) predicts from the **arithmetic intensity**, operations per byte moved. A forward pass does about $2P$ operations per token (one multiply and one add per weight) and reads all $2P$ bytes of 16-bit weights once, whatever the number of tokens in the pass:
+
+$$
+I_{\text{prefill}} \approx \frac{2P \cdot n}{2P} = n, \qquad I_{\text{decode}} \approx \frac{2P \cdot b}{2P} = b .
+$$
+
+The H100's ridge point is $989 / 3.35 \approx 295$ operations per byte. A prompt of 2,048 tokens has an intensity of 2,048, far above the ridge: prefill is **compute-bound**. For Qwen3-8B ($P = 8.2 \times 10^9$, 16.4 GB of weights) its arithmetic takes at least $2 \cdot 8.2 \times 10^9 \cdot 2048 / 989 \times 10^{12} = 34$ ms, while reading the weights takes 4.9 ms. A decode step at batch size 1 has an intensity of 1: reading the weights takes $16.4\ \text{GB} / 3.35\ \text{TB/s} = 4.9$ ms, the arithmetic 0.017 ms. The GPU spends 0.3% of the step computing. Decode is **memory-bound**, and the remedy is the one of the previous note: more sequences per step, since the weights read for one serve all of them. At $b = 64$ the arithmetic takes 1.1 ms, still far less than the 4.9 ms of weight reading.
+
+The attention part of decode does not improve with batching. A new token of one sequence attends only to that sequence's cache: per layer it does $4 H_q d_h n$ operations (scores against $n$ keys, a weighted sum of $n$ values) and reads $2 \cdot H_{kv} d_h n$ numbers of 2 bytes. Its intensity is
+
+$$
+I_{\text{attention}} = \frac{4 H_q d_h n}{4 H_{kv} d_h n} = \frac{H_q}{H_{kv}},
+$$
+
+4 for Qwen3-8B, independent of the batch size and the context length. Every byte of cache read in decode is read for one sequence only, so the cache traffic grows with the batch and the context. FlashAttention, which reduces the memory traffic of attention in prefill and training, is in the [efficient Transformers note](/notes/nlp/efficient-transformers#where-the-time-goes-memory-traffic-not-arithmetic); in decode the cache must be read in full at every step.
+
+The two phases set two latencies a user sees: the **time to first token** is dominated by waiting in the queue and by prefill, and the **time per output token** by decode steps. They are traded against each other by the scheduler, as the metrics section shows.
+
+## The KV cache: how large it is
+
+Per layer, each position stores one key vector and one value vector for each key–value head, $2 \cdot H_{kv} \cdot d_h$ numbers. Over $L$ layers, at $s$ bytes per number, one token occupies
+
+$$
+\boxed{M_{\text{token}} = 2 \cdot L \cdot H_{kv} \cdot d_h \cdot s \ \text{bytes}}
+$$
+
+which is the formula of the [quantization note](/notes/nlp/quantization#memory-latency-and-throughput-of-generation) with its key–value width written as $d_{kv} = H_{kv} \cdot d_h$. In models with **grouped-query attention** ([Ainslie et al., 2023](#references)), several query heads share one key–value head, and $H_{kv}$ is smaller than $H_q$.
+
+**Worked example: Qwen3-8B.** Its configuration lists `num_hidden_layers: 36`, `num_attention_heads: 32`, `num_key_value_heads: 8`, `head_dim: 128` and `torch_dtype: bfloat16` ([Qwen, 2025](#references)). Then
+
+$$
+M_{\text{token}} = 2 \cdot 36 \cdot 8 \cdot 128 \cdot 2 = 147{,}456 \ \text{bytes} = 144 \ \text{KiB}.
+$$
+
+With 32 key–value heads, one per query head, it would be four times as much, 576 KiB. A sequence of 2,048 tokens holds $147{,}456 \cdot 2048 = 0.30$ GB of cache; one at the native context of 32,768 tokens holds 4.83 GB, more than a quarter of the weights.
+
+**How many sequences fit.** On an 80 GB H100, an engine that takes 92% of the memory (the default share in vLLM 0.32) has 73.6 GB. The weights take $8.2 \times 10^9 \cdot 2 = 16.4$ GB; allow 2 GB for activations and buffers. The cache gets
+
+$$
+73.6 - 16.4 - 2 = 55.2 \ \text{GB} = \frac{55.2 \times 10^9}{147{,}456} \approx 374{,}000 \ \text{tokens},
+$$
+
+enough for 11 sequences at the full 32,768-token context, or 182 sequences of 2,048. The cache, not the arithmetic, caps the batch, and the batch sets the throughput: a decode step at $b = 64$ with 2,048 tokens of context per sequence reads $16.4 + 64 \cdot 0.30 = 35.7$ GB and takes at least 10.7 ms, which bounds the throughput at about 6,000 tokens per second, against 201 tokens per second for a single sequence. Quantizing the weights or the cache, which the [quantization note](/notes/nlp/quantization#worked-example-a-7-b-model-on-one-gpu) works through for a 7 B model, raises the batch that fits in the same way.
+
+## Static and continuous batching
+
+**Static batching** forms a batch, runs it until every sequence in it has finished, and only then forms the next. **Continuous batching**, introduced as **iteration-level scheduling** by Orca ([Yu et al., 2022](#references)), makes the scheduling decision after every decode step: a sequence that has produced its end token leaves the batch at once and frees its slot, and a waiting request joins the running batch at the next step, its prefill run in that iteration alongside the decode of the others. Orca's second idea, **selective batching**, makes this possible: sequences of different lengths cannot be stacked into one rectangular tensor, but every operation except attention works on tokens independently, so the engine flattens the tokens of all sequences into one long batch for the matrix products and runs attention for each sequence separately.
+
+<ContinuousBatching />
+
+1. Static batching: three slots, six requests that need 2, 9, 3, 4, 2 and 5 steps. The first batch runs for 9 steps because of its longest request; the slots of the two short ones sit idle. The second batch starts only after step 9.
+2. Continuous batching: the same requests and slots. Each request leaves when it is done, and the next one in the queue takes its slot at the following step.
+3. The same 25 tokens take 14 steps with static batching and 10 with continuous; the mean time to finish a request falls from 8.7 to 5.8 steps.
+
+The Example simulates both policies on 4,000 requests with random prompt and output lengths, arriving at random, on the cost model of the previous section with up to 32 sequences per batch. Static batching saturates at about 940 output tokens per second: above that its queue grows without limit, and at 6 requests per second the median request waits three minutes. Continuous batching serves 14 requests per second, 3,265 tokens per second, with a median time to first token of half a second. The difference comes from the slots: in a static batch, on average only 6.4 of the 32 sequences are still generating, while continuous batching keeps 29 of them busy at its highest load.
+
+Two refinements address what continuous batching leaves. A newly admitted request's prefill of thousands of tokens takes tens of milliseconds, during which every running sequence waits for its next token: users see a pause in the stream. **Chunked prefill** splits a long prompt into chunks of a few hundred tokens and runs one chunk per iteration beside the decode steps, so that each iteration's cost stays bounded ([Agrawal et al., 2024](#references)). **Disaggregated serving** goes further and runs prefill and decode on different GPUs, sending the cache from one to the other, so that each phase runs on hardware and batch sizes suited to its own limit ([Zhong et al., 2024](#references)).
+
+## PagedAttention: the cache in pages
+
+A server that stores each sequence's cache in one contiguous region must reserve the region for the longest output the sequence may produce, because it cannot know in advance when the sequence will stop. The reserved but unused part is internal fragmentation; the gaps between regions of different sizes are external fragmentation. A request with a context limit of 32,768 tokens that stops after 2,048 has held $30{,}720 \cdot 144\ \text{KiB} = 4.5$ GB of Qwen3-8B cache that no other sequence could use. Kwon et al. measured that such systems used between 20% and 38% of their cache memory for actual token states; the measurements and the operating-system analogy are in the [virtual-memory note](/notes/acos/virtual-memory#paging-beyond-the-operating-system).
+
+**PagedAttention** ([Kwon et al., 2023](#references)) stores the cache in fixed-size **blocks** of a few tokens each (16 in the default configuration of the paper), allocated one at a time as the sequence grows, anywhere in GPU memory. A per-sequence **block table** maps the sequence's logical blocks to physical ones, and the attention kernel follows the table. Three consequences:
+
+- **Waste is bounded by one block per sequence.** Only the last block of a sequence can be partly empty: on average half a block, 8 tokens, $8 \cdot 144\ \text{KiB} = 1.2$ MB per sequence for Qwen3-8B, against gigabytes for a contiguous reservation. Kwon et al. report 96% of the cache memory holding token states.
+- **Blocks can be shared.** Several samples from the same prompt, or the beams of beam search, point to the same physical blocks for their common prefix, with a reference count; a block is copied only when a sequence writes into a shared one (copy-on-write).
+- **Sequences can be preempted.** When the cache is full, the engine evicts a running sequence's blocks, either swapping them to CPU memory or dropping them and recomputing them later with a prefill, and resumes it when space is free. The scheduler therefore admits requests by free blocks, not by a fixed slot count.
+
+## Prefix caching
+
+Many requests begin with the same tokens: a system prompt, tool descriptions, few-shot examples, a document retrieved for [RAG](/notes/nlp/rag), or the earlier turns of a conversation. Their keys and values are the same in every request, because the cache of a position depends only on the tokens up to it. **Prefix caching** keeps the blocks of finished requests and reuses them. In vLLM, each full block is identified by a hash of its tokens together with the hash of the block before it, so a block matches only if the whole prefix up to it matches; blocks no longer used by any sequence stay in a pool and are evicted least-recently-used first ([vLLM documentation, Automatic prefix caching](#references)). SGLang's **RadixAttention** keeps the cached sequences in a radix tree of tokens, so that the longest cached prefix of a new request is found in one walk ([Zheng et al., 2024](#references)).
+
+For a 2,000-token system prompt on Qwen3-8B, a hit saves the prefill of those tokens, at least $2 \cdot 8.2 \times 10^9 \cdot 2000 / 989 \times 10^{12} = 33$ ms of arithmetic per request, and stores $2000 \cdot 144\ \text{KiB} = 295$ MB of cache once instead of once per sequence. The time to first token falls by the same amount. Because a block matches only with all of its prefix, the order of the prompt matters: the stable parts (system prompt, tools, documents) go first and the parts that change per request (the user's question, the date) last. A timestamp at the top of the system prompt defeats the cache for every request.
+
+## Speculative decoding
+
+A decode step at small batch sizes reads all the weights for very little arithmetic, so a pass of the large model over $k + 1$ tokens costs about as much as a pass over one. **Speculative decoding** ([Leviathan, Kalman and Matias, 2023](#references); [Chen et al., 2023](#references)) exploits this. A small, fast **draft** model with distribution $q$ proposes $k$ tokens $x_1, \dots, x_k$ one after another. The large **target** model, with distribution $p$, scores all of them in one pass, which yields $p$ at each of the $k + 1$ positions. Then, for $i = 1, \dots, k$ in order:
+
+- accept $x_i$ with probability $\min\bigl(1, p(x_i)/q(x_i)\bigr)$;
+- at the first rejection, sample a replacement token from the **residual distribution** $r(x) = \bigl(p(x) - q(x)\bigr)_+ / \sum_y \bigl(p(y) - q(y)\bigr)_+$, where $(u)_+ = \max(u, 0)$, and stop;
+- if all $k$ are accepted, sample one more token from the target's distribution at position $k + 1$, which the pass has already computed.
+
+### Why the output has exactly the target's distribution
+
+*Optional depth: the proof that the acceptance rule preserves the target's distribution. The rest of the note uses only its result.*
+
+Consider one position, with the draft proposing $x \sim q$. Let $\beta = \sum_y \min\bigl(p(y), q(y)\bigr)$ be the probability that the proposal is accepted, and assume $\beta < 1$ (if $\beta = 1$, then $p = q$ and every proposal is accepted). The token $x$ is produced either by proposing and accepting it, or by a rejection followed by a draw of $x$ from $r$:
+
+$$
+\begin{aligned}
+P(\text{output} = x) &= q(x) \min\!\Big(1, \frac{p(x)}{q(x)}\Big) + (1 - \beta)\, r(x) \\
+&= \min\bigl(q(x), p(x)\bigr) + (1 - \beta) \frac{\bigl(p(x) - q(x)\bigr)_+}{1 - \beta} \\
+&= \min\bigl(p(x), q(x)\bigr) + \bigl(p(x) - q(x)\bigr)_+ \\
+&= p(x).
+\end{aligned}
+$$
+
+The second line uses $\sum_y \bigl(p(y) - q(y)\bigr)_+ = \sum_y \bigl(p(y) - \min(p(y), q(y))\bigr) = 1 - \beta$; the last uses $\min(p, q) + (p - q)_+ = p$, checked separately for $p \le q$ and $p > q$. The argument applies position by position, each conditioned on the accepted prefix, so the whole generated sequence has the distribution it would have had without the draft. The draft's quality changes only how many tokens are accepted, never what the output looks like. A check on a four-token vocabulary, with $p = (0.50, 0.25, 0.15, 0.10)$ and $q = (0.30, 0.40, 0.20, 0.10)$ and one million proposals, followed by a check of the speed-up formula of the next subsection:
+
+```python
+# The acceptance rule of speculative sampling keeps the target distribution p exactly.
+import numpy as np
+rng = np.random.default_rng(0)
+p = np.array([0.50, 0.25, 0.15, 0.10])         # target model's next-token distribution
+q = np.array([0.30, 0.40, 0.20, 0.10])         # draft model's
+N = 1_000_000
+x = rng.choice(4, N, p=q)                                       # draft proposals
+accept = rng.random(N) < np.minimum(1, p[x] / q[x])             # keep x with probability min(1, p/q)
+resid = np.maximum(p - q, 0); resid /= resid.sum()              # on rejection, sample from (p - q)+
+out = np.where(accept, x, rng.choice(4, N, p=resid))
+print('target p          ', p)
+print('output frequencies', np.bincount(out, minlength=4) / N)
+print(f'acceptance rate {accept.mean():.4f}, sum of min(p, q) = {np.minimum(p, q).sum():.4f}')
+# Expected tokens per target call with k draft tokens accepted independently with probability a.
+for a, k in [(0.6, 4), (0.8, 4), (0.8, 8)]:
+    formula = (1 - a ** (k + 1)) / (1 - a)
+    acc = rng.random((200_000, k)) < a
+    run = np.where(acc.all(1), k, acc.argmin(1))                # accepted prefix length
+    print(f'a = {a}, k = {k}: tokens per target call {formula:.3f} (formula), {(run + 1).mean():.3f} (simulated)')
+```
+
+```console
+$ python3.14 speculative.py
+target p           [0.5  0.25 0.15 0.1 ]
+output frequencies [0.500082 0.249243 0.150372 0.100303]
+acceptance rate 0.7999, sum of min(p, q) = 0.8000
+a = 0.6, k = 4: tokens per target call 2.306 (formula), 2.305 (simulated)
+a = 0.8, k = 4: tokens per target call 3.362 (formula), 3.366 (simulated)
+a = 0.8, k = 8: tokens per target call 4.329 (formula), 4.339 (simulated)
+```
+
+### The expected speed-up
+
+Assume, as Leviathan et al. do, that each drafted token is accepted independently with probability $\alpha$. The number $N$ of accepted drafts satisfies $P(N \ge i) = \alpha^i$ for $i \le k$, and every target pass emits $N + 1$ tokens: the accepted ones plus either the replacement or the extra token. So
+
+$$
+\mathbb E[N + 1] = 1 + \sum_{i=1}^{k} P(N \ge i) = \sum_{i=0}^{k} \alpha^i = \frac{1 - \alpha^{k+1}}{1 - \alpha}.
+$$
+
+If one draft step costs a fraction $c$ of a target step, a round costs $k c + 1$ target steps, and the speed-up over plain decoding is
+
+$$
+\boxed{S = \frac{1 - \alpha^{k+1}}{(1 - \alpha)(k c + 1)}}
+$$
+
+With $\alpha = 0.8$, $k = 4$ and $c = 0.05$, a round emits $(1 - 0.8^5)/0.2 = 3.36$ tokens for 1.2 target steps: $S = 2.80$. With $\alpha = 0.6$ it is $2.31/1.2 = 1.92$; with $\alpha = 0.8$ and $k = 8$, $4.33/1.4 = 3.09$. A simulation of independent acceptances agrees with the formula (3.366 tokens per round for $\alpha = 0.8$, $k = 4$). Real acceptance rates depend on the text: high for code and for text that echoes the prompt, lower for open-ended writing.
+
+### Where it stops paying
+
+The gain assumes that the target's verification pass is nearly free because decode is memory-bound; at large batch sizes the step approaches the compute roof, extra positions are no longer free, and the speed-up shrinks, so engines use speculation mostly at low and medium load. And a separate draft model must share the target's tokenizer and fit in memory beside it. Later methods replace the draft model with extra prediction heads on the target itself, such as Medusa ([Cai et al., 2024](#references)) and EAGLE ([Li et al., 2024](#references)), or with n-grams copied from the prompt. The [GPT note](/notes/nlp/gpt#making-generation-faster) measures the method on a small model pair.
+
+## Metrics: TTFT, TPOT, throughput and goodput
+
+The latency of a streamed answer is not one number. For a request with $m$ output tokens:
+
+- **Time to first token** (TTFT): from the request's arrival to its first output token. It is the queueing time plus the prefill. It decides how responsive a chat feels.
+- **Time per output token** (TPOT): the average gap between output tokens after the first, $(\text{end-to-end latency} - \text{TTFT})/(m - 1)$. The individual gaps are the **inter-token latencies** (ITL), whose distribution shows stalls, such as a long prefill admitted into the batch, that the average hides.
+- **End-to-end latency** $= \text{TTFT} + (m - 1)\cdot\text{TPOT}$. With a TTFT of 200 ms and a TPOT of 20 ms, a 500-token answer takes $0.2 + 499 \cdot 0.02 = 10.2$ s.
+- **Throughput**: output tokens per second over all requests, the number that sets the cost per token.
+- **Goodput**: requests per second that meet the latency objectives for both TTFT and TPOT ([Zhong et al., 2024](#references)). Throughput counts tokens delivered too late to be useful; goodput does not.
+
+Every scheduling choice moves these numbers against each other. Larger batches raise throughput and slow every sequence's steps (TPOT). Admitting new prefills eagerly lowers TTFT and creates ITL spikes for the running sequences; chunked prefill bounds them. Quantization and speculation lower TPOT at a cost in quality or memory. The right configuration is the one that maximizes goodput, or minimizes cost per request, under the product's objectives, which is how the [LLM System Engineering course](#references) frames the choice of a serving configuration and how the [cost note](/notes/mlops/cost-and-efficiency) computes it. As the [observability note](/notes/devops/observability#why-percentiles-cannot-be-averaged) warns, percentiles of these latencies cannot be averaged across replicas; they are computed from histograms.
+
+## Inference engines
+
+An **inference engine** implements the machinery of this note: continuous batching, a paged cache, prefix caching, quantized kernels, speculative decoding, and an HTTP server, usually compatible with the OpenAI API. The main open ones, as of October 2026:
+
+| Engine | Focus | State, October 2026 |
+| --- | --- | --- |
+| **vLLM** | the reference implementation of PagedAttention; continuous batching, automatic prefix caching, many quantization formats and hardware back-ends | 0.32.0, 18 October 2026 |
+| **SGLang** | RadixAttention for prefix reuse, a scheduler tuned for multi-turn and structured outputs, a front-end language for programs of LLM calls | 0.5.22, October 2026 |
+| **TensorRT-LLM** (NVIDIA) | models compiled into optimized engines for NVIDIA GPUs, in-flight (continuous) batching, paged cache, FP8 and FP4 kernels | 1.4.0rc1, 22 October 2026 |
+| **llama.cpp** | C/C++ inference on CPUs, Apple silicon and consumer GPUs, with weights quantized in its GGUF format; a server with continuous batching | continuous builds, b11836 on 23 October 2026 |
+
+vLLM and SGLang are the usual choices on data-centre GPUs and can be hosted by the model servers of the [previous note](/notes/mlops/serving-models#model-servers); TensorRT-LLM gives the highest throughput on NVIDIA hardware at the cost of a compilation step per model and configuration; llama.cpp is the engine for laptops, edge devices and CPU servers. Their relative speed changes from release to release, so published benchmarks are only meaningful for their date, model, hardware and workload.
+
+<aside class="callout"><strong>Check yourself.</strong> (1) Why does increasing the batch size from 1 to 64 barely change the time of a decode step's matrix products on an H100, and why does the attention part not benefit? (2) A model has 40 layers, 8 key–value heads of dimension 128, and stores its cache in 8-bit numbers. How large is the cache of one 8,192-token sequence? (3) In the static-batching example of the figure, what would the second batch's completion times be if request 2 needed 20 steps instead of 9? (4) Why must the residual distribution in speculative decoding be $(p - q)_+$ normalized, rather than $p$? (5) A team adds the current date and time to the first line of its system prompt. What happens to the prefix cache and to the time to first token?<details><summary>Answers</summary>(1) The products read all weights once per step whatever $b$ is, and their arithmetic at $b = 64$ (about 1 ms) is still well under the 4.9 ms of weight reading: the step is memory-bound. Attention reads each sequence's own cache for that sequence's single query, with intensity $H_q/H_{kv}$ regardless of $b$, so its traffic grows with the batch. (2) $2 \cdot 40 \cdot 8 \cdot 128 \cdot 1 = 81{,}920$ bytes per token, times 8,192 tokens: 671 MB. (3) The first batch would run 20 steps, so the second would start at step 20 and finish at 24, 22 and 25: every waiting request pays for the longest one in front of it. (4) Accepted proposals already produce $x$ with probability $\min(p(x), q(x))$; the residual must add exactly the missing mass $p(x) - \min(p(x), q(x)) = (p(x) - q(x))_+$. Sampling from $p$ after a rejection would over-produce tokens the draft already proposes often. (5) Every request's first block differs, and since a block matches only with all of its prefix, nothing after it matches either: the cache never hits, and every request pays the full prefill again.</details></aside>
+
+## What changed
+
+| | One request at a time, or padded static batches (the baseline) | An inference engine |
+| --- | --- | --- |
+| Decode step | reads 16.4 GB of weights for one token | reads them once for every sequence in the batch |
+| When a sequence ends | its slot computes padding until the batch ends | it leaves at once, and a waiting request takes the slot |
+| New requests | wait for the whole batch | join at the next iteration |
+| Cache memory | reserved for the maximum length; 20–38% used | allocated in blocks on demand; about 96% used |
+| Shared prompts | recomputed for every request | cached by block and reused |
+| Tokens per pass of the large model | one | several, with speculative decoding, from the same distribution |
+| Latency reported | one number | TTFT, TPOT and ITL, throughput, goodput |
+| In the simulation | about 940 output tokens per second at most | 3,265 tokens per second at 14 requests per second, median TTFT 0.5 s |
+
+## Limitations
+
+- **Bounds are not measurements.** The step times here are lower bounds from bandwidth and peak arithmetic. Real kernels reach a fraction of either peak, and the gap depends on the engine, the model and the batch.
+- **The cache dominates long contexts.** Paging removes fragmentation, not size: a long-context workload still fits few sequences per GPU, and techniques that shrink the cache itself (grouped-query attention, cache quantization, attention over a window) change the model or its accuracy.
+- **Speculation pays only when decode is memory-bound,** and its gain depends on the acceptance rate of the actual traffic.
+- **Preemption and fairness.** A scheduler that admits greedily can evict and recompute long requests repeatedly under load; engines offer priorities and policies, but none is right for every workload.
+- **Fast-moving.** Engines release every few weeks, and their features and relative speed change; the versions here are those of October 2026.
+
+## What you should remember
+
+- Prefill processes the prompt in one pass with intensity about $n$ and is compute-bound; decode produces one token per pass with intensity about $b$ for the weights and $H_q/H_{kv}$ for attention, and is memory-bound. TTFT comes from queueing and prefill, TPOT from decode.
+- The KV cache takes $2 \cdot L \cdot H_{kv} \cdot d_h \cdot s$ bytes per token: 144 KiB for Qwen3-8B in BF16, so an 80 GB H100 holds about 374,000 tokens of cache next to the weights. The cache caps the batch, and the batch sets the throughput.
+- Continuous batching (Orca) schedules every iteration: finished sequences leave, waiting ones join. In the simulation it served 3.5 times the load of static batching.
+- PagedAttention stores the cache in blocks through a block table, wasting at most one partial block per sequence, sharing blocks copy-on-write and allowing preemption.
+- Prefix caching reuses the cache of identical prefixes; put the stable part of a prompt first.
+- Speculative decoding accepts a drafted token with probability $\min(1, p/q)$ and resamples from $(p - q)_+$ on rejection, which preserves $p$ exactly; the speed-up is $(1 - \alpha^{k+1}) / ((1 - \alpha)(k c + 1))$.
+- Judge a configuration by goodput under TTFT and TPOT objectives, not by throughput alone. vLLM, SGLang, TensorRT-LLM and llama.cpp are the main engines of 2026.
+
+## Example
+
+The program simulates an engine one iteration at a time, with two schedulers. Each iteration costs 5.0 ms to read the weights of Qwen3-8B (16.4 GB at 3.35 TB/s is 4.9 ms, rounded up), 0.044 µs per token of cache read (147,456 bytes at 3.35 TB/s), and 0.033 ms per prompt token prefilled (the $2P$ operations of a token at half the H100's peak). At most 32 sequences run at once, well below the 182 sequences of 2,048 tokens that the cache could hold, so memory never binds. Requests arrive as a Poisson process with prompt lengths around 500 tokens and output lengths around 150, both log-normal, as in chat traffic. Static batching admits requests only when the running batch is empty; continuous batching admits into any free slot at every iteration.
+
+```python
+# Static against continuous batching for an LLM, simulated one engine iteration at a time.
+# Cost model of one iteration (Qwen3-8B in bf16 on one H100 SXM, bandwidth and compute bounds, see the text):
+#   5.0 ms to read the weights + 0.044 us per cached token read + 0.033 ms per prompt token prefilled.
+import numpy as np
+
+T_WEIGHTS, T_KV, T_PREFILL = 5.0, 0.044e-3, 0.033            # milliseconds
+SLOTS, N_REQ = 32, 4_000
+
+def workload(rate, seed=1):
+    rng = np.random.default_rng(seed)
+    arrive = np.cumsum(rng.exponential(1000.0 / rate, N_REQ))                       # ms
+    prompt = np.clip(rng.lognormal(np.log(500), 0.8, N_REQ), 20, 4000).astype(int)
+    output = np.clip(rng.lognormal(np.log(150), 1.0, N_REQ), 5, 2000).astype(int)
+    return arrive, prompt, output
+
+def run(rate, continuous):
+    arrive, prompt, output = workload(rate)
+    first = np.full(N_REQ, np.nan); finish = np.full(N_REQ, np.nan)
+    t, nxt, running, made, slots_used = 0.0, 0, [], np.zeros(N_REQ, int), []
+    while nxt < N_REQ or running:
+        if not running and nxt < N_REQ:
+            t = max(t, arrive[nxt])                     # idle: wait for the next request
+        new = []
+        # static: admit only when the whole batch has finished; continuous: admit into any free slot
+        if continuous or not running:
+            while nxt < N_REQ and arrive[nxt] <= t and len(running) + len(new) < SLOTS:
+                new.append(nxt); nxt += 1
+        running += new
+        ctx = sum(prompt[i] + made[i] for i in running)
+        step = T_WEIGHTS + T_KV * ctx + T_PREFILL * sum(prompt[i] for i in new)
+        t += step
+        slots_used.append(sum(1 for i in running if made[i] < output[i]))
+        for i in running:
+            if made[i] < output[i]:
+                made[i] += 1
+                if made[i] == 1: first[i] = t
+                if made[i] == output[i]: finish[i] = t
+        # static: a finished sequence keeps its slot until the longest one in the batch ends
+        running = [i for i in running if made[i] < output[i]] if continuous else \
+                  ([] if all(made[i] >= output[i] for i in running) else running)
+    ttft, e2e = first - arrive, finish - arrive
+    tpot = (finish - first) / np.maximum(output - 1, 1)
+    return dict(tput=output.sum() / (finish.max() - arrive[0]) * 1000, ttft50=np.median(ttft), ttft99=np.percentile(ttft, 99),
+                e2e50=np.median(e2e) / 1000, e2e99=np.percentile(e2e, 99) / 1000, tpot=np.median(tpot), busy=np.mean(slots_used))
+
+arrive, prompt, output = workload(1)
+print(f'{N_REQ} requests; prompt tokens median {np.median(prompt):.0f}, output tokens median {np.median(output):.0f}, mean {output.mean():.0f}, max {output.max()}')
+print('rate/s  batching     tokens/s  TTFT p50  TTFT p99   E2E p50  E2E p99  TPOT p50  slots busy')
+for rate in [2, 6, 10, 14]:
+    for cont in [False, True]:
+        r = run(rate, cont)
+        print(f'{rate:6d}  {"continuous" if cont else "static    "}  {r["tput"]:8.0f}  {r["ttft50"]:6.0f} ms {r["ttft99"]:7.0f} ms  {r["e2e50"]:6.1f} s {r["e2e99"]:6.1f} s  {r["tpot"]:5.1f} ms  {r["busy"]:6.1f}')
+```
+
+```console
+$ python3.14 scheduler.py
+4000 requests; prompt tokens median 498, output tokens median 148, mean 236, max 2000
+rate/s  batching     tokens/s  TTFT p50  TTFT p99   E2E p50  E2E p99  TPOT p50  slots busy
+     2  static           477    2147 ms   10805 ms     3.3 s   12.7 s    5.3 ms     2.7
+     2  continuous       477      25 ms     115 ms     0.8 s    7.6 s    5.3 ms     2.8
+     6  static           937  177099 ms  342718 ms   180.0 s  343.8 s    6.0 ms     6.4
+     6  continuous      1429      27 ms     131 ms     1.0 s    8.7 s    6.2 ms     8.9
+    10  static           941  302926 ms  604272 ms   305.8 s  605.0 s    6.0 ms     6.4
+    10  continuous      2363      31 ms     153 ms     1.1 s   10.5 s    7.3 ms    17.3
+    14  static           937  360599 ms  717582 ms   362.1 s  722.8 s    6.0 ms     6.4
+    14  continuous      3265     539 ms    3953 ms     2.4 s   13.6 s    9.0 ms    29.2
+```
+
+- **The workload.** The mean output (236 tokens) is well above the median (148) because a few requests are long, up to the cap of 2,000. Such a tail is what makes static batching slow: a batch of 32 almost always contains one long request.
+- **At 2 requests per second** both schedulers keep up, so they deliver the same 477 tokens per second, the offered load. But static batching makes a request that arrives during a batch wait for it: a median time to first token of 2.1 s against 25 ms.
+- **At 6 requests per second and above** static batching is saturated at about 940 tokens per second: the queue grows for the whole run, and the latencies (three to six minutes) measure only how long the run lasted. The column "slots busy" explains why: of up to 32 sequences in a batch, on average 6.4 are still generating, and the rest wait for the longest.
+- **Continuous batching** keeps up with the load at every rate shown, its throughput equal to the offered tokens. Its median time per output token grows from 5.3 to 9.0 ms as the batch grows from 3 to 29 sequences: the weights are read once per step for all of them, while the cache reads and the prefills added to each step grow with the batch. At 14 requests per second it nears its own limit, and queueing appears in the time to first token: 0.5 s at the median, 4 s at the p99.
+- **What the model leaves out.** The 32-sequence cap stands in for the memory limit, which a paged engine applies by blocks; a prefill is charged in one iteration, so a long prompt stalls the other sequences for that iteration, which chunked prefill would spread; and every number is a bound from bandwidth and peak arithmetic. The comparison between the policies, not the absolute numbers, is the result.
+
+## Next
+
+An engine and a model server can now serve a model, a classifier or an LLM, within a latency budget. The next question is how a new version of that model reaches users. A new model can fail in ways that a code change does not: it returns well-formed answers that are worse, sometimes only for some users, sometimes only by a fraction of a percent. The [next note](/notes/mlops/rolling-out-models) adapts the canaries of the DevOps course to models and adds shadow deployments, A/B tests sized in advance, and interleaving.
+
+## References
+
+- HSE University and Yandex School of Data Analysis. M. Ryabinin et al. [*Efficient Deep Learning Systems*](https://github.com/mryab/efficient-dl-systems) (2026): inference systems: KV cache, continuous batching, PagedAttention, FlashAttention, speculative decoding, quantization.
+- HSE University. [*LLM System Engineering*](https://github.com/xufana/llm-system-engineering) (2026): inference engines; choosing a serving configuration on the quality–latency–cost frontier.
+- HSE University. *Введение в MLOps* (master's programme «Машинное обучение в цифровом продукте», 2025/26): LLMOps basics.
+- C. Huyen. *AI Engineering*. O'Reilly, 2025. Chapter 9: inference optimization. And *Designing Machine Learning Systems*. O'Reilly, 2022, chapter 7.
+- G.-I. Yu, J. S. Jeong, G.-W. Kim, S. Kim, B.-G. Chun. [Orca: A Distributed Serving System for Transformer-Based Generative Models](https://www.usenix.org/conference/osdi22/presentation/yu). OSDI 2022: iteration-level scheduling and selective batching.
+- W. Kwon, Z. Li, S. Zhuang, Y. Sheng, L. Zheng, C. H. Yu, J. E. Gonzalez, H. Zhang, I. Stoica. [Efficient Memory Management for Large Language Model Serving with PagedAttention](https://arxiv.org/abs/2309.06180). SOSP 2023.
+- L. Zheng, L. Yin, Z. Xie, C. Sun, J. Huang, C. H. Yu, S. Cao, C. Kozyrakis, I. Stoica, J. E. Gonzalez, C. Barrett, Y. Sheng. [SGLang: Efficient Execution of Structured Language Model Programs](https://arxiv.org/abs/2312.07104). NeurIPS 2024 (RadixAttention).
+- A. Agrawal, N. Kedia, A. Panwar, J. Mohan, N. Kwatra, B. S. Gulavani, A. Tumanov, R. Ramjee. [Taming Throughput-Latency Tradeoff in LLM Inference with Sarathi-Serve](https://arxiv.org/abs/2403.02310). OSDI 2024 (chunked prefill).
+- Y. Zhong, S. Liu, J. Chen, J. Hu, Y. Zhu, X. Liu, X. Jin, H. Zhang. [DistServe: Disaggregating Prefill and Decoding for Goodput-optimized Large Language Model Serving](https://arxiv.org/abs/2401.09670). OSDI 2024 (goodput, disaggregation).
+- Y. Leviathan, M. Kalman, Y. Matias. [Fast Inference from Transformers via Speculative Decoding](https://arxiv.org/abs/2211.17192). ICML 2023. Section 3: the expected number of tokens per iteration and the speed-up.
+- C. Chen, S. Borgeaud, G. Irving, J.-B. Lespiau, L. Sifre, J. Jumper. [Accelerating Large Language Model Decoding with Speculative Sampling](https://arxiv.org/abs/2302.01318). 2023. Theorem 1: the modified rejection sampling recovers the target distribution.
+- T. Cai, Y. Li, Z. Geng, H. Peng, J. D. Lee, D. Chen, T. Dao. [Medusa: Simple LLM Inference Acceleration Framework with Multiple Decoding Heads](https://arxiv.org/abs/2401.10774). ICML 2024.
+- Y. Li, F. Wei, C. Zhang, H. Zhang. [EAGLE: Speculative Sampling Requires Rethinking Feature Uncertainty](https://arxiv.org/abs/2401.15077). ICML 2024.
+- J. Ainslie, J. Lee-Thorp, M. de Jong, Y. Zemlyanskiy, F. Lebrón, S. Sanghai. [GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints](https://arxiv.org/abs/2305.13245). EMNLP 2023.
+- Qwen Team. [Qwen3-8B model card and `config.json`](https://huggingface.co/Qwen/Qwen3-8B), Hugging Face Hub, 2025 (accessed October 2026); [Qwen3 Technical Report](https://arxiv.org/abs/2505.09388), 2025.
+- NVIDIA. [H100 Tensor Core GPU datasheet](https://www.nvidia.com/en-us/data-center/h100/) (H100 SXM: 80 GB HBM3, 3.35 TB/s, 989 TFLOP/s dense BF16).
+- S. Williams, A. Waterman, D. Patterson. [Roofline: An Insightful Visual Performance Model for Multicore Architectures](https://doi.org/10.1145/1498765.1498785). Communications of the ACM 52(4), 2009.
+- vLLM documentation: [Automatic prefix caching](https://docs.vllm.ai/en/latest/design/prefix_caching.html), [engine arguments](https://docs.vllm.ai/en/latest/configuration/engine_args.html) (`gpu_memory_utilization`, default 0.92); [releases](https://github.com/vllm-project/vllm/releases) (0.32.0, October 2026).
+- [SGLang releases](https://github.com/sgl-project/sglang/releases) (0.5.22, October 2026); [TensorRT-LLM releases](https://github.com/NVIDIA/TensorRT-LLM/releases) (1.4.0rc1, October 2026); [llama.cpp releases](https://github.com/ggml-org/llama.cpp/releases) (b11836, October 2026).

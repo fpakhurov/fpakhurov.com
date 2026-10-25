@@ -1,0 +1,341 @@
+---
+title: Cost and efficiency of ML systems
+section: Responsibility and Cost
+description: "Where the money of an ML system goes and how to spend less: training against inference, GPU utilization and MFU, latency–cost Pareto fronts, choosing a serving configuration, spot capacity and scaling to zero, the cost of an LLM request, and its energy."
+course: mlops
+order: 15
+status: published
+tags: [cost, efficiency, unit-economics, mfu, gpu-utilization, pareto-front, serving-configuration, quantization, batching, tensor-parallelism, spot-instances, checkpointing, autoscaling, scale-to-zero, energy, carbon]
+prerequisites: [Distributed training, Serving models, LLM inference systems]
+---
+
+import CostFront from '../../../components/figures/cost-and-efficiency/CostFront.astro';
+
+The [previous note](/notes/mlops/responsible-ml) asked what a model owes the people it affects. The last obligation is to the people who pay for it: a model must cost less than the value it creates, and in 2026 the bill of an ML system is often its largest line after salaries. Training a large model takes thousands of GPUs for weeks; serving it can cost more over its life; and the same model can cost twenty or sixty times more per request depending on choices that have nothing to do with its quality. This note does the arithmetic: where the money goes, what "utilization" should mean, how latency and cost trade against each other on a Pareto front, how to choose a serving configuration, how to use interruptible and elastic capacity, what one LLM request costs, and what it costs the environment. It ends with the course in one paragraph.
+
+**Conventions.** Hardware numbers are datasheet values: an NVIDIA H100 SXM has 80 GB of memory at 3.35 TB/s and 989 TFLOP/s of dense BF16 arithmetic (1,979 in FP8); an A100 80 GB has 2.04 TB/s and 312 TFLOP/s; an L4 has 24 GB at 300 GB/s and 121 TFLOP/s (242 in FP8). GPU prices are illustrative round numbers, \$3, \$2 and \$0.80 per GPU-hour, not quotes: real prices vary by provider, region, commitment and month. The [Example](#example) is a cost model in Python (3.14.7, 23 October 2026); nothing here ran on a GPU. **Notation.** $N$ is the number of parameters, $D$ the number of training tokens, $F$ a GPU's peak arithmetic rate, $B$ its memory bandwidth, $g$ the GPUs per replica, $k$ the batch size, $\lambda$ the load in requests per second.
+
+## Baseline: the biggest model, one request at a time
+
+The first deployment of a language model often looks like this: the 70 B-parameter model because it scored best, in its original 16-bit weights, on the two GPUs it needs to fit, answering one request at a time because batching was not set up. The cost model of the Example prices it at 34.5 ms per output token and **\$21.00 per 1,000 requests** at 20 requests a second, with the GPUs doing 0.21 % of the arithmetic they could. The cheapest configuration of the same model that meets a 50 ms per-token objective costs \$0.333 per 1,000 requests, 63 times less; a smaller model, if the evaluation says it suffices, costs \$0.042. None of these differences shows up on a dashboard that says the GPUs are 100 % busy.
+
+<aside class="callout"><strong>Key idea.</strong> Cost per unit of useful work, per request, per token, per trained model, is a quantity the system's design determines and arithmetic predicts. It is set by how much of the hardware's arithmetic and bandwidth the work actually uses (MFU for training, cost per token at the latency objective for serving), by how full the machines are, and by the price of the capacity. Choose the configuration from a Pareto front of latency and cost among the options whose quality passes evaluation, and measure it afterwards.</aside>
+
+## Where the money goes: training against inference
+
+**Training** a dense Transformer takes about $6ND$ floating-point operations: $2N$ per token for the forward pass and $4N$ for the backward pass ([Scaling laws](/notes/nlp/scaling-laws#what-is-counted-parameters-tokens-and-compute)). At a model FLOPs utilization $u$ (defined in the next section) on GPUs of peak $F$, the GPU-time is $6ND / (uF)$. For an 8 B-parameter model on $2 \times 10^{12}$ tokens, at $u = 0.4$ on H100s:
+
+$$
+\begin{aligned}
+6ND &= 6 \times 8 \times 10^{9} \times 2 \times 10^{12} = 9.6 \times 10^{22} \ \text{FLOPs}, \\
+\text{GPU-time} &= \frac{9.6 \times 10^{22}}{0.4 \times 989 \times 10^{12}} = 2.43 \times 10^{8} \ \text{s} = 67{,}400 \ \text{GPU-hours},
+\end{aligned}
+$$
+
+\$202,000 at \$3 an hour, or 5.5 days on 512 GPUs. That is one final run. The experiments, ablations, failed runs and evaluations around it usually cost a multiple of it.
+
+**Inference** takes about $2N$ operations per token processed, and it never stops. Served at 20 requests a second of 1,250 tokens each, the same model processes $7.9 \times 10^{11}$ tokens a year: 13 % of its training compute, about \$26,000 a year at the Example's \$0.042 per 1,000 requests. At 1,000 requests a second it processes $3.9 \times 10^{13}$ tokens, 6.6 times its training compute, for about \$1.3 million a year. Which of the two dominates is a question of traffic, and for products with many users the answer is inference. Across Google's ML workloads in 2019–2021, which stayed below 15 % of the company's energy use, about three fifths of the ML energy went to inference and two fifths to training ([Patterson et al., 2022](#references)). This is also why a model that is smaller than compute-optimal but trained on more tokens can be the cheaper choice overall, the argument of [Compute-optimal is not inference-optimal](/notes/nlp/scaling-laws#compute-optimal-is-not-inference-optimal).
+
+The rest of the bill is easy to forget: storage of datasets, checkpoints and logs; data movement and egress, which the [cloud note](/notes/devops/cloud-building-blocks#cost-on-demand-reserved-spot-and-egress) prices; evaluation, including the model-judge calls of [LLMOps](/notes/mlops/llmops#a-model-as-judge-at-the-gate); idle capacity kept for peaks; and the engineers, whose time is usually the largest cost of all.
+
+## GPU utilization and MFU
+
+The utilization that `nvidia-smi` reports is the share of time during which some kernel was running, and a GPU can be "100 % utilized" while doing 1 % of the arithmetic it could, as the [serving note](/notes/mlops/serving-models#hardware-cpu-gpu-and-what-utilization-means) shows. The quantity that measures how well expensive hardware is used is **model FLOPs utilization** ([Chowdhery et al., 2022](#references)):
+
+$$
+\boxed{\;\text{MFU} = \frac{\text{FLOPs the model needs per second of work}}{\text{peak FLOPs of the hardware}} = \frac{6N \cdot \text{tokens per second}}{n_{\text{GPU}} \cdot F}\;} \quad \text{(training)}.
+$$
+
+The numerator counts only the operations the model requires, not the ones an implementation chooses to do. **Hardware FLOPs utilization** (HFU) also counts recomputed operations, such as those of [gradient checkpointing](/notes/mlops/distributed-training#gradient-checkpointing), so HFU ≥ MFU, and only MFU compares implementations fairly.
+
+**On published numbers.** PaLM 540B trained at 238,300 tokens per second on 6,144 TPU v4 chips of 275 TFLOP/s each:
+
+$$
+\text{MFU} = \frac{6 \times 540 \times 10^{9} \times 238{,}300}{6{,}144 \times 275 \times 10^{12}} = \frac{7.72 \times 10^{17}}{1.69 \times 10^{18}} = 45.7\,\%,
+$$
+
+46.2 % when the attention operations are counted too, with an HFU of 57.8 %; the same paper puts GPT-3's training at 21.3 % ([Chowdhery et al., 2022](#references), Table 3). Llama 3 405B trained at 38–43 % BF16 MFU on 8,192 and 16,384 H100s ([Dubey et al., 2024](#references), Table 4). For one's own run the formula works backwards: an 8 B model on H100s at 3,300 tokens per second per GPU is at $6 \times 8 \times 10^9 \times 3{,}300 / 989 \times 10^{12} = 16\,\%$ MFU, and 40 % would mean 8,240 tokens per second per GPU. A low MFU in training usually means a small per-GPU batch, communication that is not overlapped with computation (the all-reduce of [Distributed training](/notes/mlops/distributed-training#the-cost-of-all-reduce)), a data loader that starves the GPUs, or kernels that are not fused.
+
+**Decoding is a different regime.** Each step of generation reads all the weights to produce one token per sequence, so at small batches it is limited by memory bandwidth, not arithmetic ([Prefill and decode](/notes/mlops/llm-inference-systems#prefill-and-decode)). An 8 B model in 16-bit weights on an H100 can produce at most $3.35 \times 10^{12} / (16 \times 10^{9}) = 209$ tokens per second at batch size 1, an MFU of $2 \times 8 \times 10^9 \times 209 / 989 \times 10^{12} = 0.34\,\%$. Batching raises it: in the Example, 0.21 % for the 70 B model at batch 1, 10.9 % for the 8 B model in FP8 at batch 256, 16.6 % for the 70 B model in FP8 on eight GPUs at batch 256. Serving rarely reaches the MFU of training, and it does not need to: the target for serving is the lowest cost per request within the latency objective, which the next section computes.
+
+## Throughput, latency and cost
+
+The Example models one decode step of a batch of $k$ sequences on a replica of $g$ GPUs as the longer of two times, reading the weights and the key–value caches, and doing the arithmetic, plus a fixed overhead:
+
+$$
+t_{\text{step}}(k) = \max\!\left(\frac{W + k\, c\, m_{\text{kv}}}{\eta_B\, g B},\ \frac{2Nk}{\eta_F\, g F}\right) + t_0 ,
+$$
+
+where $W$ is the size of the weights ($N$ times 2, 1 or 0.53 bytes for BF16, FP8 or 4-bit with group scales), $c$ the mean context length, $m_{\text{kv}}$ the cache per token ([its size](/notes/mlops/llm-inference-systems#the-kv-cache-how-large-it-is)), $\eta_B = 0.8$ and $\eta_F = 0.5$ the achievable shares of bandwidth and arithmetic, and $t_0$ 2 ms of scheduling and launch overhead plus two all-reduces per layer when $g > 1$. The time per output token, TPOT, is $t_{\text{step}}$. A request with $n_{\text{in}}$ input and $n_{\text{out}}$ output tokens occupies the replica for
+
+$$
+s = \underbrace{\frac{2N n_{\text{in}}}{\eta_F\, g F}}_{\text{prefill}} + \underbrace{\frac{n_{\text{out}}\, t_{\text{step}}(k)}{k}}_{\text{its share of the decode steps}}
+$$
+
+seconds. By Little's law, a load of $\lambda$ requests per second keeps $\lambda s$ replicas busy on average; to keep queueing delay small, each replica is held below 70 % busy, the reasoning of [Latency against utilization](/notes/devops/resilience-and-capacity#latency-against-utilization), so the fleet has $r = \lceil \lambda s / 0.7 \rceil$ replicas and costs
+
+$$
+\boxed{\;\text{cost per request} = \frac{r \cdot g \cdot \text{price per GPU-hour}}{3600\, \lambda}\;}.
+$$
+
+Larger batches lower $s$ and raise TPOT; fewer bits per weight shrink $W$ and leave memory for more sequences, the trade-off worked out for one GPU in [Quantization](/notes/nlp/quantization#worked-example-a-7-b-model-on-one-gpu); more GPUs per replica divide the memory term and add communication.
+
+### One request, priced
+
+The cheapest configuration of the 70 B model within 50 ms per token, at 20 requests a second of 1,000 input and 250 output tokens, is FP8 weights on 8 H100s with batches of up to 256. Its numbers, from the Example:
+
+$$
+\begin{aligned}
+\text{prefill} &= \frac{2 \times 70.6 \times 10^{9} \times 1{,}000}{0.5 \times 8 \times 0.9 \times 1{,}979 \times 10^{12}} = 19.8 \ \text{ms}, \\
+\text{decode share} &= \frac{250 \times 13.7 \ \text{ms}}{256} = 13.4 \ \text{ms}, \qquad s = 33.2 \ \text{ms of the 8-GPU replica}, \\
+\lambda s &= 20 \times 0.0332 = 0.66 \ \Rightarrow\ r = 1 \text{ replica, } 66\,\% \text{ busy}, \\
+\text{cost per request} &= \frac{1 \times 8 \times 3}{3600 \times 20} = 0.000333 \ \text{dollars, or 0.333 dollars per 1,000 requests}.
+\end{aligned}
+$$
+
+The 0.9 in the prefill is the efficiency of splitting the work over eight GPUs. The prefill takes more GPU time than the 250 output tokens, because a thousand input tokens are a thousand times $2N$ operations even though they run at full arithmetic speed; long prompts, such as those of [RAG](/notes/nlp/rag) and agents, are paid for in prefill, which is why prompt caching ([LLMOps](/notes/mlops/llmops#caching)) saves so much. Per token, the request costs $0.000333 / 1{,}250 = 2.7 \times 10^{-7}$ dollars, 27 cents per million tokens, all overheads of the model included but none of the people. A hosted API for a model of this class priced at an illustrative \$0.60 per million input and output tokens would charge $1{,}250 \times 0.60 / 10^6 = 0.00075$ dollars, \$0.75 per 1,000 requests: more than the self-hosted fleet at 20 requests a second, less than it at 0.5, where the fleet sits mostly idle (\$1.11 per 1,000, below). Self-hosting pays only with enough steady traffic, and only if engineering time is free.
+
+## Choosing a serving configuration
+
+<CostFront />
+
+Each dot is one configuration that fits in memory: model size, precision, GPU type, GPUs per replica, batch cap. A configuration is on the **Pareto front** if no other is at least as fast and at least as cheap; the step lines join the fronts of the two models. Reading the figure:
+
+- **Most configurations are far from the front.** The 70 B model's dots span from \$0.33 to \$56 per 1,000 requests, a factor of 170, and the baseline sits in the middle of the cloud.
+- **Lower latency costs more, steeply.** From 13.7 down to 7.2 ms per token the 70 B front climbs from \$0.333 to \$17.67: small batches on eight GPUs buy speed by idling most of their arithmetic.
+- **The front is a staircase.** Costs come in whole replicas, so a configuration that needs 1.01 replicas costs twice one that needs 0.99.
+- **Quality is a third axis.** The 8 B front lies far below the 70 B one; whether the cheaper model or a 4-bit version of the larger one is good enough is a question for the [evaluation suite](/notes/mlops/llmops#evaluation-sets-and-evaluation-in-ci), not for the cost model. The Pareto front of an LLM system is really over quality, latency and cost, and the procedure below handles the third axis by filtering first ([HSE, 2026](#references)).
+
+A procedure that follows the framing of the HSE course on LLM systems engineering:
+
+1. **Fix the quality floor.** Evaluate the candidate models and precisions on the product's evaluation set; keep those that pass. Quantization is a different model, as [Quantization](/notes/nlp/quantization#weight-only-quantization-for-large-language-models) shows; it needs its own evaluation.
+2. **Fix the latency objectives**: TTFT and TPOT at a percentile, the [metrics](/notes/mlops/llm-inference-systems#metrics-ttft-tpot-throughput-and-goodput) of the inference note. Here, 50 ms per output token.
+3. **Fix the load profile**: requests per second at peak and on average, and the lengths of inputs and outputs.
+4. **Enumerate and prune**: compute the front with a model like the Example's, and take the cheapest configuration within the objectives.
+5. **Measure it**, with the real engine and the real traffic shape, before committing: the cost model has constants ($\eta_B$, $\eta_F$, $t_0$) that only a benchmark can fix, and goodput, not throughput, is what has to hold.
+
+The load changes the answer. The cheapest configuration within 50 ms per token, by load, from the Example:
+
+| load, requests per second | 8 B | 70 B |
+| --- | --- | --- |
+| 0.5 | 4-bit, 1 × L4, batch ≤ 16: \$0.444 | 4-bit, 1 × A100, batch ≤ 16: \$1.111 |
+| 5 | 4-bit, 1 × A100, batch ≤ 256: \$0.111 | 4-bit, 1 × H100, batch ≤ 64: \$0.500 |
+| 20 | FP8, 1 × H100, batch ≤ 256: \$0.042 | FP8, 8 × H100, batch ≤ 256: \$0.333 |
+| 100 | FP8, 1 × H100, batch ≤ 256: \$0.042 | FP8, 4 × H100, batch ≤ 256: \$0.300 |
+
+(dollars per 1,000 requests). At low load the cheapest GPU that fits wins, because one replica is mostly idle whatever it is; at high load the GPU with the most bandwidth and arithmetic per dollar wins, because every replica is full. A team whose traffic grows from 0.5 to 20 requests a second should expect to change hardware, not only to add replicas.
+
+## Spot and reserved capacity
+
+The pricing shapes of the cloud, reserved capacity for the base load, on-demand for the peaks, spot capacity for work that can be interrupted, are those of [Cloud building blocks](/notes/devops/cloud-building-blocks#cost-on-demand-reserved-spot-and-egress). What is specific to ML is the work that tolerates interruption.
+
+**Training on spot GPUs** is interruptible if it checkpoints. Writing a checkpoint takes time $\delta$, and an interruption loses the work done since the last checkpoint. With checkpoints every $\tau$ and interruptions arriving at random, on average every $M$, the waste per unit of time is approximately
+
+$$
+\begin{aligned}
+\text{waste}(\tau) &\approx \frac{\delta}{\tau} + \frac{\tau}{2M} && \text{checkpoint overhead, plus half an interval lost per interruption,} \\
+\frac{d\,\text{waste}}{d\tau} &= -\frac{\delta}{\tau^2} + \frac{1}{2M} = 0 \ \Rightarrow\ \boxed{\,\tau^* = \sqrt{2\,\delta\, M}\,},
+\end{aligned}
+$$
+
+Young's approximation ([Young, 1974](#references)), valid when $\delta \ll \tau \ll M$. The training state of an 8 B model with mixed-precision Adam is 16 bytes per parameter ([Where the memory goes](/notes/mlops/distributed-training#where-the-memory-goes)), 128 GB, which at 2 GB/s takes about a minute to write. With interruptions every four hours on average, $\tau^* = \sqrt{2 \times 1 \times 240} = 21.9$ minutes and the waste is $1/21.9 + 21.9/480 = 9.1\,\%$. If spot capacity costs 35 % of the on-demand price, the effective price is $0.35 / (1 - 0.091) = 0.385$ of on-demand: interruptions cost 9 % of the time and still save 61 % of the money. The restarts themselves must be automatic, and the data loader must resume where it stopped, or a restart repeats data.
+
+**Inference** has two kinds of work. Online serving needs capacity when users arrive: reserve the base load, add on-demand replicas for the peaks, and keep spot capacity for what can wait. Batch inference, scoring a table overnight or embedding a corpus, can wait, and runs well on spot capacity with the same checkpointing logic applied to partitions of the input, the idempotent tasks of [Data pipelines](/notes/mlops/data-pipelines#idempotent-tasks-over-date-partitions).
+
+## Autoscaling and scaling to zero
+
+A model service scales on the signal that measures its saturation. CPU utilization is the wrong one for a GPU server; the queue length, the number of requests in flight per replica, or the KV-cache occupancy reported by the engine are the right ones, fed to the [Horizontal Pod Autoscaler](/notes/devops/kubernetes-in-practice#autoscaling-the-hpa-and-the-cluster-autoscaler) or to KServe's autoscaler. Scaling is slow for large models, because a new replica must be scheduled on a GPU node (which may itself have to be created), pull its image and load its weights: 70.6 GB of FP8 weights read at 2 GB/s take 35 seconds before any warm-up. Autoscaling therefore keeps a margin, the 70 % of the cost model, rather than adding replicas at the moment of need.
+
+**Scaling to zero** removes the last replica when there is no traffic, which KServe and Knative support. An H100 kept warm costs \$72 a day at \$3 an hour; an internal tool used for two hours a day pays \$6 if it scales to zero, and its first user after a quiet period waits for a cold start: the image, the weights (4 s for an 8 B model in FP8 at 2 GB/s) and the engine's warm-up, tens of seconds in all. It suits development environments, internal tools and rarely used models; a product with a latency objective keeps at least one replica warm, or sends cold requests to a hosted API while the replica starts, a fallback in the sense of the [serving note](/notes/mlops/serving-models#fallbacks).
+
+## The environmental cost
+
+Energy follows the same arithmetic as money, with watts in place of dollars. An H100 draws at most 700 W. The 70 B configuration above holds 8 GPUs for 33.2 ms per request, $8 \times 700 \times 0.0332 = 186$ J, 0.052 Wh at full power, an upper bound for the GPUs alone. Hosts, networking, cooling and idle capacity add to it; with a data-centre overhead (PUE) of 1.1 and hosts adding half again, an assumption for the arithmetic, it is about 0.09 Wh. Google reported in August 2025 that the median text prompt of its Gemini apps used 0.24 Wh, counting active accelerators, host machines, idle capacity and data-centre overhead, and reported a 33-fold reduction in energy per median prompt over the preceding twelve months, from software efficiency and hardware ([Elsworth et al., 2025](#references)). Per request the numbers are small; multiplied by billions of requests a day they are not.
+
+Training is concentrated rather than spread out. GPT-3's training was estimated at 1,287 MWh and 552 tonnes of CO₂-equivalent ([Patterson et al., 2021](#references)); BLOOM, a 176 B-parameter model trained in France on a low-carbon grid, used 433 MWh and emitted about 24.7 tonnes counting only the electricity of training and 50.5 tonnes counting equipment manufacture, idle power and the rest of its life cycle ([Luccioni, Viguier and Ligozat, 2023](#references)). The comparison shows the main lever after efficiency: the same energy emits five to ten times more in some places and hours than others ([Patterson et al., 2021](#references)). At the scale of the industry, data centres used about 415 TWh in 2024, around 1.5 % of the world's electricity, and the IEA projects about 945 TWh by 2030, with AI as the largest driver of growth ([IEA, 2025](#references)). The accounting began with [Strubell, Ganesh and McCallum (2019)](#references), who asked that papers report the energy and cost of training.
+
+What lowers the money lowers the energy: higher utilization, batching, quantization, smaller models where they suffice, caching and routing. Two levers are specific to energy: choosing where and when to run the jobs that can move, and reporting energy and emissions alongside accuracy.
+
+<aside class="callout"><strong>Check yourself.</strong> (1) A team trains a 3 B-parameter model on $6 \times 10^{11}$ tokens on 64 H100s and measures 7,000 tokens per second per GPU. What is the MFU, and how long does the run take? (2) In the cost model, a configuration needs 0.72 replicas' worth of busy time at its load. How many replicas does the fleet have, and how busy is each? (3) A training job writes a 4-minute checkpoint and loses its spot capacity on average every 6 hours. What checkpoint interval minimizes waste, and how much time is wasted? (4) Why does the cheapest 8 B configuration change from an L4 at 0.5 requests a second to an H100 at 20? (5) An LLM product serves 10 million requests a day at 0.25 Wh each. How much energy is that per year?<details><summary>Answers</summary>(1) $\text{MFU} = 6 \times 3 \times 10^9 \times 7{,}000 / 989 \times 10^{12} = 12.7\,\%$. The run is $6 \times 10^{11} / (64 \times 7{,}000) = 1.34 \times 10^6$ s, about 15.5 days, which a better MFU would shorten. (2) $\lceil 0.72 / 0.7 \rceil = 2$ replicas, each $0.72 / 2 = 36\,\%$ busy: the cost doubles because the load is 3 % above what one replica may carry. (3) $\tau^* = \sqrt{2 \times 4 \times 360} = 53.7$ minutes; waste $4/53.7 + 53.7/720 = 0.0745 + 0.0745 = 14.9\,\%$. (4) At 0.5 requests a second one replica of anything is mostly idle, so the cheapest GPU per hour that fits and meets the objective wins: the L4 at \$0.80. At 20 requests a second replicas are full, and the H100 delivers more bandwidth and arithmetic per dollar, so it serves the load with fewer GPU-hours. (5) $10^7 \times 0.25 \times 365 = 9.1 \times 10^8$ Wh, about 910 MWh a year, 70 % of the estimated energy of GPT-3's training run, every year.</details></aside>
+
+## What changed
+
+| | The biggest model, one request at a time (the baseline) | A configuration chosen on the front |
+| --- | --- | --- |
+| 70 B model, cost per 1,000 requests at 20 per second | \$21.00 | \$0.333 (FP8, 8 × H100, batch ≤ 256) |
+| Time per output token | 34.5 ms | 13.7 ms |
+| Decode MFU | 0.21 % | 16.6 % |
+| If the 8 B model passes evaluation | not considered | \$0.042 per 1,000 requests |
+| Utilization metric | "GPU 100 % busy" | MFU for training, cost per request at the latency objective for serving |
+| Hardware | whatever was free | chosen by load: L4 at 0.5 requests per second, H100 at 20 |
+| Training on spot capacity | avoided | checkpoints every $\sqrt{2\delta M}$: 9 % waste for 61 % savings |
+| Idle service | one replica always on, \$72 a day | scaled to zero, \$6 a day, with a cold start |
+| Energy | unknown | about 0.05–0.09 Wh per request, estimated from the same model |
+
+## Limitations
+
+- **A roofline model, not a benchmark.** The efficiencies $\eta_B$ and $\eta_F$, the fixed overhead and the tensor-parallel scaling are assumptions; real engines differ by release, kernel and workload, and continuous batching interleaves prefill with decode in ways a per-request average does not capture. The model ranks configurations; only a measurement prices them.
+- **Illustrative prices.** GPU and API prices change monthly and differ between providers by large factors; with other prices the front, and the winner, can change. Rerun the arithmetic with real ones.
+- **Steady load.** Real traffic has daily cycles and bursts; the cost of a fleet sized for the peak is higher than the steady-load number, and the ceiling of replicas makes it lumpy.
+- **Energy is estimated.** Power draw is below the rated maximum most of the time; embodied emissions of the hardware and the water used for cooling are not counted.
+- **Not covered:** speculative decoding and disaggregated prefill and decode as cost levers (their mechanics are in [LLM inference systems](/notes/mlops/llm-inference-systems)), mixture-of-experts serving, accelerators other than GPUs, and the financial practice of cost allocation and budgeting (FinOps).
+
+## What you should remember
+
+- Training costs about $6ND$ FLOPs once; inference costs about $2N$ per token for as long as the model serves, and at scale it is the larger part (three fifths of Google's ML energy in 2019–2021).
+- GPU "utilization" is the share of time a kernel runs; MFU, model FLOPs per second over peak, is how much of the hardware is used. Good training runs reach 40–46 %; decoding at small batches is under 1 %.
+- A decode step is the longer of reading weights and caches and doing the arithmetic; batching amortizes the weights, quantization shrinks them, more GPUs split them.
+- Cost per request is replicas × GPUs × price ÷ (3600 λ), with replicas from Little's law and a utilization margin.
+- Choose a serving configuration by filtering on quality, then taking the cheapest point of the latency–cost front within the objectives, then measuring it. The answer depends on the load.
+- Checkpoint spot training every $\sqrt{2\delta M}$; scale idle services to zero when a cold start is acceptable.
+- Energy follows cost: about 0.05–0.25 Wh per LLM request, hundreds of MWh per large training run, 1.5 % of world electricity for data centres in 2024.
+
+## Example
+
+The cost model of the note: two model shapes (Llama 3 8B and 70B: 32 and 80 layers, 8 key–value heads of dimension 128), three precisions, three GPUs, 1 to 8 GPUs per replica and five batch caps, priced at a load of 20 requests a second, with the Pareto fronts, the cheapest configuration within 50 ms per token, its cost broken down, and the cheapest configuration at four loads. The figure recomputes the same model in TypeScript. Python 3.14.7, standard library only.
+
+```python
+"""Choose a serving configuration: a roofline cost model over model size, precision, batch size and hardware."""
+import itertools, math
+
+MODELS = {  # parameters, layers, key-value width per layer (8 KV heads x 128); Llama 3 shapes
+    "8B": (8.0e9, 32, 1024), "70B": (70.6e9, 80, 1024)}
+BYTES = {"bf16": 2.0, "fp8": 1.0, "int4": 0.53}          # bytes per weight; int4 includes group scales
+GPUS = {  # memory GB, bandwidth GB/s, dense bf16 TFLOPS, dense fp8 TFLOPS, illustrative $ per GPU-hour, watts
+    "L4": (24, 300, 121, 242, 0.80, 72),
+    "A100": (80, 2039, 312, 312, 2.00, 400),
+    "H100": (80, 3350, 989, 1979, 3.00, 700)}
+IN, OUT = 1000, 250                                       # tokens per request
+ETA_MEM, ETA_FLOP, TP_EFF = 0.8, 0.5, 0.9                 # achievable fractions of peak; tensor-parallel scaling
+STEP_FIXED, ALLREDUCE = 2e-3, 20e-6                       # s per decode step; s per all-reduce (2 per layer if g > 1)
+LOAD, MAX_UTIL = 20.0, 0.7                                # requests per second; keep each group below 70 % busy
+
+def evaluate(model, prec, gpu, g, k, load=None):
+    load = load or LOAD
+    P, L, dkv = MODELS[model]
+    mem, bw, f16, f8, price, watts = GPUS[gpu]
+    if prec == "fp8" and gpu == "A100":
+        return None                                       # no fp8 tensor cores on A100
+    flops = (f8 if prec == "fp8" else f16) * 1e12 * g * (TP_EFF if g > 1 else 1) * ETA_FLOP
+    band = bw * 1e9 * g * (TP_EFF if g > 1 else 1) * ETA_MEM
+    weights = P * BYTES[prec]
+    kv_token = 2 * L * dkv * 2                            # keys and values in 16-bit, bytes per token
+    if weights + k * (IN + OUT) * kv_token > 0.9 * mem * 1e9 * g:
+        return None                                       # does not fit
+    ctx = IN + OUT / 2                                    # mean context length during decoding
+    step = max((weights + k * ctx * kv_token) / band, k * 2 * P / flops) \
+        + STEP_FIXED + (2 * L * ALLREDUCE if g > 1 else 0)   # one decode step for k sequences
+    prefill = 2 * P * IN / flops                          # compute-bound, per request
+    gpu_s = prefill + OUT * step / k                      # GPU-seconds per request on the whole group
+    replicas = math.ceil(load * gpu_s / MAX_UTIL)         # Little's law: groups busy on average, plus headroom
+    return dict(model=model, prec=prec, gpu=gpu, g=g, k=k, tpot=1e3 * step, replicas=replicas,
+                util=load * gpu_s / replicas, gpu_s=gpu_s, prefill=prefill,
+                cost=replicas * g * price / 3600 / load * 1000,  # $ per 1,000 requests at this load
+                mfu=(2 * P * k / step) / ((f8 if prec == "fp8" else f16) * 1e12 * g),
+                joules=watts * g * gpu_s)                 # at full power: an upper bound
+
+configs = [c for c in (evaluate(*a) for a in itertools.product(
+    MODELS, BYTES, GPUS, (1, 2, 4, 8), (1, 4, 16, 64, 256))) if c]
+print(f"{len(configs)} configurations fit in memory")
+
+def front(cs):
+    """Configurations that no other beats on both latency per token and cost."""
+    return sorted((c for c in cs if not any(o["tpot"] <= c["tpot"] and o["cost"] <= c["cost"]
+                   and (o["tpot"] < c["tpot"] or o["cost"] < c["cost"]) for o in cs)), key=lambda c: c["tpot"])
+
+SLO = 50.0                                                # ms per output token
+for model in MODELS:
+    f = front([c for c in configs if c["model"] == model])
+    print(f"\n{model}: Pareto front ({len(f)} points)")
+    print("  precision gpu  x  batch  replicas  util   ms/token   $ per 1k req   MFU")
+    for c in f:
+        print(f"  {c['prec']:5s} {c['gpu']:5s}{c['g']:2d} {c['k']:5d}  {c['replicas']:5d}   {100 * c['util']:4.0f}%  {c['tpot']:8.1f}   {c['cost']:10.3f}   {100 * c['mfu']:5.1f}%")
+    best = min((c for c in configs if c["model"] == model and c["tpot"] <= SLO), key=lambda c: (c["cost"], c["tpot"]))
+    print(f"  cheapest within {SLO:.0f} ms/token: {best['prec']} on {best['g']} x {best['gpu']}, batch {best['k']}: "
+          f"{best['tpot']:.1f} ms/token, ${best['cost']:.3f} per 1,000 requests, "
+          f"{best['joules']:.0f} J per request at full power")
+    print(f"  per request: prefill {1e3 * best['prefill']:.1f} ms + decode {1e3 * (best['gpu_s'] - best['prefill']):.1f} ms "
+          f"of the {best['g']}-GPU group; {best['replicas']} group(s) at {100 * best['util']:.0f}% busy")
+
+print("\ncheapest configuration within the SLO, by load")
+print("  load req/s   8B                               70B")
+for load in (0.5, 5, 20, 100):
+    cells = []
+    for model in MODELS:
+        cs = [c for c in (evaluate(*a, load=load) for a in itertools.product(
+            [model], BYTES, GPUS, (1, 2, 4, 8), (1, 4, 16, 64, 256))) if c and c["tpot"] <= SLO]
+        b = min(cs, key=lambda c: (c["cost"], c["tpot"]))
+        cells.append(f"{b['prec']} {b['g']}x{b['gpu']} b{b['k']} ${b['cost']:.3f}".ljust(33))
+    print(f"  {load:8.1f}   " + "".join(cells))
+one = evaluate("70B", "bf16", "H100", 2, 1)
+print(f"\n70B bf16 on 2 x H100 at batch 1: {one['tpot']:.1f} ms/token, ${one['cost']:.2f} per 1,000 requests, MFU {100 * one['mfu']:.2f}%")
+```
+
+```text
+252 configurations fit in memory
+
+8B: Pareto front (8 points)
+  precision gpu  x  batch  replicas  util   ms/token   $ per 1k req   MFU
+  int4  H100  8     1     26     68%       3.5        8.667     0.1%
+  int4  H100  8     4      7     64%       3.5        2.333     0.2%
+  int4  H100  8    16      2     61%       3.6        0.667     0.9%
+  int4  H100  1     4      8     67%       3.8        0.333     1.7%
+  int4  A100  8    64      1     63%       4.4        0.222     9.2%
+  int4  H100  1    16      3     68%       4.5        0.125     5.8%
+  int4  H100  1    64      2     60%       7.1        0.083    14.6%
+  fp8   H100  1   256      1     70%      19.1        0.042    10.9%
+  cheapest within 50 ms/token: fp8 on 1 x H100, batch 256: 19.1 ms/token, $0.042 per 1,000 requests, 24 J per request at full power
+  per request: prefill 16.2 ms + decode 18.6 ms of the 1-GPU group; 1 group(s) at 70% busy
+
+70B: Pareto front (6 points)
+  precision gpu  x  batch  replicas  util   ms/token   $ per 1k req   MFU
+  int4  H100  8     1     53     69%       7.2       17.667     0.2%
+  int4  H100  8     4     15     65%       7.2        5.000     1.0%
+  int4  H100  8    16      5     62%       7.4        1.667     3.8%
+  int4  H100  8    64      3     48%       8.4        1.000    13.7%
+  fp8   H100  8    64      2     59%      10.1        0.667     5.7%
+  fp8   H100  8   256      1     66%      13.7        0.333    16.6%
+  cheapest within 50 ms/token: fp8 on 8 x H100, batch 256: 13.7 ms/token, $0.333 per 1,000 requests, 186 J per request at full power
+  per request: prefill 19.8 ms + decode 13.4 ms of the 8-GPU group; 1 group(s) at 66% busy
+
+cheapest configuration within the SLO, by load
+  load req/s   8B                               70B
+       0.5   int4 1xL4 b16 $0.444             int4 1xA100 b16 $1.111           
+       5.0   int4 1xA100 b256 $0.111          int4 1xH100 b64 $0.500           
+      20.0   fp8 1xH100 b256 $0.042           fp8 8xH100 b256 $0.333           
+     100.0   fp8 1xH100 b256 $0.042           fp8 4xH100 b256 $0.300           
+
+70B bf16 on 2 x H100 at batch 1: 34.5 ms/token, $21.00 per 1,000 requests, MFU 0.21%
+```
+
+Read part by part:
+
+- `MODELS` gives the parameter count, the layers and the key–value width per layer, from which `kv_token`, the cache per token in 16-bit numbers, follows: 131 kB for the 8 B shape, 328 kB for the 70 B one.
+- `GPUS` holds datasheet numbers and illustrative prices. A100s have no FP8 arithmetic, so FP8 configurations on them are skipped; 4-bit weights are dequantized and multiplied in BF16, so they use the BF16 rate.
+- The memory test keeps every configuration whose weights plus the full caches of `k` sequences fit in 90 % of the replica's memory: 252 of the 360 combinations.
+- `step` is the boxed decode-step model; `prefill` and `gpu_s` are the per-request occupancy $s$; `replicas` is Little's law with the 70 % ceiling; `cost` is the boxed cost per request, scaled to 1,000 requests.
+- `front` keeps the configurations that no other dominates. The 8 B front starts with eight GPUs at batch 1, the fastest and most expensive, and ends with one H100 at batch 256; the steps between them trade 16 milliseconds per token for a factor of 200 in cost.
+- `mfu` is the decode MFU: model FLOPs per second, $2N k / t_{\text{step}}$, over the peak of the precision in use.
+- The load table recomputes everything at four loads: the cheapest hardware changes with the load, from an L4 to an H100 for the 8 B model.
+- The last line is the baseline of the note: the 70 B model in BF16 on the two H100s it needs, one request at a time.
+
+## The course in one paragraph
+
+A model is the small box in the middle of an ML system, and this course was about the rest of it. **ML systems**: decide whether the problem needs ML at all, turn the product's goals into metrics, latency and cost budgets, and plan for the model being wrong, because the technical debt of an ML system grows in its data, glue and configuration, not in its model. **Data**: pipelines of idempotent tasks over partitions, validated and versioned by content, with features computed once and joined point-in-time correctly, so that training and serving see the same world. **Training**: runs that can be reproduced from their recorded inputs and promoted through a registry, models tested like code on data, behaviour and slices, and training spread over many GPUs by data, tensor and pipeline parallelism. **Serving**: batch, online or streaming inference behind a model server, LLM engines that batch continuously and cache keys and values in pages, and new models rolled out through shadow, canary and A/B stages that test them statistically. **Operations**: monitoring that watches inputs, predictions and delayed labels for drift, a retraining loop with triggers and a gate that keeps broken models out, and for language models a release tuple of prompts, models and tools, evaluated in CI and traced call by call. **Responsibility and cost**: fairness criteria that conflict and must be chosen, privacy bounded by ε, documentation and law that make a model accountable, and a cost per request that design determines and arithmetic predicts. Each section reuses the DevOps course for running services and the Deep Learning course for training models, and adds only what changes when the thing being run is learned from data.
+
+## References
+
+- A. Chowdhery et al. [PaLM: Scaling Language Modeling with Pathways](https://arxiv.org/abs/2204.02311). 2022; *JMLR* 24, 2023. Table 3 (model and hardware FLOPs utilization) and Appendix B.
+- A. Dubey et al. (Llama Team, Meta). [The Llama 3 Herd of Models](https://arxiv.org/abs/2407.21783). 2024. Table 4 and the text around it (38–43 % BF16 MFU).
+- M. Ryabinin et al. [*Efficient Deep Learning Systems*](https://github.com/mryab/efficient-dl-systems). HSE University and Yandex School of Data Analysis, 2026: GPU performance and profiling, distributed training, inference systems.
+- HSE University. [*Инженерия LLM-систем*](https://github.com/xufana/llm-system-engineering) (Engineering of LLM systems), Faculty of Computer Science, 2026: system budgets, unit economics, choosing a serving configuration on the quality–latency–cost front.
+- C. Kästner. [*Machine Learning in Production: From Models to Products*](https://mlip-cmu.github.io/book/). MIT Press, 2025. Ch. 12, Scaling the System; ch. 13, Planning for Operations.
+- C. Huyen. *Designing Machine Learning Systems*. O'Reilly, 2022. Ch. 7 (model deployment and the cost of inference) and ch. 10 (infrastructure: compute, public cloud and private data centres).
+- J. W. Young. [A First Order Approximation to the Optimum Checkpoint Interval](https://doi.org/10.1145/361147.361115). *Communications of the ACM* 17(9), 1974.
+- D. Patterson et al. [Carbon Emissions and Large Neural Network Training](https://arxiv.org/abs/2104.10350). 2021. GPT-3: 1,287 MWh, 552 tCO₂e; location factors.
+- D. Patterson et al. [The Carbon Footprint of Machine Learning Training Will Plateau, Then Shrink](https://arxiv.org/abs/2204.05149). *IEEE Computer* 55(7), 2022. ML below 15 % of Google's energy, three fifths of it inference.
+- A. S. Luccioni, S. Viguier, A.-L. Ligozat. [Estimating the Carbon Footprint of BLOOM, a 176B Parameter Language Model](https://arxiv.org/abs/2211.02001). *JMLR* 24, 2023.
+- C. Elsworth et al. [Measuring the Environmental Impact of Delivering AI at Google Scale](https://arxiv.org/abs/2508.15734). 2025. Median Gemini Apps text prompt: 0.24 Wh.
+- International Energy Agency. [*Energy and AI*](https://www.iea.org/reports/energy-and-ai). April 2025. Data-centre electricity: about 415 TWh in 2024, about 945 TWh projected for 2030.
+- E. Strubell, A. Ganesh, A. McCallum. [Energy and Policy Considerations for Deep Learning in NLP](https://arxiv.org/abs/1906.02243). ACL, 2019.
+- NVIDIA. [H100 Tensor Core GPU datasheet](https://www.nvidia.com/en-us/data-center/h100/), [A100 datasheet](https://www.nvidia.com/en-us/data-center/a100/), [L4 datasheet](https://www.nvidia.com/en-us/data-center/l4/). Accessed October 2026.

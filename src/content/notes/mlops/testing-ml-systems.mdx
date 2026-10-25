@@ -1,0 +1,281 @@
+---
+title: Testing ML systems
+description: "How to test a system whose behaviour is learned rather than written: the ML Test Score rubric, tests of data, models and pipelines, behavioural tests of minimum functionality, invariance and direction, regressions on slices judged statistically, and where each test runs in CI."
+course: mlops
+section: Training
+order: 6
+status: published
+tags: [testing, ml-test-score, data-tests, model-tests, behavioral-testing, checklist, invariance, metamorphic-testing, slices, mcnemar, integration-test, pytest, continuous-integration]
+prerequisites: [Testing, Continuous integration, "Experiments, reproducibility and the model registry"]
+---
+
+import MlTestPyramid from '../../../components/figures/testing-ml-systems/MlTestPyramid.astro';
+
+The [previous note](/notes/mlops/experiments-and-registry) ended with a model version in a registry: traceable to its run, reproducible, and one alias move away from production. What decides whether the alias moves? So far, one number on a held-out set. This note is about everything that number misses, and about turning those misses into tests that run automatically: tests of the data and the code that computes features, tests of the model's behaviour on cases with a known answer and under changes that should or should not matter, tests of quality on the slices of users that matter, and tests of the pipeline as a whole. The [Python course](/notes/python/testing) introduced pytest and the [DevOps course](/notes/devops/continuous-integration#the-test-pyramid-and-fast-feedback) the test pyramid; here both are applied to a system whose behaviour nobody wrote down.
+
+**Conventions.** The tests of the Example are a real run (pytest 9.0.3, Python 3.14.7, scikit-learn 1.9.1, 23 October 2026) on synthetic data with fixed seeds. The slice statistics are computed exactly with SciPy 1.18.1 on toy counts.
+
+## Baseline: accuracy on a held-out set
+
+A loan model is trained, scores an accuracy of 0.71 on a held-out set against 0.60 for always predicting "repaid", and is approved for release. Every statement in that sentence can be true while the model is unfit to ship. The held-out set comes from the same collection process as the training set, so a flaw in the collection is in both and the metric cannot see it. The average hides a region where the model is much worse, or where it treats applicants differently for a reason the business has ruled out. The model may be correct and the code around it wrong: a feature that is computed differently in serving, a preprocessing step that crashes on a value the training data never contained, a model that the serving binary cannot load. And next month's retrained model will be released by the same rule, with no comparison against this one beyond the one number.
+
+## Why ML systems are hard to test
+
+A unit test compares an output with a specification. A learned model has no specification at the level of single outputs: it is expected to be right most of the time, not every time, so a single wrong prediction is not a bug, and a test cannot simply assert the answer for each input. Kästner calls the activity model *validation* rather than *verification*: checking whether the model fits the purpose well enough, not whether it is correct ([Kästner, 2025](#references), chapter 15). Three consequences shape everything below.
+
+- **Tests become statistical.** "Accuracy at least 0.80 on this slice" holds or fails up to sampling noise, so thresholds need margins, and comparisons need the statistics of the [canary note](/notes/devops/continuous-delivery#judging-a-canary-on-a-small-sample).
+- **Behaviour is specified by properties, not examples.** Without the right answer for every input, one can still state relations that must hold: a clear case must be classified right, a change that should not matter must not change the output, a change that should push the prediction one way must not push it the other. These are the [property-based tests](/notes/python/testing#properties-instead-of-examples) of the Python course applied to a model.
+- **Most failures are silent.** A model trained on corrupted data still trains, and a model fed a wrong feature still predicts. The error shows up, if at all, as a slightly worse metric somewhere, so tests have to look for it on purpose.
+
+## The ML Test Score
+
+Breck et al. turned the experience of production ML at Google into a rubric of 28 tests in four sections of seven: tests of **features and data**, tests of **model development**, tests of **ML infrastructure**, and **monitoring** tests ([Breck et al., 2017](#references)). Each test is an assertion to check, as often as possible:
+
+- **Data**, for example: feature expectations are captured in a schema; every feature is worth its cost; the data pipeline has privacy controls; all input feature code is tested.
+- **Model**, for example: offline proxy metrics correlate with the online metrics that matter; a simpler model is not better; model quality is sufficient on all important data slices; the impact of model staleness is known.
+- **Infrastructure**, for example: training is reproducible; the full pipeline is integration tested; model quality is validated before serving; models are canaried and can be rolled back.
+- **Monitoring**, for example: data invariants hold for training and serving inputs; training and serving features compute the same values; models are not too stale; prediction quality has not regressed.
+
+The score of a test is half a point if it is done manually with the results documented and shared, and one point if it is automated and runs repeatedly. Each section's points are summed, and **the ML Test Score is the minimum of the four sums**: a team with section totals of 4, 3.5, 2 and 0.5 scores 0.5, which the rubric reads as a system that is not entirely untested but may have serious holes in its reliability. A score above 2 means reasonably tested, above 3 strong automated testing and monitoring, above 5 exceptional. The minimum is deliberate: excellent model tests do not compensate for a system nobody monitors.
+
+The paper's survey of 36 teams is as instructive as the rubric. None of the 28 tests was implemented by more than 80% of the teams. The full-pipeline integration test had the lowest adoption of the infrastructure tests, because training was often a set of ad hoc scripts with manual steps; and the authors single out the test that training and serving features agree, the subject of the [features note](/notes/mlops/features-and-skew#log-what-you-serve), as perhaps the most important and least implemented. One team discovered that the features of its model were created by a thousand-line file of code with no tests at all.
+
+## Tests of data and feature code
+
+The data tests of the rubric are the subject of the [data-quality note](/notes/mlops/data-quality-and-versioning#validation-as-tests-on-data): a schema with types, ranges, allowed values and the fraction of missing values, checked on every batch of training data and on a sample of serving data. Two points belong here.
+
+- **Feature code is ordinary code and gets ordinary unit tests.** A function that computes "support cases opened in the last 30 days" has edge cases (no cases at all, one opened exactly 30 days ago, a timezone boundary) that a few pytest tests settle in milliseconds. Writing feature transformations as pure functions of their inputs, outside notebooks and without database access inside them, is what makes them testable; Kästner's chapter on pipeline quality is mostly about this refactoring ([Kästner, 2025](#references), chapter 17).
+- **The schema tests the training code too.** Breck et al. describe training code that took the logarithm of a numeric feature, an implicit assumption that the feature is positive that no schema stated; training data happened to be positive, so nothing failed until serving received a zero. Their system generates synthetic inputs from the schema, including values the schema allows but the training data never contained, and runs the training code on them, a form of fuzz testing ([Breck et al., 2019](#references), section 5).
+
+## Tests of the model
+
+### Does training work at all?
+
+Training is slow, so the tests that run on every commit train tiny models: a few steps on a few hundred rows. They do not test quality; they test that the code is wired correctly. The useful ones ([Breck et al., 2017](#references), test Infra 2; [Kästner, 2025](#references), chapter 17):
+
+- **One step lowers the loss**: one gradient step on random data from the schema runs without error and changes the loss in the right direction. It catches most API misuse in seconds.
+- **The model can overfit a batch**: with enough capacity, the training loss on one fixed batch must go to about zero, the check of the [Deep Learning course](/notes/deep-learning/training-in-practice#overfit-one-batch).
+- **Training is deterministic**: two runs with the same seed give the same predictions, so that later differences mean something.
+- **Save and load round-trip**: the saved artifact, loaded in a fresh process, gives the same predictions as the object in memory; for a converted model (ONNX), the same predictions within a stated tolerance.
+- **Training resumes from a checkpoint.**
+
+The rubric warns against **golden tests**, which train a model partially and compare the result with a stored one: any legitimate change breaks them, and they end up updated blindly.
+
+### Is the model good enough to replace the current one?
+
+Quality gates compare the candidate with two references before the alias moves: a **simple baseline**, such as logistic regression or a rule, which a complex model must beat by a margin to justify its cost (rubric test Model 5), and the **current production version** on the same evaluation set, which the candidate must not trail by more than a tolerance (Infra 4). Both comparisons are on held-out data from after the training period, and both are statistical, a point made precise in the section on slices.
+
+### Behavioural tests
+
+Ribeiro et al. borrowed **behavioural testing** from software engineering, testing what a system does without looking inside it, and organized it as **CheckList**: a matrix of the capabilities a model should have, against three types of tests ([Ribeiro et al., 2020](#references)). With $f$ the model and $T$ a transformation of an input:
+
+- A **minimum functionality test** (MFT) is a set of simple cases with known answers, $f(x_i) = y_i$, like unit tests. For a loan model: a high income and no debt must be approved; a low income and a debt ratio of 0.8 must be declined. The result is a failure rate, and the cases are generated from templates, so there are hundreds of them per capability.
+- An **invariance test** (INV) applies a change that should not matter and requires $f(T(x)) = f(x)$: a name in a review, a typo, the region of an applicant when the business has ruled region out. The result is the share of inputs whose prediction changes.
+- A **directional expectation test** (DIR) applies a change with a known direction and requires, for example, $f(T(x)) \le f(x)$ for the probability of approval when $T$ raises the debt: more debt must never make approval more likely.
+
+INV and DIR tests need **no labels**: the expected relation is between two predictions, not between a prediction and the truth. They can therefore run on any inputs, including fresh unlabeled production data, which makes them a form of metamorphic testing ([Kästner, 2025](#references), chapter 15). Applied to commercial sentiment models and research models, CheckList found critical failures that their accuracy did not show; in a user study, practitioners with CheckList created about twice as many tests and found about three times as many bugs as those without it ([Ribeiro et al., 2020](#references)). Huyen describes the same three kinds under the names perturbation, invariance and directional expectation tests ([Huyen, 2022](#references), chapter 6).
+
+### Slices and regressions on slices
+
+An aggregate metric is an average over subgroups, and an average can rise while a subgroup collapses. The rubric's example: global accuracy improved by 1% while accuracy for one country dropped by 50% (test Model 6). A **slice** is a subset of the evaluation data defined by a feature or a combination of features: a region, a device type, new users, a language, a data source, a protected group, a rare but costly class. Slices come from product requirements and from incidents, not from browsing: each has an owner who can say how good is good enough.
+
+A slice test needs statistics, because slices are small. On a slice of $n = 400$ applications, an accuracy around $0.85$ has a standard error of $\sqrt{0.85 \cdot 0.15 / 400} = 0.018$, and the difference between two independently measured accuracies one of $\sqrt{2} \cdot 0.018 = 0.025$. Suppose the production model is right on 340 of the 400 and the candidate on 328: three points worse. Compared as two independent proportions, $z = 0.03 / 0.025 = 1.2$ and the one-sided $p$-value is $0.12$, no evidence of anything. But both models were scored on the *same* 400 applications, and most of them both get right or both get wrong. Only the cases where they disagree carry information: say the candidate is right and production wrong on $b = 14$, production right and the candidate wrong on $c = 26$ (and $c - b = 12$ is the difference in correct answers). If the two models were equally good, each disagreement would go either way with probability one half, so
+
+$$
+P(\text{at most } 14 \text{ of } 40 \text{ disagreements favour the candidate}) = \sum_{k=0}^{14} \binom{40}{k} 2^{-40} = 0.040 .
+$$
+
+This is the exact **McNemar test**, one-sided, and at the 5% level it flags the regression that the unpaired comparison could not see. The Probability course makes the same point for two models on [one test set](/notes/probability/confidence-intervals-and-bootstrap#comparing-two-models-on-one-test-set) with a paired bootstrap, and the [retraining note](/notes/mlops/continual-learning#evaluation-gates-champion-against-challenger) builds the full champion–challenger gate on it. A regression gate on slices therefore compares models on the same examples, fixes its tolerance and level in advance, and accounts for the number of slices tested: twenty slices tested at 5% each will flag a good model regularly, the [multiple-comparisons](/notes/probability/hypothesis-tests#multiple-comparisons) problem again.
+
+## Tests of the pipeline
+
+The integration test runs the whole pipeline, from raw data to a model loaded and answering requests in the serving code, on a small sample, and checks that each stage hands the next what it expects (rubric test Infra 3). It catches what no unit test can: a column renamed upstream, a training job that writes the model where the registry does not look, a model that the serving binary cannot load. Breck et al. give an example of the last: a refactoring of the learning library replaced the implementation of an operation, and a model trained with the new library would not load in a serving binary built with the old one ([2017](#references), test Infra 6). The integration test is the slowest automated test and the one with the lowest adoption in the survey, because it needs the pipeline to be one runnable program rather than a sequence of notebooks; [pipelines as code](/notes/mlops/data-pipelines) are the precondition.
+
+## Tests in CI
+
+The pyramid of the [CI note](/notes/devops/continuous-integration#the-test-pyramid-and-fast-feedback) applies, with layers that are specific to ML:
+
+<MlTestPyramid />
+
+1. **Data and feature code**: schema checks and unit tests of feature functions, many of them, on every commit, in seconds.
+2. **Model**: smoke training, determinism, round-trips, behavioural tests and slice metrics on a small model, in minutes, on every commit; the full quality gates against the baseline and the production version on every candidate model.
+3. **Pipeline**: the integration test on a sample, nightly and before a release.
+4. **Production**: checks on real traffic, shadow and canary deployments and monitoring, the subjects of the [rollout](/notes/mlops/rolling-out-models) and [monitoring](/notes/mlops/monitoring-and-drift) notes.
+
+Two practical rules follow from the statistical nature of the middle layers. First, they must not be **flaky**: every random generator is seeded, thresholds sit below the observed value by more than its spread over seeds, and a test that compares two models uses the same evaluation data for both. A model test that fails one run in twenty trains people to rerun until it passes, which is the [failure mode of flaky tests](/notes/devops/continuous-integration#flaky-tests) in general. Second, **code changes and model changes run different gates**. A commit that changes code runs the fast layers with small models; a new model version, produced by a training pipeline rather than a commit, runs the full quality gates against the registry's current `champion`, and the alias moves only if they pass. For language-model applications, where outputs are text, the same structure holds with evaluation sets scored by metrics or judges, the [evaluation in CI](/notes/mlops/llmops) of the LLMOps note.
+
+<aside class="callout"><strong>Key idea.</strong> A model has no specification for single outputs, so test what can be specified: the data it receives, the code that computes its features, relations between its outputs (cases with clear answers, changes that must not matter, changes with a known direction), its quality on the slices that matter compared with the previous version on the same examples, and the pipeline end to end. Automate the cheap tests on every commit and the expensive gates on every candidate model, and keep them deterministic.</aside>
+
+<aside class="callout"><strong>Check yourself.</strong> (1) A team has automated all seven model tests and all seven data tests, documents one infrastructure test manually and has no monitoring. What is its ML Test Score? (2) Why does an invariance test not need labels, and why is that useful in production? (3) A sentiment model gives "The food was great, said Maria" a positive score and "The food was great, said Mohammed" a negative one. Which test type catches this, and what does a single such pair prove? (4) A candidate model is better overall and worse on a slice of 120 examples by 2 points. What would you compute before blocking it? (5) Why is "the model trained for 5 steps gives exactly these 10 predictions" a bad test?<details><summary>Answers</summary>(1) The section sums are 7, 7, 0.5 and 0; the minimum is 0, which the rubric reads as more of a research project than a production system. (2) It compares two predictions of the model, on an input and on its transformed copy, so the truth is not needed. It can therefore run on fresh unlabeled traffic, where labels arrive late or never. (3) An invariance test with the name as the changed field. One pair shows that the model is not invariant; the test reports the share of pairs that change, which says how often it matters. (4) The paired comparison on the same 120 examples: the numbers of disagreements in each direction and the exact one-sided McNemar $p$-value, with a level fixed in advance and adjusted for the number of slices. On 120 examples a 2-point difference is about 2 or 3 answers. (5) It is a golden test: any legitimate change in libraries, initialization or data breaks it, it does not say whether the new output is worse, and it gets updated without thought. Test properties instead (the loss decreases, the model overfits a batch, the predictions are deterministic for one version).</details></aside>
+
+## What changed
+
+| | One held-out metric (the baseline) | A tested ML system |
+| --- | --- | --- |
+| What is checked | average accuracy | data, feature code, behaviour, slices, the pipeline |
+| Specification | none | clear cases, invariances and directions written as tests |
+| Labels needed | always | not for invariance and directional tests |
+| Comparison with production | none, or two numbers | the same examples, paired, with a level fixed in advance |
+| Subgroups | hidden in the average | slices with owners and thresholds |
+| When tests run | before release, by hand | fast layers on every commit, quality gates on every model |
+| Readiness | "accuracy is good" | an ML Test Score, the minimum over four sections |
+
+## Limitations
+
+- **Tests encode what someone thought of.** Behavioural tests and slices cover the capabilities and groups that were listed; a failure on a dimension nobody listed passes every test.
+- **Thresholds are judgements.** "At least 0.65 on every region" or "at most 1% of decisions change" come from requirements, and a threshold chosen so that the current model passes tests nothing.
+- **Statistical tests trade errors.** Strict gates block good models by chance, loose gates pass bad ones; with many slices both happen unless the level is adjusted.
+- **Offline is not online.** Every test here runs on data that already exists; behaviour on tomorrow's inputs is the job of the canary and the monitor.
+- **Invariance is not fairness.** Removing a protected attribute and passing an invariance test on it does not remove proxies that carry the same information; the [responsibility note](/notes/mlops/responsible-ml) measures outcomes instead.
+
+## What you should remember
+
+- An ML model has no specification for single outputs; test the data, the feature code, properties of the model's behaviour, quality on slices, and the pipeline.
+- The ML Test Score has 28 tests in four sections (data, model, infrastructure, monitoring); half a point manual, one point automated; the score is the minimum over the sections.
+- Behavioural tests: MFT, simple cases with known answers; INV, $f(T(x)) = f(x)$ for changes that must not matter; DIR, a known direction of change. INV and DIR need no labels.
+- Compare a candidate with production on the same examples: only disagreements count, and the exact McNemar test turns them into a $p$-value. Slices are small, so fix tolerances in advance and correct for the number of slices.
+- Smoke-train on every commit; run quality gates against the baseline and the current champion on every candidate model; run the pipeline end to end nightly; keep all of it seeded and deterministic.
+
+## Example
+
+A loan model and its tests. `loan.py` generates synthetic applications and trains a pipeline that predicts repayment; one partner's data, in the south region, recorded late payments as defaults, so the labels themselves depend on the region, and the business has decided that region must not affect a decision.
+
+```python
+# A loan model: synthetic applications and a scikit-learn pipeline that predicts repayment.
+import numpy as np
+import pandas as pd
+from sklearn.compose import make_column_transformer
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+
+FEATURES = ['income', 'debt_ratio', 'region']
+
+def make_data(n=4000, seed=0):
+    rng = np.random.default_rng(seed)
+    df = pd.DataFrame({
+        'income': rng.lognormal(np.log(50), 0.5, n).round(1),        # thousands per year
+        'debt_ratio': rng.beta(2, 5, n).round(3),                     # monthly debt over monthly income
+        'region': rng.choice(['north', 'south'], n, p=[0.6, 0.4]),
+    })
+    logit = 1.5 * np.log(df.income / 50) - 6 * (df.debt_ratio - 0.3) + 0.8
+    logit -= 1.0 * (df.region == 'south')    # a collection artefact: one partner recorded late payments as defaults
+    df['repaid'] = (rng.random(n) < 1 / (1 + np.exp(-logit))).astype(int)
+    return df
+
+def train(df, seed=0):
+    pre = make_column_transformer((StandardScaler(), ['income', 'debt_ratio']), (OneHotEncoder(), ['region']))
+    return make_pipeline(pre, LogisticRegression(random_state=seed)).fit(df[FEATURES], df.repaid)
+```
+
+`test_loan.py`, one test or more for each layer of this note:
+
+```python
+# Tests of the loan model: data, pipeline, model quality and behaviour.
+import pickle
+import numpy as np
+import pandas as pd
+import pytest
+from sklearn.metrics import accuracy_score
+from loan import FEATURES, make_data, train
+
+@pytest.fixture(scope='module')
+def data():
+    return make_data(4000, seed=0), make_data(2000, seed=1)       # training and held-out applications
+
+@pytest.fixture(scope='module')
+def model(data):
+    return train(data[0])
+
+# Data tests: the inputs look the way the model assumes.
+def test_schema(data):
+    for df in data:
+        assert list(df.columns) == FEATURES + ['repaid']
+        assert df.notna().all().all()
+        assert (df.income > 0).all() and df.debt_ratio.between(0, 1).all()
+        assert set(df.region) <= {'north', 'south'}
+
+# Pipeline tests: training is repeatable, and the saved model is the trained one.
+def test_training_is_deterministic(data):
+    X = data[1][FEATURES]
+    assert np.array_equal(train(data[0]).predict_proba(X), train(data[0]).predict_proba(X))
+
+def test_save_and_load(model, data, tmp_path):
+    (tmp_path / 'model.pkl').write_bytes(pickle.dumps(model))
+    loaded = pickle.loads((tmp_path / 'model.pkl').read_bytes())
+    X = data[1][FEATURES]
+    assert np.array_equal(loaded.predict_proba(X), model.predict_proba(X))
+
+# Model tests: quality overall and on every slice.
+def test_beats_majority_baseline(model, data):
+    test = data[1]
+    baseline = max(test.repaid.mean(), 1 - test.repaid.mean())
+    assert accuracy_score(test.repaid, model.predict(test[FEATURES])) >= baseline + 0.05
+
+@pytest.mark.parametrize('region', ['north', 'south'])
+def test_slice_accuracy(model, data, region):
+    s = data[1][data[1].region == region]
+    assert accuracy_score(s.repaid, model.predict(s[FEATURES])) >= 0.65
+
+# Behavioural tests: minimum functionality, directional expectation, invariance.
+def test_mft_clear_cases(model):
+    clear = pd.DataFrame({'income': [150.0, 150.0, 15.0, 15.0], 'debt_ratio': [0.05, 0.05, 0.8, 0.8],
+                          'region': ['north', 'south', 'north', 'south']})
+    assert list(model.predict(clear)) == [1, 1, 0, 0]
+
+def test_dir_more_debt_never_helps(model, data):
+    X = data[1][FEATURES].copy()
+    before = model.predict_proba(X)[:, 1]
+    X['debt_ratio'] = (X.debt_ratio + 0.1).clip(upper=1.0)
+    assert (model.predict_proba(X)[:, 1] <= before).all()
+
+def test_inv_region(model, data):
+    X = data[1][FEATURES].copy()
+    before = model.predict(X)
+    X['region'] = X.region.map({'north': 'south', 'south': 'north'})
+    changed = np.mean(model.predict(X) != before)
+    assert changed <= 0.01, f'{changed:.1%} of decisions change when only the region changes'
+```
+
+```console
+$ python -m pytest -q --tb=short test_loan.py
+........F                                                                [100%]
+=================================== FAILURES ===================================
+_______________________________ test_inv_region ________________________________
+test_loan.py:64: in test_inv_region
+    assert changed <= 0.01, f'{changed:.1%} of decisions change when only the region changes'
+E   AssertionError: 28.1% of decisions change when only the region changes
+E   assert np.float64(0.281) <= 0.01
+=========================== short test summary info ============================
+FAILED test_loan.py::test_inv_region - AssertionError: 28.1% of decisions cha...
+1 failed, 8 passed in 0.94s
+```
+
+- **`make_data`.** Income is log-normal around 50 thousand a year, the debt ratio follows a Beta(2, 5) distribution with mean 0.29, and 40% of applications come from the south. Repayment follows a logistic model in log income and debt, and the line with `region == 'south'` is the collection artefact: it lowers the log-odds of a recorded repayment in the south by 1, for reasons that have nothing to do with the applicants.
+- **`train`** standardizes the numeric features, one-hot encodes the region and fits a logistic regression: the region is one of the model's inputs.
+- **Fixtures.** `data` builds a training set of 4,000 and a held-out set of 2,000 applications from different seeds, once per module (`scope='module'`), and `model` trains once; every test receives them by name. `tmp_path` is pytest's temporary directory, fresh for each test.
+- **`test_schema`** is a data test: columns, no missing values, positive incomes, ratios in $[0, 1]$, known regions. In a real pipeline it runs on every new batch, as the data-quality note describes.
+- **`test_training_is_deterministic` and `test_save_and_load`** are pipeline tests: two trainings give bit-identical probabilities, and the artifact written to disk and read back predicts exactly what the trained object does. Both are cheap, and both catch bugs that make every later comparison meaningless.
+- **`test_beats_majority_baseline`** is a quality gate against the simplest baseline: on the held-out set, 59.65% of applications were repaid, so always predicting "repaid" scores 0.5965, and the model must reach at least 0.6465. It scores 0.71.
+- **`test_slice_accuracy`** runs once per region through `parametrize`, against the requirement of at least 0.65 on every region. It passes: 0.720 in the north and 0.694 in the south.
+- **`test_mft_clear_cases`** checks four applications with obvious answers, in both regions. It passes.
+- **`test_dir_more_debt_never_helps`** raises every applicant's debt ratio by 0.1 and requires that no approval probability rises. It passes, as it must for a logistic regression with a negative coefficient on debt; for a tree ensemble it would need a monotonic constraint, and this test is how one finds out.
+- **`test_inv_region`** swaps the region of every held-out application and counts changed decisions. The requirement is at most 1%; the model changes **28.1%** of them. The model learned the artefact in the labels: it approves 75.7% of applications from the north and 47.6% from the south. Every metric above passed, because the held-out labels carry the same artefact; only a test that states the requirement directly could fail.
+
+Removing the region from the features makes the invariance test pass trivially and costs a point of measured accuracy, 0.70 instead of 0.71, because the measurement itself is made against the biased labels; approval rates become 65.1% in the north and 63.9% in the south. Whether that is the right fix, or whether other features carry the region in disguise, is the subject of the [responsibility note](/notes/mlops/responsible-ml). What this note establishes is narrower: the failure was found by a test that ran in a second, before the alias moved.
+
+## Next
+
+Every test so far trains small models on one machine. Large models do not fit on one: a 7-billion-parameter model needs more memory for training than an 80 GB GPU has, and a run that takes months on one device must take days on hundreds. The [next note](/notes/mlops/distributed-training) works out where the memory goes and how data, tensor and pipeline parallelism and sharded optimizers spread a training run across many GPUs.
+
+## References
+
+- HSE University. *Введение в MLOps* (master's programme «Машинное обучение в цифровом продукте», 2025/26): testing and validation of data and models.
+- E. Breck, S. Cai, E. Nielsen, M. Salib, D. Sculley. [The ML Test Score: A Rubric for ML Production Readiness and Technical Debt Reduction](https://research.google/pubs/the-ml-test-score-a-rubric-for-ml-production-readiness-and-technical-debt-reduction/). IEEE Big Data, 2017. Sections II–VII, tables I–V.
+- E. Breck, N. Polyzotis, S. Roy, S. E. Whang, M. Zinkevich. [Data Validation for Machine Learning](https://mlsys.org/Conferences/2019/doc/2019/167.pdf). SysML, 2019. Section 5 (model unit testing).
+- M. T. Ribeiro, T. Wu, C. Guestrin, S. Singh. [Beyond Accuracy: Behavioral Testing of NLP Models with CheckList](https://arxiv.org/abs/2005.04118). ACL, 2020.
+- C. Kästner. *Machine Learning in Production: From Models to Products*. MIT Press, 2025. [Chapter 15: Model Quality](https://mlip-cmu.github.io/book/15-model-quality.html) (slicing, behavioural testing, invariants without labels), [chapter 17: Pipeline Quality](https://mlip-cmu.github.io/book/17-pipeline-quality.html). Course [17-445/645, spring 2025](https://mlip-cmu.github.io/).
+- C. Huyen. *Designing Machine Learning Systems*. O'Reilly, 2022. Chapter 6 (model offline evaluation: perturbation, invariance and directional expectation tests, slice-based evaluation). Stanford [CS 329S](https://stanford-cs329s.github.io/).
+- HSE University. [*Инженерия LLM-систем*](https://github.com/xufana/llm-system-engineering) (2026): evaluation design and evaluation in CI.
+- Q. McNemar. [Note on the sampling error of the difference between correlated proportions or percentages](https://doi.org/10.1007/BF02295996). Psychometrika 12, 153–157, 1947.
+- pytest documentation (9.0): [fixtures](https://docs.pytest.org/en/stable/explanation/fixtures.html), [parametrize](https://docs.pytest.org/en/stable/how-to/parametrize.html).

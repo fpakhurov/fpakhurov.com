@@ -1,0 +1,373 @@
+---
+title: Data quality, validation and versioning
+description: "How to catch bad data before a model learns from it and name the exact data a model was trained on: kinds of data errors, validation suites as tests on data, where to put the gates, and versioning by content hashes with snapshots and lineage."
+course: mlops
+section: Data
+order: 3
+status: published
+tags: [data-quality, data-validation, expectations, great-expectations, pandera, tfdv, schema, missing-values, duplicates, distribution-checks, l-infinity, quarantine, data-versioning, content-addressing, dvc, lakefs, snapshots, lineage]
+prerequisites: [Data pipelines and orchestration, "Data, features and leakage", Testing, Continuous integration]
+---
+
+import ValidationGates from '../../../components/figures/data-quality-and-versioning/ValidationGates.astro';
+
+The [previous note](/notes/mlops/data-pipelines) built a pipeline that turns raw events into one clean partition per day, safely re-runnable, with a hash that changes exactly when the content changes. A pipeline that is correct as code can still deliver wrong data: it faithfully converts what the producer sent, and the producer sent cents instead of euros. Software has tests that fail a build before a bug ships; data need the same, run on every partition rather than on every commit, because the data change without any commit. This note classifies the errors that data have, writes validation checks as tests on data, places them as gates in the pipeline, and then makes data versions as precise as code versions, so that every model can name the exact bytes it learnt from.
+
+## Baseline: train on whatever arrived
+
+Without checks, every partition that the pipeline produces is used. Week 5 of the [first note's Example](/notes/mlops/what-mlops-is#example) showed what follows: an upstream service sent amounts in cents, every payment looked a hundred times larger, and the model flagged 97% of them. That failure was loud. Most are quieter: a join that starts to miss 4% of countries, a retry that writes 2% of rows twice, a client that lower-cases currency codes. Each passes through the pipeline without an error, lands in a training set, and changes the next model in ways that surface weeks later as a small loss of quality nobody can explain. By then the bad partitions have been used by several models, and nobody knows which.
+
+Two questions are missing from the baseline: *is this batch fit to use?* and *which batches did this model use?* The first is validation, the second is versioning.
+
+## Kinds of data errors
+
+Data errors fall into a few classes, and each needs a different kind of check ([Kästner, 2025, chapter 16](#references); [Breck et al., 2019](#references); [Huyen, 2022, chapters 4 and 8](#references)).
+
+| Class | What goes wrong | Example in the payments | Detected by |
+| --- | --- | --- | --- |
+| Schema | a column missing, renamed or retyped | `amount` arrives as text after an export change | comparing columns and types with a declared schema |
+| Values and ranges | values outside their domain | negative amounts; currency `gbp`; amounts in cents | allowed sets, ranges, regular expressions |
+| Missingness | nulls where there should be values | a join to the country table starts to miss 4% of rows | the share of nulls per column, against a limit |
+| Duplicates | the same record more than once | a retried write repeats 2% of payments | uniqueness of a key |
+| Distribution | valid values in unusual proportions | one country's share halves; one region's amounts change scale | statistics compared with a reference batch, overall and per slice |
+| Volume and freshness | too few rows, or too late | a partition with a third of a day, or none by its deadline | row counts and timestamps against the contract |
+| Relationships | records that should match do not | payments for cards absent from the cards table | joins and referential checks |
+
+The first four classes are errors in individual records and have exact checks. The last three are properties of the batch, and their checks compare the batch with expectations or with the past, which needs thresholds and a statistical judgement. The most dangerous errors are the ones that are valid record by record: a payment of 3,416 € is a perfectly possible payment, and only its proportion among the others reveals that the unit changed.
+
+## Validation as tests on data
+
+A data check is written like a unit test, as an assertion, but evaluated on a batch: an **expectation** is a predicate over a dataset with a name, a severity and, for statistical checks, a tolerance. A **suite** is the set of expectations for one dataset, kept in version control beside the pipeline code and reviewed like it. Running the suite on a batch produces a report of which expectations held and the observed values, and a decision: accept, warn or reject.
+
+Several tools implement this, with the same core and different emphases (versions as of October 2026):
+
+- **Great Expectations** (GX Core 1.24) names the idea: expectations such as "values in this column are unique" or "values lie between a and b for at least 99.9% of rows" are grouped into suites and run by checkpoints on batches of data, producing validation results and human-readable reports ([Great Expectations documentation](#references)).
+- **pandera** (0.34) describes a data frame as a schema object: columns with types, nullability and checks, validated on pandas and other data-frame libraries, raising an error with every failing row and check ([pandera documentation](#references)). It fits checks written in code next to the transformation they guard.
+- **TensorFlow Data Validation** grew from Google's production experience ([Breck et al., 2019](#references)): it computes statistics of each batch, infers an initial schema from them for a person to review, reports anomalies against the schema, and compares batches with each other, using the L-infinity distance for categorical features and the Jensen–Shannon divergence for numeric and categorical ones ([TFDV documentation](#references)).
+- **Deequ**, from Amazon, computes the same kinds of metrics and constraints on Spark, and checks each new batch's metrics against their own history to flag anomalies ([Schelter et al., 2018](#references)).
+
+Two choices make a suite useful rather than noisy.
+
+**Severity.** An *error* rejects the batch: a duplicate key or a type change makes the data wrong, whatever their use. A *warning* flags it for a person: a distribution moved, which may be a bug or may be the world. Warnings that fire every day are ignored, exactly as the [alert-fatigue section](/notes/devops/slos-and-alerting#alert-fatigue-and-paging) of the DevOps course describes, so every warning needs an owner and a threshold set from data.
+
+**Thresholds against sampling noise.** A statistical check compares a batch with a reference, and a batch is a sample. Take the share of payments per country, with reference shares DE 0.40, FR 0.25, NL 0.15, ES 0.10, IT 0.10, and the **L-infinity distance**, the largest absolute difference between the shares of any category:
+
+$$
+L_\infty(p, q) = \max_c \lvert p_c - q_c \rvert .
+$$
+
+A batch in which a connection to the Dutch processor failed for half the day has shares DE 0.44, FR 0.28, NL 0.06, ES 0.11, IT 0.11. The differences are 0.04, 0.03, 0.09, 0.01 and 0.01, so $L_\infty = 0.09$, three times a threshold of 0.03: a warning, pointing at NL. A clean batch also differs from the reference by chance. The share of a category with probability $p$ in a batch of $n$ rows has standard deviation $\sqrt{p(1-p)/n}$: for DE, $\sqrt{0.24 / 10{,}000} = 0.0049$ with 10,000 rows, but $\sqrt{0.24/500} = 0.022$ with 500. A simulation of 20,000 clean batches against a reference of 10,000 rows shows what that means for the threshold of 0.03:
+
+```python
+# How often does a clean batch fail an L-infinity check at 0.03, by batch size?
+import numpy as np
+rng = np.random.default_rng(0)
+p = np.array([0.40, 0.25, 0.15, 0.10, 0.10])
+ref = rng.multinomial(10_000, p) / 10_000
+for n in (500, 2_000, 10_000):
+    batches = rng.multinomial(n, p, size=20_000) / n
+    linf = np.abs(batches - ref).max(axis=1)
+    print(f'n = {n:>6}: sd of the DE share {np.sqrt(0.4 * 0.6 / n):.4f}, '
+          f'median L-inf {np.median(linf):.3f}, false alarms at 0.03: {(linf > 0.03).mean():.1%}')
+```
+
+```console
+$ python3 linf.py
+n =    500: sd of the DE share 0.0219, median L-inf 0.024, false alarms at 0.03: 32.7%
+n =   2000: sd of the DE share 0.0110, median L-inf 0.013, false alarms at 0.03: 2.0%
+n =  10000: sd of the DE share 0.0049, median L-inf 0.007, false alarms at 0.03: 0.0%
+```
+
+The same threshold is silent on daily batches of 10,000 rows and fires on a third of clean hourly batches of 500. A statistical check is a hypothesis test, and its threshold must be set for the batch size; the [monitoring note](/notes/mlops/monitoring-and-drift) treats drift statistics and their tests properly. For validation gates, the practical rule is to set each threshold from the check's own history on clean batches, a few standard deviations above its usual values.
+
+**Slices.** Aggregate statistics hide errors in a segment. In the Example below, one region switched to cents: the median of all amounts moved only by a factor of 1.22, inside any sensible tolerance, while the median of that region's amounts moved by a factor of 98. Checks per slice, such as per country, per client version or per payment method, catch what the totals average away; [Sculley et al.](/notes/mlops/what-mlops-is#entanglement-changing-anything-changes-everything) recommend slicing for the same reason.
+
+## Where to validate
+
+Validation is cheapest where an error enters and most important where it would do harm, so a pipeline has several gates, each with a different suite ([Breck et al., 2019](#references); [Polyzotis et al., 2018](#references)).
+
+<ValidationGates />
+
+1. **At ingestion.** Each raw batch is checked against the producer's contract (schema, types, keys, allowed values) before anything reads it. A failing batch is **quarantined**: kept, so that it can be inspected and reprocessed, but not published. The producer is told, because the error is theirs.
+2. **After transformation.** The clean partition is checked again, for the properties the pipeline itself is responsible for: no duplicates after deduplication, row counts that match the input, distributions per slice against the reference. Only then is it published for consumers; until it is, they keep reading the previous version, stale but correct.
+3. **Before training.** The training set as a whole: enough rows, a label rate within the expected range, labels only from matured examples, no example from the evaluation period ([leakage](/notes/ml/data-features-and-leakage#traintest-contamination) by time).
+4. **At serving.** Each request is checked for schema and ranges before it reaches the model; a request that fails goes to the fallback rules of the [design note](/notes/mlops/ml-system-design#planning-for-mistakes) rather than to the model, and is counted.
+5. **Between training and serving.** The statistics of the features seen in production are compared with those of the training set, which reveals skew and drift; the [features note](/notes/mlops/features-and-skew) and the [monitoring note](/notes/mlops/monitoring-and-drift) take this up.
+
+The gates are the data counterpart of [continuous integration](/notes/devops/continuous-integration): a partition that fails a gate is like a commit that fails the pipeline, it does not reach the next stage. The difference is in what triggers them. CI runs when code changes; data gates run when data arrive, every day, on code that has not changed. A failure is also handled differently: a failed build is fixed by its author, but a failed partition is usually fixed by its producer, so the gate's report must reach someone outside the team.
+
+<aside class="callout"><strong>Key idea.</strong> Treat data like code. Declare what correct data look like as a suite of expectations, exact for records and statistical for batches, with severities and thresholds set from the history of clean batches and checked per slice; run it at every gate where data enter or change, and quarantine what fails instead of publishing it. Identify every version of the data by the hashes of its content, so that a model's training data are named as precisely as its code, and record the lineage from raw data to model.</aside>
+
+## Versioning data by content
+
+A model is reproducible only if everything that produced it can be retrieved: the code (a commit), the configuration, the environment (a [lockfile](/notes/python/modules-and-packages#lockfiles-and-reproducible-experiments) and an image digest), and the data. The first three are solved by the DevOps course. Data are harder: they are large, they live outside Git, and the usual ways of naming them are ambiguous. A path such as `clean/date=2026-10-03/` names a place, and the place's content changes with every rebuild, as the previous note's backfill showed. A copy per version is unambiguous but multiplies storage.
+
+The solution is the one Git uses for files and [content-addressed builds](/notes/devops/builds-and-dependencies#content-hashes-instead-of-timestamps) use for outputs: name each piece of data by a hash of its content. A store keeps every file under its hash, so identical content is stored once; a **snapshot** of a dataset is a manifest listing each file's name and hash; and the snapshot's own identifier is the hash of the manifest. That is a Merkle tree, the same structure as Git's [blobs and trees](/notes/devops/git#objects-blobs-trees-and-commits). Its properties follow from the hash: the same content always gets the same identifier, any change to any byte gives a new identifier, and a version can never silently change. The program below implements the idea in forty lines:
+
+```python
+"""Version a dataset by content: every file is stored under its hash, a version is the hash of its manifest."""
+import hashlib
+import json
+import shutil
+import sys
+from pathlib import Path
+
+STORE = Path(sys.argv[1])                    # the content-addressed store (a local stand-in for object storage)
+DATA = Path(sys.argv[2])                     # the working copy of the dataset: one CSV per day
+
+
+def sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def put(data: bytes) -> str:
+    """Store bytes under their hash; storing the same bytes again costs nothing."""
+    h = sha256(data)
+    path = STORE / 'objects' / h[:2] / h[2:]
+    if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+    return h
+
+
+def commit(message: str) -> str:
+    manifest = {p.name: put(p.read_bytes()) for p in sorted(DATA.glob('*.csv'))}
+    version = put(json.dumps(manifest, sort_keys=True).encode())   # the snapshot: names and hashes only
+    objects = sum(1 for p in (STORE / 'objects').rglob('*') if p.is_file())
+    print(f'{version[:12]}  {message:<40} objects in store: {objects}')
+    return version
+
+
+def checkout(version: str, target: Path):
+    h = version
+    manifest = json.loads((STORE / 'objects' / h[:2] / h[2:]).read_bytes())
+    target.mkdir(parents=True, exist_ok=True)
+    for name, h in manifest.items():
+        shutil.copyfile(STORE / 'objects' / h[:2] / h[2:], target / name)
+
+
+DATA.mkdir(parents=True, exist_ok=True)
+for day in (1, 2, 3):
+    rows = ''.join(f'd{day}-{k:05d},{(k * 37 % 5000) / 100 + day:.2f}\n' for k in range(2000))
+    (DATA / f'2026-10-0{day}.csv').write_text('id,amount_eur\n' + rows)
+
+v1 = commit('three days of payments')
+v1_again = commit('the same files, committed again')
+with open(DATA / '2026-10-03.csv', 'a') as f:
+    f.write('d3-02000,12.50\n')                                   # a late payment added to day 3
+v2 = commit('day 3 corrected by a backfill')
+(DATA / '2026-10-04.csv').write_text((DATA / '2026-10-01.csv').read_text())  # a day identical to day 1
+v3 = commit('day 4 added (same bytes as day 1)')
+
+checkout(v1, STORE.parent / 'restored')
+same = all((STORE.parent / 'restored' / n).read_bytes() == (DATA / n).read_bytes() for n in ['2026-10-01.csv', '2026-10-02.csv'])
+print(f'v1 == v1_again: {v1 == v1_again};  restored v1 matches days 1-2 of the working copy: {same}')
+code = sha256(Path(__file__).read_bytes())                        # stands in for the commit of the training code
+print('lineage of a model:', json.dumps({'data': v2[:12], 'code': code[:12], 'params': {'C': 1.0}}))
+```
+
+```console
+$ python3 version.py store data
+616fe567e427  three days of payments                   objects in store: 4
+616fe567e427  the same files, committed again          objects in store: 4
+70ce2099fedc  day 3 corrected by a backfill            objects in store: 6
+9ff6cbd3b9bf  day 4 added (same bytes as day 1)        objects in store: 7
+v1 == v1_again: True;  restored v1 matches days 1-2 of the working copy: True
+lineage of a model: {"data": "70ce2099fedc", "code": "5d1c60a7a79d", "params": {"C": 1.0}}
+```
+
+- **The first snapshot** stores three files and one manifest: four objects. Its identifier, `616fe567e427` (the first 12 hex digits), names exactly these three files with exactly these bytes.
+- **Committing again without changes** gives the same identifier and adds nothing: a snapshot depends only on content, not on when or by whom it was taken. (The message is printed, not stored; in a real tool it belongs to a commit record that points at the snapshot.)
+- **A backfill of day 3** adds one row. The new file and the new manifest are two new objects; days 1 and 2 are shared with the first snapshot, so the second version costs one file, not three. The first version is still complete in the store.
+- **A day with the same bytes as day 1** adds only a manifest, since its content is already stored: deduplication across names and versions comes for free.
+- **Checking out** the first version restores its files byte for byte, which is what reproducing an old model needs.
+- **The lineage record** of a model names its data by snapshot identifier and its code by a hash (here of the script itself, standing in for a commit), with its parameters. With such records for every artifact, "which models were trained on the partition that a gate should have rejected?" becomes a query.
+
+### DVC and lakeFS
+
+Two widely used tools apply this idea at scale, in different places (versions as of October 2026).
+
+**DVC** (3.67) keeps data next to code in a Git repository without putting the data into Git. For each tracked file or directory, a small text file (`data.dvc`) in Git records its hash, size and path; the content goes to a local cache laid out by hash, `.dvc/cache/files/md5/ec/1d2935f811…`, the first two hex digits as a directory, exactly as in the program above, and is pushed to a remote such as an object-storage bucket. A tracked directory is stored as a `.dir` object, a JSON list of the files' names and hashes: the manifest. Checking out an old Git commit and running `dvc checkout` restores the data that went with it. DVC also runs pipelines: stages declared in `dvc.yaml` with their commands, dependencies and outputs, and a `dvc.lock` that records the hash of every dependency and output of the last run, so that `dvc repro` reruns only the stages whose inputs changed, the content-hash build of the DevOps course applied to data ([DVC documentation](#references)). DVC uses MD5, which is fast and adequate for detecting changes but not collision-resistant against an attacker; the program above uses SHA-256.
+
+**lakeFS** (1.88) works at the level of a whole data lake in object storage, where datasets are too large to copy and are read by many engines. It gives the lake Git-like branches and commits: a commit records metadata that points at immutable objects, so a branch is created without copying any data, and a merge publishes a branch's changes atomically ([lakeFS documentation](#references)). This supports a pattern called write–audit–publish: a pipeline writes its new partitions to a branch, the validation suite runs on the branch, and only a passing branch is merged into `main`, which is the quarantine of the previous section implemented by the version control of the data. Table formats such as Apache Iceberg and Delta Lake provide related guarantees for individual tables: every write creates a snapshot, and queries can read the table as of an earlier snapshot.
+
+### Lineage
+
+A version identifies one dataset; **lineage** connects versions. Each derived artifact records the versions of its inputs and of the code that produced it: a clean partition its raw files and pipeline commit, a training set its partitions and the label snapshot, a model its training set, code, configuration and environment. The records form a graph from raw data to every model and prediction service ([Kästner, 2025, chapter 24](#references)). Its uses are the questions that otherwise have no answer: reproduce the model that ran last March; find every model trained on a partition that turned out to be corrupt, and retrain only those; find every dataset and model that contains a person's records when they ask for erasure, which the [responsibility note](/notes/mlops/responsible-ml) takes up. The metadata stores of ML platforms, and the run records of the [experiments note](/notes/mlops/experiments-and-registry), are lineage stores with a user interface.
+
+<aside class="callout"><strong>Check yourself.</strong> (1) Classify each error and say which check catches it: a currency code `gbp`; 200 repeated payment identifiers; the country missing in 4% of rows; the Dutch share falling from 15% to 6%. (2) A distribution check with threshold 0.03 fires on 30% of hourly batches that later turn out to be fine. What is wrong with it, and what are two fixes? (3) Why should a failed partition be quarantined rather than deleted, and what do consumers read in the meantime? (4) Two snapshots of a dataset of 1,000 daily files differ in one file. How many new objects does the second snapshot add to a content-addressed store? (5) A partition of 3 October was found to be corrupt after three models were trained. What must have been recorded to find those models?<details><summary>Answers</summary>(1) Value outside its allowed set (an allowed-values check); duplicates (uniqueness of `id`); missingness (null share against a limit); distribution (shares compared with a reference, L-infinity distance). (2) The threshold ignores sampling noise: with small batches the share of a category varies by a few hundredths by chance. Set the threshold from the check's history on clean batches, or validate larger batches (daily instead of hourly), or use a proper statistical test. (3) The batch is needed to diagnose the error and to reprocess it once fixed, and deleting raw data breaks the rule that everything is derived from them. Consumers keep reading the last published version: stale but correct. (4) Two: the changed file and the new manifest. The other 999 files are shared. (5) Lineage: for each model, the snapshot identifier of its training data, and for each training set, the partitions (with their hashes) it was built from.</details></aside>
+
+## What changed
+
+| | Train on whatever arrived (baseline) | Validated, versioned data |
+| --- | --- | --- |
+| Is a batch fit to use? | assumed | a suite of expectations at each gate decides |
+| Errors that are valid record by record | invisible | statistical checks against a reference, per slice |
+| A failing batch | used anyway | quarantined; consumers keep the last good version |
+| Thresholds | none, or guesses that cry wolf | set from the history of clean batches and the batch size |
+| Naming the data of a model | a path whose content changes | a snapshot identifier, the hash of a manifest of content hashes |
+| Storing versions | copies, or nothing | content-addressed: unchanged files are shared |
+| After a bad batch is found | nobody knows which models used it | lineage lists them |
+
+## Limitations
+
+- **A suite checks only what it states.** Expectations encode known failure modes; a new kind of error passes until someone adds a check for it. Inferred schemas and automatic anomaly detection on metric histories widen the net, at the price of more false alarms.
+- **Statistical checks need a reference that is itself correct.** A reference batch taken during an undetected incident teaches the gate that the incident is normal. References must be chosen and reviewed, and updated deliberately when the world changes.
+- **Validation cannot tell a bug from a change in the world.** A shift in the share of a country may be an outage or a marketing campaign. Gates flag; people, or the contract's producer, decide.
+- **Content hashing costs reading every byte.** Hashing terabytes on every snapshot is slow, so tools hash files once and trust file metadata afterwards, or hash at write time; and versioning row-level changes in huge tables needs table formats rather than file manifests.
+- **Versions are only as reproducible as their storage.** Snapshots must outlive the models that name them, and retention, deletion requests and storage costs pull in the other direction. The versions of the tools named are those of October 2026.
+
+## What you should remember
+
+- Data errors: schema, values and ranges, missingness, duplicates, distribution, volume and freshness, relationships. The dangerous ones are valid record by record.
+- A validation suite is a set of expectations with severities: errors reject a batch, warnings flag it. Great Expectations, pandera, TFDV and Deequ implement the same idea.
+- Statistical checks are hypothesis tests: thresholds must account for batch size, and come from the history of clean batches. Check per slice as well as overall.
+- Validate at ingestion, after transformation, before training and at serving, and compare training with serving. Quarantine failing batches; consumers keep the last good version.
+- Version data by content: files stored under their hashes, a snapshot is the hash of a manifest. Same content gives the same identifier, unchanged files are shared, versions cannot silently change.
+- DVC tracks data beside Git with hash pointers, a cache by hash and pipelines that rerun only what changed; lakeFS gives an object-storage lake zero-copy branches, commits and atomic merges.
+- Lineage records, for every artifact, the versions of its inputs and code; it answers which models used a bad partition.
+
+## Example
+
+A validation suite for the daily payments, run on a clean batch and on a batch with four planted errors: one region (NL) sends amounts in cents, a join starts to lose the country of 4% of rows, a retry writes 2% of rows twice, and a new client lower-cases the currency `GBP`. The suite is written as plain data, a list of named expectations with severities, in the style of the tools of this note, so that it runs with pandas alone.
+
+```python
+"""A validation suite for daily batches of payments, run on a clean and on a corrupted batch."""
+import numpy as np
+import pandas as pd
+
+rng = np.random.default_rng(5)
+COUNTRIES = ['DE', 'FR', 'NL', 'ES', 'IT']
+
+
+def batch(n, day):
+    return pd.DataFrame({
+        'id': [f'{day}-{k:05d}' for k in range(n)],
+        'amount_eur': rng.lognormal(3.5, 1.0, n).round(2),
+        'currency': rng.choice(['EUR', 'USD', 'GBP'], n, p=[0.9, 0.06, 0.04]),
+        'country': rng.choice(COUNTRIES, n, p=[0.4, 0.25, 0.15, 0.1, 0.1]),
+    })
+
+
+reference = batch(10_000, 'd1')                       # last week's accepted data
+clean = batch(10_000, 'd2')
+bad = batch(10_000, 'd3')
+nl = bad['country'] == 'NL'
+bad.loc[nl, 'amount_eur'] *= 100                       # one upstream region switched to cents
+bad.loc[bad.sample(frac=0.04, random_state=1).index, 'country'] = None   # a join started to miss
+bad = pd.concat([bad, bad.sample(frac=0.02, random_state=2)])           # a retry wrote rows twice
+bad['currency'] = bad['currency'].replace({'GBP': 'gbp'})                # a new client lower-cases codes
+
+
+def share(s, values):
+    return s.value_counts(normalize=True).reindex(values, fill_value=0.0)
+
+
+def per_country(b):
+    return b.groupby('country')['amount_eur'].median() / reference.groupby('country')['amount_eur'].median()
+
+
+# Each expectation: a name, a severity, and a function from the batch to (observed value, passed).
+SUITE = [
+    ('columns are id, amount_eur, currency, country', 'error',
+     lambda b: (list(b.columns), list(b.columns) == ['id', 'amount_eur', 'currency', 'country'])),
+    ('amount_eur is a float', 'error',
+     lambda b: (str(b['amount_eur'].dtype), b['amount_eur'].dtype == 'float64')),
+    ('id is unique', 'error',
+     lambda b: (f'{b["id"].duplicated().sum()} duplicates', not b['id'].duplicated().any())),
+    ('currency in EUR, USD, GBP', 'error',
+     lambda b: (f'{(~b["currency"].isin(["EUR", "USD", "GBP"])).mean():.1%} outside', b['currency'].isin(['EUR', 'USD', 'GBP']).all())),
+    ('0 < amount_eur <= 20,000 for 99.9% of rows', 'error',
+     lambda b: (f'{b["amount_eur"].between(0.01, 20_000).mean():.2%} inside', b['amount_eur'].between(0.01, 20_000).mean() >= 0.999)),
+    ('country missing in at most 1% of rows', 'error',
+     lambda b: (f'{b["country"].isna().mean():.1%} missing', b['country'].isna().mean() <= 0.01)),
+    ('row count within 50% of the reference', 'warn',
+     lambda b: (f'{len(b) / len(reference):.2f} x reference', 0.5 <= len(b) / len(reference) <= 1.5)),
+    ('median amount within a factor 2 of the reference', 'warn',
+     lambda b: (f'{b["amount_eur"].median() / reference["amount_eur"].median():.2f} x reference',
+                0.5 <= b['amount_eur'].median() / reference['amount_eur'].median() <= 2)),
+    ('median amount per country within a factor 2', 'warn',
+     lambda b: (f'max {per_country(b).max():.2f} x reference ({per_country(b).idxmax()})',
+                per_country(b).between(0.5, 2).all())),
+    ('country shares: L-inf distance to reference <= 0.03', 'warn',
+     lambda b: (f'{(share(b["country"].dropna(), COUNTRIES) - share(reference["country"], COUNTRIES)).abs().max():.3f}',
+                (share(b['country'].dropna(), COUNTRIES) - share(reference['country'], COUNTRIES)).abs().max() <= 0.03)),
+]
+
+
+def validate(name, b):
+    print(f'{name}: {len(b)} rows')
+    failed = []
+    for expectation, severity, check in SUITE:
+        observed, ok = check(b)
+        status = 'pass' if ok else ('FAIL' if severity == 'error' else 'WARN')
+        if not ok and severity == 'error':
+            failed.append(expectation)
+        print(f'  {status:<4}  {expectation:<54}  {observed}')
+    print(f'  -> {"quarantine: " + str(len(failed)) + " errors" if failed else "accept"}')
+
+
+validate('clean batch', clean)
+validate('corrupted batch', bad)
+```
+
+```console
+$ python3 validate.py
+clean batch: 10000 rows
+  pass  columns are id, amount_eur, currency, country           ['id', 'amount_eur', 'currency', 'country']
+  pass  amount_eur is a float                                   float64
+  pass  id is unique                                            0 duplicates
+  pass  currency in EUR, USD, GBP                               0.0% outside
+  pass  0 < amount_eur <= 20,000 for 99.9% of rows              100.00% inside
+  pass  country missing in at most 1% of rows                   0.0% missing
+  pass  row count within 50% of the reference                   1.00 x reference
+  pass  median amount within a factor 2 of the reference        0.99 x reference
+  pass  median amount per country within a factor 2             max 1.10 x reference (IT)
+  pass  country shares: L-inf distance to reference <= 0.03     0.008
+  -> accept
+corrupted batch: 10200 rows
+  pass  columns are id, amount_eur, currency, country           ['id', 'amount_eur', 'currency', 'country']
+  pass  amount_eur is a float                                   float64
+  FAIL  id is unique                                            200 duplicates
+  FAIL  currency in EUR, USD, GBP                               4.0% outside
+  FAIL  0 < amount_eur <= 20,000 for 99.9% of rows              99.49% inside
+  FAIL  country missing in at most 1% of rows                   4.0% missing
+  pass  row count within 50% of the reference                   1.02 x reference
+  pass  median amount within a factor 2 of the reference        1.22 x reference
+  WARN  median amount per country within a factor 2             max 98.16 x reference (NL)
+  pass  country shares: L-inf distance to reference <= 0.03     0.010
+  -> quarantine: 4 errors
+```
+
+Reading the suite and its results check by check:
+
+- **The data.** `batch` draws 10,000 payments with log-normal amounts in euros and fixed shares of currencies and countries. `reference` stands for last week's accepted data, against which the statistical checks compare. The four planted errors are one line each, and none of them makes a single record invalid on its own except the lower-case currency.
+- **`SUITE`** is a list of triples: a readable name, a severity, and a function that returns what was observed and whether the expectation held. Writing expectations as data, rather than as scattered `assert`s, is what lets the runner report every result instead of stopping at the first, and lets a reviewer read the suite as a specification. It is the shape of a GX suite or a pandera schema.
+- **Schema checks** (columns, type of `amount_eur`) pass on both batches: the corruption kept the schema intact, which is why schema validation alone is not enough.
+- **Duplicates.** The retry wrote 200 rows twice: the uniqueness of `id` fails, an error, because duplicates distort every count and rate downstream.
+- **Allowed values.** 4.0% of currencies fall outside the allowed set: the GBP payments, now `gbp`. An error, since every consumer that compares strings would silently drop them; the fix belongs to the producer, or to a normalisation step written on purpose.
+- **Ranges with a tolerance.** "For 99.9% of rows" is a tolerance, the `mostly` of Great Expectations: an occasional extreme payment does not reject a day. The corrupted batch has 99.49% inside the range; the 0.5% outside are the Dutch payments that the factor of 100 pushed above 20,000 €. The check fires, but only by luck: most Dutch amounts, multiplied by 100, are still under 20,000 € and individually plausible.
+- **Missingness.** 4.0% of countries are null against a limit of 1%: the broken join.
+- **Volume and the overall median** are warnings and pass: 10,200 rows is a normal day, and the median of all amounts moved by a factor of 1.22, within the tolerance of 2. The unit error is invisible in the totals.
+- **The sliced median** is the check that names the unit error: Dutch amounts have a median 98 times the reference's, the factor of 100 up to sampling noise. It is a warning here because per-slice medians move for real reasons too; its message points straight at the cause.
+- **The L-infinity distance** of the country shares is 0.010, computed on non-null countries: the 4% of missing countries were removed at random, so the remaining shares did not move. A distribution check does not catch every kind of loss; the missingness check did.
+- **The decision.** Four errors: the batch is quarantined, not published, and the clean batch is accepted. Consumers keep reading the last accepted partition, the producer of the payments receives the report, and once fixed the partition is rebuilt by the idempotent task of the [previous note](/notes/mlops/data-pipelines#example), with a new content hash that tells every consumer that the data changed.
+
+## Next
+
+The data reaching training are now validated and versioned. One gap remains between training and serving: features. The model is trained on features computed from history by batch jobs, and served with features computed from live data by other code, at a different moment. If the two differ by a unit, a time window or a single day of hindsight, the model is served inputs it never learnt from. The [next note](/notes/mlops/features-and-skew) builds point-in-time correct features and the feature stores that serve the same definitions to both sides.
+
+## References
+
+- E. Breck, N. Polyzotis, S. Roy, S. E. Whang, M. Zinkevich. [Data Validation for Machine Learning](https://mlsys.org/Conferences/2019/doc/2019/167.pdf). *Proceedings of the 2nd SysML Conference* (now MLSys), 2019 (schemas, validation at ingestion, skew between training and serving).
+- N. Polyzotis, S. Roy, S. E. Whang, M. Zinkevich. [Data Lifecycle Challenges in Production Machine Learning: A Survey](https://doi.org/10.1145/3299887.3299891). *SIGMOD Record* 47(2), 2018.
+- S. Schelter, D. Lange, P. Schmidt, M. Celikel, F. Biessmann, A. Grafberger. [Automating Large-Scale Data Quality Verification](https://doi.org/10.14778/3229863.3229867). *Proceedings of the VLDB Endowment* 11(12), 2018 (Deequ).
+- C. Kästner. [*Machine Learning in Production: From Models to Products*](https://mlip-cmu.github.io/book/). MIT Press, 2025. Chapters 16 (data quality) and 24 (versioning, provenance and reproducibility); and the course [CMU 17-445/645 Machine Learning in Production](https://mlip-cmu.github.io/), spring 2025.
+- C. Huyen. *Designing Machine Learning Systems*. O'Reilly, 2022. Chapters 4 (training data) and 8 (data distribution shifts and monitoring); and the course [Stanford CS329S: Machine Learning Systems Design](https://stanford-cs329s.github.io/).
+- HSE University. *Введение в MLOps* (Introduction to MLOps), master's programme «Машинное обучение в цифровом продукте», 2025/26: data versioning; testing and validation of data and models.
+- D. Sculley et al. [Hidden Technical Debt in Machine Learning Systems](https://proceedings.neurips.cc/paper_files/paper/2015/hash/86df7dcfd896fcaf2674f757a2463eba-Abstract.html). *NIPS 2015*, section 8 (data testing debt, reproducibility debt).
+- Great Expectations (GX Core 1.24, October 2026): [documentation](https://docs.greatexpectations.io/docs/core/introduction/) (expectations, suites, checkpoints, validation results).
+- pandera (0.34, October 2026): [documentation](https://pandera.readthedocs.io/en/stable/) (data-frame schemas and checks).
+- TensorFlow Data Validation: [Get started](https://www.tensorflow.org/tfx/data_validation/get_started) (schema inference, anomalies, drift and skew comparators with L-infinity and Jensen–Shannon distances).
+- DVC (3.67): [Internal files](https://doc.dvc.org/user-guide/project-structure/internal-files) (the cache laid out by hash, `.dir` objects, run cache), and the user guide on `dvc.yaml` and `dvc.lock`.
+- lakeFS (1.88, October 2026): [documentation](https://docs.lakefs.io/) (branches, commits and merges over object storage; write–audit–publish).
