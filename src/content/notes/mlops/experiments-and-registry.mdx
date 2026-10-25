@@ -1,0 +1,394 @@
+---
+title: Experiments, reproducibility and the model registry
+description: "What it takes to rerun a training run and get the same model: pinned code, data, configuration and environment, seeds and hardware nondeterminism; experiment tracking with MLflow; a model registry with versions, aliases and lineage; and model formats that are safe to load."
+course: mlops
+section: Training
+order: 5
+status: published
+tags: [reproducibility, experiment-tracking, mlflow, model-registry, model-versioning, aliases, lineage, provenance, mlproject, pickle, safetensors, onnx, skops]
+prerequisites: [Features and training–serving skew, "Data quality, validation and versioning", Training networks in practice, "Modules, packages and environments"]
+---
+
+import RunToRegistry from '../../../components/figures/experiments-and-registry/RunToRegistry.astro';
+
+The [previous note](/notes/mlops/features-and-skew) made the input of training well defined: features that mean in training what they mean in serving, joined without information from the future. Training itself is still a sequence of runs, dozens of them, started from notebooks and scripts with slightly different settings, and one of them produces the model that goes to production. Months later someone asks which data that model was trained on, or a bug fix needs the same model retrained with one change, and the answer has to exist. This note is about making runs reproducible, recording them so that they can be compared and rerun, and keeping the chosen models in a registry that links each one back to the run that made it and forward to the deployment that serves it.
+
+**Conventions.** The tracker, the pickle demonstration and the safetensors layout are real runs (Python 3.14.7, NumPy 2.5.4, scikit-learn 1.9.1, 23 October 2026). The MLflow project of the Example is written against the documentation of MLflow 3.17.2, the current release in October 2026; its YAML files were parsed but the project was not run.
+
+## Baseline: a model file on a shared drive
+
+The usual starting point is a directory: `model_final.pkl`, `model_final_v2.pkl`, `model_final_v2_fixed.pkl`, and a spreadsheet of accuracies typed in by hand. The notebook that produced the deployed file has been edited since. The training data was the result of a query on a day nobody wrote down, against tables that have changed. The library versions were whatever was installed on one laptop. When the model misbehaves, nobody can say whether it was trained on the data that is suspected of being bad; when a fix is made, nobody can retrain "the same model plus the fix", because the same model cannot be produced again. And the file itself, a pickle, runs arbitrary code when it is loaded.
+
+## What a training run depends on
+
+A trained model is the output of a function of everything that went into the run:
+
+$$
+\text{model} = \text{train}(\text{code},\ \text{data},\ \text{config},\ \text{environment},\ \text{randomness},\ \text{hardware}).
+$$
+
+Rerunning gives the same model only if every argument is the same, so each needs an identifier that is recorded with the run ([Kästner, 2025](#references), chapter 24):
+
+- **Code**: the commit hash, plus a flag or a diff when the working tree had uncommitted changes. A run from a dirty tree cannot be reproduced from the repository alone.
+- **Data**: an immutable snapshot identifier or a content hash, as produced by the tools of the [data versioning note](/notes/mlops/data-quality-and-versioning#versioning-data-by-content). A table name is not a version; a query result on a moving table is not reproducible.
+- **Configuration**: every hyperparameter, defaults included, in a file under version control rather than in arguments typed at a prompt.
+- **Environment**: the interpreter, the library versions pinned by a [lockfile](/notes/python/modules-and-packages#lockfiles-and-reproducible-experiments), and for full fidelity the digest of the [container image](/notes/devops/container-images#registries-tags-and-digests) the run executed in, which also fixes system libraries such as CUDA and BLAS.
+- **Randomness**: the seeds of every generator, set before the model is built; the Deep Learning course lists the [sources of randomness and the pitfalls](/notes/deep-learning/training-in-practice#make-runs-reproducible).
+- **Hardware and parallelism**: GPU kernels that use atomic additions or pick algorithms by benchmarking, and the order in which a sum over devices is reduced, change the last bits of results, because [floating-point addition is not associative](/notes/acos/floating-point#order-matters-floating-point-addition-is-not-associative). The [distributed training note](/notes/mlops/distributed-training) shows a ring all-reduce and a naive reduce disagreeing in half of the sums. The same code on 8 GPUs and on 16 is not the same computation.
+
+Three levels of reproduction are worth distinguishing. A **bitwise** reproduction gives identical weights; it is achievable on one machine with a fixed environment and deterministic kernels, and the Example achieves it for a random forest. A **statistical** reproduction gives a model whose metrics fall within the spread over seeds; it is what survives a change of hardware or library version. A **conclusion** reproduction confirms that the claimed effect, "feature X helps", holds up with a fresh setup. The ACM's terminology for published research calls these repeatability (the same team and setup), reproducibility (another team, the same setup) and replicability (another team, another setup) ([ACM, 2020](#references)).
+
+**How big is "the same"?** In the Example, two runs that differ only in the random seed of a random forest score 0.9474 and 0.9357 on a test set of 171 examples: 162 against 160 correct. The test set itself adds noise of the same size: an accuracy of 0.947 measured on $n = 171$ examples has a standard error of
+
+$$
+\sqrt{\frac{p (1 - p)}{n}} = \sqrt{\frac{0.947 \cdot 0.053}{171}} = 0.017 .
+$$
+
+A change that "improves accuracy by one point" on this test set has not been shown to do anything. Comparing configurations needs several seeds on each side and an evaluation set large enough for its standard error to be smaller than the effect sought ([Bouthillier et al., 2021](#references)).
+
+## Experiment tracking
+
+An **experiment tracker** records every run automatically, with the identifiers above and its results, in a store that can be queried. MLflow, the most widely used open-source tracker, organizes it as follows ([MLflow documentation, tracking](#references)):
+
+- An **experiment** groups the runs of one task, such as `cancer-rf`.
+- A **run** is one execution of training code. It has an identifier, start and end times, a status, and **tags**, among them the source file and the Git commit, which MLflow records automatically when the code runs from a repository.
+- **Parameters** are the inputs: key–value pairs, logged once and immutable.
+- **Metrics** are the outputs: numeric values with a step and a timestamp, so that a learning curve is a series of values of one metric.
+- **Artifacts** are files: the model, plots, a sample of predictions, the environment specification. They live in an artifact store, usually object storage, while parameters, metrics and tags live in a database, the backend store.
+- **Datasets** are logged as inputs with a name, a source and a content digest (`mlflow.log_input`), which is the data identifier of the previous section.
+- Since MLflow 3 (2025), a **logged model** is an entity of its own, linked to the run that created it, to its metrics, and later to the evaluations run against it.
+
+The tracker makes comparison a query instead of an archaeology: `mlflow.search_runs(filter_string="params.trees = '50' and metrics.accuracy > 0.94")` returns a table of runs, and the user interface plots metrics of selected runs side by side. Weights & Biases, Neptune, ClearML and Aim offer the same model with hosted services; DVC records experiments as Git commits beside the data versions. What none of them does is decide what to record: a run that reads an unversioned table is tracked perfectly and still cannot be reproduced. The practice that makes tracking useful, changing one thing at a time and writing down why a run was made, is the one the Deep Learning course describes under [tracking experiments](/notes/deep-learning/training-in-practice#track-every-experiment).
+
+## The model registry
+
+A tracker holds hundreds of runs and their models. A **model registry** holds the few that matter, under names that the rest of the system can refer to ([MLflow documentation, model registry](#references)):
+
+- A **registered model** is a name, such as `cancer-rf`, for one prediction task.
+- A **model version** is an immutable entry under that name, numbered 1, 2, 3, …, pointing to one model artifact and to the run that produced it. A new model never overwrites a version; it becomes the next one.
+- An **alias** is a mutable, named pointer to one version: `champion` for the version in production, `challenger` for the one being evaluated against it. `models:/cancer-rf@champion` loads whatever version the alias points to.
+- **Tags** on versions record the outcome of checks, such as `validation_status: passed`.
+
+<RunToRegistry />
+
+1. A run records the versions of code, data, configuration and environment it started from.
+2. It logs its parameters and metrics, and the trained model as an artifact.
+3. The model is registered as version 3 of `cancer-rf`, with a link back to its run.
+4. After validation, the alias `champion` moves from version 2 to version 3.
+5. Serving loads `cancer-rf@champion`; a rollback moves the alias back to version 2.
+
+**Lineage** is the chain of links in the figure read backwards: from a prediction to the model version that made it (so every prediction log should carry the version), from the version to its run, and from the run to the commit, the data snapshot, the parameters and the environment. It is the model end of the [lineage graph](/notes/mlops/data-quality-and-versioning#lineage) that the data pipeline records. It answers the questions that come up in incidents and audits: which data trained the model that rejected this application, which models were trained on the snapshot later found to be corrupted, what changed between the version that worked and the one that does not. Kästner's book opens its chapter on versioning and provenance with exactly such a case, the debugging of one loan decision ([Kästner, 2025](#references), chapter 24).
+
+**Stages and aliases.** Earlier versions of MLflow gave each version one **stage** out of a fixed list: None, Staging, Production, Archived. A version could be in only one stage, and the vocabulary did not fit every workflow, so stages were deprecated in MLflow 2.9 in favour of aliases, which are arbitrary names and of which a version can carry several ([MLflow RFC #10336](#references)). Many tutorials still show stages.
+
+**Promotion is a pointer move.** Moving `champion` from version 2 to version 3 is the model equivalent of the promotion commit in the [continuous delivery note](/notes/devops/continuous-delivery#one-artifact-many-environments): the artifact is not rebuilt, only the reference to it changes, and rollback is the same operation in reverse. There is one difference worth designing for. A serving process that resolves the alias when it starts will pick up a moved alias only when it restarts, so for a while the fleet runs a mixture of versions, and a process that crashes and restarts mid-rollout jumps ahead. Pinning the explicit version in the deployment configuration, kept in Git, and having the alias move trigger a deployment that changes that pin keeps the deployed state visible and lets the gradual rollouts of the [rollout note](/notes/mlops/rolling-out-models) control the change.
+
+## Packaging a model
+
+The artifact in a registry has to be loadable by a different process, on a different machine, months later. A usable package has four parts: the learned parameters; the code that turns parameters and inputs into outputs, preprocessing included; the environment that code needs; and a **signature**, the names, types and shapes of inputs and outputs, against which requests can be checked. An MLflow model is a directory with exactly these: an `MLmodel` file that lists the **flavors** through which the model can be loaded (`sklearn`, and the generic `python_function`) and its signature, the serialized model, and the environment files (`python_env.yaml`, `requirements.txt`). How the parameters are serialized matters more than it looks.
+
+### Pickle runs code on load
+
+Python's `pickle` does not store data; it stores a program that rebuilds the object, and the program may call any importable function. An object controls this through `__reduce__`:
+
+```python
+# Loading a pickle runs code chosen by whoever wrote the file.
+import pickle, pickletools
+
+class Model:
+    def __reduce__(self):                 # tells pickle how to rebuild the object: call this function with these arguments
+        return (print, ('this line was printed by pickle.loads',))
+
+blob = pickle.dumps(Model(), protocol=5)
+pickletools.dis(blob)
+pickle.loads(blob)
+```
+
+```console
+$ python pickle_demo.py
+    0: \x80 PROTO      5
+    2: \x95 FRAME      66
+   11: \x8c SHORT_BINUNICODE 'builtins'
+   21: \x94 MEMOIZE    (as 0)
+   22: \x8c SHORT_BINUNICODE 'print'
+   29: \x94 MEMOIZE    (as 1)
+   30: \x93 STACK_GLOBAL
+   31: \x94 MEMOIZE    (as 2)
+   32: \x8c SHORT_BINUNICODE 'this line was printed by pickle.loads'
+   71: \x94 MEMOIZE    (as 3)
+   72: \x85 TUPLE1
+   73: \x94 MEMOIZE    (as 4)
+   74: R    REDUCE
+   75: \x94 MEMOIZE    (as 5)
+   76: .    STOP
+highest protocol among opcodes = 4
+this line was printed by pickle.loads
+```
+
+The disassembly is the whole story: `STACK_GLOBAL` looks up `builtins.print`, `TUPLE1` builds its arguments, and `REDUCE` calls it. Replace `print` with `os.system` and a string with a shell command, and loading the "model" runs the command with the loader's privileges. This is not hypothetical: in February 2024, JFrog reported about 100 models on the Hugging Face hub with malicious payloads, among them a PyTorch model whose pickle opened a reverse shell to the attacker's machine on load ([JFrog, 2024](#references)). Pickles have a second, mundane problem: they refer to classes by module path, so a model pickled with one version of scikit-learn may load with a warning, or wrongly, under another. The rule is the one the Python documentation states: never unpickle data from an untrusted source. The defences have become defaults: `torch.load` has loaded with `weights_only=True`, a restricted unpickler that accepts only tensors and plain containers, since PyTorch 2.6 (January 2025), and `mlflow.sklearn.log_model` in MLflow 3.17 serializes scikit-learn models with **skops**, a format that loads only types on an allow-list, by default everywhere except on Databricks ([MLflow documentation, `mlflow.sklearn`](#references)).
+
+### safetensors stores only data
+
+**safetensors**, the format of the Hugging Face hub, stores tensors and nothing else: an 8-byte little-endian length, a JSON header that maps each tensor name to its dtype, shape and byte range, and the raw bytes. Loading is parsing a length and a JSON object and viewing bytes as arrays, so there is no code to run, and a tensor can be memory-mapped and read lazily without loading the whole file. The layout is simple enough to write by hand:
+
+```python
+# The safetensors layout: an 8-byte header length, a JSON header, then raw tensor bytes. Loading parses; it never executes.
+import json, struct
+import numpy as np
+
+tensors = {'w': np.arange(6, dtype=np.float32).reshape(2, 3), 'b': np.zeros(3, dtype=np.float32)}
+header, offset = {'__metadata__': {'run': 'run-1'}}, 0
+for name, t in tensors.items():
+    header[name] = {'dtype': 'F32', 'shape': list(t.shape), 'data_offsets': [offset, offset + t.nbytes]}
+    offset += t.nbytes
+h = json.dumps(header, separators=(',', ':')).encode()
+h += b' ' * (-len(h) % 8)                                  # pad the header to a multiple of 8 bytes
+blob = struct.pack('<Q', len(h)) + h + b''.join(t.tobytes() for t in tensors.values())
+print(len(blob), 'bytes; header:', h.decode().strip())
+
+n = struct.unpack('<Q', blob[:8])[0]                      # reading: lengths, JSON and byte ranges only
+meta = json.loads(blob[8:8 + n])
+start, end = meta['w']['data_offsets']
+print(np.frombuffer(blob[8 + n + start: 8 + n + end], dtype=np.float32).reshape(meta['w']['shape']))
+```
+
+```console
+$ python st_demo.py
+188 bytes; header: {"__metadata__":{"run":"run-1"},"w":{"dtype":"F32","shape":[2,3],"data_offsets":[0,24]},"b":{"dtype":"F32","shape":[3],"data_offsets":[24,36]}}
+[[0. 1. 2.]
+ [3. 4. 5.]]
+```
+
+The file is $8 + 144 + 36 = 188$ bytes: the length, a header of 143 bytes padded with one space to 144, and $6 + 3$ float32 values. The program follows the published format specification (safetensors 0.8.0, October 2026); the library was not used to read it back. What safetensors does not store is the computation: the code that knows that `w` multiplies the input still has to come from somewhere trusted, usually a library at a pinned version, and the optional `__metadata__` map of strings is the place for a run identifier or a commit.
+
+### ONNX stores the computation
+
+**ONNX** goes the other way and stores the computation itself, as a graph of standard operators (`MatMul`, `Add`, `Relu`, `TreeEnsembleClassifier`) with the weights as constant tensors, in a protocol-buffer file. Each operator belongs to a versioned **operator set**, so a file states exactly which semantics it needs (ONNX 1.23.2 in October 2026). Exporters exist for PyTorch (`torch.onnx.export`) and scikit-learn (`skl2onnx`), and runtimes such as ONNX Runtime, TensorRT and OpenVINO execute the graph without Python, often faster, which is why the [serving note](/notes/mlops/serving-models) returns to it. The price is the conversion: not every operation or custom layer has an ONNX equivalent, and a converted model computes in a different order and sometimes a different precision, so its outputs agree with the original only within a tolerance. That agreement is a test to write, on real inputs, before the converted model is registered; the [next note](/notes/mlops/testing-ml-systems) is about such tests.
+
+<aside class="callout"><strong>Key idea.</strong> A model is reproducible only if every input of its run has an identifier that the run records: commit, data snapshot, configuration, environment, seeds; and even then, results are identical only on the same hardware and software, and equivalent elsewhere only within the spread over seeds. A tracker records runs; a registry gives the few models that matter immutable numbered versions linked to their runs, and mutable aliases that deployments follow, so that promotion and rollback are pointer moves. Ship weights in formats that cannot execute code.</aside>
+
+<aside class="callout"><strong>Check yourself.</strong> (1) A run's record has the commit hash but the training script read `SELECT * FROM events`. What is missing, and why does a hash of the code not help? (2) Two runs with the same seed, code, data and lockfile give accuracies of 0.951 and 0.953 on one GPU type and on another. Is the run reproducible? (3) Why can a model version not be edited, while an alias can? (4) A serving fleet of 20 processes loads `cancer-rf@champion` at start-up. The alias is moved to a new version, and five processes restart over the next hour because of an unrelated memory leak. What runs in production? (5) A colleague sends a `model.pt` file from a public forum. What should `torch.load` be called with, and what if the file needs `weights_only=False`?<details><summary>Answers</summary>(1) The data version: the query reads whatever the table holds today. Record a snapshot identifier or a content hash of the data that was read, or read from an immutable snapshot. (2) Not bitwise, which is expected across hardware; statistically yes if 0.002 is within the spread over seeds, which on most test sets it is. (3) Versions are what lineage, prediction logs and rollbacks refer to; if version 3 could change, "the model that made this prediction" would have no fixed meaning. An alias is a statement about the present, "the version in production", and has to move. (4) A mixture: 15 processes on the old version and 5 on the new, without anyone having decided to run a 25% canary. Pin versions in the deployment and roll out deliberately. (5) `weights_only=True`, the default since PyTorch 2.6, which loads tensors but refuses arbitrary objects. If the file fails under it, it contains Python objects, and loading it with `weights_only=False` runs whatever code it carries; ask for the weights in safetensors instead.</details></aside>
+
+## What changed
+
+| | A model file on a drive (the baseline) | Tracked runs and a registry |
+| --- | --- | --- |
+| What produced a model | unknown | a run with commit, data snapshot, config, environment, seed |
+| Rerunning | a different model | the same model on the same stack, an equivalent one elsewhere |
+| Comparing runs | a hand-typed spreadsheet | queries over logged parameters and metrics, several seeds |
+| The production model | the newest file | a registry version that an alias or a pinned deployment points to |
+| Rollback | find the old file | move the alias back, or redeploy the previous pinned version |
+| Questions after an incident | unanswerable | lineage from prediction to version to run to data |
+| File format | pickle, which runs code | safetensors or skops for weights, ONNX for portable graphs |
+
+## Limitations
+
+- **Bitwise reproducibility is narrow.** It holds on one hardware and software stack with deterministic kernels, often at a cost in speed; across GPUs, library versions or numbers of devices, only statistical reproduction is realistic.
+- **A tracker records what it is told.** Unversioned data, a hand-edited feature file or an environment variable that changes behaviour are invisible to it.
+- **Lineage stops at the boundary of the platform.** Data that came from another team's pipeline is traceable only as far as that pipeline records its own provenance.
+- **A registry is a process as much as a tool.** Who may move `champion`, and which checks must pass first, are decisions; the tool only records them.
+- **Tools move.** MLflow 3 changed the model APIs (`name` replaced `artifact_path`, logged models became entities), and the versions and defaults here are those of October 2026.
+
+## What you should remember
+
+- A model is a function of code, data, configuration, environment, randomness and hardware; record an identifier for each, or the run cannot be reproduced.
+- Bitwise reproduction holds on a fixed stack; elsewhere, reproduce statistically, and judge differences against the spread over seeds and the standard error $\sqrt{p(1-p)/n}$ of the test metric.
+- A tracker logs runs: parameters, metrics with steps, artifacts, datasets with digests, tags with the commit.
+- A registry holds named models with immutable versions linked to their runs, and mutable aliases such as `champion` that deployments follow; promotion and rollback are alias moves. MLflow's stages are deprecated in favour of aliases.
+- Lineage runs from a prediction to a version, to a run, to the commit and the data; every prediction log should carry the model version.
+- Pickle executes code on load. Ship weights as safetensors or skops, load PyTorch files with `weights_only=True`, and test a converted ONNX model against the original within a tolerance.
+
+## Example
+
+The tracker below is the minimal version of everything above, in about fifty lines: each run writes a JSON record with the identifiers of its code, data, parameters and environment, its metrics, and the hash of its model; `diff` compares two records; `register` adds versions and aliases. It trains a random forest on scikit-learn's bundled breast-cancer data three times: twice with seed 0, once with seed 1.
+
+```python
+# A minimal experiment tracker and model registry: every run is one JSON file with everything needed to rerun it.
+import hashlib, json, pickle, platform
+from pathlib import Path
+import numpy as np, sklearn
+from sklearn.datasets import load_breast_cancer
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score, log_loss
+from sklearn.model_selection import train_test_split
+
+RUNS, REGISTRY = Path('runs'), Path('registry.json')
+digest = lambda b: hashlib.sha256(b).hexdigest()[:12]
+
+def run(name, **params):
+    X, y = load_breast_cancer(return_X_y=True)
+    Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.3, random_state=0, stratify=y)   # the split is data, fixed
+    model = RandomForestClassifier(n_estimators=params['trees'], max_features=params['max_features'],
+                                   random_state=params['seed']).fit(Xtr, ytr)
+    blob = pickle.dumps(model)
+    (RUNS / name).mkdir(parents=True, exist_ok=True)
+    (RUNS / name / 'model.pkl').write_bytes(blob)
+    record = {
+        'run': name,
+        'code': digest(Path(__file__).read_bytes()),              # in a repository: the commit hash and a dirty flag
+        'data': digest(X.tobytes() + y.tobytes()),
+        'params': params,
+        'env': {'python': platform.python_version(), 'numpy': np.__version__, 'sklearn': sklearn.__version__,
+                'machine': platform.machine()},
+        'metrics': {'accuracy': round(accuracy_score(yte, model.predict(Xte)), 4),
+                    'log_loss': round(log_loss(yte, model.predict_proba(Xte)), 4)},
+        'artifacts': {'model.pkl': digest(blob)},
+    }
+    (RUNS / name / 'run.json').write_text(json.dumps(record, indent=2))
+    return record
+
+def diff(a, b, path=''):
+    out = []
+    for k in a.keys() - {'run'}:
+        if isinstance(a[k], dict):
+            out += diff(a[k], b[k], f'{path}{k}.')
+        elif a[k] != b[k]:
+            out.append(f'  {path}{k}: {a[k]} -> {b[k]}')
+    return sorted(out)
+
+def register(model_name, run_name, alias=None):
+    reg = json.loads(REGISTRY.read_text()) if REGISTRY.exists() else {}
+    m = reg.setdefault(model_name, {'versions': [], 'aliases': {}})
+    rec = json.loads((RUNS / run_name / 'run.json').read_text())
+    m['versions'].append({'version': len(m['versions']) + 1, 'run': run_name, 'model': rec['artifacts']['model.pkl'],
+                          'code': rec['code'], 'data': rec['data']})
+    if alias:
+        m['aliases'][alias] = len(m['versions'])
+    REGISTRY.write_text(json.dumps(reg, indent=2))
+    return m
+
+a = run('run-1', trees=50, max_features='sqrt', seed=0)
+b = run('run-2', trees=50, max_features='sqrt', seed=1)
+c = run('run-3', trees=50, max_features='sqrt', seed=0)
+print(json.dumps(a, indent=2))
+print('run-1 -> run-2 (only the seed changed):', *diff(a, b), sep='\n')
+print('run-1 -> run-3 (the same configuration again):', *(diff(a, c) or ['  no differences']), sep='\n')
+register('cancer-rf', 'run-1', alias='champion')
+m = register('cancer-rf', 'run-2', alias='challenger')
+print('registry of cancer-rf:', *[f'  {v}' for v in m['versions']], f'  aliases: {m["aliases"]}', sep='\n')
+```
+
+```console
+$ python track.py
+{
+  "run": "run-1",
+  "code": "7bcef726d6fe",
+  "data": "25e2eb7b7a87",
+  "params": {
+    "trees": 50,
+    "max_features": "sqrt",
+    "seed": 0
+  },
+  "env": {
+    "python": "3.14.7",
+    "numpy": "2.5.4",
+    "sklearn": "1.9.1",
+    "machine": "arm64"
+  },
+  "metrics": {
+    "accuracy": 0.9474,
+    "log_loss": 0.3353
+  },
+  "artifacts": {
+    "model.pkl": "a078c160ecbd"
+  }
+}
+run-1 -> run-2 (only the seed changed):
+  artifacts.model.pkl: a078c160ecbd -> 255c16db6bca
+  metrics.accuracy: 0.9474 -> 0.9357
+  metrics.log_loss: 0.3353 -> 0.3371
+  params.seed: 0 -> 1
+run-1 -> run-3 (the same configuration again):
+  no differences
+registry of cancer-rf:
+  {'version': 1, 'run': 'run-1', 'model': 'a078c160ecbd', 'code': '7bcef726d6fe', 'data': '25e2eb7b7a87'}
+  {'version': 2, 'run': 'run-2', 'model': '255c16db6bca', 'code': '7bcef726d6fe', 'data': '25e2eb7b7a87'}
+  aliases: {'champion': 1, 'challenger': 2}
+```
+
+- **`digest`.** The first 12 hex digits of a SHA-256: enough to tell versions apart, short enough to read. Every identifier in the record is a content hash, so equal hashes mean equal bytes.
+- **The split is fixed separately from the model's seed.** `random_state=0` in `train_test_split` belongs to the data, not to the run: if it followed the seed, two runs would be scored on different test sets, and their difference would mix model variance with evaluation variance.
+- **`code`** hashes the script itself. In a repository, the commit hash and a dirty flag (`git status --porcelain` is empty or not) replace it; MLflow records the commit as the tag `mlflow.source.git.commit`.
+- **`data`** hashes the arrays actually used, not a file name: if the bundled data set ever changed, the hash would.
+- **`env`** records the versions that a lockfile would pin, and the machine architecture, since the same versions can compute differently on `arm64` and `x86_64`.
+- **`artifacts`** hashes the pickled model, which turns "is it the same model?" into a string comparison. (A pickle is acceptable here because the tracker only reads files it wrote itself.)
+- **Seed 1 against seed 0.** The diff lists exactly what changed: the seed, and as a consequence the model and both metrics. Accuracy moved from 162 to 160 correct out of 171, a difference smaller than the standard error of 0.017 computed earlier.
+- **Seed 0 again.** No difference at all, including the model hash: on one machine, with the same versions, a random forest with a fixed seed is bitwise reproducible.
+- **The registry.** Two versions of `cancer-rf`, each carrying its run, model hash, code and data: the lineage of the figure in miniature. `champion` points to version 1, `challenger` to version 2; promoting the challenger would be one assignment in `aliases`, and rolling back another.
+
+The same run with MLflow is a **project**: a directory with an `MLproject` file that declares how to run it, an environment file, and the training script. `MLproject`:
+
+```yaml
+name: cancer-rf
+
+python_env: python_env.yaml
+
+entry_points:
+  main:
+    parameters:
+      trees: {type: int, default: 50}
+      max_features: {type: string, default: sqrt}
+      seed: {type: int, default: 0}
+      data: {type: path, default: data/cancer.parquet}
+    command: "python train.py --trees {trees} --max-features {max_features} --seed {seed} --data {data}"
+```
+
+`python_env.yaml`:
+
+```yaml
+python: "3.14.7"
+build_dependencies:
+  - pip
+dependencies:
+  - mlflow==3.17.2
+  - numpy==2.5.4
+  - pandas==3.1.0
+  - scikit-learn==1.9.1
+```
+
+and the part of `train.py` that talks to MLflow:
+
+```python
+with mlflow.start_run():
+    mlflow.log_params(vars(args))
+    mlflow.log_input(mlflow.data.from_pandas(df, source=args.data, name='cancer', targets='target'), context='training')
+    model = RandomForestClassifier(n_estimators=args.trees, max_features=args.max_features,
+                                   random_state=args.seed).fit(Xtr, ytr)
+    mlflow.log_metric('accuracy', accuracy_score(yte, model.predict(Xte)))
+    mlflow.sklearn.log_model(model, name='model', signature=infer_signature(Xte, model.predict(Xte)),
+                             registered_model_name='cancer-rf')
+```
+
+```bash
+mlflow run . -P seed=1 --experiment-name cancer-rf
+python -c "from mlflow import MlflowClient; MlflowClient().set_registered_model_alias('cancer-rf', 'champion', version=2)"
+```
+
+- **`name`** names the project. **`python_env`** points to the environment file; the alternatives are `conda_env` and `docker_env`, which runs the project in a container image, the strongest pin of the environment.
+- **`entry_points.main`** is what `mlflow run` executes by default. Each **parameter** has a type and a default; `type: path` makes MLflow download a remote file to a local path before the run, so the same project can read `s3://` in production and a local file in a test.
+- **`command`** is the shell command, with parameters substituted into the braces. The parameters therefore exist in two places, the `MLproject` and the script's argument parser, and must agree.
+- **`python_env.yaml`** pins the interpreter and every package with `==`. `mlflow run` builds a virtual environment from it (with `virtualenv` or `uv`, chosen by `--env-manager`), so the run does not depend on what is installed on the machine. Exact pins of direct dependencies are not a lockfile: the dependencies of those packages are still resolved at build time.
+- **`mlflow.start_run()`** opens the run; when started by `mlflow run`, it attaches to the run the project already created, which has the Git commit as a tag if the directory is a repository.
+- **`log_params(vars(args))`** logs every argument, defaults included. **`log_input`** logs the data set with a digest of its contents, the data identifier of this note.
+- **`log_metric`** logs one value; inside a training loop it would take `step=epoch`.
+- **`log_model(..., name='model', ...)`** saves the model as an MLflow model, with the `sklearn` and `python_function` flavors, the signature inferred from test inputs and predictions, and the environment. In MLflow 3, `name` replaces the deprecated `artifact_path`; in 3.17, scikit-learn models are serialized with skops by default. **`registered_model_name`** registers the logged model as the next version of `cancer-rf`.
+- **`mlflow run . -P seed=1`** runs the project with one parameter overridden, in a run of the experiment `cancer-rf`. The second command points the alias `champion` at version 2, after whatever checks the team requires; serving then loads `models:/cancer-rf@champion`.
+
+## Next
+
+A registered version is now traceable and reproducible, but nothing so far says it is correct. Accuracy on a test set is one number; the model can be right on average and wrong for a whole region, sensitive to a field that should not matter, or broken by a change in the pipeline that no metric notices. The [next note](/notes/mlops/testing-ml-systems) is about testing ML systems: the data, the model's behaviour and the pipeline, and the checks a version must pass before the alias moves.
+
+## References
+
+- HSE University. *Введение в MLOps* (master's programme «Машинное обучение в цифровом продукте», 2025/26): experiment tracking with MLflow, the model registry and the model lifecycle.
+- C. Kästner. *Machine Learning in Production: From Models to Products*. MIT Press, 2025. [Chapter 24: Versioning, Provenance, and Reproducibility](https://mlip-cmu.github.io/book/24-versioning-provenance-and-reproducibility.html). Course [17-445/645, spring 2025](https://mlip-cmu.github.io/).
+- C. Huyen. *Designing Machine Learning Systems*. O'Reilly, 2022. Chapter 6 (experiment tracking and versioning). Stanford [CS 329S](https://stanford-cs329s.github.io/).
+- X. Bouthillier et al. [Accounting for Variance in Machine Learning Benchmarks](https://arxiv.org/abs/2103.03098). MLSys, 2021.
+- Association for Computing Machinery. [Artifact Review and Badging, version 1.1](https://www.acm.org/publications/policies/artifact-review-and-badging-current), August 2020 (repeatability, reproducibility, replicability).
+- MLflow documentation (v3.17, October 2026): [Tracking](https://mlflow.org/docs/latest/ml/tracking/), [Model Registry](https://mlflow.org/docs/latest/ml/model-registry/), [Projects](https://mlflow.org/docs/latest/ml/projects/), [`mlflow.sklearn`](https://mlflow.org/docs/latest/api_reference/python_api/mlflow.sklearn.html) (serialization formats), [command line](https://mlflow.org/docs/latest/api_reference/cli.html).
+- MLflow. [RFC: Model Registry stages deprecation, issue #10336](https://github.com/mlflow/mlflow/issues/10336), 2023.
+- Python documentation: [`pickle`](https://docs.python.org/3/library/pickle.html) (the warning on untrusted data), [`pickletools`](https://docs.python.org/3/library/pickletools.html).
+- PyTorch documentation: [Serialization semantics](https://docs.pytorch.org/docs/stable/notes/serialization.html) (`weights_only`); [BC-breaking change: `torch.load` uses `weights_only=True` by default](https://dev-discuss.pytorch.org/t/bc-breaking-change-torch-load-is-being-flipped-to-use-weights-only-true-by-default-in-the-nightlies-after-137602/2573), 2024.
+- JFrog. [Data Scientists Targeted by Malicious Hugging Face ML Models with Silent Backdoor](https://jfrog.com/blog/data-scientists-targeted-by-malicious-hugging-face-ml-models-with-silent-backdoor/), February 2024.
+- Hugging Face. [safetensors](https://github.com/huggingface/safetensors) (format specification in the README), version 0.8.0.
+- [ONNX](https://onnx.ai/) and its [operator documentation](https://onnx.ai/onnx/operators/), version 1.23.2; [skops](https://skops.readthedocs.io/) (secure persistence of scikit-learn models).

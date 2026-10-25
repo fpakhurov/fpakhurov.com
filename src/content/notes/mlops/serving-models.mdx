@@ -1,0 +1,397 @@
+---
+title: Serving models
+description: "How a trained model answers requests: batch, online and streaming inference, the model as a service with its API and timeouts, the batching trade-off between latency and throughput computed, CPUs against GPUs, model servers, prediction caches and fallbacks."
+course: mlops
+section: Serving
+order: 8
+status: published
+tags: [model-serving, inference, batch-inference, online-inference, streaming, dynamic-batching, latency, throughput, gpu, triton, kserve, bentoml, caching, fallbacks]
+prerequisites: ["Experiments, reproducibility and the model registry", Resilience and capacity]
+---
+
+import DynamicBatching from '../../../components/figures/serving-models/DynamicBatching.astro';
+import BatchingTradeoff from '../../../components/figures/serving-models/BatchingTradeoff.astro';
+
+The training section ended with a model in the [registry](/notes/mlops/experiments-and-registry): a versioned artifact with its data, code and metrics recorded, tested by the [checks of the testing note](/notes/mlops/testing-ml-systems), and trained on as many GPUs as it needed ([distributed training](/notes/mlops/distributed-training)). Nobody has used it yet. This note is about the step that turns the artifact into answers: when predictions are computed, ahead of time or on request; how a model is wrapped as a service with an API, health checks and timeouts; why a GPU serving one request at a time wastes almost all of itself, and what batching requests buys and costs, computed on numbers; how to choose hardware and read its utilization; what the model servers of 2026 provide; and how caches and fallbacks keep the service answering when the model cannot.
+
+**Conventions.** The batching simulation of the Example is a NumPy program run with Python 3.14.7, with fixed seeds; its service times come from a simple cost model, not from a measured GPU. The Triton configuration is written against the documentation of Triton Inference Server 2.73 (September 2026) and was not run. Versions and project states are those of October 2026.
+
+## Baseline: a model inside a web handler
+
+The first version of most model services is a few lines in a web framework: load the pickled model when the process starts, and in the handler of `POST /predict` parse the JSON body, build a feature vector, call `model.predict` and return the result. It works on a laptop, and each of its choices fails in production. The handler runs one request at a time through the model, so a GPU behind it spends nearly all of its time waiting for the next request, as the batching section computes. Each worker process loads its own copy of the weights, so eight workers of a 2 GB model take 16 GB. The features are rebuilt by code written for the handler, not the code that built them for training, which is the [training–serving skew](/notes/mlops/features-and-skew) of the data section. Nothing bounds how long a request may take, so a slow input or a slow dependency holds a worker until the client has long given up. The model version is whichever file happened to be on disk, so a prediction cannot be traced back to the model that made it. And when the model fails, the endpoint fails with it.
+
+<aside class="callout"><strong>Key idea.</strong> Decide first when a prediction is needed: if the inputs are known in advance, compute predictions in batch and serve a lookup; only inputs that arrive with the request need a model online. An online model is a service like any other, with an API, readiness, timeouts and deadlines, plus one property of its own: the hardware runs a batch of $b$ inputs in barely more time than one, so throughput grows almost $b$-fold while each request pays the time spent waiting for its batch. Choose the largest batch and queue delay that the latency budget allows, cache what repeats, and keep a tested fallback for when the model cannot answer in time.</aside>
+
+## Batch, online and streaming inference
+
+Three ways of producing predictions differ in when the model runs and what it can see ([Huyen, 2022, ch. 7](#references)):
+
+- **Batch inference** runs the model on a schedule over a known set of inputs, for example every user every night, and writes the predictions to a table or a key–value store. Serving is a lookup. It can use the largest batches and the cheapest hardware, it has no latency constraint, and a failed run leaves yesterday's predictions in place. It is limited by what it knows in advance: a new user has no prediction until the next run, a prediction can be up to a day old, and features that only exist at request time, such as the current search query or the items in the basket, cannot be used. It also computes predictions nobody reads: a service that scores 10 million users each night but sees 2 million of them a day discards 80% of the work.
+- **Online inference** runs the model when a request arrives and answers within it. It is the only option when the input cannot be enumerated in advance: a search query, an uploaded image, a card transaction to be approved or declined. It needs a service that meets a latency target under load, which is most of this note.
+- **Streaming inference** runs the model on events from a stream, such as a log of clicks or transactions, as they arrive, and writes the results to where the next request will find them: a fraud score attached to an account, an updated user embedding. Nobody waits on it synchronously, but its results are seconds old rather than hours. It needs a stream processor and the [pipelines of the data section](/notes/mlops/data-pipelines), and the same feature code for the stream and for training, or the skew returns.
+
+Many systems combine them. A recommender computes item embeddings in batch, updates a user's recent-interest features from the stream, and ranks candidates online with both. The decision for each prediction follows from three questions: is the input known before the request (batch is possible), how old may the answer be (hours: batch; seconds: streaming; none: online), and does the model need features that exist only in the request (online).
+
+| | Batch | Online | Streaming |
+| --- | --- | --- | --- |
+| When the model runs | on a schedule | on each request | on each event |
+| Who waits | nobody | the caller, synchronously | nobody; the next request reads the result |
+| Freshness of the answer | hours | the request itself | seconds |
+| Inputs | a known set | anything in the request | events and their history |
+| Typical cost | lowest: large batches, spare capacity | highest: capacity for the peak | in between |
+| What fails | stale or missing predictions for new keys | latency, overload, a slow dependency | lag, events out of order |
+
+## The model as a service
+
+An online model sits behind an API, and most of what the [DevOps course](/notes/devops/resilience-and-capacity) says about services applies unchanged: it is stateless, it runs as several replicas behind a load balancer, it has [liveness and readiness probes](/notes/devops/kubernetes#probes-is-it-alive-is-it-ready-has-it-started), and it scales with traffic. Four things are specific to models.
+
+**The protocol.** Model servers converged on the **Open Inference Protocol**, which started as KServe's "v2" protocol and is implemented by Triton, KServe and others ([KServe, Open Inference Protocol](#references)). A request names a model and a version and carries named tensors with a shape and a data type:
+
+```text
+POST /v2/models/ranker/versions/2/infer
+{
+  "inputs": [
+    { "name": "features", "shape": [2, 64], "datatype": "FP32", "data": [0.12, -1.3, 0.88, "... 125 more numbers"] }
+  ]
+}
+```
+
+The response repeats `model_name` and `model_version`, which belong in every log line and every stored prediction: the [monitoring note](/notes/mlops/monitoring-and-drift) joins predictions to labels and to the model that made them. The same protocol has a gRPC form, `ModelInfer`, with tensors as packed bytes. The difference matters for large inputs. One $224 \times 224 \times 3$ image in 32-bit floats is 0.60 MB as bytes; as a JSON list of decimal numbers the same body is 3.11 MB, 5.2 times larger (measured on standard normal values written by Python's `json`), and it has to be parsed on both sides. Tensors therefore travel over gRPC or in the binary extension of the HTTP protocol, and JSON is kept for small inputs and for debugging.
+
+**Readiness.** A model replica is ready only when the weights are loaded and the first requests have run. The first batch on a GPU pays for memory allocation and kernel selection, often tens or hundreds of milliseconds more than later ones, so servers run **warm-up** requests before they report ready. Loading a multi-gigabyte model from object storage can take minutes, which sets how fast the service can scale up and is one reason to keep spare replicas.
+
+**Timeouts at two places.** The client's timeout is chosen from the service's latency distribution, a little above its high percentile, and the remaining time travels with the request as a [deadline](/notes/devops/resilience-and-capacity#timeouts-and-deadlines). The server needs a timeout of its own on its **queue**: under overload, requests wait for the model, and a request whose client has already timed out should be dropped before it uses the GPU, not after. Model servers expose this as a queue policy, as the Triton configuration of the Example does.
+
+**Batching**, the subject of the next section, is the property that makes a model service unlike a web service: the server deliberately holds requests back so that it can run them together.
+
+## Latency against throughput: the batching trade-off
+
+Why hold requests back? Because running a model on a batch of inputs costs barely more than running it on one. A forward pass reads every weight from memory and launches the same sequence of kernels whatever the batch size; only the arithmetic grows with the number of inputs. A simple model of the time to serve a batch of $b$ requests is therefore
+
+$$
+s(b) = a + c\,b ,
+$$
+
+with $a$ the fixed cost per batch (reading the weights, launching kernels, moving data) and $c$ the cost per request. Take $a = 8$ ms and $c = 0.5$ ms, round numbers for a mid-sized network on one GPU.
+
+**Throughput.** One model instance that runs batches back to back serves
+
+$$
+X(b) = \frac{b}{s(b)} = \frac{b}{a + c\,b} \ \xrightarrow{\ b \to \infty\ } \ \frac{1}{c}
+$$
+
+requests per unit time. At $b = 1$ that is $1/8.5\ \text{ms} = 118$ requests per second; at $b = 4$, 400; at $b = 16$, $16/16\ \text{ms} = 1{,}000$; at $b = 32$, $32/24\ \text{ms} = 1{,}333$, approaching the limit $1/c = 2{,}000$. The fixed cost is paid once per batch instead of once per request, so the gain is large while $c\,b$ is small against $a$ and fades once the per-request work dominates.
+
+**The smallest batch that keeps up.** If requests arrive at rate $\lambda$, the instance keeps up only if $X(b) \ge \lambda$:
+
+$$
+\begin{aligned}
+\frac{b}{a + c\,b} &\ge \lambda \\
+b &\ge \lambda a + \lambda c\, b \\
+b\,(1 - \lambda c) &\ge \lambda a \\
+b &\ge \frac{\lambda a}{1 - \lambda c} \qquad (\lambda c < 1).
+\end{aligned}
+$$
+
+At 400 requests per second, $\lambda a = 0.4 \cdot 8 = 3.2$ and $\lambda c = 0.2$, so $b \ge 4$. At 1,000 per second, $b \ge 8/0.5 = 16$. Without batching the instance saturates at 118 requests per second, and no amount of tuning changes that.
+
+**The latency price.** A request now waits for its batch to form and then for the batch to run. If requests arrive evenly at rate $\lambda$, a batch of $b$ needs $(b - 1)/\lambda$ to fill after its first request: the first request waits all of it, the last none, and the average request $(b - 1)/(2\lambda)$. Then every request in the batch waits $s(b)$, which itself grows with $b$. At 1,000 requests per second, a batch of 16 fills in 15 ms and runs in 16 ms, so a request spends about $7.5 + 16 = 23.5$ ms on average, of which 8.5 ms would have been the cost of serving it alone on an idle instance.
+
+<BatchingTradeoff />
+
+1. Throughput of one instance against the batch size: $b/(a + c b)$, climbing from 118 requests per second at $b = 1$ towards the limit of 2,000.
+2. The time to run one batch, $a + c b$, from 8.5 ms to 24 ms: the latency each request in the batch pays once the batch starts.
+3. The loads of the text: at 400 requests per second the instance needs batches of at least 4, at 1,000 batches of at least 16.
+
+### Dynamic batching
+
+Clients send one request at a time, so the server forms the batches. **Dynamic batching** collects requests from a queue: when a model instance is free, the batcher takes everything waiting, up to a **maximum batch size**; if that is fewer than the maximum, it may wait, but not longer than a **maximum queue delay** measured from the arrival of the oldest request in the batch ([Crankshaw et al., 2017](#references); [Olston et al., 2017](#references)). Two parameters, then, and one rule: a batch starts when it is full, or when its oldest request has waited the maximum delay, whichever comes first, and never before an instance is free.
+
+<DynamicBatching />
+
+1. Requests arrive one by one and wait in the queue; the instance is idle.
+2. The first request starts the delay timer of the batch: 5 ms.
+3. The timer expires with three requests waiting, fewer than the maximum of 4; the batch starts anyway, and the instance is busy for $8 + 0.5 \cdot 3 = 9.5$ ms.
+4. Requests keep arriving while it runs; by the time it ends, four are waiting.
+5. A full batch does not wait for the timer: it starts the moment the instance is free.
+
+The rule adapts by itself. At high load the queue fills while the instance is busy, so batches are large without any delay; at low load batches are small, and a delay buys larger ones only by making requests wait. The Example runs the rule on simulated traffic. Its findings, for the cost model above with a maximum batch of 32:
+
+- **Without batching** the instance at 100 requests per second is 85% busy, with a p99 of 127 ms for 8.5 ms of work, the [queueing curve](/notes/devops/resilience-and-capacity#latency-against-utilization) of the DevOps course; above 118 per second it falls behind without limit. With batching and no delay, the p99 at the same load is 18 ms.
+- **At 400 requests per second**, with no delay, the instance is busy 99% of the time with batches of 4: it keeps up, with no headroom for a burst. A delay of 10 ms raises the batches to 5.1 and cuts the busy time to 83%, for 0.6 ms more at the p99. The extra waiting is mostly spent while the instance would otherwise have been running small, inefficient batches.
+- **At 100 requests per second**, the same 10 ms delay raises the median from 11 to 19 ms and saves GPU time nobody needed. A fixed delay helps at one load and hurts at another.
+- **At 1,000 requests per second** the queue alone forms batches of 16 and the delay hardly matters, until at 20 ms it starts adding to the latency.
+
+The practical rule follows: start with no delay, which already batches under load, and add one only when the GPU time saved is worth the latency, keeping the delay a small fraction of the latency objective. Clipper tunes the maximum batch size online, raising it while the latency objective is met and cutting it when it is not ([Crankshaw et al., 2017](#references)).
+
+<aside class="callout"><strong>Batching changes what one slow request costs.</strong> In a batch, every request finishes when the batch does. A single long input, a sentence of 500 tokens among sentences of 20, makes the whole batch as slow as itself when inputs are padded to the longest. Servers sort or bucket inputs by length, or use models and kernels that handle ragged batches; the [next note](/notes/mlops/llm-inference-systems) meets this problem at its most extreme, in generation, where requests differ in length by hundreds of steps.</aside>
+
+## Hardware: CPU, GPU and what utilization means
+
+*Optional depth: the arithmetic-intensity argument for batching. The rest of the note uses only its conclusion.* The cost model above has a reason in the hardware. A dense layer of width $d$ applied to a batch of $b$ inputs multiplies a $b \times d$ matrix by a $d \times d$ weight matrix: $2 b d^2$ floating-point operations. In 16-bit numbers it reads $2 d^2$ bytes of weights and reads and writes $2 \cdot 2 b d$ bytes of activations. Its **arithmetic intensity**, operations per byte moved, is
+
+$$
+I = \frac{2 b d^2}{2 d^2 + 4 b d} = \frac{b}{1 + 2b/d} \approx b \qquad (b \ll d).
+$$
+
+By the [roofline model](/notes/acos/data-level-parallelism#the-roofline-model-arithmetic-or-memory), a computation reaches the peak arithmetic rate only above the ridge point, the ratio of peak arithmetic to memory bandwidth: about 200 operations per byte for the 16-bit tensor cores of an A100, about 295 for an H100. At batch size 1 a dense layer has $I \approx 1$ and can use at most about 1/200 of the GPU's arithmetic; it is limited by reading the weights, which is the fixed cost $a$. Each additional input in the batch reuses weights already read, so it costs only arithmetic until $b$ approaches the ridge point.
+
+**When a CPU is the right choice.** A CPU's peak arithmetic is one to two orders of magnitude below a data-centre GPU's, so its ridge point is reached at much smaller batches, and a CPU is efficient where a GPU is not:
+
+- tree ensembles and linear models, whose work is branching and small dot products rather than large matrix products;
+- small networks at low traffic, where batches never grow and copying inputs to a GPU and back costs more than the model;
+- inference at the edge or on a phone, and any service where the cost of an idle GPU is not justified.
+
+A GPU pays off for large networks with enough traffic, or enough batching, to keep it above a small fraction of its peak. Other accelerators, such as TPUs and AWS Inferentia, follow the same arithmetic.
+
+**What "GPU utilization" measures.** The utilization reported by `nvidia-smi` is the share of time during which at least one kernel was running on the GPU ([NVIDIA, nvidia-smi documentation](#references)). A GPU running batch-1 inference back to back reports 100% while using about 1% of its arithmetic. The numbers that say how well it is used are the achieved throughput against the batch curve of the previous section, and the profiling counters of NVIDIA's data-centre GPU manager, DCGM, such as the share of time streaming multiprocessors are active (`DCGM_FI_PROF_SM_ACTIVE`) and tensor cores are busy (`DCGM_FI_PROF_PIPE_TENSOR_ACTIVE`). A small model that cannot fill a GPU can share it: several model instances on one GPU, or a GPU split into isolated slices with Multi-Instance GPU on A100 and later.
+
+**Cost per request.** The batch size sets the cost of a prediction. At a price of 2 dollars per GPU-hour (a round number for the arithmetic), an instance serving 118 requests per second costs $2 / (3600 \cdot 118) = 4.7$ dollars per million requests; one serving 1,000 per second with batches of 16 costs 0.56 dollars, 8.5 times less, on the same GPU. The [cost note](/notes/mlops/cost-and-efficiency) returns to this arithmetic for whole systems.
+
+## Model servers
+
+A model server provides the machinery of the previous sections, so that a team writes a configuration instead of a web service: loading models from a repository and swapping versions, dynamic batching, several instances per GPU, the inference protocol over HTTP and gRPC, health endpoints and metrics. The main ones, as of October 2026:
+
+| Server | What it is | State, October 2026 |
+| --- | --- | --- |
+| **Triton Inference Server** (NVIDIA) | a C++ server for many backends: TensorRT, ONNX Runtime, PyTorch, Python, and LLM engines; dynamic batching, concurrent instances, ensembles of models | 2.73.0, September 2026 (NGC container 26.09) |
+| **KServe** | a Kubernetes custom resource, `InferenceService`, that runs a model server (Triton, an LLM engine, its own Python servers) with autoscaling, including to zero, canary traffic splits and pre- and post-processing steps | 0.21.0, September 2026 |
+| **BentoML** | a Python framework: a service is a Python class whose methods become endpoints, with adaptive batching, packaged into a container image | 1.4.39, May 2026 |
+| **TorchServe** | the PyTorch model server of AWS and Meta | archived in August 2025: read-only, no further fixes, including security fixes |
+
+The choice usually follows the rest of the platform. Triton gives the most control over batching and GPU sharing for models exported to a standard runtime; KServe adds the Kubernetes side, scaling and traffic splitting, around a server such as Triton; BentoML suits teams whose pre- and post-processing is Python code that must ship with the model. A project still on TorchServe needs a migration plan, since an unmaintained server in front of production traffic accumulates unpatched vulnerabilities. Large language models are served by specialized engines, the subject of the [next note](/notes/mlops/llm-inference-systems), which these servers can host as backends.
+
+## Caching predictions
+
+A model that is deterministic returns the same answer for the same input, and a cache in front of it answers repeated inputs without running it. Two conditions make a cache correct. The **key** must contain everything the answer depends on: the model version and the feature values, not just a user identifier, or a new model and yesterday's features both return stale answers. And a **time to live** must bound how old an answer may be when features change without the key changing.
+
+How much a cache helps depends on how often inputs repeat. Request popularity is often close to a Zipf law, in which the $k$-th most popular key is requested in proportion to $1/k$. For a million keys with this law, a cache that holds the 1,000 most popular answers 52% of requests, the top 10,000 answer 68%, and the top 100,000 answer 84% (the partial sums of $1/k$, computed for the note). With a 68% hit rate, a 1 ms cache hit and a 25 ms model call, the mean latency is
+
+$$
+0.68 \cdot 1 + 0.32 \cdot 25 = 8.7 \ \text{ms},
+$$
+
+and the model needs a third of the capacity. The p99 does not improve, because the slowest requests are misses that go to the model anyway; a cache lowers the average and the cost, not the tail.
+
+Inputs with continuous, personal features, such as a user's recent history and the current time, rarely repeat exactly, and a cache of whole predictions finds little. What repeats there is a part of the computation: item embeddings computed in batch and looked up online, or the shared prompt prefix of a language model, which the [next note](/notes/mlops/llm-inference-systems) caches.
+
+## Fallbacks
+
+When the model cannot answer within the deadline, because it is overloaded, its dependency is down or a new version fails, the service still has to answer something. A **fallback** is a cheaper answer prepared in advance, and the choice is a product decision made in the [design](/notes/mlops/ml-system-design), not during the incident:
+
+- the last prediction stored for this key, from the cache or from the batch table;
+- a simpler model that runs on CPU, such as a logistic regression beside a large network;
+- a non-personalized answer: the popular items, the median delivery time;
+- a safe default for decisions: route a transaction to manual review rather than approve or decline it blindly.
+
+The service code applies the fallback on a timeout or an error, behind a [circuit breaker](/notes/devops/resilience-and-capacity#circuit-breakers) that stops calling a model which keeps failing, as part of the [graceful degradation](/notes/devops/resilience-and-capacity#graceful-degradation) of the DevOps course. Two rules keep it honest. The fallback is tested like the model, since it serves real users at the worst moment. And the **fallback rate** is a metric with an alert: a service whose fallback answers 30% of requests is returning 200 OK during an outage of its model, and nothing else will show it.
+
+<aside class="callout"><strong>Check yourself.</strong> (1) A bank scores every customer nightly for a marketing offer, and also scores every card payment for fraud. Which inference mode suits each, and why? (2) With $a = 8$ ms and $c = 0.5$ ms, what is the smallest batch size that keeps up with 1,500 requests per second, and why does no batch size keep up with 2,500? (3) A team sets the maximum queue delay to 50 ms on a service whose p99 objective is 60 ms and whose model runs a full batch in 24 ms. What happens at low traffic? (4) `nvidia-smi` shows 100% utilization for a model server at batch size 1. Is the GPU fully used? (5) A prediction cache keyed by user identifier has a 90% hit rate. After a new model is deployed, the business metrics do not change at all. What is the likely cause?<details><summary>Answers</summary>(1) Marketing scores: batch, since the customers are known in advance and a day-old score is fine. Fraud: online, since the payment's own features (amount, merchant, location) exist only at request time and the decision is needed before the payment completes; streaming can keep account-level features fresh for it. (2) $b \ge \lambda a/(1 - \lambda c) = 12/(1 - 0.75) = 48$. At 2,500 per second, $\lambda c = 1.25 > 1$: even infinitely large batches serve at most $1/c = 2{,}000$ per second, so more instances are needed. (3) At low traffic batches never fill, so most requests wait the full 50 ms for the timer and then for their batch to run; with service times of 8.5 ms and up, the p99 objective is missed although the GPU is nearly idle. (4) No: the figure is the share of time some kernel was running. At batch size 1 a dense network has an arithmetic intensity near 1 and uses on the order of 1% of the arithmetic of a GPU whose ridge point is about 200. (5) The key does not include the model version, so 90% of requests still get the old model's cached predictions.</details></aside>
+
+## What changed
+
+| | A model in a web handler (the baseline) | A model service |
+| --- | --- | --- |
+| When predictions are computed | always on request | in batch, on events or on request, by what the input and the freshness allow |
+| API | ad hoc JSON | the Open Inference Protocol over HTTP or gRPC, with model name and version |
+| GPU use | one request at a time, at about 1% of the arithmetic | dynamic batches: 118 to 1,000 requests per second on the same instance in the example |
+| Overload | requests pile up and time out after the client gave up | queue timeouts drop stale requests; deadlines propagate |
+| Readiness | ready when the process starts | ready after the weights load and warm-up requests run |
+| Model versions | whatever file is on disk | versions loaded from the registry, recorded in every response |
+| Repeated inputs | recomputed | cached, with the model version in the key |
+| Model failure | the endpoint fails | a tested fallback answers, and its rate is monitored |
+
+## Limitations
+
+- **The cost model is a model.** $a + c b$ is a good first approximation for dense networks on GPUs, but real batch times have steps (kernels tuned for particular sizes), depend on input lengths, and change with the runtime, so the curve must be measured for each model and server.
+- **Batching needs traffic.** A service with a few requests per second has nothing to batch; it pays for a mostly idle GPU or runs on CPU.
+- **Tail latency is shared.** In a batch, every request waits for the slowest one, and a delay that improves throughput adds to every request's latency.
+- **Caches hide model changes.** Every cache, of predictions or of features, delays the effect of a new model or new data by its time to live, and a missing version in the key delays it forever.
+- **Projects move.** TorchServe was archived within a few years of being a default choice; versions and features here are those of October 2026.
+
+## What you should remember
+
+- Batch inference precomputes predictions for known inputs and serves a lookup; online inference answers each request and is needed when the input exists only in the request; streaming inference updates predictions and features from events within seconds.
+- An online model is a service with an inference protocol (named tensors, model name and version), readiness after warm-up, client deadlines and a server-side queue timeout.
+- With batch time $a + c b$, throughput is $b/(a + c b)$, approaching $1/c$; keeping up with $\lambda$ requests per second needs $b \ge \lambda a / (1 - \lambda c)$. In the example, 118 requests per second without batching and 1,000 with batches of 16.
+- Dynamic batching starts a batch when it is full or when its oldest request has waited the maximum delay. Under load the queue forms batches by itself; a delay buys GPU time with latency and helps only at some loads.
+- A dense layer at batch $b$ has arithmetic intensity about $b$, so a GPU at batch 1 uses about 1% of its arithmetic; `nvidia-smi` utilization is time with a kernel running, not arithmetic used.
+- Triton, KServe and BentoML are the main model servers of 2026; TorchServe is archived.
+- Cache predictions with the model version and the features in the key; a cache lowers mean latency and cost, not the tail. Keep a tested fallback and alert on its rate.
+
+## Example
+
+The program simulates one model instance behind a dynamic batcher, with requests arriving as a Poisson process and the cost model $s(b) = 8 + 0.5\,b$ ms. Each loop iteration forms one batch with the rule of the dynamic-batching section: it starts at the later of the moment the instance is free and the earlier of "the oldest request has waited `max_delay`" and "the batch is full", and takes every request that has arrived by then, up to 32.
+
+```python
+# Dynamic batching on one model instance: Poisson arrivals, a batcher with a maximum batch size and a
+# maximum queue delay, and a batch whose service time is a fixed cost plus a cost per request.
+import numpy as np
+
+A_MS, C_MS, MAX_BATCH = 8.0, 0.5, 32          # service time of a batch of b: A + C * b milliseconds
+N = 200_000                                   # requests per run
+
+def simulate(rate_per_s, max_delay_ms, max_batch=MAX_BATCH, seed=0):
+    rng = np.random.default_rng(seed)
+    arrive = np.cumsum(rng.exponential(1000.0 / rate_per_s, N))   # arrival times, ms
+    done = np.empty(N)
+    sizes, busy, free_at, head = [], 0.0, 0.0, 0
+    while head < N:
+        last = min(head + max_batch, N) - 1
+        # the batch closes when it is full or when its oldest request has waited max_delay,
+        # but it cannot start before the instance is free
+        start = max(free_at, min(arrive[head] + max_delay_ms, arrive[last]))
+        end = np.searchsorted(arrive, start, side='right')        # requests that have arrived by then
+        b = min(max(end - head, 1), max_batch)
+        service = A_MS + C_MS * b
+        done[head:head + b] = start + service
+        sizes.append(b); busy += service
+        free_at = start + service; head += b
+    lat = done - arrive
+    return np.percentile(lat, [50, 95, 99]), np.mean(sizes), busy / done[-1]
+
+print(f'batch service time {A_MS} + {C_MS} * b ms; max batch {MAX_BATCH}')
+for b in [1, 4, 8, 16, 32]:
+    s = A_MS + C_MS * b
+    print(f'  b = {b:2d}: {s:5.1f} ms per batch, {1000 * b / s:6.0f} requests/s at most')
+for rate in [100, 400, 1000]:
+    print(f'\n{rate} requests/s')
+    print('  max delay   p50 ms   p95 ms   p99 ms   mean batch   busy')
+    for d in [0, 1, 2, 5, 10, 20]:
+        (p50, p95, p99), mb, util = simulate(rate, d)
+        print(f'  {d:6d} ms  {p50:7.1f}  {p95:7.1f}  {p99:7.1f}  {mb:9.1f}   {util:5.0%}')
+
+print('\nwithout batching (max batch 1), no delay')
+for rate in [100, 110]:
+    (p50, p95, p99), mb, util = simulate(rate, 0, max_batch=1)
+    print(f'  {rate} requests/s: p50 {p50:.1f} ms, p99 {p99:.1f} ms, busy {util:.0%}')
+```
+
+```console
+$ python3.14 dynamic_batching.py
+batch service time 8.0 + 0.5 * b ms; max batch 32
+  b =  1:   8.5 ms per batch,    118 requests/s at most
+  b =  4:  10.0 ms per batch,    400 requests/s at most
+  b =  8:  12.0 ms per batch,    667 requests/s at most
+  b = 16:  16.0 ms per batch,   1000 requests/s at most
+  b = 32:  24.0 ms per batch,   1333 requests/s at most
+
+100 requests/s
+  max delay   p50 ms   p95 ms   p99 ms   mean batch   busy
+       0 ms     11.2     16.9     17.9        1.3     67%
+       1 ms     11.0     16.9     17.9        1.3     65%
+       2 ms     11.0     16.9     17.9        1.4     63%
+       5 ms     13.5     16.9     18.0        1.6     56%
+      10 ms     18.5     19.6     20.5        2.0     45%
+      20 ms     25.0     30.5     31.0        3.0     32%
+
+400 requests/s
+  max delay   p50 ms   p95 ms   p99 ms   mean batch   busy
+       0 ms     15.5     20.8     22.6        4.0     99%
+       1 ms     15.5     20.9     22.6        4.0     99%
+       2 ms     15.5     20.8     22.6        4.1     99%
+       5 ms     15.5     20.8     22.6        4.2     97%
+      10 ms     17.4     21.9     23.2        5.1     83%
+      20 ms     24.3     33.4     35.0        9.0     56%
+
+1000 requests/s
+  max delay   p50 ms   p95 ms   p99 ms   mean batch   busy
+       0 ms     24.6     34.7     38.7       16.0    100%
+       1 ms     24.6     34.7     38.7       16.0    100%
+       2 ms     24.6     34.8     38.7       16.0    100%
+       5 ms     24.6     34.7     38.7       16.0    100%
+      10 ms     24.5     34.7     38.7       16.1    100%
+      20 ms     29.8     39.9     42.5       21.2     88%
+
+without batching (max batch 1), no delay
+  100 requests/s: p50 24.6 ms, p99 126.7 ms, busy 85%
+  110 requests/s: p50 51.9 ms, p99 295.0 ms, busy 94%
+```
+
+- **The first table** is the throughput formula $b/(a + c b)$ of the batching section.
+- **At 1,000 requests per second** the mean batch with no delay is exactly the 16 that the formula $b \ge \lambda a/(1 - \lambda c)$ requires: the queue that builds while a batch runs is the next batch. The median latency, 24.6 ms, is close to the 23.5 ms estimated for evenly spaced arrivals; Poisson arrivals add the tail.
+- **At 400 requests per second** the instance at zero delay is busy 99% of the time with batches of 4, the smallest that keeps up. Nothing is left for a burst. Ten milliseconds of delay bring the busy share to 83% for 0.6 ms of p99, while 20 ms more than doubles the batch and costs 12 ms of p99.
+- **At 100 requests per second** delays of 1 and 2 ms change almost nothing, because most requests that arrive while a batch runs already wait longer than that; from 5 ms on, the delay adds to the latency almost one for one, and the GPU time it saves is not needed at this load.
+- **Without batching** the same instance is 85% busy at 100 requests per second and its p99 is seven times that of the batched instance; at 110 per second, 94% busy, it reaches 295 ms. The batcher with zero delay is the single largest improvement in the table.
+
+The same policy in a Triton model configuration, the file `config.pbtxt` in the model's directory of the model repository, next to version directories `1/model.onnx` and `2/model.onnx`. The format is protocol buffers in text form; this file was written against the Triton 2.73 documentation and not run:
+
+```text
+name: "ranker"
+backend: "onnxruntime"
+max_batch_size: 32
+input [
+  {
+    name: "features"
+    data_type: TYPE_FP32
+    dims: [ 64 ]
+  }
+]
+output [
+  {
+    name: "score"
+    data_type: TYPE_FP32
+    dims: [ 1 ]
+  }
+]
+version_policy: { latest: { num_versions: 2 } }
+instance_group [
+  {
+    count: 2
+    kind: KIND_GPU
+    gpus: [ 0 ]
+  }
+]
+dynamic_batching {
+  max_queue_delay_microseconds: 5000
+  default_queue_policy {
+    timeout_action: REJECT
+    default_timeout_microseconds: 200000
+    allow_timeout_override: true
+    max_queue_size: 1024
+  }
+}
+model_warmup [
+  {
+    name: "full_batch"
+    batch_size: 32
+    inputs {
+      key: "features"
+      value: {
+        data_type: TYPE_FP32
+        dims: [ 64 ]
+        random_data: true
+      }
+    }
+  }
+]
+```
+
+- **`name`, `backend`.** The model is served under the name `ranker`, the name in the URL `/v2/models/ranker/...`, and executed by the ONNX Runtime backend: the model was exported to ONNX from the training framework, so the server needs no Python.
+- **`max_batch_size: 32`.** The largest batch the server forms. A value above zero also tells Triton that the first dimension of every tensor is the batch, which is why `dims` does not include it.
+- **`input`, `output`.** One input of 64 features in 32-bit floats per request, one score per request. A request whose tensor has another shape or type is rejected before it reaches the model.
+- **`version_policy`.** Keep the two newest versions in the repository loaded, so that a client can pin `versions/1` while `versions/2` is being rolled out, and a rollback needs no reload. Which version receives which traffic is the subject of the [rollout note](/notes/mlops/rolling-out-models).
+- **`instance_group`.** Two copies of the model on GPU 0. Each forms and runs its own batches, so while one copies inputs to the GPU the other computes, which hides part of the fixed cost $a$.
+- **`max_queue_delay_microseconds: 5000`.** The maximum queue delay of 5 ms. Without this line the batcher does not wait at all and takes whatever is queued, which the simulation showed to be the right default at most loads. The documentation also offers `preferred_batch_size` and recommends leaving it unset unless a particular batch size is much faster than its neighbours.
+- **`default_queue_policy`.** The server-side timeout: a request that has waited 200 ms in the queue is rejected (`REJECT`) instead of being run for a client that has probably given up; a client may set a shorter timeout per request (`allow_timeout_override`); and at most 1,024 requests may wait, after which new ones are refused at once, which is [load shedding](/notes/devops/resilience-and-capacity#rate-limiting-and-load-shedding).
+- **`model_warmup`.** Before the model reports ready, Triton runs a batch of 32 random inputs through it, so the first user request does not pay for memory allocation and kernel selection.
+
+## Next
+
+Every request here was one forward pass of a fixed cost, and the batcher's job was to group passes. A large language model answers one request with hundreds of forward passes, one per generated token, each request needs a different number of them, and each sequence keeps a growing cache of keys and values in GPU memory. Batching such requests well needs a scheduler that works one step at a time and a memory manager for the cache. The [next note](/notes/mlops/llm-inference-systems) builds both.
+
+## References
+
+- HSE University. *Введение в MLOps* (master's programme «Машинное обучение в цифровом продукте», 2025/26): deploying and serving models.
+- HSE University and Yandex School of Data Analysis. M. Ryabinin et al. [*Efficient Deep Learning Systems*](https://github.com/mryab/efficient-dl-systems) (2026): web service deployment basics, GPU performance.
+- HSE University. [*LLM System Engineering*](https://github.com/xufana/llm-system-engineering) (2026): system budgets, choosing a serving configuration.
+- C. Kästner. *Machine Learning in Production: From Models to Products*. MIT Press, 2025: the chapters on deploying a model and on scaling the system; course [17-445/645](https://mlip-cmu.github.io/), Carnegie Mellon University, spring 2025.
+- C. Huyen. *Designing Machine Learning Systems*. O'Reilly, 2022. Chapter 7: model deployment and prediction service (batch prediction, online prediction with batch and streaming features). Stanford [CS329S](https://stanford-cs329s.github.io/), *Machine Learning Systems Design*.
+- D. Crankshaw, X. Wang, G. Zhou, M. J. Franklin, J. E. Gonzalez, I. Stoica. [Clipper: A Low-Latency Online Prediction Serving System](https://www.usenix.org/conference/nsdi17/technical-sessions/presentation/crankshaw). NSDI 2017: adaptive batching with additive increase and multiplicative decrease, delayed batching, prediction caching.
+- C. Olston, N. Fiedel, K. Gorovoy, J. Harmsen, L. Lao, F. Li, V. Rajashekhar, S. Ramesh, J. Soyke. [TensorFlow-Serving: Flexible, High-Performance ML Serving](https://arxiv.org/abs/1712.06139). Workshop on ML Systems at NIPS 2017.
+- S. Williams, A. Waterman, D. Patterson. [Roofline: An Insightful Visual Performance Model for Multicore Architectures](https://doi.org/10.1145/1498765.1498785). Communications of the ACM 52(4), 2009.
+- NVIDIA. Triton Inference Server documentation: [Model configuration](https://docs.nvidia.com/deeplearning/triton-inference-server/user-guide/docs/user_guide/model_configuration.html), [Dynamic batcher](https://docs.nvidia.com/deeplearning/triton-inference-server/user-guide/docs/user_guide/batcher.html), [Model repository](https://docs.nvidia.com/deeplearning/triton-inference-server/user-guide/docs/user_guide/model_repository.html); [releases](https://github.com/triton-inference-server/server/releases) (2.73.0, September 2026).
+- NVIDIA. [nvidia-smi documentation](https://docs.nvidia.com/deploy/nvidia-smi/index.html) (the definition of GPU utilization); [DCGM profiling metrics](https://docs.nvidia.com/datacenter/dcgm/latest/user-guide/feature-overview.html#profiling-metrics); [Multi-Instance GPU user guide](https://docs.nvidia.com/datacenter/tesla/mig-user-guide/).
+- KServe. [Open Inference Protocol](https://github.com/kserve/open-inference-protocol) specification; [KServe documentation](https://kserve.github.io/website/); [releases](https://github.com/kserve/kserve/releases) (0.21.0, September 2026).
+- BentoML. [Documentation](https://docs.bentoml.com/) (services, adaptive batching); [releases](https://github.com/bentoml/BentoML/releases) (1.4.39, May 2026).
+- PyTorch. [TorchServe repository](https://github.com/pytorch/serve), archived on 7 August 2025.

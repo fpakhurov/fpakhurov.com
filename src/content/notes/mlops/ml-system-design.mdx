@@ -1,0 +1,383 @@
+---
+title: Designing an ML system
+description: "How to turn a product requirement into an ML system: deciding whether ML is needed and beating a heuristic baseline, qualities beyond accuracy, offline, online and proxy metrics, planning for mistakes, latency and cost budgets as arithmetic, and a design document."
+course: mlops
+section: ML Systems
+order: 1
+status: published
+tags: [ml-system-design, requirements, baselines, heuristics, quality-attributes, offline-metrics, online-metrics, proxy-metrics, planning-for-mistakes, human-in-the-loop, guardrails, latency-budget, tail-latency, cost-budget, design-doc]
+prerequisites: [What MLOps is, Classification metrics, "SLOs, error budgets and alerting"]
+---
+
+import LatencyBudget from '../../../components/figures/ml-system-design/LatencyBudget.astro';
+
+The [previous note](/notes/mlops/what-mlops-is) showed that the model is a small box in a large system, and ran one turn of the loop that keeps it current. All of that machinery is wasted if it serves the wrong goal: a model that optimises a metric the product does not need, answers too slowly for the page that calls it, costs more than it saves, or does damage when it is wrong, as every model sometimes is. Those questions are decided before any training, on paper. This note works through them for the fraud check of the running example: whether to use machine learning at all, which qualities besides accuracy the system needs, which numbers measure success, how to limit the harm of mistakes, and how to check a latency and a cost budget with arithmetic. It ends with the design document that records the answers.
+
+## Baseline: start from the model
+
+The usual first step is a modelling task: "build a fraud model with the best possible AUC". A data scientist gets a table, tries gradient boosting and a neural network, reaches 0.95, and presents it. Then the questions arrive, all of them too late. The checkout team asks how long a score takes, because the page has 50 milliseconds for the whole risk check, and the ensemble needs 200. The finance team asks how much fraud loss it will save, and nobody can say, because AUC is not in euros. The support team asks what a customer is told when a payment is declined by mistake. The fraud analysts ask which payments they should review, since a model that only says "fraud" or "not fraud" leaves them nothing to do. Each question changes the model that should have been built.
+
+Designing the system means asking these questions first. The answers fit on a few pages, and the rest of this note derives them.
+
+## Should this be ML at all?
+
+Machine learning earns its cost when three things hold ([Kästner, 2025, chapter 4](#references); [Huyen, 2022, chapter 1](#references)): the rule cannot be written down but examples of the right answer exist in quantity; occasional mistakes are acceptable or can be contained; and the patterns change, so that a learnt rule can be relearnt more cheaply than a written one can be rewritten. Fraud detection meets all three. Computing the VAT on a payment meets none, and a model there would only add a way to be wrong.
+
+Even when ML fits, the first version need not use it. The first of Google's rules of ML says not to be afraid of launching without machine learning, and the third says to switch to ML once a heuristic becomes complex ([Zinkevich, rules 1 and 3](#references)). A heuristic is the **baseline** every model must beat, and beating it is measured in the product's currency, not in AUC. For a fraud check the currency is euros: what each kind of mistake costs. With illustrative costs, a missed fraud costs its amount plus a chargeback fee of 15 €; a declined good payment costs 10% of its amount in lost margin plus 5 € of goodwill; a manual review costs 4 € of an analyst's time and is assumed to decide correctly; and analysts can review at most 2% of payments. The program compares four plans on a synthetic week of 20,000 payments, with a fraud rate of 2% (exaggerated, as in the previous note, so that a week contains enough fraud to measure):
+
+```python
+"""Cost of four ways to handle payments: approve all, a rule, a model with one threshold, a model with a review band."""
+import numpy as np
+from sklearn.linear_model import LogisticRegression
+
+rng = np.random.default_rng(11)
+N = 20_000
+
+
+def week():
+    fraud = rng.random(N) < 0.02
+    amount = np.where(fraud, rng.lognormal(5.0, 0.8, N), rng.lognormal(3.5, 1.0, N)).round(2)
+    new_device = rng.random(N) < np.where(fraud, 0.6, 0.1)
+    foreign = rng.random(N) < np.where(fraud, 0.5, 0.15)
+    return amount, new_device, foreign, fraud
+
+
+def features(amount, new_device, foreign):
+    return np.column_stack([np.log1p(amount), new_device, foreign])
+
+
+# Costs in euros, per payment.
+FEE = 15            # chargeback fee on top of the lost amount
+MARGIN = 0.10       # share of a declined good payment that is lost as margin
+GOODWILL = 5        # a good customer who is declined may not come back
+REVIEW = 4          # an analyst's time per reviewed payment; the analyst decides correctly
+CAPACITY = 0.02     # analysts can review at most 2% of payments
+
+
+def cost(decision, amount, fraud):
+    """decision: 0 approve, 1 review, 2 decline. Returns euros per 1,000 payments."""
+    c = np.where(fraud & (decision == 0), amount + FEE, 0.0)
+    c += np.where(~fraud & (decision == 2), MARGIN * amount + GOODWILL, 0.0)
+    c += np.where(decision == 1, REVIEW, 0.0)
+    return 1000 * c.mean()
+
+
+train, valid, test = week(), week(), week()
+model = LogisticRegression().fit(features(*train[:3]), train[3])
+p_valid = model.predict_proba(features(*valid[:3]))[:, 1]
+p_test = model.predict_proba(features(*test[:3]))[:, 1]
+
+# Choose thresholds on the validation week; report on the test week.
+grid = np.quantile(p_valid, np.linspace(0.90, 0.9995, 300))
+amount_v, *_, fraud_v = valid
+one = min(grid, key=lambda t: cost(np.where(p_valid >= t, 2, 0), amount_v, fraud_v))
+best = None
+for lo in grid:
+    for hi in grid[grid > lo]:
+        d = np.where(p_valid >= hi, 2, np.where(p_valid >= lo, 1, 0))
+        if (d == 1).mean() <= CAPACITY:
+            c = cost(d, amount_v, fraud_v)
+            if best is None or c < best[0]:
+                best = (c, lo, hi)
+_, lo, hi = best
+
+amount, new_device, foreign, fraud = test
+plans = {
+    'approve everything': np.zeros(N, int),
+    'rule: review if > 200 € and new device': np.where((amount > 200) & new_device, 1, 0),
+    'model, decline above one threshold': np.where(p_test >= one, 2, 0),
+    'model, review band, decline the top': np.where(p_test >= hi, 2, np.where(p_test >= lo, 1, 0)),
+}
+print(f'{"plan":<40} {"cost per 1,000":>14} {"reviewed":>9} {"declined":>9} {"fraud caught":>13}')
+for name, d in plans.items():
+    caught = (d[fraud] > 0).mean()
+    print(f'{name:<40} {cost(d, amount, fraud):>12.0f} € {(d == 1).mean():>9.1%} {(d == 2).mean():>9.1%} {caught:>13.0%}')
+print(f'fraud rate {fraud.mean():.2%}, mean fraudulent amount {amount[fraud].mean():.0f} €')
+```
+
+```console
+$ python3 plans.py
+plan                                     cost per 1,000  reviewed  declined  fraud caught
+approve everything                               4398 €      0.0%      0.0%            0%
+rule: review if > 200 € and new device           2623 €      0.9%      0.0%           24%
+model, decline above one threshold               1852 €      0.0%      3.0%           53%
+model, review band, decline the top              1547 €      1.9%      1.1%           53%
+fraud rate 2.02%, mean fraudulent amount 203 €
+```
+
+Three conclusions follow, and none of them is about the model's AUC.
+
+- **The heuristic does most of the work first.** A one-line rule, reviewing payments over 200 € from a new device, cuts the cost of fraud from 4,398 € to 2,623 € per 1,000 payments while using less than half of the review capacity. It needs no training data, no pipeline and no monitoring of a model, and it is what to launch first.
+- **The model must pay for itself against the rule, not against nothing.** The best model plan saves a further 2,623 − 1,547 = 1,076 € per 1,000 payments. If building and running the ML system costs, say, 25,000 € a month in people and infrastructure, it pays off above $25{,}000 / 1.076 \approx 23{,}000$ payments a month in this synthetic shop. Real fraud is ten to a hundred times rarer than here, and the threshold volume is correspondingly higher: below it, the rule is the right system.
+- **The design around the model matters as much as the model.** The last two plans use the same model with the same AUC. Declining everything above one threshold costs 1,852 €; adding a band of uncertain payments for human review, and declining only the clearest cases, costs 1,547 €, because reviews are cheaper than wrong declines. That difference, 305 € per 1,000 payments, came from a design decision, not from better modelling.
+
+The threshold choice itself, picking the operating point from the costs of the two errors, is the one of the [classification metrics note](/notes/ml/classification-metrics#costs-decide-the-threshold); what the system design adds is a third action, a capacity limit on it, and the comparison with a baseline that needs no model.
+
+## Qualities beyond accuracy
+
+A model is one component of a product, and the product has requirements that accuracy does not capture. Kästner calls them the **quality attributes** of an ML component ([Kästner, 2025, chapter 9](#references); see also [Huyen, 2022, chapter 2](#references)). Each one constrains the choice of model and of architecture, and each should be written down as a number.
+
+| Quality | The question | For the fraud check |
+| --- | --- | --- |
+| Latency | how long one prediction may take, at the median and in the tail | 50 ms at p99 for the whole risk check, inside the checkout page |
+| Throughput | how many predictions per second, at peak | 42 per second at peak (1.2 million payments a day, peak three times the mean) |
+| Cost | what one prediction, and one retraining, may cost | small against the losses it prevents; see the budget below |
+| Freshness | how old the model, and the features it reads, may be | model retrained at least monthly; card history features at most a minute old |
+| Updateability | how fast a fix or a new model reaches production | a new model within a day, a threshold change within minutes |
+| Explainability | whether a decision must be explained, and to whom | analysts see the main reasons for every reviewed payment |
+| Robustness | what inputs the model must survive | malformed and adversarial payments; fraudsters probe the system |
+| Footprint | where the model runs and what it may occupy | a CPU service beside the checkout; no GPU on the request path |
+
+These qualities trade against each other and against accuracy. A gradient-boosted ensemble with a thousand trees may gain a point of recall and lose the latency budget; a model retrained hourly is fresh but costly to validate; a large language model that writes a reason for each decision is explainable and far too slow for checkout, but may suit the analysts' review queue, which has minutes rather than milliseconds. Writing the qualities down turns these trade-offs into explicit choices. The table is the core of the design document in the Example.
+
+## Offline, online and proxy metrics
+
+Three kinds of numbers measure an ML system, and confusing them is a common way to optimise the wrong thing ([Huyen, 2022, chapters 2 and 6](#references); [Kästner, 2025, chapter 5](#references)).
+
+- **Offline metrics** are computed on held-out data before deployment: AUC, precision and recall at the review budget, the cost per 1,000 payments of the previous section. They are cheap, repeatable and available at once, and they are what training and the evaluation gate optimise.
+- **Online metrics** are measured in production, on the product's real goal: fraud losses in euros, the rate of false declines (good customers refused), the conversion of the checkout, the length of the review queue, customer complaints. They are what the business cares about, and they can be measured only on live traffic, usually by an [A/B test](/notes/probability/hypothesis-tests#the-ab-test) or a [canary](/notes/devops/continuous-delivery#judging-a-canary-on-a-small-sample), which the [rollout note](/notes/mlops/rolling-out-models) develops for models.
+- **Proxy metrics** stand in for a goal that is measured too late or too rarely. A chargeback, the definitive label of fraud, arrives weeks to months after the payment. Waiting for it means judging a model two months after it went live. A proxy, such as the fraud confirmed by analysts within 48 hours, or the share of payments flagged, is available at once.
+
+Offline and online metrics disagree for reasons worth listing in a design. The offline test set comes from the past; the model's decisions change the data it will see (declined payments never get a label, so the model never learns whether they were fraud); and the online goal includes effects no offline set contains, such as customers who leave after a false decline. A proxy brings its own risk: the more a team optimises a proxy, the less it tends to track the goal, which is Goodhart's law. Flag fewer payments and the share flagged looks better while fraud losses grow. Every proxy therefore needs a **guardrail metric** that must not get worse, and a periodic check against the real outcome when it arrives.
+
+## Planning for mistakes
+
+A model will be wrong on some inputs, for reasons that are hard to predict and that are not random: whole groups of payments, such as one new fraud pattern or one country's customers, can be misjudged together. Kästner's rule is to design the system so that mistakes are tolerable, rather than to hope they are rare ([Kästner, 2025, chapter 7](#references)). His strategies, applied to the fraud check:
+
+- **Human in the loop.** Decide how much the model decides alone. Here: approve automatically below the review band, send the band to analysts, decline automatically only the clearest cases. Automation fits cheap mistakes, human review fits expensive or uncertain ones, and the review capacity caps how wide the band can be.
+- **Undoable actions.** Prefer actions whose effect can be reversed. A *hold* (the payment waits a few minutes for review, or for the customer to confirm with their bank's app) can be undone; a *decline* may lose the customer for good; an *approval* of fraud cannot be undone by the shop at all. The design therefore turns many declines into holds and step-up checks.
+- **Guardrails.** Rules outside the model that bound what it can do, so that one prediction is never the only basis for a decision: never auto-decline a returning customer's payment under 10 €, always require bank confirmation above 2,000 € from a new device, block cards on a list of known stolen numbers whatever the score. A guardrail also caps the action rate, like the action limit of the previous note's Example.
+- **Mistake detection and recovery.** Watch for the symptoms of mistakes, such as complaints, appeals, chargebacks or a sudden change in the share flagged, and give customers a path to appeal a decline. When the model itself is unavailable, degrade gracefully: the risk service falls back to the rules of the baseline rather than to "approve all" (which lets fraud through) or "decline all" (which stops the shop).
+- **Redundancy and containment.** Run the rules beside the model so that each catches some of the other's misses, and keep the fraud model from becoming a dependency of systems that do not need it, which is the undeclared-consumer debt of the [previous note](/notes/mlops/what-mlops-is#undeclared-consumers).
+
+The four plans of the previous section are this list in miniature: the review band is a human in the loop, its capacity is a guardrail, and the rule-only plan is the fallback.
+
+## Latency and cost budgets as arithmetic
+
+A budget is a requirement that can be checked with arithmetic before anything is built, and checked again against measurements afterwards. The [SLO note](/notes/devops/slos-and-alerting#sli-slo-and-sla) defines the vocabulary; here it is applied to a model on the request path.
+
+### The latency budget
+
+The checkout page has a latency objective, and its owners give the risk check 50 ms at the 99th percentile. The check has four stages, measured on a prototype (the numbers are illustrative): the network hop in and out of the risk service (median 2 ms, p99 5 ms); three feature lookups, sent in parallel to three stores, the card's history, the device's history and the customer's account (each median 4 ms, p99 20 ms); the model (median 3 ms, p99 8 ms); and the rules and the response (median 1 ms, p99 3 ms).
+
+Two facts make the arithmetic less obvious than adding the numbers.
+
+**Parallel calls wait for the slowest.** The lookups run at the same time, so the stage takes the maximum of three latencies. If one lookup is slower than 20 ms with probability 0.01, independently of the others, then
+
+$$
+P(\text{the slowest of 3} > 20\ \text{ms}) = 1 - 0.99^3 = 0.0297 ,
+$$
+
+three times as often: the p99 of one call is about the p97 of the fan-out. To find the p99 of the maximum, ask which per-call quantile $q$ gives $q^3 = 0.99$: $q = 0.99^{1/3} = 0.99666$. Assume, as is common for service latencies, that each lookup's latency is log-normal, $\ln T \sim \mathcal N(\mu, \sigma^2)$. Then a quantile is $T_q = e^{\mu + \sigma z_q}$, with $z_q$ the standard normal quantile, and the median is $e^\mu$. From the median and the p99,
+
+$$
+\sigma = \frac{\ln(p_{99} / p_{50})}{z_{0.99}} = \frac{\ln(20/4)}{2.326} = 0.692 ,
+$$
+
+and the p99 of the fan-out is
+
+$$
+T_{0.99666} = 4 \cdot e^{0.692 \cdot 2.712} = 4 \cdot 6.53 = 26.1\ \text{ms} .
+$$
+
+The effect grows with the fan-out: with 100 parallel calls, $1 - 0.99^{100} = 63\%$ of requests wait for at least one call slower than its p99, which is why [Dean and Barroso (2013)](#references) call it the tail at scale.
+
+**Percentiles do not add.** The sum of the stages' p99s, $5 + 26.1 + 8 + 3 = 42.1$ ms, is not the p99 of the total, because the slow tails of independent stages rarely coincide on the same request. A simulation with a million requests, each stage drawn from its log-normal, gives the real figure:
+
+```python
+"""The latency budget of a fraud check: stages with log-normal latencies, three feature lookups in parallel."""
+import numpy as np
+from scipy.stats import norm
+
+rng = np.random.default_rng(3)
+n = 1_000_000
+z99 = norm.ppf(0.99)
+
+
+def lognormal(p50, p99, size):
+    sigma = np.log(p99 / p50) / z99
+    return p50 * np.exp(sigma * rng.standard_normal(size))
+
+
+stages = {                        # (p50, p99) in milliseconds
+    'network in and out': (2, 5),
+    'feature lookup (each of 3)': (4, 20),
+    'model': (3, 8),
+    'rules and response': (1, 3),
+}
+net = lognormal(*stages['network in and out'], n)
+lookups = np.max([lognormal(*stages['feature lookup (each of 3)'], n) for _ in range(3)], axis=0)
+model = lognormal(*stages['model'], n)
+rules = lognormal(*stages['rules and response'], n)
+total = net + lookups + model + rules
+
+sigma = np.log(20 / 4) / z99
+z = norm.ppf(0.99 ** (1 / 3))
+print(f'one lookup slower than 20 ms: 1%;  any of three: {1 - 0.99**3:.2%}')
+print(f'p99 of the slowest of three: analytic 4 * exp({sigma:.3f} * {z:.3f}) = {4 * np.exp(sigma * z):.1f} ms, '
+      f'simulated {np.quantile(lookups, 0.99):.1f} ms')
+print(f'sum of the stage p99s: {5 + 20 + 8 + 3} ms (one lookup), {5 + 4*np.exp(sigma*z) + 8 + 3:.1f} ms (fan-out)')
+print(f'end to end: p50 {np.median(total):.1f} ms, p99 {np.quantile(total, 0.99):.1f} ms, '
+      f'p99.9 {np.quantile(total, 0.999):.1f} ms')
+for t in (40, 60):
+    print(f'share of checks over {t} ms: {(total > t).mean():.3%}')
+# With a 25 ms timeout on the lookups the fallback (rules only) answers instead.
+capped = net + np.minimum(lookups, 25) + model + rules
+print(f'with a 25 ms lookup timeout: fallback on {(lookups > 25).mean():.2%} of checks, '
+      f'p99 {np.quantile(capped, 0.99):.1f} ms, max {capped.max():.1f} ms')
+```
+
+```console
+$ python3 latency.py
+one lookup slower than 20 ms: 1%;  any of three: 2.97%
+p99 of the slowest of three: analytic 4 * exp(0.692 * 2.712) = 26.1 ms, simulated 26.0 ms
+sum of the stage p99s: 36 ms (one lookup), 42.1 ms (fan-out)
+end to end: p50 13.7 ms, p99 33.0 ms, p99.9 48.5 ms
+share of checks over 40 ms: 0.336%
+share of checks over 60 ms: 0.027%
+with a 25 ms lookup timeout: fallback on 1.19% of checks, p99 30.9 ms, max 44.5 ms
+```
+
+<LatencyBudget />
+
+1. The network hop: 2 ms at the median, 5 ms at p99.
+2. Three lookups in parallel: the stage ends when the slowest returns, 26.1 ms at p99, not 20.
+3. The model: 3 ms at the median, 8 ms at p99.
+4. Rules and the response: 1 ms and 3 ms.
+5. The end-to-end p99 is 33.0 ms, below the sum of the stage p99s (42.1 ms), and both are inside the 50 ms budget.
+
+Here the sum of p99s overstates the tail, which makes it a safe first check. That is a property of these light-tailed stages, not a law: quantiles of a sum can exceed the sum of quantiles when tails are heavy, so the sum is a first estimate and a simulation or a load test is the check. The budget holds at p99 with 17 ms to spare. It does not hold at every percentile: 0.03% of checks take over 60 ms. The fix is not a faster model but a **deadline**: a 25 ms timeout on the lookups, after which the service answers from the rules alone (the fallback of the previous section). It triggers on 1.19% of checks and bounds the total at 44.5 ms. The [resilience note](/notes/devops/resilience-and-capacity#timeouts-and-deadlines) develops timeouts and deadlines; the ML-specific part is that the fallback must be a decision, not an error.
+
+The arithmetic also says where to spend effort. The model, which the baseline would have optimised first, takes 8 of the 33 ms at p99. The lookups take 26: caching the card history, or computing it ahead of time, buys more than any model change.
+
+### The cost budget
+
+The cost of serving follows from the throughput. The shop handles 1.2 million payments a day, a mean of $1{,}200{,}000 / 86{,}400 = 13.9$ per second, and three times that, 41.7 per second, at the evening peak. The model needs 3 ms of one CPU core per prediction, so one core serves at most $1000 / 3 = 333$ predictions per second; planned at 50% utilisation, to keep the queueing delay small ([latency against utilization](/notes/devops/resilience-and-capacity#latency-against-utilization)), it serves 167. The peak needs $41.7 / 167 = 0.25$ of a core.
+
+Availability, not compute, sets the size: three replicas with one virtual CPU each, in two zones, so that the loss of one zone leaves enough capacity. That is $3 \times 730 = 2{,}190$ vCPU-hours a month, which at an illustrative price of 0.04 € per vCPU-hour is 87.6 € a month. A month has $1.2 \times 365 / 12 = 36.5$ million predictions, so the model costs
+
+$$
+\frac{87.6 \text{ euros}}{36{,}500 \text{ thousand predictions}} = 0.0024 \text{ euros per thousand predictions} .
+$$
+
+Against savings of the order of hundreds of euros per 1,000 payments, the serving compute of a small tabular model is a rounding error; the costs that matter are the feature stores, the pipelines, the review team and the engineers. The same arithmetic gives very different answers for a model that needs a GPU per few requests, or for a large language model billed per token, where the cost per 1,000 predictions can rival the value of the prediction itself. The [last note of the course](/notes/mlops/cost-and-efficiency) does that arithmetic.
+
+<aside class="callout"><strong>Key idea.</strong> Design the system before the model. Ask whether a rule would do, and make the best rule the baseline that the model must beat in the product's own units. Write down the qualities the component needs as numbers: latency at a percentile, throughput at peak, cost per prediction, freshness, updateability. Choose online metrics for the goal, offline metrics for development, and proxies with guardrails for what arrives too late. Assume the model will be wrong and design how: who reviews, what can be undone, which rules bound it, what happens when it is down. Check every budget with arithmetic first and measurements later.</aside>
+
+<aside class="callout"><strong>Check yourself.</strong> (1) A team replaces the 200 € rule with a model and reports an AUC of 0.94. What is missing from the report before anyone can decide whether to ship it? (2) A service calls 10 feature stores in parallel, each with a p99 of 20 ms. What fraction of requests wait for at least one call slower than 20 ms? (3) Why is "the share of payments flagged" a dangerous metric to optimise on its own, and what guardrail would you add? (4) The risk service times out. Compare failing open (approve), failing closed (decline) and falling back to rules. (5) A model needs 2 ms of CPU per prediction and the peak is 500 per second. How many cores does it need at a 50% utilisation target, and what else might set the number of replicas?<details><summary>Answers</summary>(1) The comparison with the baseline in the product's units (cost per 1,000 payments, or fraud caught at the same review budget), the operating point and actions (thresholds, review band), and whether latency and cost budgets hold. AUC says nothing about any of them. (2) $1 - 0.99^{10} = 9.6\%$. (3) It can be improved by flagging less, which lets more fraud through; pair it with fraud losses or confirmed fraud caught, which must not get worse, and check it against chargebacks when they arrive. (4) Approving lets every fraud through during the outage; declining stops all sales; the rules keep most of the protection at no extra latency, which is why they are the fallback. (5) One core serves 500 predictions per second at 100% and 250 at 50%, so the peak needs 2 cores; availability (at least two or three replicas across zones), memory per replica and the time to start a new replica during a spike may require more.</details></aside>
+
+## What changed
+
+| | Start from the model (baseline) | Design the system first |
+| --- | --- | --- |
+| First question | which model scores best | does this need ML, and what does the best rule achieve |
+| Measure of success | AUC on a test set | cost or value in the product's units, against the baseline |
+| Requirements | implicit | latency, throughput, cost, freshness, updateability, explainability as numbers |
+| Metrics | one offline metric | offline for development, online for the goal, proxies with guardrails |
+| Mistakes | an accuracy figure | review band, undoable holds, guardrail rules, fallback, appeals |
+| Latency | measured after the build, if at all | a budget per stage, with fan-out and tails computed and a deadline |
+| Cost | discovered on the invoice | cost per prediction derived from throughput and utilisation |
+
+## Limitations
+
+- **The costs are assumptions.** The euros per mistake, the review capacity and the price per vCPU-hour above are illustrative, and real ones are hard to estimate: the goodwill lost by a false decline is a guess. The structure of the calculation transfers; the numbers do not.
+- **Independence is assumed in the tail arithmetic.** Parallel calls that share a network, a cache or a garbage-collecting host are slow together, which makes the fan-out better than computed and the end-to-end tail worse. Load tests on the real system replace the formula.
+- **Log-normal latencies are a model.** Real latency distributions have bumps (cache hits and misses, retries) that a two-parameter fit cannot represent; quantiles should come from measured histograms ([percentiles cannot be averaged](/notes/devops/observability#why-percentiles-cannot-be-averaged)).
+- **Offline gains do not guarantee online gains.** The cost comparison uses held-out data from the same distribution and ignores the model's effect on the data it will see; only an online experiment settles it.
+- **A design is a hypothesis.** Requirements change as the product learns, and a design document that is not updated becomes another form of configuration debt.
+
+## What you should remember
+
+- Use ML when the rule cannot be written, examples exist, mistakes can be contained and patterns change. Launch the best heuristic first; it is the baseline the model must beat.
+- Compare plans in the product's units. In the example, a rule cut fraud cost from 4,398 € to 2,623 € per 1,000 payments; the model with a review band reached 1,547 €, and 305 € of that came from the review band, not from the model.
+- Specify qualities beyond accuracy as numbers: latency at a percentile, throughput at peak, cost, freshness, updateability, explainability, robustness, footprint.
+- Offline metrics guide development, online metrics measure the goal, proxies stand in for late labels and need guardrail metrics.
+- Plan for mistakes: human in the loop, undoable actions, guardrails, detection and recovery, a fallback that is a decision.
+- Fan-out multiplies tail probability, $1 - (1 - p)^k$, and percentiles do not add. Check a latency budget per stage, then by simulation or load test, and bound it with a deadline and a fallback.
+- Cost per prediction follows from throughput, CPU time per prediction and a utilisation target; for small models, availability, not compute, sets the size.
+
+## Example
+
+A design document for the fraud check of the running example, short enough to be read in ten minutes and reviewed before any code is written. The shop is fictional and the document's figures are illustrative, chosen to be consistent with each other rather than with the exaggerated synthetic data of this note. The order of its sections follows the reasoning of this note and of the design-document template of the HSE course on LLM systems engineering, which puts the contract and the budgets before evaluation and before the choice of model ([HSE, 2026](#references)); it also covers the questions of Kästner's requirements chapters and Huyen's design chapter.
+
+```markdown
+# Design doc: payment risk check v1
+
+Owner: risk team · Reviewers: checkout, fraud operations, data platform · Status: in review · Updated: 2026-10-20
+
+## 1. Problem and goal
+Card fraud costs the shop 0.6% of card revenue (chargebacks and fees, last 12 months).
+Goal: halve fraud losses within two quarters without raising false declines above 0.5% of good payments.
+Non-goals: account takeover, refund abuse, fraud by merchants.
+
+## 2. Baseline
+Today: rule R1 (review if amount > 200 EUR and new device) and the card network's own checks.
+Offline on the last full month: R1 catches 30% of fraud and reviews 0.1% of payments.
+The model ships only if it beats R1 on cost per 1,000 payments at the same review capacity.
+
+## 3. Contract
+Input: one payment at checkout (card, device, account, amount, country).
+Output: APPROVE | HOLD (review or bank confirmation) | DECLINE, with up to three reason codes.
+If the model is unavailable or late: rules R1-R4 decide. Never "approve all", never "decline all".
+
+## 4. Budgets and qualities
+Latency: risk check <= 50 ms at p99 (checkout SLO); feature lookups have a 25 ms deadline.
+Throughput: 42 checks/s at peak, 1.2 M per day. Availability: 99.95% (same as checkout).
+Cost: serving <= 0.01 EUR per 1,000 checks; review queue <= 0.2% of payments (2,400 a day, 30 analysts).
+Freshness: model retrained at least every 30 days; card-history features <= 60 s old.
+Explainability: reason codes for every HOLD and DECLINE, visible to analysts and support.
+
+## 5. Metrics
+Online (goal): fraud loss per 1,000 EUR of revenue; false-decline rate; checkout conversion.
+Proxy (daily): analyst-confirmed fraud among HOLDs; share of HOLD and DECLINE (action limit: 2x plan).
+Offline (gate): cost per 1,000 payments on the latest held-out week; recall at 0.2% reviewed.
+Guardrails: false-decline rate and conversion must not worsen by a significant amount in the rollout test.
+
+## 6. Planning for mistakes
+Human in the loop: HOLD band sized to analyst capacity. Undo: HOLD instead of DECLINE where possible;
+appeal path through support. Guardrails: R2 never auto-decline returning customers under 10 EUR;
+R3 bank confirmation above 2,000 EUR on a new device; R4 known stolen cards always declined.
+
+## 7. Data
+Sources: checkout events, card network authorisations, chargebacks (arrive up to 120 days later),
+analyst decisions. Labels: chargeback or analyst-confirmed fraud. Declined payments have no label:
+keep 1% of would-be declines as HOLD to measure what the model blocks.
+
+## 8. Rollout and monitoring
+Shadow for two weeks (score, do not act), then 5% / 25% / 100% with the online metrics above.
+Monitor input distributions, action shares, latency, fallback rate; recall as labels arrive.
+
+## 9. Risks and open questions
+Feedback loop from declines (section 7). Drift as fraudsters adapt. Fairness of declines across countries.
+Who else may consume the score? Access to the score table is restricted to the risk team.
+```
+
+Reading it section by section:
+
+- **Header.** An owner and named reviewers from every team the system touches, which is how undeclared consumers and surprises at launch are avoided. The status and date make it a living document.
+- **1. Problem and goal.** The goal is stated in the business's units with a deadline, and paired with a guardrail (false declines), so that the goal cannot be met by declining everyone. The non-goals keep the scope from creeping.
+- **2. Baseline.** The rule in production and its measured performance. The shipping criterion compares the model with the rule in the same units and at the same review capacity, as in the cost table of this note.
+- **3. Contract.** What goes in and what comes out, including a third action and reason codes, and what happens when the model is unavailable: the fallback decision of the planning-for-mistakes section.
+- **4. Budgets and qualities.** The table of qualities as numbers, each with its source: the 50 ms comes from the checkout SLO, the 0.2% from the number of analysts (30 of them, about 80 reviews each a day). The cost ceiling of 0.01 € per 1,000 checks leaves room above the computed 0.0024 €.
+- **5. Metrics.** One line each for online, proxy and offline metrics, with the action limit and the guardrails. The offline gate is the one the previous note's Example applied automatically.
+- **6. Planning for mistakes.** The strategies of Kästner's chapter, made concrete as rules with names (R2–R4), so that they can be implemented, tested and referred to in incidents.
+- **7. Data.** Where labels come from and how late they are, and a mitigation for the feedback loop: without a small share of would-be declines turned into holds, the model never learns whether its declines were right.
+- **8. Rollout and monitoring.** Shadow mode, then gradual exposure judged on the online metrics; the [rollout note](/notes/mlops/rolling-out-models) and the [monitoring note](/notes/mlops/monitoring-and-drift) supply the machinery.
+- **9. Risks and open questions.** What the authors do not know yet, written down so that reviewers can answer or track it.
+
+Nothing in the document names a model architecture. That decision comes later, inside the budgets of section 4.
+
+## Next
+
+The design fixes what the system must do; the first thing it needs is data that arrive reliably. Payments, chargebacks and analyst decisions come from different systems, at different times, sometimes late and sometimes twice. The [next note](/notes/mlops/data-pipelines) builds the pipelines that turn them into daily, reproducible datasets.
+
+## References
+
+- C. Kästner. [*Machine Learning in Production: From Models to Products*](https://mlip-cmu.github.io/book/). MIT Press, 2025. Chapters 4 (when to use machine learning), 5 (setting and measuring goals), 6 (gathering requirements), 7 (planning for mistakes) and 9 (quality attributes of ML components); and the course [CMU 17-445/645 Machine Learning in Production](https://mlip-cmu.github.io/), spring 2025.
+- C. Huyen. *Designing Machine Learning Systems*. O'Reilly, 2022. Chapters 1 (when to use ML), 2 (business and ML objectives, requirements) and 6 (offline evaluation); and the course [Stanford CS329S: Machine Learning Systems Design](https://stanford-cs329s.github.io/).
+- HSE University. [*Инженерия LLM-систем*](https://github.com/xufana/llm-system-engineering) (Engineering of LLM systems), Faculty of Computer Science, 2026: system anatomy and budgets, the design-document template (`templates/design_doc_template.md`), evaluation design.
+- HSE University. *Введение в MLOps* (Introduction to MLOps), master's programme «Машинное обучение в цифровом продукте», 2025/26: requirements and metrics of ML systems.
+- M. Zinkevich. [Rules of Machine Learning: Best Practices for ML Engineering](https://developers.google.com/machine-learning/guides/rules-of-ml). Google for Developers. Rules 1 (launch without ML), 2 (metrics first), 3 (ML over a complex heuristic) and 8 (freshness).
+- J. Dean, L. A. Barroso. [The Tail at Scale](https://doi.org/10.1145/2408776.2408794). *Communications of the ACM* 56(2), 2013 (fan-out and tail latency).
+- B. Beyer, C. Jones, J. Petoff, N. R. Murphy (eds.). *Site Reliability Engineering*. O'Reilly, 2016. [Chapter 4: Service Level Objectives](https://sre.google/sre-book/service-level-objectives/).
+- S. Amershi et al. [Guidelines for Human-AI Interaction](https://doi.org/10.1145/3290605.3300233). *CHI 2019* (designing for mistakes in AI-enabled products).

@@ -1,0 +1,318 @@
+---
+title: What MLOps is
+description: "Why the model is a small part of a machine-learning system, the hidden technical debt that grows around it, the lifecycle loop from data to retraining and how it differs from DevOps, maturity levels, roles, and the plan of the course."
+course: mlops
+section: ML Systems
+order: 0
+status: published
+tags: [mlops, ml-systems, technical-debt, cace, entanglement, undeclared-consumers, glue-code, pipeline-jungles, configuration-debt, ml-lifecycle, continuous-training, maturity-models, roles]
+prerequisites: [What DevOps is, Training networks in practice]
+---
+
+import MlSystem from '../../../components/figures/what-mlops-is/MlSystem.astro';
+import LifecycleLoop from '../../../components/figures/what-mlops-is/LifecycleLoop.astro';
+
+Two courses end where this one begins. The [DevOps course](/notes/devops/what-devops-is) ends with a service that is built from a commit, shipped as an image, rolled out gradually, watched by its SLOs and rolled back when it misbehaves. The [Deep Learning course](/notes/deep-learning/training-in-practice) ends with a network trained by a careful recipe: checked at initialization, tracked run by run, reproducible from a seed. Put the network inside the service and the two stories do not simply add up. The service now depends on data that nobody versions, its behaviour changes when the world changes even if no one commits anything, and its failures rarely raise an exception: a wrong prediction is returned with status 200. This course is about running models as dependable products. This first note asks what the rest of an ML system is made of, which kinds of debt accumulate around a model, how the loop of building and operating a model differs from the loop of shipping code, and how the course is organised.
+
+**Conventions.** Programs in this course were run in October 2026 on an Apple M1 under macOS 26 with CPython 3.14.7, NumPy 2.5.4, pandas 3.1.0, SciPy 1.18.1 and scikit-learn 1.9.1, and the output shown is what they printed. Their data are synthetic and seeded, so the procedures carry over and the exact numbers do not. Systems that need a cluster, a GPU, a cloud account or a running server (an orchestrator, an experiment tracker, an inference engine) are explained and, where a quantity matters, simulated in a few lines of NumPy; their configurations are written against the documentation of the version named, and the notes say which were not run. Fast-moving facts are dated. A running example recurs: a shop at `shop.example.com` that scores every card payment for fraud at checkout.
+
+## Baseline: a model handed over in a file
+
+The arrangement that most teams start with looks like the wall of the [DevOps course](/notes/devops/what-devops-is#baseline-throw-it-over-the-wall), with a model in place of a release. A data scientist pulls a few months of payments into a notebook, cleans them, tries several models and reaches a good validation score. The winner is saved with `pickle`, together with a note on which columns it expects, and handed to the engineers who own the checkout service. They write a scoring endpoint around it, reimplement the cleaning steps in the service's language, and deploy it.
+
+For a while it works. Then three things happen, none of which produces an error.
+
+- **The data change.** An upstream team improves a signal the model uses, or changes its units, or a join starts to miss rows. The model receives inputs unlike the ones it was trained on and keeps answering.
+- **The world changes.** Fraudsters adapt to the model that blocks them. Six months later the patterns it learnt are partly obsolete, and nobody knows by how much, because the labels (chargebacks) arrive weeks after the payments.
+- **Nobody can redo it.** Retraining means finding the notebook, the exact query, the data as they were that day and the library versions, and recovering which of the dozens of runs was shipped. Usually some of these are lost, so the next model is a new project rather than an update.
+
+The model was the part everyone worked on, and it was not where the trouble came from.
+
+## The model is a small box
+
+[Sculley et al. (2015)](#references), engineers at Google, described what real ML systems consist of, and their picture has become the standard starting point: the code that learns or predicts is a small box surrounded by much larger infrastructure. The drawing below is built on the same idea, arranged along the path of one payment through the fraud system of the running example.
+
+<MlSystem />
+
+1. **Data collection and verification.** Events are gathered from the checkout, the card network and the chargeback process, joined, and checked before anything is trained on them.
+2. **Features.** Raw events become the numbers a model consumes, computed once for training from history and again for serving from live data, which must agree.
+3. **The model.** Training code and the fitted parameters: the part a machine-learning course is about.
+4. **Serving.** An endpoint inside the checkout's latency budget, with a fallback when it fails.
+5. **Monitoring.** The inputs, the predictions and, later, the outcomes, compared with what was expected.
+6. **Around everything.** Configuration, compute, orchestration of the jobs, analysis tools and the processes that tie them together.
+
+The point is proportion, not exact areas: [Sculley et al.](#references) estimate that a mature system may be at most about 5% machine-learning code. The rest is the subject of this course. The same paper lists the ways in which the rest becomes expensive, which is a useful catalogue of what to design against.
+
+## Hidden technical debt
+
+**Technical debt** is the cost of the changes that a shortcut today will make expensive tomorrow ([Cunningham, 1992](#references)). ML systems carry all of the usual software debt, and [Sculley et al.](#references) argue that they add their own, which is harder to see because it lives at the level of the system, in data and behaviour, rather than in any one file. Six kinds matter throughout the course.
+
+### Entanglement: changing anything changes everything
+
+A model mixes its inputs. If one input's distribution changes, the weights and the use of every other input can change on the next training, and the decision threshold tuned for the old model no longer means what it meant. [Sculley et al.](#references) call this the **CACE principle**: Changing Anything Changes Everything, and it applies to hyperparameters, sampling and data selection as well as to features.
+
+A small experiment shows both effects. The fraud model uses a device-reputation score computed by our team and an IP-reputation score computed by another team; both are noisy measurements of how risky a payment really is. The other team improves its score (less noise, $\sigma$ from 2 to 0.5) and tells no one:
+
+```python
+# CACE: another team improves one input signal, and our model changes in two ways.
+import numpy as np
+from sklearn.linear_model import LogisticRegression
+
+rng = np.random.default_rng(0)
+n = 50_000
+risk = rng.normal(size=n)                                  # how risky a payment really is (never observed)
+fraud = rng.random(n) < 1 / (1 + np.exp(4.0 - 2.0 * risk))  # about 7% of payments are fraud
+device = risk + rng.normal(scale=1.0, size=n)              # device reputation, computed by our team
+ip_old = risk + rng.normal(scale=2.0, size=n)              # IP reputation, computed by another team
+ip_new = risk + rng.normal(scale=0.5, size=n)              # the same score after that team improved it
+amount = rng.normal(size=n)                                # a feature unrelated to fraud
+
+X_old = np.column_stack([device, ip_old, amount])
+X_new = np.column_stack([device, ip_new, amount])
+model = LogisticRegression().fit(X_old, fraud)
+threshold = np.quantile(model.decision_function(X_old), 0.98)   # flag the riskiest 2% of payments
+
+def report(name, m, X):
+    flagged = m.decision_function(X) >= threshold
+    w = m.coef_[0]
+    print(f'{name}  device {w[0]:+.2f}  ip {w[1]:+.2f}  amount {w[2]:+.2f}'
+          f'  flagged {flagged.mean():.1%}  precision {fraud[flagged].mean():.0%}')
+
+report('A. old ip score, old model  ', model, X_old)
+report('B. new ip score, old model  ', model, X_new)
+report('C. new ip score, retrained  ', LogisticRegression().fit(X_new, fraud), X_new)
+```
+
+```console
+$ python3 cace.py
+A. old ip score, old model    device +0.75  ip +0.20  amount -0.02  flagged 2.0%  precision 42%
+B. new ip score, old model    device +0.75  ip +0.20  amount -0.02  flagged 1.6%  precision 47%
+C. new ip score, retrained    device +0.30  ip +1.25  amount -0.01  flagged 3.8%  precision 49%
+```
+
+Line A is the system as deployed: 2% of payments go to manual review, and 42% of those are fraud. Line B is the morning after the upstream improvement. Nothing in our code changed, yet the share of flagged payments moved from 2.0% to 1.6%: the old model's small weight on the IP score was fitted to a noisy signal, and the cleaner signal shifts its scores. Line C is the next scheduled retraining. The model now leans on the IP score and drops the weight of the device score from 0.75 to 0.30, so our own feature, which no one touched, matters less than half as much as before. The threshold, fixed when the model was first tuned, now flags 3.8% of payments: the review team's queue nearly doubles overnight. Every number moved because of a change in someone else's code.
+
+Mitigations are partial: retune thresholds automatically from held-out data as part of every training run, monitor the share of flagged payments with an alert on a sudden change (an **action limit** in the paper's terms), and treat upstream signals as versioned dependencies that change only on purpose, which is the subject of the [data notes](/notes/mlops/data-quality-and-versioning).
+
+### Undeclared consumers
+
+A model's predictions are usually easy to read: they are logged, written to a table, returned by an API. Other teams start to use them without telling the owner. The fraud score of the running example might feed a marketing model that avoids discounts for risky customers, or a dashboard the finance team uses to forecast losses. These **undeclared consumers** couple the model to systems its owners do not know about, so a change that improves fraud detection can break them, and a model that feeds its own future training data through such a consumer creates a hidden feedback loop. The remedy is the one for any interface: access control on the outputs, and a declared contract with each consumer, which the [data pipelines note](/notes/mlops/data-pipelines#data-contracts) develops.
+
+### Glue code and pipeline jungles
+
+**Glue code** is everything written to move data into and out of a general-purpose ML package: format conversions, wrappers, adapters. It freezes the system around the package's quirks and makes trying another package expensive. A **pipeline jungle** is glue code for data preparation that grew one source at a time: scrapes, joins, samplings and intermediate files whose order and purpose nobody remembers, testable only end to end. Both are prevented by design rather than by care: a common interface around models, and data preparation built as an explicit graph of small, idempotent, tested steps, which is what the [next section of the course](/notes/mlops/data-pipelines#a-pipeline-is-a-graph-of-tasks) builds.
+
+### Configuration debt
+
+An ML system has many settings: which features, which time range of data, which filters, which hyperparameters, which thresholds, which features are unavailable before a certain date or in production. [Sculley et al.](#references) observe that in mature systems the lines of configuration can outnumber the lines of code, and that configuration is rarely reviewed or tested with the same care. A threshold changed in a dashboard, a feature list edited by hand, a training date range typed into a notebook: each is a production change with no history. The rules for good configuration follow the ones for code: small diffs from a previous configuration, mistakes hard to make, every configuration under version control and code review, and checks that assert facts about it (the number of features, that every feature exists in production).
+
+### Other debts in brief
+
+The paper lists more, and later notes take them up where they belong: **unstable data dependencies** (inputs that change under the model, as in the experiment above), **underutilized ones** (features that add little and break often), **feedback loops** (a model that influences its own training data, such as a fraud model whose declined payments never get a label), **dead experimental code paths**, **fixed thresholds in a changing system**, and debts of testing, reproducibility and process. A useful test of a system's debt, from the same paper: how easily can an entirely new approach be tested at full scale, and does improving one model or signal degrade others?
+
+<aside class="callout"><strong>Key idea.</strong> A model in production is a system whose behaviour is set by code, data and configuration together, and two of those change without a commit. MLOps applies the discipline of DevOps (versioning, automation, testing, gradual rollout, monitoring) to all three, and adds what code does not need: validation of data, tracking of experiments and lineage, retraining as a routine operation, and monitoring of quality, not only of uptime, because a model fails silently.</aside>
+
+## The lifecycle loop
+
+A model is never finished. It is trained on the past, used on the present, and goes stale as the present drifts away from the past. Its life is therefore a loop rather than a line, and the loop has a fixed set of stages ([Huyen, 2022, chapters 1–2](#references); [Kästner, 2025, chapters 2 and 11](#references); [Kazmierczak, Salama and Huerta, 2024](#references)):
+
+<LifecycleLoop />
+
+1. **Data.** Collect events and labels, validate them, and turn them into a versioned training set.
+2. **Train.** Fit a model with recorded code, configuration, data version and environment.
+3. **Evaluate.** Compare the candidate with the model in production on fresh held-out data, by the metrics the product cares about, and stop at a gate if it is worse.
+4. **Deploy.** Ship the model as a service or a batch job, gradually, with the previous version ready to take over.
+5. **Monitor.** Watch inputs, predictions and outcomes; compare them with training data and with expectations.
+6. **Retrain.** On a schedule, or when monitoring signals drift or decay, start the loop again on newer data.
+
+The same loop is drawn for software in the DevOps course as plan, code, build, test, release, deploy, operate, monitor. The difference is in what can start a new turn. Software changes when someone commits. A model changes when someone commits, when new data arrive, and when the world drifts, which needs no one at all. That third trigger is what makes MLOps more than DevOps with a model inside.
+
+| | Software (DevOps) | ML system (MLOps) |
+| --- | --- | --- |
+| What defines the behaviour | code and configuration | code, configuration, data and the fitted parameters |
+| What is versioned | the commit, the image digest | also the dataset snapshot, the model and its lineage |
+| What triggers a change | a commit | a commit, new data, drift in the world |
+| How correctness is tested | assertions with exact answers | also statistical thresholds on data and on model quality |
+| How a failure shows | errors, crashes, latency | often only as worse predictions, seen later through labels |
+| Reproducing a result | rebuild from the commit and lockfile | also the data as of a date, seeds, sometimes the hardware |
+| A routine operation | deploy a new version | also retrain the same code on new data |
+
+Google's MLOps guide names the new routine **continuous training** (CT), beside continuous integration and continuous delivery ([Kazmierczak, Salama and Huerta, 2024](#references)): retraining and redeploying the model automatically as part of normal operation. It also widens the old two. CI tests data, schemas and models as well as code, and CD delivers not just a model but a training pipeline that in turn produces and deploys models.
+
+## Maturity levels
+
+Organisations reach this discipline in stages, and two published maturity models describe the stages. They are useful as a vocabulary for "where are we and what is the next step", not as a certification.
+
+### Google's levels 0, 1 and 2
+
+The guide of [Kazmierczak, Salama and Huerta](#references) (Google Cloud Architecture Center, last reviewed 28 August 2024) has three levels.
+
+- **Level 0, manual process.** Every step is done by hand in notebooks and scripts; a data scientist hands a model to engineers; releases are rare; only the prediction service is deployed; nothing watches the model's quality in production. This is the baseline of this note.
+- **Level 1, ML pipeline automation.** The steps from data extraction to model validation become an orchestrated pipeline, and that pipeline, rather than a model, is what is deployed. It retrains in production on fresh data (continuous training), triggered on a schedule, on new data, on a drop in quality or on a change in the data distribution. The same pipeline code runs in development and in production. Data and model validation steps act as gates, a metadata store records every run and its artifacts, and a feature store may serve the same features to training and serving.
+- **Level 2, CI/CD pipeline automation.** The pipeline itself is built, tested and deployed by a CI/CD system, so that new ideas for features, architectures or training code reach production quickly and safely. A model registry, a feature store, a metadata store and an orchestrator are all in place.
+
+The progression matters: level 1 automates retraining the *same* model on new data, level 2 automates shipping *new* pipelines. A team with a fixed problem and drifting data needs level 1 long before level 2.
+
+### Microsoft's five levels
+
+The Azure Architecture Center's MLOps maturity model (page dated 3 June 2026) splits the same path into five levels and describes each by people, model creation, model release and application integration ([Microsoft, 2026](#references)): **0, no MLOps** (manual everything, a single model file handed off); **1, DevOps but no MLOps** (application builds and tests automated, models still trained and released by hand); **2, automated training** (managed, tracked, reproducible training; releases still manual); **3, automated model deployment** (releases through CI/CD with traceability from deployment back to data, and A/B testing); **4, full MLOps automated operations** (production metrics trigger retraining, promotion by policy). Its level 1 is a state many teams are in: a mature software pipeline with a model wedged into it.
+
+Both models agree on the order: first make training reproducible and automated, then make deployment automated, then close the loop from monitoring back to training. The Example at the end of this note runs one turn of that loop by hand.
+
+## Roles
+
+An ML system needs more kinds of expertise than one person has, and teams usually split the work as follows ([Kästner, 2025, chapter 21](#references); [Huyen, 2022, chapter 11](#references)).
+
+- **Data scientists** frame the problem, explore data, choose and evaluate models, and own the question "is the model good enough, and for whom".
+- **Data engineers** build and run the pipelines that collect, clean and store data, and own its freshness, quality and contracts with producers.
+- **ML engineers** turn a modelling approach into production software: training pipelines, evaluation gates, serving, monitoring and retraining. They sit between the two roles above and the platform.
+- **ML platform engineers** build the shared machinery that every model team uses: the orchestrator, the feature store, the experiment tracker and model registry, the serving platform, the GPU scheduling. They play for models the part that [platform engineering](/notes/devops/what-devops-is#devops-sre-and-platform-engineering) plays for services.
+- Around them: **software engineers** of the product that calls the model, **SREs** who keep it within its SLOs, **product managers** who decide what the model is for, and domain experts, here fraud analysts, who label cases and review the model's decisions.
+
+The failure mode of the baseline is the same as in DevOps: a wall between the people who build models and those who run them. The cure is also the same: one team owns the model in production, from data to monitoring, and the platform makes the routine parts self-service. In a small company the five roles may be two people; the responsibilities still exist.
+
+## The plan of the course
+
+The course has six sections, sixteen notes. Each explains a mechanism, shows it on a small runnable program or a real configuration, and ends with what goes wrong. The DevOps course is assumed for building, shipping and operating services, and the Deep Learning course, with the Machine Learning course through it, for how models are trained.
+
+1. **ML Systems.** This note, then [designing an ML system](/notes/mlops/ml-system-design): deciding whether a problem needs ML at all, turning product requirements into metrics and latency and cost budgets, and planning for the model being wrong.
+2. **Data.** [Data pipelines and orchestration](/notes/mlops/data-pipelines): a pipeline as a graph of idempotent tasks over date partitions, backfills, late data and data contracts. [Data quality, validation and versioning](/notes/mlops/data-quality-and-versioning): tests on data and content-addressed snapshots, on top of the content hashes of the [builds note](/notes/devops/builds-and-dependencies#content-hashes-instead-of-timestamps). [Features and training–serving skew](/notes/mlops/features-and-skew): point-in-time correct features and feature stores, extending [leakage](/notes/ml/data-features-and-leakage#target-leakage) from the Machine Learning course to time.
+3. **Training.** [Experiments, reproducibility and the model registry](/notes/mlops/experiments-and-registry), which turns the [tracking](/notes/deep-learning/training-in-practice#track-every-experiment) and [reproducibility](/notes/deep-learning/training-in-practice#make-runs-reproducible) habits of the Deep Learning course into infrastructure; [testing ML systems](/notes/mlops/testing-ml-systems), which extends the [Python testing note](/notes/python/testing) and [continuous integration](/notes/devops/continuous-integration) to data and models; and [distributed training](/notes/mlops/distributed-training): data, tensor and pipeline parallelism and sharded optimizers, building on [mixed precision](/notes/deep-learning/optimizing-deep-networks) and on [GPUs](/notes/acos/data-level-parallelism#gpus-thousands-of-threads-in-groups-of-32).
+4. **Serving.** [Serving models](/notes/mlops/serving-models) in batch, online and streaming modes inside the [containers](/notes/devops/container-images) and [Kubernetes](/notes/devops/kubernetes) of the DevOps course; [LLM inference systems](/notes/mlops/llm-inference-systems): the KV cache, continuous batching, paged attention and speculative decoding, on top of [decoding](/notes/nlp/gpt), [quantization](/notes/nlp/quantization) and [FlashAttention](/notes/nlp/efficient-transformers#flashattention) from the NLP course; and [rolling out models](/notes/mlops/rolling-out-models) with shadow, canary and A/B tests, reusing the [canary statistics](/notes/devops/continuous-delivery#judging-a-canary-on-a-small-sample) and [A/B tests](/notes/probability/hypothesis-tests#the-ab-test) of earlier courses.
+5. **Operations.** [Monitoring and drift](/notes/mlops/monitoring-and-drift), on top of [observability](/notes/devops/observability) and [SLOs](/notes/devops/slos-and-alerting); [retraining and continual learning](/notes/mlops/continual-learning); and [LLMOps](/notes/mlops/llmops): prompts as versioned artifacts, evaluation in CI and tracing, linking [LLM evaluation](/notes/nlp/llm-evaluation), [RAG](/notes/nlp/rag), [agent evaluation](/notes/agents/evaluating-agents) and [agent security](/notes/agents/agent-security).
+6. **Responsibility and Cost.** [Fairness, privacy and accountability in production](/notes/mlops/responsible-ml), and [cost and efficiency of ML systems](/notes/mlops/cost-and-efficiency), which closes the course in one paragraph.
+
+What is linked rather than repeated: the mechanics of CI/CD, images, Kubernetes, observability and SLOs (DevOps course); training recipes, mixed precision and compression (Deep Learning); attention cost, quantization, RAG and LLM evaluation (NLP); agent evaluation and security (AI Agents); hypothesis tests (Probability); leakage and validation (Machine Learning). Each note here adds only what is specific to models.
+
+<aside class="callout"><strong>Check yourself.</strong> (1) In the CACE experiment, the team that owns the device score changed nothing. Name two numbers that still changed for them, and why. (2) A model's inputs, outputs and service metrics all look normal, yet its quality has halved. How is that possible, and what is the only signal that would show it? (3) A team retrains its model nightly with an automated pipeline, but every change to features goes through a data scientist's notebook and a manual hand-over. Which Google level is it at, and what does the next level add? (4) Why is "the model returned an error" a rarer failure of an ML system than of an ordinary service?<details><summary>Answers</summary>(1) The weight of the device score on retraining, from 0.75 to 0.30, because the model now gets the same information more cleanly from the IP score; and the share of payments flagged at the fixed threshold, which moved to 1.6% without retraining and to 3.8% with it. (2) The relationship between inputs and the label can change while the inputs themselves do not (fraudsters change tactics; concept drift), or the inputs can shift in a way the chosen statistics miss. Only outcomes, that is labels or a proxy for them, reveal a drop in quality, and they usually arrive late. (3) Level 1: the pipeline and continuous training are automated. Level 2 adds CI/CD for the pipeline itself, so that new features and training code are tested and deployed automatically. (4) A model maps any well-formed input to some output; a wrong input or a stale model produces a wrong answer, not an exception. Errors come from the service around the model, which is why ML systems monitor the content of predictions, not only their status codes.</details></aside>
+
+## What changed
+
+| | A model handed over in a file (baseline) | An ML system operated with MLOps |
+| --- | --- | --- |
+| What is shipped | a pickled model and a note | a versioned pipeline that produces, evaluates and deploys models |
+| Data | a query run once in a notebook | validated, versioned snapshots with lineage to every model |
+| Retraining | a new project, months later | a routine run, on a schedule or a trigger |
+| Release | replace the file | an evaluation gate, then a gradual rollout with rollback |
+| What is monitored | the service is up | inputs, predictions, outcomes and the service |
+| How a silent failure is found | complaints, months later | input and output checks the same day, label-based metrics as labels arrive |
+| Who owns the model in production | nobody in particular | one team, on a shared platform |
+
+## Limitations
+
+- **Sculley's picture is a picture.** The box sizes in the paper and in the figure here are illustrative. The proportion of ML code varies widely, and for a system built around a large language model the model's serving may be the most expensive component, as later notes show.
+- **Maturity models are vendor documents.** Both describe the path in terms of their vendor's products, change between revisions and are not validated by measurement. They are useful checklists; the levels are not a score to maximise.
+- **Not every model needs the full loop.** A model trained once for a stable problem, or used offline for analysis, may be best served by level 0 done carefully. The machinery pays off when models change often, when there are many of them, or when mistakes are expensive.
+- **The roles are a division of labour, not a hierarchy of titles.** Hiring an "MLOps engineer" to sit between the data scientists and production recreates the wall that the role was meant to remove.
+- **Tools move quickly.** Product names and versions in this course are those of October 2026; the mechanisms they implement change much more slowly.
+
+## What you should remember
+
+- The model is a small part of an ML system; data collection and verification, features, serving, monitoring, configuration and process make up most of it ([Sculley et al., 2015](#references)).
+- Hidden technical debt in ML: entanglement and CACE (changing one input or setting changes the use of all of them and invalidates fixed thresholds), undeclared consumers, glue code, pipeline jungles, configuration debt, unstable data dependencies and feedback loops.
+- The lifecycle is a loop: data, train, evaluate, deploy, monitor, retrain. Unlike software, it can be restarted by new data and by drift, without any commit; continuous training is the new routine beside CI and CD.
+- ML failures are usually silent: wrong answers with status 200. Check inputs and the distribution of outputs immediately, and quality as soon as labels arrive.
+- Google's levels: 0 manual, 1 automated pipeline with continuous training, 2 CI/CD for the pipeline itself. Microsoft's five levels split the same path: no MLOps, DevOps without MLOps, automated training, automated deployment, full automation.
+- Data scientists, data engineers, ML engineers and platform engineers share the work; one team should own each model in production.
+
+## Example
+
+The program below runs one turn of the lifecycle loop for the fraud model of the running example, with the two kinds of failure from the baseline: an upstream unit change and a change in the world. Payments arrive in weeks of 20,000. In week 5 the upstream service starts sending amounts in cents, and in week 6 the bug is fixed; from week 6 fraudsters also move to smaller amounts. The model sees three features (the logarithm of the amount, whether the device is new, whether the card is foreign) and sends the riskiest 3% of payments to manual review.
+
+```python
+"""One turn of the ML lifecycle loop for a fraud model: train, evaluate, deploy, monitor, retrain."""
+import numpy as np
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import roc_auc_score
+
+rng = np.random.default_rng(7)
+N = 20_000                                          # payments per week
+
+
+def week(w):
+    """Synthetic payments of week w. From week 5 the upstream service sends amounts in cents
+    (fixed in week 6); from week 6 fraudsters move to smaller amounts."""
+    fraud = rng.random(N) < 0.02
+    big = 5.0 if w < 6 else 3.8                     # log-mean amount of a fraudulent payment, in euros
+    amount = np.where(fraud, rng.lognormal(big, 0.8, N), rng.lognormal(3.5, 1.0, N)).round(2)
+    new_device = rng.random(N) < np.where(fraud, 0.6, 0.1)
+    foreign = rng.random(N) < np.where(fraud, 0.5, 0.15)
+    sent = amount * 100 if w == 5 else amount       # what the upstream service actually sends
+    return sent, new_device, foreign, fraud
+
+
+def features(amount, new_device, foreign):
+    return np.column_stack([np.log1p(amount), new_device, foreign])
+
+
+data = {w: week(w) for w in range(1, 11)}
+X = {w: features(*data[w][:3]) for w in data}
+y = {w: data[w][3] for w in data}
+
+# 1. Train on weeks 1-2 and 2. evaluate on week 3, which the model has not seen.
+model = LogisticRegression().fit(np.vstack([X[1], X[2]]), np.concatenate([y[1], y[2]]))
+threshold = np.quantile(model.predict_proba(np.vstack([X[1], X[2]]))[:, 1], 0.97)  # review 3% of payments
+auc = roc_auc_score(y[3], model.predict_proba(X[3])[:, 1])
+print(f'train weeks 1-2, evaluate on week 3: AUC {auc:.3f}, gate AUC >= 0.85: {"pass" if auc >= 0.85 else "fail"}')
+
+# 3. Deploy and 4. monitor: inputs and outputs every week, labels (chargebacks) two weeks later.
+ref_median = np.median(np.concatenate([data[1][0], data[2][0]]))
+print('week  median amount  flagged  input check  output check  recall (known 2 weeks later)')
+for w in range(3, 9):
+    amount, *_ = data[w]
+    flagged = model.predict_proba(X[w])[:, 1] >= threshold
+    ratio = np.median(amount) / ref_median
+    inputs = 'ALERT' if not 0.5 < ratio < 2 else 'ok'
+    outputs = 'ALERT' if flagged.mean() > 2 * 0.03 else 'ok'           # action limit: twice the planned rate
+    recall = flagged[y[w]].mean()
+    print(f'{w:>4}  {np.median(amount):>10.2f} €  {flagged.mean():>6.1%}  {inputs:>11}  {outputs:>12}  {recall:>8.0%}')
+
+# 5. Retrain on weeks 7-8 (after the fix), compare with the production model on week 9, deploy only if better.
+cand = LogisticRegression().fit(np.vstack([X[7], X[8]]), np.concatenate([y[7], y[8]]))
+for name, m in [('production', model), ('candidate', cand)]:
+    p = m.predict_proba(X[9])[:, 1]
+    t = np.quantile(p, 0.97)                        # the same review budget for both
+    print(f'{name:>10} on week 9: AUC {roc_auc_score(y[9], p):.3f}, recall at 3% reviewed {(p >= t)[y[9]].mean():.0%}')
+```
+
+```console
+$ python3 loop.py
+train weeks 1-2, evaluate on week 3: AUC 0.945, gate AUC >= 0.85: pass
+week  median amount  flagged  input check  output check  recall (known 2 weeks later)
+   3       34.06 €    3.0%           ok            ok       56%
+   4       33.63 €    3.1%           ok            ok       55%
+   5     3416.00 €   96.9%        ALERT         ALERT      100%
+   6       33.53 €    2.5%           ok            ok       19%
+   7       32.96 €    2.3%           ok            ok       20%
+   8       33.02 €    2.7%           ok            ok       22%
+production on week 9: AUC 0.806, recall at 3% reviewed 25%
+ candidate on week 9: AUC 0.844, recall at 3% reviewed 37%
+```
+
+Reading it stage by stage:
+
+- **`week`** generates the data and plants both failures. About 2% of payments are fraud, far more than in a real shop, so that a synthetic week contains a few hundred frauds to measure; fraudulent amounts are larger until week 6. The variable `sent` is what the model receives, which in week 5 is not what the payment was.
+- **Train and evaluate.** The model is fitted on weeks 1–2 and judged on week 3, data it has not seen and that comes after its training data in time, as production data will ([validation that matches deployment](/notes/ml/validation-and-overfitting#splits-that-match-deployment)). The gate is a fixed rule written before the result was known: an AUC of at least 0.85. It passes with 0.945. The threshold is chosen so that 3% of payments go to review, the capacity of the review team.
+- **Monitor inputs.** The median amount sent this week is compared with the median of the training weeks, 34 €; a ratio outside 0.5 to 2 raises an alert. In week 5 the median is 3,416 €, a factor of 100, and the alert fires on the first day's data. No exception was raised anywhere: the model scored every payment and the service answered every request.
+- **Monitor outputs.** The share of flagged payments has an action limit of twice the planned 3%. In week 5 it is 96.9%: almost every customer would have been sent to review or, with an automatic decline, refused. Either check alone would have caught this failure.
+- **Monitor quality.** Recall, the share of fraud that the review catches, needs labels, and chargebacks arrive about two weeks later, so the last column is known only in week $w + 2$. In weeks 6–8 the inputs look normal (median 33 €), the flag rate even falls (2.3–2.7%), and both checks stay quiet, yet recall has collapsed from 55% to about 20%: fraudsters now use amounts the model considers safe. This is the silent failure, and only the delayed labels reveal it.
+- **Retrain, evaluate, deploy.** A candidate trained on weeks 7–8, after the unit bug was fixed (training on week 5 would have taught the model that amounts are in cents), is compared with the production model on week 9 at the same review budget. It catches 37% of fraud against 25%, so it replaces the production model, and the loop starts again. The candidate is better but still far from the 55% of the first weeks: the new fraud looks more like ordinary payments, and better features, not only fresher data, are needed. That is a modelling question, which the loop surfaces but does not answer.
+
+The whole loop fits in forty lines because everything is in memory and runs once. In production each stage is a separate job with its own failure modes: data arrive late and twice, checks need thresholds that do not cry wolf, the training data must be exactly reproducible, and the new model must reach users without a risky switch. The rest of the course takes the stages one at a time.
+
+## Next
+
+Before building any of this machinery, a team must decide what the system is for: whether the problem needs a model at all, what "good" means in the product's terms rather than in AUC, how fast and how cheap each prediction must be, and what happens when the model is wrong. The [next note](/notes/mlops/ml-system-design) turns product requirements into metrics, budgets and a design document.
+
+## References
+
+- D. Sculley, G. Holt, D. Golovin, E. Davydov, T. Phillips, D. Ebner, V. Chaudhary, M. Young, J.-F. Crespo, D. Dennison. [Hidden Technical Debt in Machine Learning Systems](https://proceedings.neurips.cc/paper_files/paper/2015/hash/86df7dcfd896fcaf2674f757a2463eba-Abstract.html). *Advances in Neural Information Processing Systems 28* (NIPS 2015). Figure 1 (the small box), sections 2 (entanglement, CACE, undeclared consumers), 3 (data dependencies), 5 (glue code, pipeline jungles), 6 (configuration debt) and 7 (fixed thresholds, action limits). A short version appeared at the SE4ML workshop in 2014 as *Machine Learning: The High-Interest Credit Card of Technical Debt*.
+- W. Cunningham. The WyCash portfolio management system. *OOPSLA '92 Experience Report*, 1992 (the technical-debt metaphor).
+- J. Kazmierczak, K. Salama, V. Huerta. [MLOps: Continuous delivery and automation pipelines in machine learning](https://docs.cloud.google.com/architecture/mlops-continuous-delivery-and-automation-pipelines-in-machine-learning). Google Cloud Architecture Center, last reviewed 28 August 2024 (levels 0, 1 and 2; continuous training).
+- Microsoft. [MLOps maturity model](https://learn.microsoft.com/en-us/azure/architecture/ai-ml/guide/mlops-maturity-model). Azure Architecture Center, page dated 3 June 2026 (levels 0 to 4).
+- C. Kästner. [*Machine Learning in Production: From Models to Products*](https://mlip-cmu.github.io/book/). MIT Press, 2025. Chapters 2 (from models to systems), 11 (automating the pipeline), 21 (interdisciplinary teams) and 22 (technical debt); and the course [CMU 17-445/645 Machine Learning in Production](https://mlip-cmu.github.io/), spring 2025.
+- C. Huyen. *Designing Machine Learning Systems*. O'Reilly, 2022. Chapters 1 (overview of ML systems), 2 (introduction to ML systems design) and 11 (the human side); and the course [Stanford CS329S: Machine Learning Systems Design](https://stanford-cs329s.github.io/).
+- HSE University. *Введение в MLOps* (Introduction to MLOps), master's programme «Машинное обучение в цифровом продукте», 2025/26: MLOps, data versioning, experiment tracking, model registry, orchestration, platforms, testing, monitoring, LLMOps basics.
+- HSE University. [*Инженерия LLM-систем*](https://github.com/xufana/llm-system-engineering) (Engineering of LLM systems), Faculty of Computer Science, 2026: system anatomy, budgets, design documents, evaluation, observability.
+- M. Ryabinin et al. [*Efficient Deep Learning Systems*](https://github.com/mryab/efficient-dl-systems). HSE University and Yandex School of Data Analysis, 2026: GPU performance, distributed training, serving and inference systems.
+- M. Zinkevich. [Rules of Machine Learning: Best Practices for ML Engineering](https://developers.google.com/machine-learning/guides/rules-of-ml). Google for Developers (rule 10: watch for silent failures).

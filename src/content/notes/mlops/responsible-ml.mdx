@@ -1,0 +1,395 @@
+---
+title: Fairness, privacy and accountability in production
+section: Responsibility and Cost
+description: "What a deployed model owes the people it affects: three fairness criteria and why they conflict, membership inference and differential privacy with the Laplace mechanism derived, model cards and datasheets, the EU AI Act's tiers and dates, and attacks on models."
+course: mlops
+order: 14
+status: published
+tags: [fairness, demographic-parity, equalized-odds, calibration, impossibility, privacy, membership-inference, differential-privacy, laplace-mechanism, dp-sgd, model-cards, datasheets, eu-ai-act, data-poisoning, model-extraction]
+prerequisites: [Designing an ML system, LLMOps, Classification metrics, Stochastic gradient descent]
+---
+
+import FairnessTradeoff from '../../../components/figures/responsible-ml/FairnessTradeoff.astro';
+
+The [previous note](/notes/mlops/llmops) put guardrails on what a language model may say and kept the content of its traces out of reach. Those were two instances of a wider question that every model in production raises: what does a model owe the people it makes decisions about? A credit model can approve one group of applicants more often than another, a model can reveal who was in its training data, a decision can be impossible to explain to the person it affected or to the regulator who asks, and a model can be manipulated by whoever controls part of its data. This note covers the four parts of the answer that an engineering team can measure and act on: fairness criteria and the result that they conflict, privacy attacks and differential privacy, documentation for accountability, and the EU AI Act, with the attacks on models in production in brief.
+
+**Conventions.** The fairness definitions are computed exactly on a synthetic population by numerical integration (SciPy 1.18.1). The [Example](#example) is a real Python program (3.14.7, NumPy 2.5.4, scikit-learn 1.9.1, 23 October 2026) on synthetic credit data. Legal facts are dated October 2026 and summarized for engineers; they are not legal advice. **Notation.** $G \in \{A, B\}$ is a group (a protected attribute such as sex or ethnicity), $Y \in \{0, 1\}$ the true outcome ($1$: the loan is repaid), $S \in [0, 1]$ the model's score and $\hat Y = \mathbb 1\{S > t\}$ the decision ($1$: approve). $p_g = P(Y = 1 \mid G = g)$ is the base rate of group $g$. TPR, FPR and PPV are the true-positive rate, false-positive rate and positive predictive value of [Classification metrics](/notes/ml/classification-metrics#precision-recall-and-f1), computed within a group.
+
+## Baseline: leave the protected attribute out
+
+The first instinct is to make a model fair by not giving it the protected attribute: if the model never sees $G$, how can it treat the groups differently? This is called **fairness through unawareness**, and it does not work. Other features carry the information: a postcode, a first name, a school, a shopping pattern. The Example builds a credit model for 8,000 synthetic applicants without the group attribute; the features are income, which differs between the groups by 0.4 standard deviations, a credit history, six noise features, and a region that agrees with the group 80 % of the time. On held-out applicants:
+
+| group | base rate | approved | TPR | FPR | PPV |
+| --- | --- | --- | --- | --- | --- |
+| A | 0.408 | 0.374 | 0.655 | 0.181 | 0.714 |
+| B | 0.534 | 0.531 | 0.748 | 0.282 | 0.752 |
+
+Group B is approved 15.6 points more often than group A, more than the 12.6-point difference in their base rates, and its true-positive and false-positive rates are both about ten points higher. The model never saw $G$; it did not need to. Whether these gaps are unfair is not a question the table can answer, since some of them follow from real differences in income and history. What the table does show is that leaving $G$ out removes neither the gaps nor the duty to measure them, and that measuring them requires the very attribute that was left out.
+
+<aside class="callout"><strong>Key idea.</strong> Fairness, privacy and accountability are properties of a system that can be specified and measured like latency, but each involves a choice that is not technical. Fairness has several definitions that cannot all hold when groups differ in base rates, so a team must choose which errors to equalize and say why. Privacy can be bounded by a number, the ε of differential privacy, and the bound costs accuracy. Accountability means that the choices, the data and the measured behaviour are written down where the people responsible can read them. The law now requires much of this for high-risk uses, on dates that are fixed.</aside>
+
+## Three fairness criteria
+
+Most group fairness definitions are one of three conditions on the joint distribution of $G$, $Y$ and the decision $\hat Y$ or the score $S$ ([Barocas, Hardt and Narayanan, 2023](#references)):
+
+- **Independence**, or **demographic parity**: the decision does not depend on the group, $P(\hat Y = 1 \mid G = A) = P(\hat Y = 1 \mid G = B)$. Equal approval rates.
+- **Separation**, or **equalized odds**: the decision does not depend on the group *given the true outcome*: equal TPR and equal FPR across groups ([Hardt, Price and Srebro, 2016](#references)). People who would repay are approved at the same rate in every group, and so are people who would not. *Equal opportunity* asks only for equal TPR.
+- **Sufficiency**, or **calibration within groups**: the outcome does not depend on the group *given the score*, $P(Y = 1 \mid S = s, G = g) = s$ for every $g$. A score of 0.7 means a 70 % chance of repaying in every group. Its version for decisions is **predictive parity**: equal PPV, so that an approval means the same in every group.
+
+Each corresponds to a different idea of what is unfair. Independence says the groups should get the same share of the good, whatever the data say; separation says equal people should be treated equally, where "equal" means equal in the true outcome; sufficiency says the model's statements should mean the same thing for everyone.
+
+To compute them exactly, take a population in which scores are **calibrated by construction**: in group A the score is distributed as $\text{Beta}(2, 4)$, in group B as $\text{Beta}(3, 3)$, and in both $P(Y = 1 \mid S = s) = s$. The base rates are the mean scores, $p_A = 2/6 = 1/3$ and $p_B = 3/6 = 1/2$. Each quantity is an integral of the score density $f_g$ above the threshold:
+
+$$
+\begin{aligned}
+P(\hat Y = 1 \mid g) &= \int_t^1 f_g(s)\,ds, &
+\text{TPR}_g &= \frac{\int_t^1 s\, f_g(s)\,ds}{p_g}, \\
+\text{FPR}_g &= \frac{\int_t^1 (1 - s)\, f_g(s)\,ds}{1 - p_g}, &
+\text{PPV}_g &= \frac{\int_t^1 s\, f_g(s)\,ds}{\int_t^1 f_g(s)\,ds},
+\end{aligned}
+$$
+
+since a person with score $s$ is a positive with probability $s$. With one threshold $t = 0.5$ for everyone:
+
+| group | base rate | approved | TPR | FPR | PPV |
+| --- | --- | --- | --- | --- | --- |
+| A | 0.333 | 0.188 | 0.344 | 0.109 | 0.611 |
+| B | 0.500 | 0.500 | 0.656 | 0.344 | 0.656 |
+
+The score is calibrated in both groups, so sufficiency holds for the score, and yet every decision-level criterion fails: approval rates of 0.19 against 0.50, TPR 0.34 against 0.66, FPR 0.11 against 0.34, PPV 0.61 against 0.66. A single threshold applied to calibrated scores reproduces the difference in base rates in every rate.
+
+### Why they cannot all hold
+
+Moving the threshold for one group shows what can be equalized. Keep group A at 0.5 and move group B's threshold:
+
+<FairnessTradeoff />
+
+- **Equal approval rates** need a threshold of 0.682 for group B.
+- **Equal TPR** needs 0.655 and **equal FPR** 0.658: equalized odds is nearly reachable here, because the two groups' ROC curves happen to almost cross at group A's operating point. At $t_B = 0.655$, both TPRs are 0.344 and the FPRs are 0.113 and 0.109.
+- **Equal PPV** needs 0.419, far from the others. At $t_B = 0.655$, where the error rates are equal, PPV is 0.753 in group B and 0.611 in group A: an approval of a B applicant is much more reliable than an approval of an A applicant.
+
+This is not a property of the example. **When base rates differ, a decision rule cannot have equal PPV and equal error rates at once**, unless it is perfect ([Chouldechova, 2017](#references)). The proof is three lines of Bayes' rule. Within one group, write $p$ for the base rate. The approved positives are a share $(1 - \text{FNR})\,p$ of the group and the approved negatives a share $\text{FPR}\,(1 - p)$, so
+
+$$
+\begin{aligned}
+\text{PPV} &= \frac{(1 - \text{FNR})\,p}{(1 - \text{FNR})\,p + \text{FPR}\,(1 - p)} && \text{share of the approved who are positive} \\
+\Rightarrow\quad \text{FPR}\,(1 - p) &= (1 - \text{FNR})\,p\,\frac{1 - \text{PPV}}{\text{PPV}} && \text{solve for the second term of the denominator} \\
+\Rightarrow\quad \text{FPR} &= \boxed{\;\frac{p}{1 - p} \cdot \frac{1 - \text{PPV}}{\text{PPV}} \cdot (1 - \text{FNR})\;}
+\end{aligned}
+$$
+
+Fix PPV and FNR to be the same in both groups; then the FPRs are in the ratio of the odds $p/(1 - p)$, which differ when the base rates differ. With group A's PPV of 0.611 and TPR of 0.344 imposed on group B, whose odds are $1$ against group A's $0.5$, group B's FPR would have to be $1 \times (0.389/0.611) \times 0.344 = 0.219$, twice group A's 0.109. [Kleinberg, Mullainathan and Raghavan (2017)](#references) proved the version for scores: calibration within groups and equal average scores for the positives and for the negatives of each group cannot hold together, except with equal base rates or perfect prediction.
+
+### What a team can do with this
+
+The impossibility does not make fairness arbitrary; it makes it a decision with stated reasons ([Kästner, 2025, ch. 26](#references)).
+
+- **Choose the criterion from the harm.** If a false negative denies someone a loan they would have repaid, the harm is in the TPR, and equal opportunity is the natural target. If a positive decision triggers an investigation, the harm is in the FPR. If downstream users read the score as a probability, calibration matters most.
+- **Measure all of them, by group and over time.** Disaggregated metrics belong in the [monitoring](/notes/mlops/monitoring-and-drift) of the model and in its documentation, like any slice; a retraining that improves the average can widen a gap, which the [gate](/notes/mlops/continual-learning#evaluation-gates-champion-against-challenger) of the continual-learning note can check.
+- **Intervene at the right stage.** Before training (collect more data for the under-represented group, reweight), during training (a constraint or penalty on a gap), or after it (group-specific thresholds, as in the figure). Group-specific thresholds are simple and exact, and in some jurisdictions and domains, treating applicants differently by a protected attribute is itself unlawful; that is a legal question for each product.
+- **Keep the attribute for measurement, not for prediction.** Auditing requires knowing group membership, which is often sensitive personal data. The EU's 2026 amendment of the AI Act, below, adds a legal basis for processing such data to detect and correct bias.
+
+## Privacy: what a model reveals about its training data
+
+A trained model is a function of its training data, and functions of data leak data. The question is how much, and the cleanest measurable form is **membership inference**: given a model and a person's record, can an attacker tell whether the record was in the training set ([Shokri et al., 2017](#references))? Being in a training set can itself be sensitive: the training set of a model for a disease, or of a bank's defaulters.
+
+The simplest attack uses the loss. A model fits its training examples better than unseen ones, so a low loss on a record is evidence that it was trained on ([Yeom et al., 2018](#references)). Score each record by its negative loss and ask how well that separates members from non-members: an AUC of 0.5 means no information, 1 means full membership disclosure. In the Example:
+
+| model | membership AUC |
+| --- | --- |
+| the deployed gradient-boosted trees (depth 3) | 0.517 |
+| a random forest of fully grown trees, on the same data | 0.813 |
+
+The deep forest memorizes its training records, nearly every leaf holds a single training example, and the loss tells them apart. The regularized model leaks very little through this attack. Leakage follows overfitting, and a model's generalization gap is a first, crude measure of its privacy risk. Two cautions from the literature: an average AUC can hide a few records that are exposed with near certainty, so attacks should be reported at a low false-positive rate as well; and stronger attacks, which train reference models on similar data, find much more than the loss threshold does ([Carlini et al., 2022](#references)).
+
+## Differential privacy
+
+Defences that remove names or identifiers fail because the rest of a record identifies the person. **Differential privacy** (DP) instead bounds what any output can reveal about any one record ([Dwork et al., 2006](#references); [Dwork and Roth, 2014](#references)). Two datasets are **neighbours** if they differ in one person's record. A randomized algorithm $M$ is **ε-differentially private** if for every pair of neighbours $D, D'$ and every set $S$ of outputs
+
+$$
+P\big(M(D) \in S\big) \le e^{\varepsilon}\, P\big(M(D') \in S\big).
+$$
+
+Whatever an attacker sees, it is at most $e^{\varepsilon}$ times more likely with any one person's data than without it. The relaxation $(\varepsilon, \delta)$-DP adds $+\,\delta$ on the right, a small probability with which the bound may fail; $\delta$ is chosen well below one over the number of people.
+
+### The Laplace mechanism
+
+To release a number $f(D)$, such as a count, add noise from the Laplace distribution, whose density is $\frac{1}{2b} e^{-|z|/b}$. How much noise depends on the **sensitivity** $\Delta = \max |f(D) - f(D')|$ over neighbours: a count changes by at most 1 when one person is added or removed, so $\Delta = 1$. With $M(D) = f(D) + \text{Laplace}(b)$, the ratio of the output densities at any $z$ is
+
+$$
+\begin{aligned}
+\frac{p_{M(D)}(z)}{p_{M(D')}(z)} &= \frac{e^{-|z - f(D)|/b}}{e^{-|z - f(D')|/b}} = \exp\!\Big(\frac{|z - f(D')| - |z - f(D)|}{b}\Big) \\
+&\le \exp\!\Big(\frac{|f(D) - f(D')|}{b}\Big) && \text{triangle inequality: } |z - f(D')| \le |z - f(D)| + |f(D) - f(D')| \\
+&\le \exp\!\Big(\frac{\Delta}{b}\Big) = e^{\varepsilon} && \text{choosing } \boxed{\,b = \Delta / \varepsilon\,}.
+\end{aligned}
+$$
+
+Integrating the density bound over any set $S$ gives the definition. **Worked example.** A bank publishes the number of defaulters in a region, 312, at $\varepsilon = 0.5$. Then $b = 1/0.5 = 2$: the published value is 312 plus noise with standard deviation $\sqrt 2\, b = 2.83$, and since $P(|\text{noise}| > x) = e^{-x/b}$, the noise exceeds $b \ln 20 = 6.0$ only 5 % of the time. For a count of 312 that is accurate enough; for a count of 3 it is not, which is the general shape of DP: it protects individuals by blurring what depends on few of them.
+
+**Composition.** Running $k$ mechanisms with budgets $\varepsilon_1, \dots, \varepsilon_k$ on the same data is $(\sum_i \varepsilon_i)$-DP: ten such counts at $\varepsilon = 0.5$ spend $\varepsilon = 5$. Privacy is a budget that every query, every model and every retraining draws on, and tighter accounting theorems slow the growth without stopping it.
+
+**What ε means for an attacker.** Take the set $S$ to be "the attack says *member*". The definition applied to $S$ and to its complement bounds any membership attack's true-positive rate by $\text{TPR} \le e^{\varepsilon}\,\text{FPR}$ and $\text{TPR} \le 1 - e^{-\varepsilon}(1 - \text{FPR})$. The area under the smaller of the two lines, which meet at $\text{FPR} = 1/(1 + e^{\varepsilon})$, is
+
+$$
+\text{AUC} \le \frac{e^{\varepsilon}}{1 + e^{\varepsilon}} :
+\qquad 0.525 \text{ at } \varepsilon = 0.1, \quad 0.731 \text{ at } \varepsilon = 1, \quad 0.881 \text{ at } \varepsilon = 2, \quad 0.9997 \text{ at } \varepsilon = 8 .
+$$
+
+At $\varepsilon = 1$, an attack that wrongly accuses 1 % of non-members can correctly identify at most 2.7 % of members. At $\varepsilon = 8$, a value often used for deep learning, the worst-case bound says almost nothing; the protection in practice is much better than the bound, as audits of trained models show, but it is no longer a guarantee one can state.
+
+### DP-SGD, in brief
+
+*Optional depth: the accounting of the Example's DP training. The rest of the note does not depend on it.*
+
+A model trained by gradient descent can be made differentially private by bounding each person's influence on every step and adding noise ([Abadi et al., 2016](#references)). Each step of **DP-SGD**:
+
+1. computes the gradient of the loss for **each example** of the batch separately;
+2. **clips** each one to norm at most $C$, so that one person changes the sum of gradients by at most $C$: the sensitivity of the sum is $C$;
+3. adds Gaussian noise $\mathcal N(0, \sigma^2 C^2 I)$ to the sum, with a **noise multiplier** $\sigma$;
+4. divides by the batch size and takes the step.
+
+The privacy of $T$ steps is computed by an accountant. The Example uses the whole training set in every step (DP gradient descent, without the sampling of batches) and the Rényi accountant ([Mironov, 2017](#references)): each Gaussian step costs $\alpha / (2\sigma^2)$ at Rényi order $\alpha$, $T$ steps cost $T\alpha/(2\sigma^2)$, and the conversion $\varepsilon = T\alpha/(2\sigma^2) + \ln(1/\delta)/(\alpha - 1)$, minimized over $\alpha$, gives
+
+$$
+\varepsilon = \frac{T}{2\sigma^2} + \frac{\sqrt{2\,T \ln(1/\delta)}}{\sigma} .
+$$
+
+With $T = 200$ steps and $\delta = 10^{-5}$, the noise multiplier for $\varepsilon = 1$ is $\sigma = 69.3$. That sounds enormous, but the noise is added to a sum over 4,000 examples and then divided by 4,000, so each step's noise per coordinate has standard deviation $69.3/4{,}000 = 0.017$. A logistic regression on the Example's data keeps its accuracy: 0.748 without DP, 0.747 at $\varepsilon = 8$ and at $\varepsilon = 1$, and 0.730 at $\varepsilon = 0.1$. Real DP-SGD samples a random batch at each step, which amplifies privacy and is accounted for by tighter methods, as implemented in libraries such as Opacus. Deep networks pay more, because they have many parameters and learn from few examples per parameter: on CIFAR-10 without extra data, a 40-layer wide residual network reached 81.4 % at $(\varepsilon, \delta) = (8, 10^{-5})$ in 2022, up from 71.7 % for the previous best private result, where non-private networks pass 95 % ([De et al., 2022](#references)).
+
+## Documentation: model cards and datasheets
+
+Accountability needs a record that people other than the model's authors can read: a product owner deciding whether to deploy, an auditor, a regulator, an affected person's advocate. Two formats are the standard.
+
+A **model card** ([Mitchell et al., 2019](#references)) documents a trained model in nine sections: model details (who built it, when, version, type, licence); intended use and out-of-scope uses; factors (the groups, instruments and environments its performance may vary across); metrics and decision thresholds; evaluation data; training data; quantitative analyses, **disaggregated** by those factors; ethical considerations; caveats and recommendations. The disaggregation is the point: an aggregate accuracy hides exactly the group differences of this note.
+
+A **datasheet for a dataset** ([Gebru et al., 2021](#references)) answers questions in seven groups: motivation (why and by whom the data were created), composition (what an instance is, what is missing, whether it contains sensitive data), collection process, preprocessing and labelling, uses (including uses to avoid), distribution, and maintenance. A model card points to the datasheets of its data, and both are versioned with the artifacts they describe, as the [data versioning note](/notes/mlops/data-quality-and-versioning) and the [model registry](/notes/mlops/experiments-and-registry) version the artifacts themselves.
+
+Documentation is only accountable if it is generated from the same evaluations that gate the model, rather than written once and left: the Example prints the quantitative section of its model card from the numbers it has just computed, so the card cannot drift from the model.
+
+## Regulation: the EU AI Act
+
+The EU AI Act, Regulation (EU) 2024/1689, regulates AI systems placed on the EU market or whose output is used in the EU, by risk tier ([European Union, 2024](#references)):
+
+| tier | what | obligations |
+| --- | --- | --- |
+| unacceptable risk (Art. 5) | banned practices, such as social scoring, manipulation that exploits vulnerabilities, untargeted scraping of facial images, emotion recognition at work and in schools, and (with narrow exceptions) real-time remote biometric identification in public spaces for law enforcement | prohibited |
+| high risk (Art. 6, Annexes I and III) | safety components of regulated products (machinery, medical devices, vehicles…), and uses in eight areas: biometrics, critical infrastructure, education, employment, access to essential services (including **credit scoring**), law enforcement, migration and border control, justice and democratic processes | requirements of Arts. 9–15, conformity assessment, registration, post-market monitoring |
+| transparency risk (Art. 50) | systems that interact with people, generate synthetic content, or recognize emotions | tell people they are dealing with an AI; mark generated content in a machine-readable way; label deepfakes |
+| minimal risk | everything else, such as spam filters and recommendations in most settings | none beyond the AI literacy duty |
+
+**General-purpose AI models**, such as large language models, have their own obligations (Arts. 53–55): technical documentation, information for the providers who build on them, a copyright policy and a summary of the training content; models trained with more than $10^{25}$ floating-point operations are presumed to have systemic risk and must also be evaluated adversarially, report serious incidents and be secured.
+
+The high-risk requirements read like the table of contents of this course, which is no accident: **risk management** (Art. 9), **data governance** with relevant, representative and as far as possible error-free data examined for bias (Art. 10; the notes on [data quality](/notes/mlops/data-quality-and-versioning) and on fairness above), **technical documentation** (Art. 11; model cards and datasheets), **automatic logging** of events (Art. 12; the logs of the [retraining loop](/notes/mlops/continual-learning#the-retraining-loop) and of [observability](/notes/devops/observability)), **transparency** towards deployers (Art. 13), **human oversight** (Art. 14; the review of [Designing an ML system](/notes/mlops/ml-system-design#planning-for-mistakes)), and **accuracy, robustness and cybersecurity** (Art. 15; testing, monitoring and the attacks below).
+
+**Dates.** The Act entered into force on 1 August 2024 and applies in stages (Art. 113). In 2026 the stages for high-risk systems were moved by the "Digital Omnibus on AI", Regulation (EU) 2026/1744, published in the Official Journal on 24 July 2026 and in force since 27 July 2026, after a political agreement in May and adoption by the Parliament on 16 June and the Council on 29 June 2026 ([European Union, 2026](#references); [Gibson Dunn, 2026](#references)):
+
+| date | what applies |
+| --- | --- |
+| 1 August 2024 | entry into force |
+| 2 February 2025 | prohibited practices (Art. 5); AI literacy (Art. 4), softened in 2026 to a duty to support it |
+| 2 August 2025 | general-purpose AI model obligations; governance; penalties |
+| 2 August 2026 | most of the rest, including the transparency duties of Art. 50 and the fines for providers of general-purpose models (Art. 101) |
+| 2 December 2026 | machine-readable marking of generated content (Art. 50(2)) for systems already on the market before 2 August 2026; new prohibition of systems generating non-consensual intimate images and child sexual abuse material |
+| 2 December 2027 | high-risk systems of Annex III, such as credit scoring and hiring (originally 2 August 2026) |
+| 2 August 2028 | high-risk systems in products of Annex I (originally 2 August 2027) |
+
+Fines reach €35 million or 7 % of worldwide annual turnover for prohibited practices, €15 million or 3 % for most other obligations, and €7.5 million or 1 % for incorrect information to authorities (Art. 99). The Act sits beside the GDPR, which already governs the personal data in training sets and logs, and beside sector law, such as consumer credit rules. The Omnibus also gave a legal basis for processing special categories of personal data to detect and correct bias, which is what a fairness audit needs.
+
+## Attacks on models in production
+
+Beyond the [adversarial examples](/notes/deep-learning/adversarial-examples) of the Deep Learning course and the [prompt injection](/notes/agents/agent-security) of the AI Agents course, two attacks matter specifically to the operation of models ([Kästner, 2025, ch. 28](#references)).
+
+- **Data poisoning.** An attacker who controls part of the training data can degrade a model or plant a **backdoor**: a trigger, such as a sticker on a stop sign or a rare phrase, that makes the model misbehave while it looks normal otherwise ([Gu et al., 2017](#references)). Web-scale data make this practical. Buying expired domains that a dataset's URLs point to would have let an attacker control 0.01 % of LAION-400M for about \$60 ([Carlini et al., 2024a](#references)); and 250 poisoned documents were enough to plant a backdoor in language models from 600 million to 13 billion parameters, a near-constant number rather than a fraction of the data ([Souly et al., 2025](#references)). The defences are those of data quality and provenance: pin dataset snapshots by content hash, record where every partition came from, validate distributions before training, and be most careful with data that users or the public can write, including the feedback that a continual training loop learns from.
+- **Model extraction.** An attacker who can query a model can train a copy on its answers, or recover parameters directly; prediction APIs that return confidence scores make it easier ([Tramèr et al., 2016](#references)). Even production language models leak: queries costing under \$20 recovered the final projection layer of two OpenAI models and revealed their hidden dimensions ([Carlini et al., 2024b](#references)). The defences are those of any API: authentication, rate limits and quotas, monitoring for query patterns that look like systematic exploration, and returning no more than the product needs, such as a label instead of a probability vector.
+
+Both belong in the threat model that the [design](/notes/mlops/ml-system-design) of a system writes down, next to the failures of the model itself.
+
+<aside class="callout"><strong>Check yourself.</strong> (1) A classifier has equal TPR (0.8) and equal PPV (0.7) in two groups with base rates 0.2 and 0.4. What are the two groups' FPRs? (2) A count of patients is released with the Laplace mechanism at $\varepsilon = 0.1$. What is the noise's standard deviation, and roughly how large must the count be for a 5 % relative error to be typical? (3) A model reaches a membership-inference AUC of 0.81, and the team claims it was trained with $\varepsilon = 1$ differential privacy. What do you conclude? (4) A hiring tool that ranks CVs is placed on the EU market in 2027. Which tier is it in, and from when must it meet the high-risk requirements? (5) Why does a continual training loop that learns from user feedback widen the attack surface for poisoning?<details><summary>Answers</summary>(1) $\text{FPR} = \frac{p}{1 - p} \cdot \frac{0.3}{0.7} \cdot 0.8$: for $p = 0.2$, $0.25 \times 0.4286 \times 0.8 = 0.086$; for $p = 0.4$, $0.6667 \times 0.4286 \times 0.8 = 0.229$. (2) $b = 1/0.1 = 10$, standard deviation $\sqrt 2 \times 10 = 14.1$; a typical error of about 14 is 5 % of about 280, so counts of a few hundred or more. (3) The claim is false or the accounting is wrong: at $\varepsilon = 1$ no attack can exceed an AUC of $e/(1 + e) = 0.731$. (4) Employment is an Annex III area, so it is high risk; under the 2026 amendment the requirements apply from 2 December 2027. (5) Users choose the data: whoever can generate interactions can steer the labels the model is retrained on, and the loop applies them automatically, so poisoning needs no access to the training pipeline. Gates, validation and limits on the influence of any one user are the defences.</details></aside>
+
+## What changed
+
+| | Leave the attribute out (the baseline) | Responsible operation |
+| --- | --- | --- |
+| Group differences | assumed away | measured by group: approval 0.374 against 0.531 in the Example |
+| Which fairness | unstated | a chosen criterion with a reason; the others reported, since they conflict |
+| Calibrated scores, one threshold | "fair" | every rate differs when base rates differ |
+| Training data privacy | anonymized, assumed safe | membership attacks measured (AUC 0.517 against 0.813); DP with a stated ε |
+| Releasing a count | exact | $+\,\text{Laplace}(\Delta/\varepsilon)$: 312 ± 2.83 at $\varepsilon = 0.5$ |
+| Documentation | a README, if any | a model card with disaggregated metrics, generated from the gate's evaluation; datasheets |
+| The law | unknown | EU AI Act tier identified, dates known: Annex III high-risk from 2 December 2027 |
+| Attacks | not considered | provenance against poisoning, rate limits against extraction |
+
+## Limitations
+
+- **Group fairness is not individual fairness.** Equal rates across two groups can hide unequal treatment within them, of subgroups and of intersections of attributes; and the groups must be known, which they often are not.
+- **Synthetic populations.** The fairness numbers come from a constructed population, chosen to make the mechanism visible; real gaps depend on real data and on how the outcome itself was recorded, which may be biased.
+- **DP protects records, not secrets shared by many.** A model that learns that a group defaults more often reveals that fact by design; differential privacy only bounds what one person's presence changes.
+- **The law is summarized, not interpreted.** The dates are those of the amended Act as of October 2026; guidelines, standards and court decisions will fill in what the obligations mean in practice.
+- **Not covered:** explainability methods (Kästner's chapter 25), causal definitions of fairness, fairness in ranking and recommendation, federated learning, and the safety of language models beyond the [guardrails](/notes/mlops/llmops#guardrails) of the previous note.
+
+## What you should remember
+
+- Leaving the protected attribute out does not remove group differences; proxies carry it. Measuring fairness needs the attribute.
+- Independence (equal approval rates), separation (equal TPR and FPR) and sufficiency (calibration, equal PPV) are different ideas of fairness.
+- $\text{FPR} = \frac{p}{1 - p}\cdot\frac{1 - \text{PPV}}{\text{PPV}}\cdot(1 - \text{FNR})$: with different base rates, equal PPV and equal error rates cannot hold together. Choose from the harm, and report all.
+- Models leak membership in proportion to how much they memorize; loss-threshold attacks measure it, stronger attacks find more.
+- ε-DP: any output is at most $e^{\varepsilon}$ times more likely with one person's data. Laplace noise of scale $\Delta/\varepsilon$ achieves it for a number; budgets add up over queries.
+- At ε, no membership attack exceeds an AUC of $e^{\varepsilon}/(1 + e^{\varepsilon})$: 0.73 at ε = 1, almost no bound at ε = 8.
+- DP-SGD clips each example's gradient and adds Gaussian noise; large datasets make the noise cheap, deep models make it expensive.
+- Model cards (with disaggregated metrics) and datasheets are the accountability record; generate them from the gate's evaluation.
+- EU AI Act: prohibited, high-risk, transparency and minimal tiers; high-risk Annex III systems from 2 December 2027 and Annex I from 2 August 2028 after the 2026 amendment; fines up to 7 % of turnover.
+- Poisoning needs few samples and is defended by provenance and validation; extraction is defended by API controls.
+
+## Example
+
+An audit of a credit model before release: group metrics, a membership-inference test, a differentially private alternative, and the quantitative part of the model card. Synthetic data; Python 3.14.7, NumPy 2.5.4, scikit-learn 1.9.1; it runs in about 4 seconds.
+
+```python
+"""Audit a credit model before release: group metrics, membership inference, a DP alternative, a model card."""
+import numpy as np
+from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import roc_auc_score
+
+rng = np.random.default_rng(0)
+n = 8000
+g = rng.integers(0, 2, n)                                   # protected group; never given to the model
+region = np.where(rng.random(n) < 0.8, g, 1 - g)            # a proxy: agrees with the group 80% of the time
+income = rng.normal(0.4 * g, 1, n)
+history = rng.normal(0, 1, n)
+noise = rng.normal(0, 1, (n, 6))
+logit = 1.2 * income + 1.0 * history + 0.4 * region - 0.6
+y = (rng.random(n) < 1 / (1 + np.exp(-logit))).astype(int)  # 1 = repaid
+X = np.column_stack([income, history, region, noise])
+tr, te = np.arange(n) < n // 2, np.arange(n) >= n // 2
+
+model = HistGradientBoostingClassifier(max_depth=3, learning_rate=0.05, random_state=0).fit(X[tr], y[tr])
+p = model.predict_proba(X[te])[:, 1]; approve = p > 0.5
+print(f"accuracy {np.mean(approve == y[te]):.3f}, AUC {roc_auc_score(y[te], p):.3f}")
+print("group  base rate  approved   TPR    FPR    PPV")
+rows = {}
+for k, name in ((0, "A"), (1, "B")):
+    m = g[te] == k; yy, aa = y[te][m], approve[m]
+    rows[name] = (yy.mean(), aa.mean(), aa[yy == 1].mean(), aa[yy == 0].mean(), yy[aa].mean())
+    print(f"  {name}     {rows[name][0]:.3f}     {rows[name][1]:.3f}   " + "  ".join(f"{v:.3f}" for v in rows[name][2:]))
+gap = {k: rows["B"][i] - rows["A"][i] for i, k in enumerate(["base", "approval", "tpr", "fpr", "ppv"])}
+print("gaps B - A: " + ", ".join(f"{k} {v:+.3f}" for k, v in gap.items()))
+
+def membership_auc(clf):
+    """Loss-threshold attack: training members tend to have lower loss than unseen people."""
+    def loss(idx):
+        q = np.clip(clf.predict_proba(X[idx])[:, 1], 1e-6, 1 - 1e-6)
+        return -(y[idx] * np.log(q) + (1 - y[idx]) * np.log(1 - q))
+    members, others = loss(tr), loss(te)
+    return roc_auc_score(np.r_[np.ones(len(members)), np.zeros(len(others))], -np.r_[members, others])
+forest = RandomForestClassifier(n_estimators=200, random_state=0).fit(X[tr], y[tr])
+print(f"membership AUC: deployed model {membership_auc(model):.3f}, unpruned random forest {membership_auc(forest):.3f}")
+
+def dp_logistic(x, yy, eps, delta=1e-5, T=200, C=1.0, lr=0.5):
+    """Full-batch DP gradient descent: clip each example's gradient to norm C, add Gaussian noise to the sum."""
+    L = np.log(1 / delta)
+    # Renyi-DP of T Gaussian steps converted to (eps, delta): eps = T/(2 s^2) + sqrt(2 T L)/s; solve for s
+    s = (np.sqrt(2 * T * L) + np.sqrt(2 * T * L + 2 * T * eps)) / (2 * eps)
+    xb = np.column_stack([x, np.ones(len(x))]); w = np.zeros(xb.shape[1]); r = np.random.default_rng(1)
+    for _ in range(T):
+        q = 1 / (1 + np.exp(-xb @ w))
+        grads = (q - yy)[:, None] * xb                       # one gradient per example
+        grads /= np.maximum(1, np.linalg.norm(grads, axis=1) / C)[:, None]
+        w -= lr * (grads.sum(0) + r.normal(0, s * C, len(w))) / len(x)
+    return w, s
+xs = (X - X[tr].mean(0)) / X[tr].std(0)
+plain = LogisticRegression().fit(xs[tr], y[tr])
+print(f"logistic regression: non-private accuracy {plain.score(xs[te], y[te]):.3f}")
+for eps in (8.0, 1.0, 0.1):
+    w, s = dp_logistic(xs[tr], y[tr], eps)
+    acc = np.mean(((np.column_stack([xs[te], np.ones(te.sum())]) @ w) > 0) == y[te])
+    print(f"  DP-GD eps = {eps:>4}: noise multiplier {s:7.1f}, accuracy {acc:.3f}")
+
+print(f"""
+model_card:
+  model: credit-approval gbdt 3.2.0
+  intended_use: rank applications for human review; not for automatic rejection
+  out_of_scope: applicants outside the training regions; business loans
+  training_data: datasheet credit-2026Q3, {tr.sum()} applications
+  metrics:
+    accuracy: {np.mean(approve == y[te]):.3f}
+    auc: {roc_auc_score(y[te], p):.3f}
+  disaggregated:
+    approval_rate: {{A: {rows['A'][1]:.3f}, B: {rows['B'][1]:.3f}}}
+    tpr: {{A: {rows['A'][2]:.3f}, B: {rows['B'][2]:.3f}}}
+    fpr: {{A: {rows['A'][3]:.3f}, B: {rows['B'][3]:.3f}}}
+    ppv: {{A: {rows['A'][4]:.3f}, B: {rows['B'][4]:.3f}}}
+  privacy:
+    membership_inference_auc: {membership_auc(model):.3f}
+  caveats: base rates differ between groups, so error rates and PPV cannot all be equal""")
+```
+
+```text
+accuracy 0.743, AUC 0.818
+group  base rate  approved   TPR    FPR    PPV
+  A     0.408     0.374   0.655  0.181  0.714
+  B     0.534     0.531   0.748  0.282  0.752
+gaps B - A: base +0.126, approval +0.156, tpr +0.093, fpr +0.101, ppv +0.038
+membership AUC: deployed model 0.517, unpruned random forest 0.813
+logistic regression: non-private accuracy 0.748
+  DP-GD eps =  8.0: noise multiplier     9.8, accuracy 0.747
+  DP-GD eps =  1.0: noise multiplier    69.3, accuracy 0.747
+  DP-GD eps =  0.1: noise multiplier   680.1, accuracy 0.730
+
+model_card:
+  model: credit-approval gbdt 3.2.0
+  intended_use: rank applications for human review; not for automatic rejection
+  out_of_scope: applicants outside the training regions; business loans
+  training_data: datasheet credit-2026Q3, 4000 applications
+  metrics:
+    accuracy: 0.743
+    auc: 0.818
+  disaggregated:
+    approval_rate: {A: 0.374, B: 0.531}
+    tpr: {A: 0.655, B: 0.748}
+    fpr: {A: 0.181, B: 0.282}
+    ppv: {A: 0.714, B: 0.752}
+  privacy:
+    membership_inference_auc: 0.517
+  caveats: base rates differ between groups, so error rates and PPV cannot all be equal
+```
+
+Read part by part:
+
+- The data: `g` is the group, used only to measure; `region` agrees with it 80 % of the time; `income` differs between groups; the outcome depends on income, history and region. The model is trained on `X`, which has no `g` column.
+- `rows` computes, for each group, the base rate, the approval rate and the TPR, FPR and PPV of the approvals: `aa[yy == 1].mean()` is the share of actual repayers approved, `yy[aa].mean()` the share of the approved who repay.
+- `membership_auc` is the loss-threshold attack: members are the training half `tr`, non-members the test half, and the score is the negative cross-entropy. The deployed model (trees of depth 3, learning rate 0.05) generalizes and leaks little, 0.517; a forest of fully grown trees fits its training records almost exactly and the attack separates them, 0.813.
+- `dp_logistic` is DP gradient descent: per-example gradients `grads`, clipped to norm `C`, summed, with Gaussian noise of standard deviation `s * C`, divided by the number of examples. The line before the loop solves the accountant's formula for the noise multiplier $\sigma$; at $\varepsilon = 1$ it is 69.3.
+- The accuracies show the cost of privacy for a model with 10 parameters and 4,000 examples: none at $\varepsilon = 8$ or $1$, 1.8 points at $\varepsilon = 0.1$.
+- `model_card` is the quantitative part of a model card in YAML, printed from the variables just computed. Its `disaggregated` block is the table at the start of this note; its `caveats` line is the impossibility result in one sentence. The rest of a card, the intended use, the factors and the ethical considerations, is written by people, and this generated part is checked into the registry next to it.
+
+## Next
+
+The last obligation of a model in production is economic: it must cost less than the value it creates. Training a large model costs as much as a building, serving one can cost more over its life, GPUs that look busy can be doing 1 % of the work they could, and the same model can cost twenty times more or less per request depending on its precision, batch size and hardware. The [next note](/notes/mlops/cost-and-efficiency), the last of the course, does that arithmetic: where the money goes, what utilization means, how to choose a serving configuration on a Pareto front of latency and cost, spot capacity and scaling to zero, the cost of one LLM request, and the energy behind it.
+
+## References
+
+- S. Barocas, M. Hardt, A. Narayanan. [*Fairness and Machine Learning: Limitations and Opportunities*](https://fairmlbook.org/). MIT Press, 2023. Ch. 3, classification: independence, separation, sufficiency.
+- M. Hardt, E. Price, N. Srebro. [Equality of Opportunity in Supervised Learning](https://arxiv.org/abs/1610.02413). NeurIPS, 2016.
+- A. Chouldechova. [Fair Prediction with Disparate Impact: A Study of Bias in Recidivism Prediction Instruments](https://arxiv.org/abs/1703.00056). *Big Data* 5(2), 2017.
+- J. Kleinberg, S. Mullainathan, M. Raghavan. [Inherent Trade-Offs in the Fair Determination of Risk Scores](https://arxiv.org/abs/1609.05807). ITCS, 2017.
+- C. Kästner. [*Machine Learning in Production: From Models to Products*](https://mlip-cmu.github.io/book/). MIT Press, 2025. Ch. 26, Fairness; ch. 27, Safety; ch. 28, Security and Privacy; ch. 29, Transparency and Accountability. Course: [CMU 17-445/645](https://mlip-cmu.github.io/), spring 2025.
+- C. Huyen. *Designing Machine Learning Systems*. O'Reilly, 2022. Ch. 11, the human side of machine learning: responsible AI.
+- R. Shokri, M. Stronati, C. Song, V. Shmatikov. [Membership Inference Attacks Against Machine Learning Models](https://arxiv.org/abs/1610.05820). IEEE S&P, 2017.
+- S. Yeom, I. Giacomelli, M. Fredrikson, S. Jha. [Privacy Risk in Machine Learning: Analyzing the Connection to Overfitting](https://arxiv.org/abs/1709.01604). IEEE CSF, 2018.
+- N. Carlini et al. [Membership Inference Attacks From First Principles](https://arxiv.org/abs/2112.03570). IEEE S&P, 2022.
+- C. Dwork, F. McSherry, K. Nissim, A. Smith. [Calibrating Noise to Sensitivity in Private Data Analysis](https://doi.org/10.1007/11681878_14). TCC, 2006. The Laplace mechanism.
+- C. Dwork, A. Roth. [The Algorithmic Foundations of Differential Privacy](https://www.cis.upenn.edu/~aaroth/privacybook.html). *Foundations and Trends in Theoretical Computer Science* 9, 2014. Ch. 3 (Laplace mechanism, composition).
+- M. Abadi et al. [Deep Learning with Differential Privacy](https://arxiv.org/abs/1607.00133). CCS, 2016. DP-SGD.
+- I. Mironov. [Rényi Differential Privacy](https://arxiv.org/abs/1702.07476). IEEE CSF, 2017. Prop. 3 (conversion to (ε, δ)) and the Gaussian mechanism.
+- S. De, L. Berrada, J. Hayes, S. L. Smith, B. Balle. [Unlocking High-Accuracy Differentially Private Image Classification through Scale](https://arxiv.org/abs/2204.13650). 2022.
+- M. Mitchell et al. [Model Cards for Model Reporting](https://arxiv.org/abs/1810.03993). FAT* 2019.
+- T. Gebru et al. [Datasheets for Datasets](https://arxiv.org/abs/1803.09010). *Communications of the ACM* 64(12), 2021.
+- European Union. [Regulation (EU) 2024/1689 (Artificial Intelligence Act)](https://eur-lex.europa.eu/eli/reg/2024/1689/oj). *Official Journal* L, 12 July 2024. Arts. 4, 5, 6, 9–15, 50, 51–55, 99, 113; Annexes I and III.
+- European Union. [Regulation (EU) 2026/1744 (Digital Omnibus on AI)](https://eur-lex.europa.eu/legal-content/EN/TXT/?uri=OJ:L_202601744). *Official Journal* L, 24 July 2026; in force 27 July 2026. Accessed October 2026.
+- Gibson Dunn. [EU AI Act Omnibus Agreement: Postponed High-Risk Deadlines and Other Key Changes](https://www.gibsondunn.com/eu-ai-act-omnibus-agreement-postponed-high-risk-deadlines-and-other-key-changes/). May 2026. A summary of the dates.
+- T. Gu, B. Dolan-Gavitt, S. Garg. [BadNets: Identifying Vulnerabilities in the Machine Learning Model Supply Chain](https://arxiv.org/abs/1708.06733). 2017.
+- N. Carlini et al. [Poisoning Web-Scale Training Datasets is Practical](https://arxiv.org/abs/2302.10149). IEEE S&P, 2024 (2024a).
+- A. Souly et al. [Poisoning Attacks on LLMs Require a Near-constant Number of Poison Samples](https://arxiv.org/abs/2510.07192). 2025.
+- F. Tramèr, F. Zhang, A. Juels, M. K. Reiter, T. Ristenpart. [Stealing Machine Learning Models via Prediction APIs](https://arxiv.org/abs/1609.02943). USENIX Security, 2016.
+- N. Carlini et al. [Stealing Part of a Production Language Model](https://arxiv.org/abs/2403.06634). ICML, 2024 (2024b).
