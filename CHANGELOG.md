@@ -4,6 +4,23 @@ Notable changes to the site, newest first. Each entry gives the date, what chang
 
 ## 2026-10-26
 
+- **Notes read more like a book.** A review of all twelve courses found that the shared template, not the content, made the notes feel generated. This change set fixes what can be fixed across the site at once; the courses will be rewritten one by one after a two-note pilot.
+  - **Type and spacing:**
+    - running text is set at 17 px with a measure of about 72 characters (it was about 93);
+    - paragraphs and list items are spaced apart;
+    - display equations no longer sit in boxes, and they are centred on the text;
+    - the *Key idea* callout is set in the text colour at full size;
+    - figure captions are larger and darker;
+    - the closing blocks (what changed, what to remember, next, references) are set smaller and left out of the page outline.
+  - **One equation per line:** 575 displays, in both languages, that set two or more equations side by side with `\qquad` are now aligned blocks with one equation per line. On a desktop screen they no longer scroll sideways.
+  - **Self-checks removed:** the 296 "Check yourself" blocks are gone from the notes; practice will live on biased.school, and the courses will link to it.
+  - **Stale pages:** the home page, About, CV, Projects, the /notes description and the 404 page described two courses taught at HSE and an NLP translation "in preparation". They now describe the twelve courses. The Russian CV again says that the ₽48M effect is an estimate. Course numbers follow the order of study (Probability is 01, MLOps 12).
+  - **Russian fixes:**
+    - "shrinks by a factor of 1 − ηλ" had been translated as «уменьшается в 1 − ηλ раз», which says the opposite. It is now «умножается на 1 − ηλ», in nine places across ML, DL, Math, Bayes and MLOps.
+    - Also fixed: a list of two fixes called «тремя способами», «Самостоятельный метод» for a self-supervised method, «Отжиг динамики Ланжевена», «точность» for accuracy in the NLP introduction, and «алерт» in MLOps.
+  - **Course entries:** the AI Agents entry now says that NLP builds on Deep Learning; DevOps says where it uses probability; NLP no longer carries an audit note.
+  - **Writing guide:** `docs/course-writing.md` gains the section "Depth and density" and rules for openings, voice ("we" in derivations), optional blocks, display math, paragraph length, captions and descriptions. `words.py` no longer miscounts notes with a dollar sign in code or prose.
+
 - **A new course: MLOps, machine learning in production.** It has 16 notes in six sections, in English and Russian, and covers what it takes to keep a model working after the notebook. It builds on DevOps and Deep Learning.
   - **ML systems:** what MLOps is (the lifecycle loop, hidden technical debt, maturity levels) and ML system design (framing, the metric chain from business to model, batch versus online prediction).
   - **Data:** data pipelines (orchestration, idempotence, backfills), data quality and versioning (validation, lineage, DVC-style snapshots), features and training–serving skew (feature stores, point-in-time joins, leakage through time).

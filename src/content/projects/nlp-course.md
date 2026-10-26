@@ -1,6 +1,6 @@
 ---
 title: NLP Notes
-description: A 34-note course from text foundations through representations, sequence models and Transformers to pretrained models, adaptation, NLP tasks and modern LLM systems, each note built as problem → baseline → mechanism → example → limitations.
+description: "41 notes from tokenization and classical text models through sequence models and Transformers to pretrained models, adaptation, LLM systems, RAG and agents, in English and Russian."
 pathLabel: Open notes →
 tags: [NLP, LLM, RAG, Agents, Education]
 year: 2026
@@ -11,7 +11,7 @@ featured: true
 order: 7
 ru:
   title: Конспекты по NLP
-  description: Структурированный маршрут от классических представлений текста до трансформеров, RAG, инструментов и агентов. Перевод на русский готовится.
+  description: "41 заметка: от токенизации и классических моделей текста через рекуррентные сети и трансформеры к предобученным моделям, адаптации, LLM-системам, RAG и агентам. На русском и английском."
   pathLabel: Открыть конспекты →
   tags: [NLP, LLM, RAG, Агенты, Обучение]
 ---

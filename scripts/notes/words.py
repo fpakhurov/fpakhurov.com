@@ -8,7 +8,8 @@ t = open(f"src/content/{'notes-ru' if lang == 'ru' else 'notes'}/{course}/{slug}
 def prose(t):
     t = re.sub(r'```.*?```', '', t, flags=re.S)
     t = re.sub(r'\$\$.*?\$\$', '', t, flags=re.S)
-    t = re.sub(r'\$[^$]+\$', 'X', t)
+    t = re.sub(r'`[^`\n]*`', 'C', t)  # inline code may hold a dollar sign
+    t = re.sub(r'(?<!\\)\$[^$\n]+?\$', 'X', t)  # inline math never spans lines
     t = re.sub(r'^import .*$', '', t, flags=re.M)
     t = re.sub(r'<[^>]+>', '', t)
     t = re.sub(r'\]\([^)]*\)', ']', t)
