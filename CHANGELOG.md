@@ -4,6 +4,18 @@ Notable changes to the site, newest first. Each entry gives the date, what chang
 
 ## 2026-10-26
 
+- **Pilot of the new note style: two notes rewritten.** "Variational inference" (Bayesian Methods) and "Rolling out models" (MLOps) were each compared, by content, with the matching lectures and chapters of their reference courses, and rewritten in English and Russian under the new writing rules. They are the sample for the owner to approve before the other courses follow.
+  - **Variational inference.**
+    - Opens with the normal model under independent priors, where the posterior has no closed form.
+    - Adds the reading of the bound as data fit minus KL to the prior, why the bound is computable when the evidence is not, fixed-form against free-form families, the Markov blanket, a proper section on the variational mixture of Gaussians, and a table that places the method among exact Bayes, EM and variational EM.
+    - Fixes two errors. The support condition on q was stated backwards. The forward and reverse KL optima of a correlated Gaussian coincide for every two-dimensional Gaussian, not because of the example's symmetry.
+    - The repeated two-mode experiment and the duplicating summary blocks are gone.
+  - **Rolling out models.**
+    - Built around one exposure ramp (shadow, canary, a 50/50 experiment in whole weeks, a long-term holdout), with a new figure, and a new team-draft figure.
+    - Adds why the experiment splits 50/50 (a 5% share needs 5.3 times the users), triggering through the shadow's disagreement rate, and A/A tests and primacy.
+    - Adds a non-inferiority decision for cheaper models. The rollback table had kept the current model on "no significant gain", which is wrong for a quantized model.
+    - The sample-size derivation and the peeking demonstration are no longer repeated from the DevOps and Probability notes. The old sample-size figure is replaced, and the note is 18% shorter.
+
 - **Notes read more like a book.** A review of all twelve courses found that the shared template, not the content, made the notes feel generated. This change set fixes what can be fixed across the site at once; the courses will be rewritten one by one after a two-note pilot.
   - **Type and spacing:**
     - running text is set at 17 px with a measure of about 72 characters (it was about 93);

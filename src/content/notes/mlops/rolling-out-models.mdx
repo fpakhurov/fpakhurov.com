@@ -1,80 +1,80 @@
 ---
 title: Rolling out models
-description: "How a new model version reaches users safely: what differs from a code rollout, shadow deployment, canaries judged on model metrics, A/B tests with the sample size derived and the peeking problem simulated, guardrails, interleaving for rankers, bandits, and rollback criteria."
+description: "How a new model version reaches users without making things worse: one exposure ramp from shadow to canary to a 50/50 experiment, how many users the experiment needs, and when to stop or roll back."
 course: mlops
 section: Serving
 order: 10
 status: published
-tags: [model-rollout, shadow-deployment, canary, ab-testing, sample-size, peeking, sequential-testing, guardrail-metrics, sample-ratio-mismatch, interleaving, bandits, rollback, kserve]
+tags: [model-rollout, shadow-deployment, canary, ab-testing, sample-size, triggering, peeking, non-inferiority, guardrail-metrics, sample-ratio-mismatch, interleaving, bandits, rollback]
 prerequisites: [Serving models, Continuous delivery and deployment, Hypothesis tests and A/B testing]
 ---
 
+import RolloutRamp from '../../../components/figures/rolling-out-models/RolloutRamp.astro';
 import TrafficSplits from '../../../components/figures/rolling-out-models/TrafficSplits.astro';
-import SampleSize from '../../../components/figures/rolling-out-models/SampleSize.astro';
+import TeamDraft from '../../../components/figures/rolling-out-models/TeamDraft.astro';
 
-The two previous notes built the machinery that serves a model: a [model server](/notes/mlops/serving-models) with dynamic batching, or an [inference engine](/notes/mlops/llm-inference-systems) for a language model. A model, though, is never served for long in the same version. It is retrained on fresh data, replaced by a better architecture, quantized to save money, or fine-tuned on a new task, and every new version must reach users without making things worse. The [continuous delivery note](/notes/devops/continuous-delivery) of the DevOps course solved this for code: one immutable artifact promoted through environments, canaries judged statistically, rollbacks that are routine. This note adds what is specific to models: they fail silently, their effects are small and delayed, and the question is usually not "does it work?" but "is it better?". It covers shadow deployments, canaries that watch the model's predictions, A/B tests sized before they start and read only when they end, guardrails, interleaving for ranking models, bandits, and the criteria for rolling back.
+A new ranking model goes live for 5% of traffic. For the users it reaches it is 10% worse: they buy a little less often. Global conversion drops from 5.000% to 4.975%, a change of half a percent of itself.
 
-**Conventions.** The sample sizes are computed from the normal approximation, and the A/B and peeking simulations of the Example are NumPy and SciPy programs (Python 3.14.7, SciPy 1.18, fixed seeds). The KServe manifest is written against the KServe 0.21 documentation (September 2026) and was parsed as YAML but not applied to a cluster.
+With 60,000 users a day, the daily conversion rate already wobbles by about 1.8% of itself from noise alone. The bad model hides inside that wobble. It also returns HTTP 200 with well-formed rankings, so the error dashboards stay flat. The same arithmetic appears in Google's account of canaries, where a release that fails 20% of requests on a 5% canary shows up as about 1% more errors overall ([Google SRE Workbook, ch. 16](#references)).
 
-## Baseline: replace the model file and watch the dashboards
+So the question of this note is practical: how do we find out whether a new model is better, while exposing as few people as possible to a worse one?
 
-The naive rollout copies the new weights over the old ones, restarts the service and watches the error rate and the latency for an hour. They stay flat, so the rollout is declared a success. Neither number could have said anything else. A model that is worse returns HTTP 200 with a well-formed prediction, so the error rate does not move. Its effect on the outcomes that matter, clicks, purchases, fraud caught, loans repaid, is a fraction of a percent, invisible on a dashboard without a comparison group, and for some outcomes the labels arrive weeks later. The new model may be better on average and much worse for one segment of users. And if it was worse, there is no previous version still loaded to switch back to.
+## Why a model is harder to roll out than code
 
-## What is different about rolling out a model
+The DevOps course already rolls out code safely: one artifact promoted through environments, canaries judged statistically, cheap rollbacks ([continuous delivery note](/notes/devops/continuous-delivery)). All of it applies to models. Models add four difficulties ([Kästner, 2025, ch. 19](#references); [Huyen, 2022, ch. 9](#references)).
 
-The DevOps course's strategies, rolling updates, blue-green switches, canaries and feature flags, apply to models unchanged, and so does the statistics of [judging a canary on a small sample](/notes/devops/continuous-delivery#judging-a-canary-on-a-small-sample). Four properties of models change what has to be measured ([Kästner, 2025](#references); [Huyen, 2022, ch. 9](#references)):
+A worse model **fails silently**. Broken code throws an exception; a worse model returns plausible answers, and only the distribution of its predictions and the outcomes that follow can reveal it.
 
-- **Failures are silent.** A broken code path throws; a worse model returns plausible answers. The signals that reveal it are distributions of predictions and outcome metrics, not error codes.
-- **Offline metrics do not settle the question.** A model that gains on a held-out test set can lose online, because the test set is yesterday's data, because the offline metric is a proxy for the business outcome, or because users react to what the model shows them. The [design note](/notes/mlops/ml-system-design) separates the model's metric from the product's; only an online comparison measures the second.
-- **Effects are small and delayed.** A better ranker moves conversion by a few percent of itself; a better credit model changes default rates months later. Detecting such effects needs large, randomized comparisons, and some outcomes can only be judged through faster proxies.
-- **The model changes its own data.** Recommendations decide what users see and therefore what they click, which becomes the next training set. Two models running side by side also influence each other's data, and an A/B test can mismeasure an effect that spills from one group to the other.
+**Offline gains may not survive online.** The test set is yesterday's data, the offline metric is a proxy for the product's outcome, and users react to what the model shows them. The [design note](/notes/mlops/ml-system-design) separates the model's metric from the product's metric; only an online comparison measures the second.
 
-These lead to a ladder of steps, each answering a question the previous one cannot, and each exposing more users to the new version:
+**Effects are small and late.** A better ranker moves conversion by a few percent of itself. A better credit model changes default rates months later. Until the true labels arrive, we work with faster proxies: corrections and complaints, an immediate cancellation, a sample of production cases labelled by people. Each proxy is biased in its own way, and the rollout plan names the one it relies on.
 
-| Step | Who sees the new model's answers | What it can detect | What it cannot |
-| --- | --- | --- | --- |
-| Offline evaluation | nobody | quality on held-out data, regressions on test suites ([testing note](/notes/mlops/testing-ml-systems)) | behaviour on today's traffic, effect on users |
-| Shadow | nobody; its answers are logged | crashes, latency, skew, how its predictions differ on real inputs | how users respond |
-| Canary | a few percent, briefly | operational failures and gross prediction shifts on real users | small effects on outcomes |
-| A/B test | a randomized half, for weeks | whether outcomes improve, by how much, for whom | effects longer than the test |
-| Full rollout | everyone | long-term effects, through monitoring | anything, without a comparison group |
+**The model changes its own data.** A recommender decides what users see, and so what they click, and the clicks become the next training set. Two models running side by side can also leak effects into each other's groups.
 
-<aside class="callout"><strong>Key idea.</strong> Roll a model out in steps that each answer one question. A shadow deployment runs the new model on real traffic without showing its answers, to find what breaks. A canary shows it to a few percent, to catch gross failures early. An A/B test randomizes users between the models, with the sample size computed in advance from the smallest effect worth detecting and the decision taken at the planned end, to measure whether it is better. Guardrail metrics, a check of the group sizes and rollback criteria written before the rollout decide when to stop.</aside>
+## One ramp from 0% to 100%
 
-## Traffic for each step
+The rollout is one ramp of exposure. Each phase answers a different question, and only one phase is meant for deciding whether the model is better ([Xu, Duan and Huang, 2018](#references); [Kohavi, Henne and Sommerfield, 2007](#references)).
+
+<RolloutRamp />
+
+The **shadow** phase shows the candidate to nobody: it answers a copy of real traffic, and we look for what breaks. The **canary** phase shows it to 1% and then 5% of users, long enough to catch a gross failure and short enough that few people suffer from it. The **measurement** phase splits users 50/50 for whole weeks and decides whether the candidate is better. The **full rollout** keeps a small long-term holdout, a few percent of users who stay on the old model so that slow effects can still be measured.
+
+The early phases limit risk; they are not for decisions. A significant gain at 5% is weak evidence, as the section on sample sizes shows. A significant loss there, on errors or on a guardrail, is a reason to stop.
+
+The router sends traffic differently in each phase:
 
 <TrafficSplits />
 
-1. **Shadow.** The router sends every request to the current model, whose answer is returned, and a copy to the candidate, whose answer is only logged.
-2. **Canary.** A small share of requests, here 5%, is answered by the candidate; its operational and prediction metrics are compared with the current model's, and the share grows only if they match.
-3. **A/B test.** Users, not requests, are split at random between the models by a hash of their identifier; each user always sees the same model, and the outcome metrics of the two groups are compared at the planned end.
+## Shadow: real inputs, no consequences
 
-## Shadow deployment
+In a **shadow deployment**, also called a dark launch, every request (or a sample of them) is duplicated. The current model answers it; the candidate receives a copy, and its answer is logged and thrown away. Users see nothing of the candidate. In exchange the candidate meets real traffic: its real distribution of inputs, malformed requests and load peaks.
 
-In a **shadow deployment** (also called a dark launch), every request, or a sample of them, is duplicated: the current model answers it, and the candidate receives a copy whose answer is recorded and discarded. Users see nothing of the candidate. In exchange, the candidate meets real traffic, with its real distribution of inputs, malformed requests and peaks, and every one of its answers can be compared with the current model's on the same input.
+It finds three kinds of problems.
 
-What a shadow finds:
+- Operational failures: crashes on inputs the test set lacked, latency under real load, memory growth.
+- Skew: online features that differ from the ones the model was trained on. The [features note](/notes/mlops/features-and-skew) explains the causes; a shadow is often where they show, as predictions that look nothing like the offline ones.
+- Different decisions: where and how often the two models disagree, and what that costs downstream.
 
-- **Operational failures**: crashes on inputs the test set did not contain, latency at real load, memory growth, a larger model that does not fit the batching configuration.
-- **Skew**: the candidate's features computed online differ from those it was trained on, because the online feature code or a data source differs. The [features note](/notes/mlops/features-and-skew) explains how; a shadow is often where it is caught, as predictions that look nothing like the offline ones.
-- **How the predictions differ**: the share of requests on which the two models disagree, where they disagree, and the downstream consequences. Suppose a fraud model flags 1.2% of a million daily payments for manual review, and the candidate, in shadow, flags 2.0% at the same threshold. That is 8,000 more reviews per day; whether the review team can take them, or the threshold must move, is decided before any user is affected.
+A fraud model flags 1.2% of a million daily payments for manual review; the candidate, in shadow, flags 2.0% at the same threshold. That is 8,000 more reviews a day. Whether the review team can absorb them, or the threshold must move, is settled before any customer is affected.
 
-The comparison is **paired**: both models score the same request, so the difference between them has no sampling noise from different users, and disagreement rates are measured precisely on small samples. What a shadow cannot measure is the users' response, because they never see the candidate's answers; the clicks that follow are responses to the current model.
+The comparison is **paired**: both models score the same request, so their disagreement rate is measured precisely even on a small sample. When the new model replaces a human decision, the shadow can be compared with the human's decision, which gives a labelled estimate of its accuracy before launch.
 
-Two costs come with it. Every shadowed request is computed twice, so a full shadow doubles the inference bill, and a sample of 5% or 10% of traffic is often enough. And the candidate must have **no side effects**: it must not write to databases, send messages, charge cards or update features that the current model reads. Shadowing is easy for a pure function from features to a score, and requires care for models that act, such as an agent that calls tools.
+A shadow cannot measure how users respond, because they only ever see the current model.
 
-## Canaries with model metrics
+It also has to stay out of the way. The copy is sent asynchronously with a timeout, so a slow or crashing candidate never delays the real answer. The candidate must have **no side effects**: no writes to databases, no messages, no charges, no updates to features or caches that the current model reads. This is easy for a model that maps features to a score, and takes care for a model that acts, such as an agent that calls tools. Computing every request twice doubles the inference bill, so a 5–10% sample of traffic is often enough.
 
-A canary routes a small share of real requests to the candidate and its answers to users, and it is judged on the same statistics as a code canary: a threshold fixed in advance, a false-alarm rate and a power ([continuous delivery note](/notes/devops/continuous-delivery#judging-a-canary-on-a-small-sample)). What changes is the list of metrics. Besides errors and latency, a model canary watches:
+## Canary: catching large failures early
 
-- **the distribution of predictions**: the share of positive decisions, the mean score, the share of each class, compared with the stable version on the same window, with the drift statistics of the [monitoring note](/notes/mlops/monitoring-and-drift);
-- **degenerate outputs**: constant predictions, missing or default values, the fallback rate of the [serving note](/notes/mlops/serving-models#fallbacks);
-- **fast outcome signals**, where they exist: clicks within the session, an immediate cancellation;
-- **segments**: a model can be fine overall and broken for one country, one device type or one language, so the comparison is repeated per segment, with the [multiple-comparison](/notes/probability/hypothesis-tests#multiple-comparisons) correction this requires.
+A canary gives the candidate's answers to a small share of real requests and compares it with the current model over the same time window. The statistics are those of a code canary: a threshold fixed in advance, a false-alarm rate and a power ([continuous delivery note](/notes/devops/continuous-delivery#judging-a-canary-on-a-small-sample)). The metrics are richer.
 
-A canary's few percent for an hour cannot detect a 2% change in conversion; the next section computes that it needs hundreds of thousands of users. Its job is to catch the large failures quickly, before an A/B test exposes half the users for weeks.
+- The distribution of predictions: the share of positive decisions, the mean score, the share of each class, with the drift statistics of the [monitoring note](/notes/mlops/monitoring-and-drift).
+- Degenerate outputs: constant predictions, default values, the fallback rate of the [serving note](/notes/mlops/serving-models#fallbacks).
+- Fast outcome signals where they exist, such as clicks within a session.
+- Segments: a model can be fine overall and broken for one country or one language, so the comparison is repeated per segment, with the [multiple-comparison](/notes/probability/hypothesis-tests#multiple-comparisons) correction this requires.
 
-On Kubernetes, KServe expresses a canary as one field of the `InferenceService`: when the model's storage location changes, the new revision receives `canaryTrafficPercent` of the requests and the previous one the rest, and raising the field to 100 promotes it; the feature needs KServe's serverless deployment mode, built on Knative ([KServe documentation, canary rollout](#references)).
+Every metric is broken down by model version. An aggregate over both versions dilutes the canary's failures, as the opening example showed. The aggregation interval must also be shorter than the canary phase itself; an hourly average cannot judge a 30-minute canary.
+
+On Kubernetes, KServe expresses a canary as one field of an `InferenceService`. When the model's location changes, the new revision gets `canaryTrafficPercent` of the requests, and raising the field to 100 promotes it ([KServe documentation](#references)).
 
 ```yaml
 apiVersion: serving.kserve.io/v1beta1
@@ -85,236 +85,251 @@ spec:
   predictor:
     canaryTrafficPercent: 5
     model:
-      modelFormat:
-        name: onnx
-      runtime: kserve-tritonserver
+      modelFormat: {name: onnx}
       storageUri: s3://models.example.com/ranker/v2
 ```
 
-The split is by request, so one user may see both models within a session; for a canary that is acceptable, for an A/B test it is not.
+The manifest follows the KServe 0.21 documentation and was not applied to a cluster. This split is per request, so one user may see both models in a session. That is acceptable for catching failures, and wrong for measuring outcomes.
 
-## A/B tests
+## How many users, and why 50/50
 
-An A/B test, or online controlled experiment, assigns **users** at random to the current model (A, the control) or the candidate (B, the treatment), keeps the assignment fixed, and compares an outcome metric between the groups after a planned duration ([Kohavi, Tang and Xu, 2020](#references)). The [probability course](/notes/probability/hypothesis-tests#the-ab-test) builds the test itself, the z statistic of a difference in rates and its p-value. Three choices are specific to rolling out models.
+The measurement phase is an **A/B test**, or online controlled experiment. Users, not requests, are assigned at random to the current model A or the candidate B, by a hash of the user's identifier and an experiment salt, `hash(salt + user_id) mod 100 < 50`. The assignment is fixed, so each user always sees one model. One number, the **overall evaluation criterion**, is chosen in advance: conversion per user, revenue per user, sessions per user ([Kohavi, Tang and Xu, 2020](#references)).
 
-**The unit of randomization** is usually the user. Randomizing requests would show one user both models, mixing their effects in the same outcomes, and would make observations dependent, since one user's requests are correlated. Assignment is deterministic, a hash of the user identifier and an experiment-specific salt, `hash(salt + user_id) mod 100 < 50`, so that a user keeps the group across sessions and servers, and different experiments split users independently.
-
-**The decision metric** is one number fixed in advance, the overall evaluation criterion: conversion per user, revenue per user, sessions per user. The model's offline metric is not it.
-
-**The sample size** is fixed before the test starts, from the smallest effect worth detecting.
-
-### How many users: the sample size
-
-Let the metric have mean $\mu_A$ and standard deviation $\sigma_A$ per user in the control and $\mu_B$, $\sigma_B$ in the treatment, and let $n$ users be in each group. The estimated effect is the difference of the group means, $\hat\delta = \bar x_B - \bar x_A$; by the central limit theorem it is approximately normal with mean $\delta = \mu_B - \mu_A$ and standard error
+The [probability course](/notes/probability/hypothesis-tests#the-ab-test) builds the test and gives its sample size. For a metric with per-user standard deviations $\sigma_A$ and $\sigma_B$, a two-sided test at level $\alpha$ that should detect a true difference $\delta$ with power $1 - \beta$ needs
 
 $$
-\operatorname{se} = \sqrt{\frac{\sigma_A^2 + \sigma_B^2}{n}} .
+n = \frac{(z_{1-\alpha/2} + z_{1-\beta})^2 \,(\sigma_A^2 + \sigma_B^2)}{\delta^2}
 $$
 
-A two-sided test at level $\alpha$ rejects "no effect" when $\lvert \hat\delta \rvert / \operatorname{se} > z_{1-\alpha/2}$. If the true effect is $\delta > 0$, the statistic $\hat\delta/\operatorname{se}$ is approximately $N(\delta/\operatorname{se}, 1)$, and the test detects the effect with probability
+users in each group. For $\alpha = 0.05$ and power 0.8 the first factor is $(1.960 + 0.842)^2 = 7.85$. For a conversion rate, $\sigma^2 = p(1 - p)$.
+
+**Worked example.** A new ranker should raise conversion from 5.0% by 4% of itself, to 5.2%:
 
 $$
-P\!\left(\frac{\hat\delta}{\operatorname{se}} > z_{1-\alpha/2}\right) = \Phi\!\left(\frac{\delta}{\operatorname{se}} - z_{1-\alpha/2}\right),
+n = \frac{7.85 \cdot (0.05 \cdot 0.95 + 0.052 \cdot 0.948)}{0.002^2} \approx 190{,}000 .
 $$
 
-ignoring the negligible chance of rejecting in the wrong direction. Setting this power to $1 - \beta$ means $\delta/\operatorname{se} - z_{1-\alpha/2} = z_{1-\beta}$, and solving for $n$:
+That is 190,000 users per group, 380,000 in all. The formula has four levers, and each one changes $n$ a lot.
+
+### The effect
+
+Halving the effect quadruples $n$: a 2% lift needs 753,000 users per group, a 1% lift 3.0 million. The smallest effect worth detecting is a business decision, made before the test.
+
+### The variance
+
+Revenue per user has a standard deviation several times its mean, because most users spend nothing. With mean 2.00 and standard deviation 8.00, a 1% change needs 2.5 million users per group. Two remedies are standard. Capping extreme values (winsorizing) shrinks $\sigma$ at the cost of a small bias. **CUPED** subtracts the part of the metric that a pre-experiment covariate predicts, such as the same user's revenue last month ([Deng et al., 2013](#references)). With correlation $\rho$ between the two,
 
 $$
-\begin{aligned}
-\frac{\delta \sqrt n}{\sqrt{\sigma_A^2 + \sigma_B^2}} &= z_{1-\alpha/2} + z_{1-\beta} \\
-\boxed{\;n = \frac{(z_{1-\alpha/2} + z_{1-\beta})^2\,(\sigma_A^2 + \sigma_B^2)}{\delta^2}\;}
-\end{aligned}
+\sigma^2_{\text{CUPED}} = (1 - \rho^2)\, \sigma^2 ,
 $$
 
-users per group. For a conversion rate, $\sigma^2 = p(1-p)$, which gives the formula quoted in the probability course. With $\alpha = 0.05$ and power 0.8, $(1.960 + 0.842)^2 = 7.85$.
+so $\rho = 0.6$ cuts the required $n$ by 36%, to 1.6 million.
 
-**Worked example.** A recommendation model is expected to raise conversion from $p_A = 5.0\%$ by 4% of itself, to $p_B = 5.2\%$:
+### The share given to the candidate
+
+With $N$ users in all and a share $q$ in the treatment, the variance of the estimated effect is proportional to
 
 $$
-n = \frac{7.85 \cdot (0.05 \cdot 0.95 + 0.052 \cdot 0.948)}{0.002^2} = \frac{7.85 \cdot 0.09680}{4 \times 10^{-6}} \approx 190{,}000
+\frac{1}{N q} + \frac{1}{N (1 - q)} = \frac{1}{N q (1 - q)} .
 $$
 
-users per group (the Example's exact value is 189,936). Smaller effects cost quadratically more: a 2% lift needs 753,000 users per group, a 1% lift 3.0 million. A rarer outcome costs more too: at a base rate of 1%, detecting a 4% lift needs 991,000.
+It is smallest at $q = 1/2$. At $q = 5\%$ the same precision needs $0.25 / (0.05 \cdot 0.95) = 5.3$ times as many users. In the example, 380,000 users at 50/50 become 2.0 million at 5%: 6.3 days of a service with 60,000 new users a day become 33 days. This is why the measurement phase is 50/50, and why waiting for significance at the canary's 5% wastes a month.
 
-<SampleSize />
+### Who is analysed
 
-1. The users per group needed for 80% power at $\alpha = 0.05$, against the relative lift to detect, for a base conversion rate of 5%.
-2. The same for a base rate of 1%: about five times as many at every lift.
-3. The worked example: a 4% lift on 5% needs 190,000 users per group; halving the lift to 2% quadruples it.
+A new ranker changes nothing for a user whose two rankings are identical. If the shadow showed that the models disagree for a fraction $f$ of users, the whole effect sits in that fraction. Averaged over everybody it is diluted to $f\delta_t$, where $\delta_t$ is the effect on the affected users, and $n$ grows by $1/f^2$. Analysing only the **triggered** users, those whose two answers differ, removes the dilution ([Kohavi, Tang and Xu, 2020, ch. 20](#references)). With $f = 20\%$ and a 4% overall lift, the triggered users see a 20% lift, from 5.0% to 6.0%. The test then needs 8,155 triggered users per group, which arrive among 40,800 users per group: about a fifth of the 190,000.
 
-**Metrics with heavy tails cost more.** Revenue per user has a standard deviation several times its mean, because most users spend nothing and a few spend a lot. With a mean of 2.00 and a standard deviation of 8.00, detecting a 1% change ($\delta = 0.02$) needs $7.85 \cdot 2 \cdot 64 / 0.02^2 \approx 2.5$ million users per group. Two remedies are standard. Cap extreme values (winsorize), which shrinks $\sigma$ at the price of a small bias. Or subtract the part of the metric predicted by a pre-experiment covariate, such as the same user's revenue in the previous month: with correlation $\rho$ between the two, the variance falls by the factor $1 - \rho^2$, which is CUPED ([Deng et al., 2013](#references)). With $\rho = 0.6$ the variance and the required $n$ fall by 36%, to 1.6 million.
+Triggering needs the counterfactual: for every user in A we compute, and log, what B would have answered, and the other way round. A shadow of the other model inside each group provides it.
 
-### Peeking
+### How long
 
-The sample size assumed one look at the data, at the end. Checking the dashboard every day and stopping as soon as the difference is significant uses many looks, and each one is another chance for noise to cross the threshold. The [probability note](/notes/probability/hypothesis-tests#peeking) shows the effect on A/A tests; the Example repeats it for a 14-day model experiment with daily looks: a test that rejects at the first look with $\lvert z \rvert > 1.96$ declares a difference between two identical models in 21.8% of experiments instead of 5%.
+Behaviour differs between weekdays and weekends, so the test runs whole weeks: the 6.3 days of the example become 7, and a slower product runs 14. Two weeks is also the minimum to see whether an effect fades.
 
-There are three honest ways to look early:
+## Looking before the end
 
-- **Do not.** Fix the duration from the sample size and decide once. Daily looks at guardrails are fine; daily decisions on the main metric are not.
-- **Group-sequential boundaries.** Plan $K$ looks and use a stricter threshold at each, chosen so that the overall false-positive rate stays at $\alpha$. A constant threshold for all looks is Pocock's design ([Pocock, 1977](#references)); a threshold that is very strict early and close to 1.96 at the end is O'Brien and Fleming's ([O'Brien and Fleming, 1979](#references)). The Example finds the constant threshold for 14 daily looks by simulation: $\lvert z \rvert > 2.61$.
-- **Always-valid inference.** Sequential tests whose p-values remain valid however often they are checked ([Johari et al., 2017](#references)), used by several experimentation platforms.
+The sample size assumes one look, at the end. Checking every day and stopping at the first $p < 0.05$ gives noise many chances to cross the threshold. The [probability note](/notes/probability/hypothesis-tests#peeking) shows this on A/A tests. For the 14-day experiment of the example, two identical models produce a "significant winner" in 21.8% of runs instead of 5%.
 
-Looking early is not free. With the threshold of 2.61, the power against the true 4% lift falls from 0.80 for one look at the end to 0.67, in exchange for stopping early when the effect is clear: the expected duration is 9.6 days instead of 14, counting the experiments that never cross the threshold as running to the end.
+If we must look early, the threshold has to be stricter at every look. A constant threshold, chosen so that the overall false-positive rate stays at 5% over 14 daily looks, is $\lvert z \rvert > 2.61$; the Example finds it by simulation, and it matches Pocock's tables ([Pocock, 1977](#references)). The price is power. With this boundary the true 4% lift is detected in 67% of experiments instead of 80%. In exchange, many experiments stop early: counting those that never cross the boundary as running all 14 days, the average experiment ends on day 9.6.
 
-### Guardrails and the sample-ratio check
+Other designs move the strictness around: very strict early and close to 1.96 at the end ([O'Brien and Fleming, 1979](#references)), or p-values that stay valid however often they are checked ([Johari et al., 2017](#references)). Whatever the design, daily looks at guardrails are fine; daily decisions on the main metric are not.
 
-An experiment is decided on one metric and protected by several **guardrail metrics**: things the candidate must not make worse, even if it wins on the main one. For a model these are the latency percentiles, the error and fallback rates, revenue when the main metric is engagement, unsubscribes and complaints, and the metric per important segment. A guardrail is tested one-sided, as a **non-inferiority** question: is the treatment worse by more than an agreed margin?
+## Can the result be trusted?
 
-The cheapest guardrail checks the experiment itself. If users were assigned 50/50, the group sizes must be consistent with 50/50. A **sample ratio mismatch** means that something between assignment and measurement depends on the group: the new model crashes for some clients, so they never log an outcome; its slower responses make some sessions time out; a bot filter treats the groups differently. With 100,700 users in A and 99,300 in B, the chi-square test against an even split gives $\chi^2 = 9.80$ and $p = 0.0017$: a 0.7% imbalance on 200,000 users is not chance. The result of such an experiment is not trusted, however good it looks, until the cause is found ([Fabijan et al., 2019](#references)).
+An experiment can be wrong in ways that no p-value shows. Four checks catch most of them.
 
-Three more effects distort model experiments. **Novelty**: users click on what is new, so a different ranker wins in its first week and loses its lead later; plotting the effect over the days of the test shows it. **Interference**: in a marketplace, a model that sends buyers to some sellers takes them from the sellers of the other group, so the groups are not independent; the remedy is to randomize by market or by time instead of by user. **Feedback loops**: after the test, the winning model's choices become the training data of the next one.
+### The sample ratio
 
-## Interleaving for ranking
+If users were assigned 50/50, the group sizes must be consistent with 50/50. With 100,700 users in A and 99,300 in B, the chi-square test against an even split gives $\chi^2 = 9.80$ and $p = 0.0017$. Group A received 50.35% of the users instead of 50%, and with 200,000 users that is not chance. A **sample ratio mismatch** means that something between assignment and measurement depends on the group. The new model crashes on some clients, so they never log an outcome. Its slower answers time out some sessions. A bot filter treats the groups differently. The result is not trusted, however good it looks, until the cause is found ([Fabijan et al., 2019](#references)).
 
-A ranking model, for search or recommendations, outputs a list. **Interleaving** compares two rankers on the same user at the same time: it merges the two lists into one, shows it, and credits each click to the ranker that contributed the clicked item. Because each user compares both models directly, the variation between users, which dominates an A/B test, cancels.
+### An A/A test
 
-**Team-draft interleaving** ([Radlinski, Kurup and Joachims, 2008](#references)) merges the lists like captains picking teams. In each round, a fair coin decides which ranker picks first; each ranker in turn adds its highest-ranked item that is not yet in the merged list, and the item is marked as belonging to its team. With ranker A's list $[a, b, c, d]$ and B's $[b, e, a, f]$:
+Before the first model experiment, run the platform with the same model in both groups. It should find a difference in about 5% of metrics, and its group sizes should pass the sample-ratio test. An A/A test catches a wrong variance (computed per request when the unit is the user), broken hashing and logging that depends on the group ([Kohavi, Henne and Sommerfield, 2007](#references)).
 
-1. Round 1, the coin says A first: A adds $a$; B adds its top item, $b$.
-2. Round 2, the coin says B first: B adds $e$ (its $b$ is taken); A adds $c$ (its $b$ is taken).
-3. The user sees $[a, b, e, c]$, with $a$ and $c$ on A's team and $b$ and $e$ on B's.
+### Novelty and primacy
 
-If the user clicks $b$ and $e$, B wins this impression 2 to 0; a click on $a$ alone would have been a win for A. Over many impressions, the share of impressions won by each ranker is compared with 50% by a binomial (sign) test, ignoring ties. The coin flips keep the comparison fair: neither ranker gets the top position more often.
+Users click on what is new, so a changed ranker can win its first week on novelty alone. Users also resist change, so a better ranker can lose its first days. Plotting the effect by day shows both, and analysing only new users removes them.
 
-Interleaving is much more sensitive than an A/B test on the same traffic. A large study on two commercial web search engines and a scientific literature search system found that it agreed with manual relevance judgements and reached reliable conclusions from far fewer queries than comparisons of click metrics between separate groups ([Chapelle et al., 2012](#references)). What it measures is a preference between lists, from clicks; it says nothing about long-term outcomes such as retention, and it applies only when the output is a list. A common practice is therefore two stages: interleaving to choose quickly among many candidate rankers, then an A/B test of the winner on the business metric. Position bias in clicks, which makes the top item clicked more whatever it is, is the subject of the [learning-to-rank note](/notes/ml/learning-to-rank#clicks-and-position-bias).
+### Interference
 
-## Bandits as adaptive rollout
+In a marketplace, a model that sends buyers to some sellers takes them from the sellers of the other group, so the groups are not independent. The remedy is to randomize by market or by time slot, at a cost in sample size.
 
-*Optional depth: adaptive allocation of traffic. The rest of the note does not depend on it.*
+## Deciding: better, or not worse?
 
-An A/B test spends half of its traffic on the worse model for its whole duration, by design: that is what makes its estimate unbiased. A **multi-armed bandit** treats the models as arms and moves traffic towards the one that is doing better while the experiment runs. **Thompson sampling** keeps a posterior over each arm's conversion rate, a Beta distribution updated with each success and failure, and sends each new user to the arm whose sampled rate is highest ([Russo et al., 2018](#references)); upper-confidence rules such as UCB1, built in the [tree-search note](/notes/agents/games-and-tree-search#selection-as-a-bandit-problem-ucb1-and-uct), pick the arm with the highest optimistic estimate. As evidence accumulates, the better arm receives most of the traffic, and the cost of the experiment, the **regret** of serving the worse arm, grows only slowly.
+The decision depends on why the new model exists.
 
-Bandits suit short-lived choices with many variants and fast feedback, such as headlines, thumbnails or the order of promotions, and contextual bandits, whose arms depend on features of the user, are themselves a kind of model ([Li et al., 2010](#references)). For replacing one model with another they are less common, for three reasons: adaptive allocation biases the estimate of the effect, so the size of the gain is not known at the end; guardrails and segments get little data on the arm that was starved early; and an arm that is better in week one but worse later, the novelty effect, collects its traffic while it looks good.
+A model meant to be *better* must show a gain. The test above is a superiority test: the candidate wins if the effect is significantly positive, and the gain is worth its cost.
 
-## Rollback criteria
+A model meant to be *cheaper*, a quantized, distilled or smaller model, does not have to be better. It has to be not worse by more than an agreed margin $m$. "No significant difference" proves nothing here, because an underpowered test finds no difference in almost any case. The right test is one-sided, $H_0: \delta \le -m$ against $\delta > -m$, and it must be sized for the margin:
 
-A rollback decided during an incident is decided under pressure; criteria written before the rollout turn it into a rule. For each step of the ladder, the plan names the signals, their thresholds and who acts:
+$$
+n = \frac{(z_{1-\alpha} + z_{1-\beta})^2 \cdot 2\sigma^2}{m^2} .
+$$
+
+To show that a quantized ranker loses at most 2% of the 5% conversion rate, the test needs 587,000 users per group, three times the superiority test of the example. A margin of 1% needs 2.3 million. Proving that nothing got worse is expensive; the margin should be as wide as the business can accept.
+
+**Guardrail metrics** are what the candidate must not make worse even when it wins: latency percentiles, error and fallback rates, revenue when the main metric is engagement, complaints, important segments. The same caution applies. A test sized for the main metric has little power for a noisy guardrail such as revenue, so it can only rule out large losses on it.
+
+The stop rules are written before the rollout, because rules made during an incident are made under pressure:
 
 | Signal | Example threshold | Action |
 | --- | --- | --- |
-| Errors and latency of the candidate | SLO burn rate of the [SLO note](/notes/devops/slos-and-alerting#burn-rate); p99 above the objective for 10 minutes | automatic rollback |
-| Fallback rate, degenerate outputs | above twice the stable version's | automatic rollback |
-| Prediction distribution against the control | positive rate outside an agreed band; drift statistic above its threshold | pause, investigate |
-| Sample ratio mismatch | $p < 0.001$ in the group sizes | stop the experiment, fix the assignment or logging |
-| Guardrail metric | significantly worse than the margin, one-sided | stop and roll back |
-| Main metric at the planned end | no significant gain, or a gain smaller than the cost of the model | keep the current model |
+| Candidate errors and latency | SLO [burn rate](/notes/devops/slos-and-alerting#burn-rate) alert; p99 above the objective for 10 minutes | automatic rollback |
+| Fallback rate, degenerate outputs | twice the current model's | automatic rollback |
+| Prediction distribution | positive rate outside an agreed band | pause and investigate |
+| Sample ratio | $p < 0.001$ | stop; fix the assignment or the logging |
+| Guardrail | significantly worse | stop and roll back |
+| Main metric, model meant to be better | no significant gain, or a gain below the model's cost | keep the current model |
+| Main metric, model meant to be cheaper | non-inferiority within the margin not shown | keep the current model |
 
-The rollback itself must be cheap, which is a property of the serving setup rather than of the decision. The previous version stays loaded beside the new one (the `version_policy` of the [serving note's Example](/notes/mlops/serving-models#example)), or at least stays in the [registry](/notes/mlops/experiments-and-registry) under an alias that the server resolves, so that going back is a change of one pointer. The features the old model needs must still be computed, so a feature removed for the new model is removed only after the rollback window has passed, the expand-and-contract rule of the DevOps course applied to features. And for models that write state, such as embeddings stored for later lookups or predictions cached for a day, the plan says what happens to what the bad version already wrote.
+Rolling back must also be cheap. The previous version stays loaded (the `version_policy` of the [serving note's Example](/notes/mlops/serving-models#example)), or at least sits in the [registry](/notes/mlops/experiments-and-registry) under an alias the server resolves, so that going back is a change of one pointer. Features the old model needs keep being computed until the rollback window has passed: the expand-and-contract rule of the DevOps course, applied to features. For a model that writes state, such as stored embeddings or cached predictions, the plan also says what happens to what the bad version wrote.
 
-## What changed
+## Rankers: interleaving
 
-| | Replace the file and watch the dashboards (the baseline) | A model rollout |
-| --- | --- | --- |
-| First contact with real traffic | all users at once | a shadow: real inputs, answers only logged |
-| What is watched | errors and latency | also prediction distributions, fallbacks, segments, outcome metrics |
-| How "better" is decided | the dashboards look fine | an A/B test with users randomized, the decision metric and $n$ fixed in advance |
-| How long it runs | an hour | the duration that the sample size requires: 190,000 users per group for a 4% lift on 5% |
-| Looking early | at will | at planned looks with a stricter threshold, or not at all; daily stopping at 1.96 gives 21.8% false winners |
-| Validity checks | none | a sample-ratio test, guardrails, novelty and interference checked |
-| Rankers | the same A/B test | interleaving first, far more sensitive per user, then an A/B test of the winner |
-| Rollback | redeploy the old file, if it can be found | criteria written in advance; the old version loaded or one alias away |
+A ranking model outputs a list, and lists can be compared on the same user. **Interleaving** merges the lists of two rankers into one, shows it, and credits each click to the ranker that contributed the clicked item. Each user compares both rankers directly, so the differences between users, which dominate the noise of an A/B test, cancel.
 
-## Limitations
+**Team-draft interleaving** builds the merged list the way captains pick teams ([Radlinski, Kurup and Joachims, 2008](#references)). In each round a fair coin decides which ranker picks first, and each ranker adds its highest item that is not yet taken.
 
-- **Experiments need traffic.** Products with few users, rare outcomes or effects of a fraction of a percent cannot run adequately powered tests; they rely on offline evaluation, proxies, longer tests or larger acceptable risks.
-- **Short tests miss long effects.** A test of two weeks says nothing about retention over a year, or about the feedback loop through which the model trains its successor.
-- **Independence is an assumption.** Marketplaces, social networks and shared caches violate it, and the remedies (randomizing clusters, markets or time slots) cost sample size.
-- **Interleaving and bandits trade measurement for speed.** Interleaving measures click preference, not business outcomes; bandits minimize exposure but estimate effects with bias.
-- **Ethics and law.** Experiments on users are subject to consent rules and, for some decisions such as credit, to regulation about how a model may be tested on people; the [responsibility note](/notes/mlops/responsible-ml) returns to this.
+<TeamDraft />
+
+Over many impressions, the share of impressions won by each ranker is compared with 50% by a sign test, ignoring ties. The coin keeps the comparison fair: neither ranker gets the top position more often.
+
+On commercial web search, interleaving agreed with manual relevance judgements and reached reliable conclusions from far fewer queries than A/B comparisons of click metrics ([Chapelle et al., 2012](#references)). It has limits. It measures a preference between lists from clicks, and says nothing about retention or revenue. It needs both rankers to answer every request, which doubles the compute. It works for two or three rankers at a time. A common practice is therefore two stages: interleaving to pick among many candidates quickly, then an A/B test of the winner on the business metric. Position bias in clicks is the subject of the [learning-to-rank note](/notes/ml/learning-to-rank#clicks-and-position-bias).
+
+## Bandits as an adaptive rollout
+
+*Optional depth: adaptive allocation of traffic. The rest of the note does not depend on it.*
+
+An A/B test spends half its traffic on the worse model for its whole duration, by design: that is what keeps its estimate unbiased. A **multi-armed bandit** treats the models as arms and moves traffic towards the better one while it runs. **Thompson sampling** keeps a Beta posterior over each arm's conversion rate and sends each new user to the arm whose sampled rate is highest ([Russo et al., 2018](#references)); UCB rules, built in the [tree-search note](/notes/agents/games-and-tree-search#selection-as-a-bandit-problem-ucb1-and-uct), pick the arm with the highest optimistic estimate. The cost of serving the worse arm, the **regret**, grows only slowly.
+
+Bandits suit short-lived choices with feedback within minutes or hours, such as headlines or thumbnails; contextual bandits are themselves a kind of model ([Li et al., 2010](#references)). For replacing one model with another they are rarer: adaptive allocation biases the estimate of the effect, an arm starved early gives guardrails little data, and an arm that looks good in week one through novelty collects its traffic while it looks good.
+
+## Where it breaks: a winner that fades
+
+A team tests a new ranker for two weeks at 50/50 with 190,000 users per group. The pooled result is a 4% lift, significant at the planned end, and the model ships.
+
+The effect by day tells another story. In a toy version of it, the new ranker shows unfamiliar items, users explore them, and the lift is about 7% in the first week. In the second week it is about 1%. The pooled 4% is an average of a novelty effect that is ending and a real effect that is close to zero. A month after the full rollout, conversion is where it was, and the long-term holdout of the ramp shows it: the holdout group converts at the same rate as everyone else.
+
+Three things in the plan would have caught it. The effect plotted by day shows the decay. New users, who have no habits to break, show the lasting effect without the novelty. And the holdout measures what remains after the experiment has ended. None of them needs more traffic; they need the plan to ask for them before the test starts.
 
 ## What you should remember
 
-- A worse model fails silently, with small and delayed effects; roll it out in steps: offline evaluation, shadow, canary, A/B test, full rollout, each answering a question the previous one cannot.
-- A shadow runs the candidate on real traffic and logs its answers: it finds crashes, latency, skew and how predictions differ, at the cost of double compute and with no side effects allowed. It cannot measure users' responses.
-- A model canary adds prediction distributions, fallback rates and segments to the error and latency checks of a code canary.
-- An A/B test randomizes users by a salted hash, fixes one decision metric and its sample size in advance: $n = (z_{1-\alpha/2} + z_{1-\beta})^2 (\sigma_A^2 + \sigma_B^2)/\delta^2$ per group, 190,000 for a 4% lift on a 5% rate. Halving the effect quadruples $n$; CUPED cuts the variance by $1 - \rho^2$.
-- Peeking daily and stopping at the first $p < 0.05$ gives 21.8% false winners over 14 looks; use a fixed horizon, a group-sequential boundary (2.61 for 14 equal looks) or always-valid tests.
-- Guardrails are tested for non-inferiority; a sample-ratio mismatch invalidates an experiment.
-- Team-draft interleaving compares two rankers within each user's list and needs far less traffic; bandits shift traffic to the better arm at the cost of biased estimates.
-- Write rollback criteria before the rollout, and keep the previous version one pointer away.
+- A worse model fails silently and its effects are small, so it is rolled out on one ramp: shadow, canary, a 50/50 measurement phase in whole weeks, then 100% with a holdout. Only the 50/50 phase decides.
+- A shadow is asynchronous and side-effect free; it finds crashes, latency, skew and the disagreement rate.
+- Per group, $n = 7.85\,(\sigma_A^2 + \sigma_B^2)/\delta^2$: 190,000 for a 4% lift on 5%. Halving $\delta$ quadruples $n$, CUPED multiplies it by $1 - \rho^2$, a 5% share costs 5.3 times the users, and analysing only the triggered users cuts it about $1/f$-fold.
+- Daily stopping at $p < 0.05$ gives 21.8% false winners over 14 looks; a constant boundary of 2.61 keeps 5% at a cost in power.
+- A sample ratio mismatch invalidates a result; an A/A test checks the platform first.
+- A cheaper model needs a non-inferiority test sized for its margin; rollback criteria are written before the rollout, and the old version stays one pointer away.
 
 ## Example
 
-The program sizes an A/B test for a ranking model that should raise conversion from 5.0% by 4%, runs one simulated experiment of that size with the effect present, checks the sample ratio of a 50/50 assignment, and then simulates 20,000 A/A experiments, two identical models, looked at once a day for 14 days.
+The program sizes an A/B test for a ranker that should raise conversion from 5.0% by 4%. It then shows what the share given to the candidate and triggering do to that size, sizes a non-inferiority test for a cheaper model, runs one experiment with a sample-ratio check, and simulates 20,000 experiments with daily looks. It runs on Python 3.14.7 with NumPy 2.5 and SciPy 1.18, with a fixed seed.
 
 ```python
-# An A/B test of a new ranking model: the sample size, one simulated experiment, and what peeking does.
+# Sizing and reading an A/B test of a new ranking model.
 import numpy as np
 from scipy import stats
 
 rng = np.random.default_rng(7)
-p_a, lift = 0.050, 0.04                      # control conversion rate per user, relative effect to detect
+p_a, lift = 0.050, 0.04                      # control conversion per user, relative effect to detect
 p_b = p_a * (1 + lift)
-alpha, power = 0.05, 0.80
-z_a, z_b = stats.norm.ppf(1 - alpha / 2), stats.norm.ppf(power)
-n = int(np.ceil((z_a + z_b) ** 2 * (p_a * (1 - p_a) + p_b * (1 - p_b)) / (p_b - p_a) ** 2))
-print(f'1. sample size: {p_a:.3f} -> {p_b:.4f} needs n = {n:,} users per group')
+z_a, z_b = stats.norm.ppf(0.975), stats.norm.ppf(0.80)
+k = (z_a + z_b) ** 2                         # 7.85 for a two-sided 5% test with power 0.8
+var = p_a * (1 - p_a) + p_b * (1 - p_b)
+n = int(np.ceil(k * var / (p_b - p_a) ** 2))
+print(f'1. {p_a:.3f} -> {p_b:.4f}: n = {n:,} users per group')
 
-# 2. One experiment at that size, with a true effect, analysed once at the end.
-conv_a, conv_b = rng.binomial(n, p_a), rng.binomial(n, p_b)
-ra, rb = conv_a / n, conv_b / n
+# 2. The share q of traffic given to the candidate: the total N needed grows as 1 / (q (1 - q)).
+for q in (0.50, 0.05):
+    total = k * (var / 2) / (q * (1 - q)) / (p_b - p_a) ** 2
+    print(f'2. share {q:.0%}: {total:,.0f} users in total, {total / 60_000:.1f} days at 60,000 a day')
+
+# 3. Triggering: the models rank differently for 20% of users; the whole effect sits in that fifth.
+f = 0.20
+pt_b = p_a * (1 + lift / f)                  # lift among the triggered users that gives 4% overall
+n_t = int(np.ceil(k * (p_a * (1 - p_a) + pt_b * (1 - pt_b)) / (pt_b - p_a) ** 2))
+print(f'3. triggered users only: {n_t:,} per group, which needs {n_t / f:,.0f} users per group in all')
+
+# 4. A cheaper model (quantized): show it is not worse by more than 2% of the rate, one-sided at 5%.
+margin = 0.02 * p_a
+n_ni = int(np.ceil((stats.norm.ppf(0.95) + z_b) ** 2 * 2 * p_a * (1 - p_a) / margin ** 2))
+print(f'4. non-inferiority within 2%: {n_ni:,} users per group')
+
+# 5. One experiment at size n with the effect present, and a sample-ratio check.
+ca, cb = rng.binomial(n, p_a), rng.binomial(n, p_b)
+ra, rb = ca / n, cb / n
 se = np.sqrt(ra * (1 - ra) / n + rb * (1 - rb) / n)
 z = (rb - ra) / se
-print(f'2. one experiment: A {ra:.4f}, B {rb:.4f}, z = {z:.2f}, p = {2 * stats.norm.sf(abs(z)):.4f}, '
-      f'95% CI for the lift [{(rb - ra - z_a * se) / ra:+.1%}, {(rb - ra + z_a * se) / ra:+.1%}]')
-# A sample-ratio check: users were split 50/50, are the group sizes consistent with that?
-users_a, users_b = 100_700, 99_300
-chi2, p_srm = stats.chisquare([users_a, users_b])
-print(f'   sample ratio check on {users_a:,} vs {users_b:,} users: chi2 = {chi2:.2f}, p = {p_srm:.4f}')
+print(f'5. A {ra:.4f}, B {rb:.4f}, z = {z:.2f}, 95% CI for the lift [{(rb - ra - z_a * se) / ra:+.1%}, {(rb - ra + z_a * se) / ra:+.1%}]')
+chi2, p_srm = stats.chisquare([100_700, 99_300])
+print(f'   sample ratio 100,700 vs 99,300: chi2 = {chi2:.2f}, p = {p_srm:.4f}')
 
-# 3. Peeking: A/A experiments (no effect), checked once a day for 14 days.
+# 6. Daily looks for 14 days: A/A runs give the false-positive rate, A/B runs the power.
 days, per_day, runs = 14, n // 14, 20_000
-a = rng.binomial(per_day, p_a, (runs, days)).cumsum(1)
-b = rng.binomial(per_day, p_a, (runs, days)).cumsum(1)
 m = per_day * np.arange(1, days + 1)
-pool = (a + b) / (2 * m)
-zt = (b - a) / m / np.sqrt(2 * pool * (1 - pool) / m)       # the z statistic after each day
-print(f'3. A/A tests, {days} daily looks, {runs:,} runs:')
-print(f'   reject at the last look only:          {np.mean(np.abs(zt[:, -1]) > z_a):.3f}')
-print(f'   reject at the first look with |z|>1.96: {np.mean((np.abs(zt) > z_a).any(1)):.3f}')
-c = np.quantile(np.abs(zt).max(1), 1 - alpha)               # one constant boundary for all 14 looks
-print(f'   a boundary that holds 5% over 14 looks: |z| > {c:.2f}, rejects {np.mean((np.abs(zt) > c).any(1)):.3f}')
-# The price of the boundary: power against the true lift, fixed horizon against daily looks.
-b1 = rng.binomial(per_day, p_b, (runs, days)).cumsum(1)
-pool1 = (a + b1) / (2 * m)
-z1 = (b1 - a) / m / np.sqrt(2 * pool1 * (1 - pool1) / m)
-hit = np.abs(z1) > c
-first = np.where(hit.any(1), hit.argmax(1) + 1, days)
-print(f'   power: fixed horizon {np.mean(np.abs(z1[:, -1]) > z_a):.3f}, daily looks with the boundary {hit.any(1).mean():.3f}'
-      f' (stopping on day {np.mean(first):.1f} on average)')
+def z_path(p1):
+    a = rng.binomial(per_day, p_a, (runs, days)).cumsum(1)
+    b = rng.binomial(per_day, p1, (runs, days)).cumsum(1)
+    pool = (a + b) / (2 * m)
+    return (b - a) / m / np.sqrt(2 * pool * (1 - pool) / m)
+aa, ab = z_path(p_a), z_path(p_b)
+print(f'6. A/A, stop at the first |z| > 1.96: {np.mean((np.abs(aa) > z_a).any(1)):.3f} false winners')
+c = np.quantile(np.abs(aa).max(1), 0.95)     # one constant boundary that keeps 5% over 14 looks
+hit = np.abs(ab) > c
+stop = np.where(hit.any(1), hit.argmax(1) + 1, days)
+print(f'   boundary |z| > {c:.2f}: power {hit.any(1).mean():.3f} (one look at the end: '
+      f'{np.mean(np.abs(ab[:, -1]) > z_a):.3f}), mean stop on day {stop.mean():.1f}')
 ```
 
 ```console
 $ python3.14 ab_test.py
-1. sample size: 0.050 -> 0.0520 needs n = 189,936 users per group
-2. one experiment: A 0.0499, B 0.0515, z = 2.17, p = 0.0297, 95% CI for the lift [+0.3%, +5.9%]
-   sample ratio check on 100,700 vs 99,300 users: chi2 = 9.80, p = 0.0017
-3. A/A tests, 14 daily looks, 20,000 runs:
-   reject at the last look only:          0.048
-   reject at the first look with |z|>1.96: 0.218
-   a boundary that holds 5% over 14 looks: |z| > 2.61, rejects 0.050
-   power: fixed horizon 0.799, daily looks with the boundary 0.667 (stopping on day 9.6 on average)
+1. 0.050 -> 0.0520: n = 189,936 users per group
+2. share 50%: 379,870 users in total, 6.3 days at 60,000 a day
+2. share 5%: 1,999,316 users in total, 33.3 days at 60,000 a day
+3. triggered users only: 8,155 per group, which needs 40,775 users per group in all
+4. non-inferiority within 2%: 587,343 users per group
+5. A 0.0499, B 0.0515, z = 2.17, 95% CI for the lift [+0.3%, +5.9%]
+   sample ratio 100,700 vs 99,300: chi2 = 9.80, p = 0.0017
+6. A/A, stop at the first |z| > 1.96: 0.218 false winners
+   boundary |z| > 2.61: power 0.665 (one look at the end: 0.795), mean stop on day 9.6
 ```
 
-- **Line 1** is the boxed formula with $\sigma^2 = p(1 - p)$ for each group: 189,936 users per group, which a service with 30,000 new users a day in each group fills in under a week, and the 14-day plan of part 3 fills at 13,566 users per group per day.
-- **Line 2** is one experiment in which the effect is real. The test rejects ($p = 0.03$), but the 95% interval for the lift runs from 0.3% to 5.9%: an experiment sized to detect a 4% effect measures it only roughly. Reporting "4% better" would overstate what is known; reporting the interval does not. One experiment out of five of this size would not have rejected at all, which is what 80% power means.
-- **The sample-ratio line** tests the group sizes of an assignment meant to be 50/50; at $p = 0.0017$ the imbalance is a defect to find, not luck.
-- **Part 3, the last look only**, rejects 4.8% of A/A experiments: the test at its planned horizon has the false-positive rate it promises.
-- **Stopping at the first look** with $\lvert z \rvert > 1.96$ rejects 21.8% of A/A experiments: two identical models, and more than one experiment in five declares a winner.
-- **The constant boundary** is the 95th percentile, over the A/A runs, of the largest $\lvert z \rvert$ across the 14 looks, so it holds 5% by construction. Its value, 2.61, is close to Pocock's tabulated constant for this number of looks.
-- **The price** is power: with the boundary, the true 4% lift is detected in 66.7% of experiments instead of 79.9% with one look at the end, and the experiments that do detect it often stop early, which brings the expected duration down to 9.6 days. A design with more power at the same horizon puts the strict thresholds early and relaxes them towards the end, as O'Brien and Fleming's does.
+Line 1 is the sample-size formula with $\sigma^2 = p(1 - p)$ in each group. Part 2 runs the same experiment at 50/50 and at the canary's 5%: a month of traffic instead of a week. Line 3 analyses only the users whose two rankings differ, and needs a fifth of the users. Line 4 is the price of proving that a quantized ranker is at most 2% worse: three times the superiority test.
+
+Line 5 is one experiment in which the effect is real. The test rejects, but the 95% interval for the lift runs from 0.3% to 5.9%, and the interval is what should be reported. Part 6 stops at the first daily $p < 0.05$ and finds a winner between two identical models in 21.8% of runs; the boundary of 2.61 keeps 5% at the cost of power 0.665 instead of 0.795.
 
 ## Next
 
-The new model has won its experiment and serves everyone. From now on there is no control group: the model's quality can only be inferred from what it receives and predicts, and from labels that arrive late, while the world that produced its training data keeps changing. The [next note](/notes/mlops/monitoring-and-drift) is about watching a model in production: what to measure, the kinds of distribution shift, and the statistics that detect them without drowning the team in false alarms.
+The new model has won its experiment and serves everyone, apart from the holdout. From now on there is little to compare it with: its quality has to be inferred from what it receives and predicts, and from labels that arrive late, while the world that produced its training data keeps changing. The [next note](/notes/mlops/monitoring-and-drift) is about watching a model in production: what to measure, the kinds of distribution shift, and the statistics that detect them without drowning the team in false alarms.
 
 ## References
 
 - HSE University. *Введение в MLOps* (master's programme «Машинное обучение в цифровом продукте», 2025/26): model lifecycle, deployment and validation.
-- C. Kästner. *Machine Learning in Production: From Models to Products*. MIT Press, 2025: the chapters on deploying a model and on testing and experimenting in production (shadow, canary, A/B tests, interleaving); course [17-445/645](https://mlip-cmu.github.io/), Carnegie Mellon University, spring 2025.
-- C. Huyen. *Designing Machine Learning Systems*. O'Reilly, 2022. Chapter 9: continual learning and test in production (shadow deployment, A/B testing, canary release, interleaving, bandits). Stanford [CS329S](https://stanford-cs329s.github.io/).
-- HSE University. [*LLM System Engineering*](https://github.com/xufana/llm-system-engineering) (2026): evaluation design and online evaluation.
-- R. Kohavi, D. Tang, Y. Xu. *Trustworthy Online Controlled Experiments: A Practical Guide to A/B Testing*. Cambridge University Press, 2020: the overall evaluation criterion, guardrail metrics, sample ratio mismatch, the statistics of controlled experiments, novelty effects and interference.
+- C. Kästner. *Machine Learning in Production: From Models to Products*. MIT Press, 2025. Chapter 19, [Testing and Experimenting in Production](https://mlip-cmu.github.io/book/19-testing-and-experimenting-in-production.html); course [17-445/645](https://mlip-cmu.github.io/), Carnegie Mellon University.
+- C. Huyen. *Designing Machine Learning Systems*. O'Reilly, 2022. Chapter 9: continual learning and test in production. Stanford [CS329S](https://stanford-cs329s.github.io/) (2022).
+- Google. [*The Site Reliability Workbook*](https://sre.google/workbook/canarying-releases/), chapter 16: Canarying Releases. O'Reilly, 2018.
+- R. Kohavi, D. Tang, Y. Xu. *Trustworthy Online Controlled Experiments: A Practical Guide to A/B Testing*. Cambridge University Press, 2020: the overall evaluation criterion, guardrails, triggering (ch. 20), A/A tests (ch. 19), sample ratio mismatch (ch. 21).
+- R. Kohavi, R. M. Henne, D. Sommerfield. [Practical Guide to Controlled Experiments on the Web: Listen to Your Customers not to the HiPPO](https://doi.org/10.1145/1281192.1281295). KDD 2007.
+- Y. Xu, W. Duan, S. Huang. [SQR: Balancing Speed, Quality and Risk in Online Experiments](https://arxiv.org/abs/1801.08532). KDD 2018.
 - A. Deng, Y. Xu, R. Kohavi, T. Walker. [Improving the Sensitivity of Online Controlled Experiments by Utilizing Pre-Experiment Data](https://doi.org/10.1145/2433396.2433413). WSDM 2013 (CUPED).
 - A. Fabijan, J. Gupchup, S. Gupta, J. Omhover, W. Qin, L. Vermeer, P. Dmitriev. [Diagnosing Sample Ratio Mismatch in Online Controlled Experiments: A Taxonomy and Rules of Thumb for Practitioners](https://doi.org/10.1145/3292500.3330722). KDD 2019.
 - S. J. Pocock. [Group Sequential Methods in the Design and Analysis of Clinical Trials](https://doi.org/10.1093/biomet/64.2.191). Biometrika 64(2), 1977.
@@ -324,4 +339,4 @@ The new model has won its experiment and serves everyone. From now on there is n
 - O. Chapelle, T. Joachims, F. Radlinski, Y. Yue. [Large-Scale Validation and Analysis of Interleaved Search Evaluation](https://doi.org/10.1145/2094072.2094078). ACM Transactions on Information Systems 30(1), 2012.
 - D. Russo, B. Van Roy, A. Kazerouni, I. Osband, Z. Wen. [A Tutorial on Thompson Sampling](https://arxiv.org/abs/1707.02038). Foundations and Trends in Machine Learning 11(1), 2018.
 - L. Li, W. Chu, J. Langford, R. E. Schapire. [A Contextual-Bandit Approach to Personalized News Article Recommendation](https://arxiv.org/abs/1003.0146). WWW 2010.
-- KServe documentation: [Canary rollout](https://kserve.github.io/website/docs/model-serving/predictive-inference/rollout-strategies/canary-example) (`canaryTrafficPercent`), [InferenceService API](https://kserve.github.io/website/docs/reference/crd-api) (KServe 0.21, September 2026).
+- KServe documentation: [Canary rollout](https://kserve.github.io/website/docs/model-serving/predictive-inference/rollout-strategies/canary-example) (`canaryTrafficPercent`), KServe 0.21, September 2026.
