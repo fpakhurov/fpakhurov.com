@@ -10,7 +10,8 @@ How the Generative Models notes were written and reviewed, as a guide for the ne
 
 ## 2. Voice
 
-- Neutral or first person plural: "we sample", "the bound becomes". No first person singular, no classroom framing ("this week", "the presenter", "homework").
+- First person plural in derivations ("we sample", "we differentiate"), second person where the reader does something ("run", "choose", "check"). The note itself is never the subject: no "this note derives", "the note shows". No first person singular, no classroom framing ("this week", "the presenter", "homework").
+- Avoid the tics that make text read as generated: "not X, but Y" and "X, not Y" framing, announcements ("Three things follow."), rule-of-three lists that exist for rhythm, a moral at the end of a section, and sentences that restate the paragraph before them.
 - Short declarative sentences, one idea each. Define a symbol before its first use, and keep one notation per concept across the whole course (variance as the second argument of $\mathcal N$; $P$ the data, $Q$ the model; $f: z \to x$ for flows).
 - Name the conclusion and then justify it. Every "therefore" needs the step that makes it true.
 
@@ -21,22 +22,41 @@ How the Generative Models notes were written and reviewed, as a guide for the ne
   - Generative Models: Gaussians → entropy and KL → fitting with KL → training background → autoencoders → VAE → VAE variants → GAN → WGAN → α-GAN → CycleGAN → StarGAN → IS → FID → LPIPS → precision and recall → human evaluation → flows → flow architectures → MCMC samplers → energy-based models → DDPM forward → DDPM objective → score matching → latent diffusion → drag editing → autoregressive models → autoregressive transformers → audio generation.
   - Machine Learning: what machine learning is → data and leakage → validation → nearest neighbours → least squares → gradient descent → stochastic and adaptive optimizers → regularization → linear classifiers → logistic regression → classification metrics → SVM → kernels → multiclass → decision trees → bias–variance → bagging and random forests → gradient boosting → neural networks → backpropagation → training deep networks → clustering → EM → dimensionality reduction → anomaly detection → learning to rank → recommender systems. Each note ends with a Code section (synthetic data or scikit-learn's bundled datasets) whose printed numbers are the ones in the text.
   - NLP: text as data → tokenization → corpora and evaluation → bag of words and TF-IDF → n-gram LMs → word embeddings → Word2Vec → CNNs → RNNs → LSTM/GRU → seq2seq → attention → self-attention → Transformer → positions → Transformer MT → BERT → GPT → model families → transfer learning → fine-tuning → PEFT → instruction tuning → quantization → classification → NER → QA → summarization → semantic search → RAG → tools and agents → LLM evaluation → text diffusion. Planned topics (GloVe, FastText, sentence-pair similarity) stay as plain strings in the map until they have source material.
-- Each NLP note follows one storyline: problem → baseline → where it fails → key idea → mechanism and formulas (with shapes) → worked example → results → what changed against the baseline → limitations → what to remember → next. Blocks used: `Key idea` callout, **Worked example**, **What changed**, **Limitations**, **What you should remember**, **Notebook**, **Next**. No quizzes.
+- Each NLP note follows one storyline: problem → baseline → where it fails → key idea → mechanism and formulas (with shapes) → worked example → results → what changed against the baseline → limitations → what to remember → next. Blocks used where they fit (see section 4): `Key idea` callout, **Worked example**, **What changed**, **What you should remember**, **Notebook**, **Next**. No quizzes or self-checks: practice lives on biased.school, and the courses will link to it.
 - Every number quoted from a notebook is a saved output of that notebook; when a run was interrupted or an output was not saved, the note says so instead of quoting a number. Numbers that only illustrate a formula are labelled as toy examples.
-- Each note opens from where the previous one ended (one paragraph: what problem is left, what this note does about it) and closes with a **Next** section that names the problem the next note solves.
+- Each note opens with the reader's problem: a question, a concrete example or a picture. At most one clause links back to the previous note. No roadmap sentence listing what the note will do; the outline column already shows it. The note closes with a **Next** section that names the problem the next note solves.
 - Every topic has exactly one home. Theory and practice can be split (entropy note: the quantities; fitting note: what they do in training), but the same derivation is never written twice. Cross-link instead, with anchors: `/notes/generative-models/vae#where-the-elbo-comes-from`.
 - Heading slugs are part of the interface: the course map and other notes link to them. Changing a heading means updating every link to it; the link check below catches misses.
 
 ## 4. Structure of a note
 
 1. Frontmatter: `title`, `description` (one sentence, what the note covers), `course`, `section` (must match a section in `courses.ts`), `order`, `status`, `tags`, `prerequisites`. Every prerequisite becomes a link: the title of a note of the same course links to that note; anything else (a background topic, a note of another course) needs an entry in `src/utils/prerequisites.ts`, or the build fails. Quote a prerequisite that contains a comma (`"Encoder, decoder and encoder–decoder models"`), or YAML splits it in two.
-2. Opening paragraph that connects to the previous note.
-3. **Notation** paragraph when the note introduces symbols.
+2. An opening that poses the problem (see section 3), not a summary of the note.
+3. Notation where it is first used: "where $x$ is …" after the first display. A note with many symbols may add a short folded table after its first section; no bold **Notation.** paragraph before the first idea.
 4. Body sections, each built around one question. Prefer "Why not just …?" or "Where the bound comes from" over generic headings.
-5. Callouts (`<aside class="callout"><strong>Title.</strong> …</aside>`) for side derivations, caveats and takeaways. Give each a real title; never "Editorial note".
-6. **Notebook**: what the accompanying notebook does, cell by cell (see section 7). This is the only place in a note that mentions the notebook.
-7. **Next**: one paragraph that hands over to the next note.
-8. **References**: full entries with links.
+5. Callouts (`<aside class="callout"><strong>Title.</strong> …</aside>`) for side derivations, caveats and takeaways. Give each a real title; never "Editorial note". A *Key idea* callout is one or two sentences (at most about 35 words) and appears only where a section has one result worth isolating.
+6. Blocks are used where they earn their place, not in every note. A **Baseline** section and a **What changed** block belong to notes that really replace a method (the ladders of Machine Learning, NLP and Generative Models); elsewhere they are left out, and **What changed** may be two sentences instead of a table. Failure cases go into the body as a section such as "Where it breaks", with one failure worked through, instead of a separate list of limitations. **What you should remember** is the short card a student would write: at most six lines.
+7. **Notebook**: one bullet per part of the notebook (see sections 4a and 7). This is the only place in a note that mentions the notebook.
+8. **Next**: one paragraph that hands over to the next note.
+9. **References**: full entries with links.
+
+## 4a. Depth and density
+
+A note should leave the reader able to explain the method, derive its key formula, compute a small example by hand and say when it fails. Everything in the note serves one of these four abilities; what serves none of them goes.
+
+**Depth.** Go one level below "what the method does": why it works (the derivation or the argument), what it costs (shapes, complexity, parameters) and where it breaks (a concrete failure case). Stop before research detail that does not change how the reader uses or understands the method: library history, every variant, reconstructions of unpublished code. One sentence and a reference cover those.
+
+**Density test for every paragraph.** It must add at least one of: a new idea, a step of a derivation, a number the reader can check, a condition under which a claim holds, or a pointer that changes how to read a figure. A paragraph that only restates a figure, a formula or an earlier paragraph is cut or merged.
+
+**Human, not compressed.** Short declarative sentences, a motivating question before each mechanism, an intuition before the formula and a worked example after it. Density comes from removing repetition and filler, not from packing several ideas into one sentence or dropping the explanation of why.
+
+**Figures carry the mechanism.** When a figure shows a process, the text states the idea and what to look at, and the caption gives the parameters; the text does not walk through the picture step by step.
+
+**Summary blocks say new things.** *What changed* compares with the previous method, *Limitations* names concrete failure cases, *What you should remember* is the short list a student would write on a card. None of them repeats the body.
+
+**Notebook section.** One bullet per part of the notebook: what it does, the setting that matters, the one saved result worth knowing. No cell-by-cell narration.
+
+**Volume follows content.** Most notes land at about 2,000–3,000 words of prose (formulas, code and references not counted), about 10–15 minutes of reading, with 4–8 figures. A topic with more genuine content may be longer; a note that runs past ~3,500 words is usually two notes or carries repetition. `scripts/notes/words.py` prints the count per section, which shows where the weight sits.
 
 ## 5. Mathematical standard
 
@@ -57,7 +77,7 @@ How the Generative Models notes were written and reviewed, as a guide for the ne
 
 - A note works on its own. Links to notebooks, cell numbers, what a notebook prints or plots, its variable names and its implementation issues belong only in the Notebook section; the body never sends the reader to the notebook, not even with "see the Notebook section". Numbers from saved runs are welcome in the body as self-contained results: state the setup (data, model, size) in the body's own words, then the number. Figure captions follow the same rule.
 - Link notebooks at the maintained branch of their repository, so readers land on the version that runs today. Generative Models: the default branch of HSE-LAMBDA, `https://github.com/HSE-LAMBDA/DeepGenerativeModels/blob/spring-2025-long/seminars/...` (the newer `spring-2026-long` has only the first seminars so far). NLP: the public copy, `https://github.com/xufana/dsba_nlp/blob/autumn-2025/seminars/...`, which holds the notebooks with pinned environments; the original course repository (`glkuzi/nlp_dsba`) is private, so do not link it. State the convention once per Notebook section: cell numbers count every cell, markdown included, from 1, and quoted numbers come from the run saved with the course (cells changed since then have no saved output). When a notebook on the branch changes, recheck the cell numbers the notes cite and the descriptions of the cells that changed.
-- Describe what the cells do and which choices they make (datasets, hyperparameters, loss reductions, sampling details), in the note's notation.
+- Describe each part of the notebook in one bullet: what it does, the setting that matters (dataset, hyperparameter, loss reduction, sampling detail) and the one saved result worth knowing. No cell-by-cell narration.
 - Separate procedure from results. Quote numbers only from saved outputs and say so; if a notebook has no saved outputs, say that it documents procedures.
 - Report implementation issues plainly and briefly (a reused tensor, a missing `eval()`, a mislabelled plot). They are useful to readers who run the notebook.
 
@@ -73,7 +93,12 @@ How the Generative Models notes were written and reviewed, as a guide for the ne
 
 ## 9. Formatting details
 
-- Long display equations overflow the reading column on narrow screens. Split them with `aligned` or `gathered`, or move conditions into the sentence before the display.
+- Display math is set as in a book. One relation per line: several updates or definitions go into one `aligned` block with `&` before each relation sign, never side by side with `\qquad`. A derivation is an `aligned` chain, one step per line, with a short `\text{(reason)}` beside a step that needs one. Number with `\tag{n}` only the equations the text refers to later.
+- Any formula with a fraction, a sum, an integral or a root goes on its own line, unless it is a short symbol definition. A worked example with more than a few numbers becomes an aligned display or a small table (quantity, formula, value), followed by one sentence that reads it.
+- Long display equations overflow the reading column on narrow screens. Split them as above, or move conditions into the sentence before the display.
+- A paragraph carries one idea, about 40 to 100 words; a one-sentence paragraph after a result is fine. Bold marks a term at its definition, not the start of every list item.
+- Figure captions say what is plotted, the parameters and what to look at, in at most about 50 words; the interpretation goes in the text.
+- The `description` in the frontmatter is the visible lead under the title: one or two plain-text sentences, at most about 35 words, with no math markup.
 - Tables: keep cells short; wide tables scroll inside their own container, but the page must never scroll horizontally.
 - Code blocks: minimal, runnable, in the note's notation, with short comments.
 

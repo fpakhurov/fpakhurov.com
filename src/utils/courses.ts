@@ -746,7 +746,7 @@ export const courses: Record<CourseKey, Course> = {
     requires: ['deep-learning'],
     shortTitle: 'NLP',
     description: 'One path from raw text to modern LLM systems. Each note says what it adds: a fix for a limitation of the previous method, or a new task, objective or system component.',
-    entry: 'Before you start: Deep Learning (training networks, normalization, optimizers), which builds on Machine Learning (logistic regression, cross-entropy, backpropagation), and basic Python. Notebook sections describe the course\'s public notebooks; the notes read without them. Results from different notes are comparable only where a note says they share a protocol.',
+    entry: 'Before you start: Deep Learning (training networks, normalization, optimizers), which builds on Machine Learning (logistic regression, cross-entropy, backpropagation), and the Programming in Python course, or basic Python. Notebook sections describe the course\'s public notebooks; the notes read without them.',
     guide: [{ label: 'The plan of the course', note: 'nlp/natural-language-processing', anchor: 'the-plan-of-the-course' }],
     progression: [
       { label: 'Text', section: 'Text Foundations' },
@@ -769,7 +769,7 @@ export const courses: Record<CourseKey, Course> = {
       title: 'Обработка естественного языка',
       shortTitle: 'NLP',
       description: 'Один путь от сырого текста к современным LLM-системам. Каждая заметка говорит, что она добавляет: исправление ограничения предыдущего метода или новую задачу, цель обучения или компонент системы.',
-      entry: 'Что нужно знать: глубинное обучение (обучение сетей, нормализация, оптимизаторы), которое опирается на машинное обучение (логистическая регрессия, кросс-энтропия, обратное распространение), и основы Python. Разделы «Ноутбук» описывают открытые ноутбуки курса; заметки читаются и без них. Результаты из разных заметок сравнимы, только если в заметке сказано, что протокол у них общий.',
+      entry: 'Что нужно знать: глубинное обучение (обучение сетей, нормализация, оптимизаторы), которое опирается на машинное обучение (логистическая регрессия, кросс-энтропия, обратное распространение), и курс программирования на Python или основы Python. Разделы «Ноутбук» описывают открытые ноутбуки курса; заметки читаются и без них.',
       progression: ['Текст', 'Классический NLP', 'Представления', 'Последовательности', 'Трансформеры', 'Предобучение', 'Масштабирование', 'Современные архитектуры', 'Адаптация', 'Задачи', 'Постобучение', 'Инференс', 'LLM-системы', 'Не слева направо'],
       labels: {
         'Scaling and LLM Pretraining': 'Масштабирование и предобучение LLM',
@@ -1277,7 +1277,7 @@ export const courses: Record<CourseKey, Course> = {
     requires: ['nlp'],
     shortTitle: 'Agents',
     description: 'Systems that act: from the classical agent and its environment, search and Markov decision processes, through reinforcement learning, to language-model agents that reason, use tools, remember, plan, write code and operate computers, and how they are trained, evaluated and kept safe.',
-    entry: 'Before you start: the NLP course up to instruction tuning and tool use, which in turn assumes Machine Learning and Probability. Reinforcement learning is developed here from the start. Every note ends with a Code section in Python with NumPy that runs on a laptop in seconds; where a real language model would be called, the code uses a small scripted stand-in so that it runs offline, and says what changes with a real model.',
+    entry: 'Before you start: the NLP course up to instruction tuning and tool use, which in turn builds on Deep Learning and Machine Learning. Reinforcement learning is developed here from the start. Every note ends with a Code section in Python with NumPy that runs on a laptop in seconds; where a real language model would be called, the code uses a small scripted stand-in so that it runs offline, and says what changes with a real model.',
     guide: [{ label: 'The plan of the course', note: 'agents/what-an-agent-is', anchor: 'the-plan-of-the-course' }, { label: 'The course in one paragraph', note: 'agents/open-problems', anchor: 'the-course-in-one-paragraph' }],
     extensions: ['agents/model-based-rl'],
     progression: [
@@ -1293,7 +1293,7 @@ export const courses: Record<CourseKey, Course> = {
       title: 'ИИ-агенты',
       shortTitle: 'Агенты',
       description: 'Системы, которые действуют: от классического агента и его среды, поиска и марковских процессов принятия решений через обучение с подкреплением к агентам на языковых моделях, которые рассуждают, пользуются инструментами, помнят, планируют, пишут код и управляют компьютером, и к тому, как их обучают, оценивают и делают безопасными.',
-      entry: 'Что нужно знать: курс NLP до дообучения на инструкциях и использования инструментов, который, в свою очередь, опирается на машинное обучение и теорию вероятностей. Обучение с подкреплением строится в этом курсе с нуля. Каждая заметка заканчивается разделом «Код» на Python с NumPy, который за секунды запускается на ноутбуке; там, где нужен вызов настоящей языковой модели, код использует небольшую заскриптованную замену, чтобы работать без сети, и объясняет, что изменится с настоящей моделью.',
+      entry: 'Что нужно знать: курс NLP до дообучения на инструкциях и использования инструментов, который, в свою очередь, опирается на глубинное и машинное обучение. Обучение с подкреплением строится в этом курсе с нуля. Каждая заметка заканчивается разделом «Код» на Python с NumPy, который за секунды запускается на ноутбуке; там, где нужен вызов настоящей языковой модели, код использует небольшую заскриптованную замену, чтобы работать без сети, и объясняет, что изменится с настоящей моделью.',
       progression: ['Агенты', 'RL', 'LLM-агенты', 'Память и планы', 'Применения', 'Обучение', 'Безопасность'],
       labels: {
         'Agents and Environments': 'Агенты и среды',
@@ -1577,7 +1577,7 @@ export const courses: Record<CourseKey, Course> = {
     requires: ['acos', 'python'],
     shortTitle: 'DevOps',
     description: 'How software gets from a commit to a reliable service: the shell and Git, builds, containers and CI/CD, networking and infrastructure as code, Kubernetes, and the site-reliability practices of observability, SLOs, resilience and incident response.',
-    entry: 'Before you start: the Computer Architecture and Operating Systems course for processes, files, sockets and containers, and the Programming in Python course, or comfort with one programming language. The notes explain concepts with worked examples of commands and configuration; hands-on practice lives outside the site. The MLOps course builds on this one.',
+    entry: 'Before you start: the Computer Architecture and Operating Systems course for processes, files, sockets and containers, and the Programming in Python course, or comfort with one programming language. A few notes use expectation and simple statistics from Probability Theory, for canary analysis and error budgets. The notes explain concepts with worked examples of commands and configuration; hands-on practice lives outside the site. The MLOps course builds on this one.',
     guide: [{ label: 'The plan of the course', note: 'devops/what-devops-is', anchor: 'the-plan-of-the-course' }, { label: 'The course in one paragraph', note: 'devops/incidents-and-security', anchor: 'the-course-in-one-paragraph' }],
     progression: [
       { label: 'Foundations', section: 'Foundations' },
@@ -1590,7 +1590,7 @@ export const courses: Record<CourseKey, Course> = {
       title: 'DevOps',
       shortTitle: 'DevOps',
       description: 'Как программа проходит путь от коммита до надёжного сервиса: командная оболочка и Git, сборка, контейнеры и CI/CD, сеть и инфраструктура как код, Kubernetes и практики SRE — наблюдаемость, SLO, устойчивость и реагирование на инциденты.',
-      entry: 'Что нужно знать: курс архитектуры компьютеров и операционных систем (процессы, файлы, сокеты, контейнеры) и курс программирования на Python или уверенное владение любым языком программирования. Заметки объясняют идеи на разобранных примерах команд и конфигураций; практика живёт вне сайта. На этот курс опирается курс MLOps.',
+      entry: 'Что нужно знать: курс архитектуры компьютеров и операционных систем (процессы, файлы, сокеты, контейнеры) и курс программирования на Python или уверенное владение любым языком программирования. Несколько заметок используют математическое ожидание и простую статистику из теории вероятностей — для анализа канареечных выпусков и бюджетов ошибок. Заметки объясняют идеи на разобранных примерах команд и конфигураций; практика живёт вне сайта. На этот курс опирается курс MLOps.',
       progression: ['Основы', 'Доставка', 'Инфраструктура', 'Оркестрация', 'Надёжность'],
       labels: {
         'Foundations': 'Основы',
@@ -1753,3 +1753,11 @@ export const courses: Record<CourseKey, Course> = {
 export function sectionOf(course: CourseKey, noteId: string): string | undefined {
   return courses[course].sections.find((section) => section.topics.some((topic) => typeof topic !== 'string' && topic.note === noteId && !topic.anchor))?.title;
 }
+
+// Course numbers shown on course pages and in the graph follow the order of study: the machine-learning
+// track first, then the systems track. The test below keeps the list complete.
+export const learningOrder: CourseKey[] = ['probability', 'math', 'python', 'ml', 'deep-learning', 'bayesian-methods', 'generative-models', 'nlp', 'agents', 'acos', 'devops', 'mlops'];
+if (learningOrder.length !== Object.keys(courses).length || !Object.keys(courses).every((key) => learningOrder.includes(key as CourseKey))) {
+  throw new Error('learningOrder must list every course exactly once');
+}
+export const courseNumber = (key: CourseKey) => String(learningOrder.indexOf(key) + 1).padStart(2, '0');
