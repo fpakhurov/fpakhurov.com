@@ -2,7 +2,32 @@
 
 Notable changes to the site, newest first. Each entry gives the date, what changed and why.
 
+## 2026-10-27
+
+- **Derivations fold under their claims, and every step must be explained.** Long derivations and proofs now sit in a block that opens on a click, marked by a rule on the left, so the text keeps its pace while every step stays on the page. The writing guide gains the rule the courses are being checked against: every formula and claim is derived in place, linked to the exact anchor where it is derived, stated as a definition, or (when the proof is beyond the course) stated precisely with its intuition and a specific reference. "It can be shown" and "it is known" never replace a step.
+
 ## 2026-10-26
+
+- **Mathematics for Machine Learning rewritten in the new style, with a new note.** Each of the 15 notes was compared, by content, with the matching lectures of the HSE matrix-computations and optimization courses, Strang's MIT courses, Boyd and Vandenberghe, and Deisenroth, Faisal and Ong. Each was then rewritten in English and Russian under the approved rules.
+  - **What every note now has:** an opening with a concrete problem, one equation per line, short reasons beside derivation steps, and a worked "Where it breaks" case. The repeated "The idea / box / first line" template and the Baseline, What changed and Notation blocks are gone.
+  - **Equations that fit:**
+    - on desktop no display equation in the course scrolls sideways any more (48 of 253 did);
+    - on phones 58 of 308 still do, against 186 of 253 before.
+  - **New note: "Iterative methods: power iteration and conjugate gradient".**
+    - It takes up the gap the review found against the HSE matrix-computations course, Strang and Boyd: the cost of factorizing at a million unknowns, the power method (moved here from the symmetric-matrices note), conjugate gradient as minimizing a quadratic, Krylov subspaces, the √κ rate and preconditioning.
+    - It now ends the course and holds "The course in one paragraph".
+  - **Also new:** Sherman–Morrison–Woodbury in the matrices note, which the Bayes course uses.
+  - **Errors fixed:**
+    - an affine "10 m² per room plus 40" relation that was meant to lower the rank;
+    - a flop count mixed with multiply–adds;
+    - two mis-cited theorems in Bubeck;
+    - the missing Frobenius norm in the Eckart–Young bound for LoRA;
+    - the ReLU rescaling symmetry, which must scale the bias too;
+    - the critical cone of the second-order KKT test;
+    - an overclaimed duality gap;
+    - several statements about the power method, inverse iteration and Chebyshev polynomials in the new note.
+  - **Overlaps now linked instead of repeated:** LoRA (to NLP), Monte Carlo integration and the 10-dimensional ball (to Probability).
+  - **References:** writers dropped every reference they could not read. *Mathematics for Machine Learning* (Deisenroth, Faisal and Ong) is one of them: its PDF is too large to fetch.
 
 - **Pilot of the new note style: two notes rewritten.** "Variational inference" (Bayesian Methods) and "Rolling out models" (MLOps) were each compared, by content, with the matching lectures and chapters of their reference courses, and rewritten in English and Russian under the new writing rules. They are the sample for the owner to approve before the other courses follow.
   - **Variational inference.**

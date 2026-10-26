@@ -1398,7 +1398,7 @@ export const courses: Record<CourseKey, Course> = {
     shortTitle: 'Math',
     description: 'The linear algebra, calculus and optimization that machine learning is written in: vector spaces and the matrix decompositions, derivatives of functions of vectors and matrices, convexity, Lagrange duality, and what floating point does to all of it.',
     entry: 'Before you start: school algebra and the derivative of a function of one variable. Proofs are given where they are short and explain why a result holds; longer ones are marked as optional depth. Every note ends with a Code section in Python with NumPy that checks its results numerically. The Probability course can be taken alongside this one; Machine Learning builds on both.',
-    guide: [{ label: 'The plan of the course', note: 'math/vectors-and-linear-maps', anchor: 'the-plan-of-the-course' }, { label: 'The course in one paragraph', note: 'math/conditioning-and-stability', anchor: 'the-course-in-one-paragraph' }],
+    guide: [{ label: 'The plan of the course', note: 'math/vectors-and-linear-maps', anchor: 'the-plan-of-the-course' }, { label: 'The course in one paragraph', note: 'math/iterative-methods', anchor: 'the-course-in-one-paragraph' }],
     progression: [
       { label: 'Linear algebra', section: 'Linear Algebra' },
       { label: 'Calculus', section: 'Calculus' },
@@ -1437,8 +1437,9 @@ export const courses: Record<CourseKey, Course> = {
         'Duality': 'Двойственность',
         'Numerical Computation': 'Численные методы',
         'What changes when the arithmetic is done by a computer.': 'Что меняется, когда арифметику выполняет компьютер.',
-        'Estimate how errors in the data and in floating point grow through a computation, and choose a stable way to solve a linear or least-squares problem.': 'Оценивать, как ошибки в данных и в плавающей точке растут в ходе вычисления, и выбирать устойчивый способ решить линейную задачу или задачу наименьших квадратов.',
+        'Estimate how errors in the data and in floating point grow through a computation, and choose a stable way to solve a linear or least-squares problem, directly or by an iterative method.': 'Оценивать, как ошибки в данных и в плавающей точке растут в ходе вычисления, и выбирать устойчивый способ решить линейную задачу или задачу наименьших квадратов, прямо или итерационным методом.',
         'Conditioning and numerical stability': 'Обусловленность и численная устойчивость',
+        'Iterative methods: power iteration and conjugate gradient': 'Итерационные методы: степенной метод и сопряжённые градиенты',
         'The plan of the course': 'План курса',
         'The course in one paragraph': 'Курс в одном абзаце',
       },
@@ -1464,8 +1465,9 @@ export const courses: Record<CourseKey, Course> = {
         noteTopic('Lagrange multipliers and KKT conditions', 'math/lagrange-multipliers-and-kkt'),
         noteTopic('Duality', 'math/duality'),
       ] },
-      { title: 'Numerical Computation', summary: 'What changes when the arithmetic is done by a computer.', outcome: 'Estimate how errors in the data and in floating point grow through a computation, and choose a stable way to solve a linear or least-squares problem.', topics: [
+      { title: 'Numerical Computation', summary: 'What changes when the arithmetic is done by a computer.', outcome: 'Estimate how errors in the data and in floating point grow through a computation, and choose a stable way to solve a linear or least-squares problem, directly or by an iterative method.', topics: [
         noteTopic('Conditioning and numerical stability', 'math/conditioning-and-stability'),
+        noteTopic('Iterative methods: power iteration and conjugate gradient', 'math/iterative-methods'),
       ] },
     ],
   },
