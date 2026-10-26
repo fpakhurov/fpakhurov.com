@@ -2,6 +2,10 @@
 
 Notable changes to the site, newest first. Each entry gives the date, what changed and why.
 
+## 2026-10-27
+
+- **Derivations fold under their claims, and every step must be explained.** Long derivations and proofs now sit in a block that opens on a click, marked by a rule on the left, so the text keeps its pace while every step stays on the page. The writing guide gains the rule the courses are being checked against: every formula and claim is derived in place, linked to the exact anchor where it is derived, stated as a definition, or (when the proof is beyond the course) stated precisely with its intuition and a specific reference. "It can be shown" and "it is known" never replace a step.
+
 ## 2026-10-26
 
 - **Mathematics for Machine Learning rewritten in the new style, with a new note.** Each of the 15 notes was compared, by content, with the matching lectures of the HSE matrix-computations and optimization courses, Strang's MIT courses, Boyd and Vandenberghe, and Deisenroth, Faisal and Ong. Each was then rewritten in English and Russian under the approved rules.
