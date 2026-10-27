@@ -4,6 +4,30 @@ Notable changes to the site, newest first. Each entry gives the date, what chang
 
 ## 2026-10-27
 
+- **Bayesian Methods rewritten, checked against the BMML lecture notes, and audited for every step.**
+  - **Content comparison.** All 15 notes were compared with the Vetrov–Kropotov course, the HSE course, Bishop, Murphy and Cambridge 4F13, then rewritten in English and Russian in the new style.
+  - **The owner's lecture notes.** Then came a pass against the lecture notes «Байесовские методы в анализе данных» (2026, [github.com/bmml-team/bmml_ftda](https://github.com/bmml-team/bmml_ftda)), which the owner chose as the course's primary reference. It added:
+    - observers with different knowledge;
+    - finding a conjugate prior from the likelihood;
+    - the three-dice Occam example;
+    - EM for crowd labels (GLAD): on simulated data, 61 errors in 1,000 items against 133 for a majority vote;
+    - prediction and the evidence from Gibbs draws.
+  - **The derivation audit.** Every formula and claim is derived in place, linked to the anchor that derives it, or stated precisely with a checked reference; long derivations fold under their claims. Bayes' formula with an extra condition is now derived both ways, and sequential updating has its explicit normalizer.
+  - **Errors fixed:**
+    - the GP evidence "local maximum" was the optimizer's bound;
+    - a positive definite Hessian is not necessary at a strict maximum;
+    - the inverted «в 1 − ηλ раз» wording;
+    - a backwards support condition and a wrong claim about the two KL directions in VI;
+    - the training error said to fall at every step;
+    - the predictive said to be always wider than the likelihood;
+    - a PyTorch-only code block, now NumPy.
+  - **Structure:**
+    - model selection no longer uses a result from the next note;
+    - each repeated derivation has one home;
+    - the section with LDA is renamed "Nonparametric and Topic Models";
+    - Gaussian processes gain expectation propagation, with a factor-graph figure.
+  - **Equations.** On a desktop screen no display equation in the course scrolls sideways (0 of 287).
+
 - **Derivations fold under their claims, and every step must be explained.** Long derivations and proofs now sit in a block that opens on a click, marked by a rule on the left, so the text keeps its pace while every step stays on the page. The writing guide gains the rule the courses are being checked against: every formula and claim is derived in place, linked to the exact anchor where it is derived, stated as a definition, or (when the proof is beyond the course) stated precisely with its intuition and a specific reference. "It can be shown" and "it is known" never replace a step.
 
 ## 2026-10-26
