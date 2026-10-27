@@ -4,6 +4,22 @@ Notable changes to the site, newest first. Each entry gives the date, what chang
 
 ## 2026-10-27
 
+- **Mathematics for ML: every step derived or linked.** All 16 notes were audited in English and Russian against one rule: each formula and claim is derived in place, linked to the anchor that derives it, or stated precisely with a checked reference. Long proofs fold under their claims.
+  - **Added derivations:**
+    - continuous partial derivatives imply differentiability, and Schwarz's theorem;
+    - Fubini on a rectangle, with an outline of the change of variables (Lebl, Theorem 10.7.2);
+    - the convergence rates of gradient descent from L-smoothness, strong convexity, PL and Armijo backtracking, and the Newton bounds;
+    - parallel gradients at a constrained optimum through the implicit function theorem, and KKT under LICQ;
+    - for conjugate gradient, A-orthogonality, Krylov optimality and the √κ rate from Chebyshev polynomials.
+  - **Errors fixed:**
+    - a generator maps into more dimensions, not fewer;
+    - the observed speed of gradient descent is now predicted from the local condition number (2,970 steps predicted, 2,727 taken);
+    - Boyd's shadow prices are §5.4.4, not §5.6;
+    - the value of 2 sin²(x/2)/x² at x = 10⁻⁴;
+    - the partitioning problem's duality gap is now certified (0.60).
+  - **References.** Theorem and section numbers that could not be checked against the source were removed.
+  - **Equations.** On a desktop screen no display equation in the course scrolls sideways (0 of 736).
+
 - **Bayesian Methods rewritten, checked against the BMML lecture notes, and audited for every step.**
   - **Content comparison.** All 15 notes were compared with the Vetrov–Kropotov course, the HSE course, Bishop, Murphy and Cambridge 4F13, then rewritten in English and Russian in the new style.
   - **The owner's lecture notes.** Then came a pass against the lecture notes «Байесовские методы в анализе данных» (2026, [github.com/bmml-team/bmml_ftda](https://github.com/bmml-team/bmml_ftda)), which the owner chose as the course's primary reference. It added:
