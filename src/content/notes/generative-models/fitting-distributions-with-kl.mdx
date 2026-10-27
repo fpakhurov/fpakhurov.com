@@ -1,11 +1,11 @@
 ---
 title: Fitting distributions with KL
-description: Training a Gaussian's mean and covariance by minimizing a sample estimate of KL(P‖Q), the assumptions the KL divergence quietly relies on, and how KL, reverse KL, JS and a least-squares loss behave when one Gaussian must fit two modes.
+description: Training a Gaussian by gradient descent on a sample estimate of KL, what the divergence quietly assumes, and what forward KL, reverse KL, JS and a least-squares loss do when one Gaussian must fit two modes.
 course: generative-models
 section: Foundations
 order: 3
 status: published
-tags: [kl-divergence, js-divergence, gradient-descent, pytorch, support, monte-carlo]
+tags: [kl-divergence, js-divergence, gradient-descent, pytorch, support, monte-carlo, mode-covering, mode-seeking]
 prerequisites: ["Entropy, cross-entropy and KL divergence", Multivariate Gaussian distributions, Gradient descent]
 ---
 
@@ -17,101 +17,72 @@ import DirectionPenalties from '../../../components/figures/fitting-distribution
 import SupportProblem from '../../../components/figures/fitting-distributions-with-kl/SupportProblem.astro';
 import ForwardReverseKL from '../../../components/figures/fitting-distributions-with-kl/ForwardReverseKL.astro';
 
-The [entropy note](/notes/generative-models/entropy-and-divergences) built the KL divergence from surprise and showed that minimizing $D_{\mathrm{KL}}(P\,\|\,Q)$ over the model is the same as maximizing likelihood. This note puts it to work on the [Gaussian model](/notes/generative-models/gaussian-distributions): a $Q$ with trainable parameters is pulled towards a target $P$ by gradient descent. Three questions organize it:
+The data have two clusters, one around $-3$ and one around $-8$, and the model is a single Gaussian. Minimize the KL divergence from the data to the model, and the Gaussian settles at $-5.5$ with a standard deviation of $2.55$: its densest part sits in the empty gap, where no data point lies. Swap the two arguments of the divergence, and the Gaussian sits on one cluster and ignores the other.
 
-1. **How are the parameters trained?** What actually happens in one iteration of the fitting loop?
-2. **What does KL assume?** What must hold for the formula to make sense, and where does each assumption show up in code?
-3. **What if the model cannot represent the target?** One Gaussian fitted to two modes shows how KL, reverse KL, JS and a least-squares loss differ.
-
-**Notation.** $P$ is the true (target) distribution with density $p$, $Q = Q_\theta$ is the model with density $q$ and parameters $\theta$, and $\eta$ is the learning rate. In one dimension $\theta = (\mu, \log\sigma)$: $\sigma$ is stored through its logarithm, so that $\sigma = e^{\log\sigma}$ stays positive. In two dimensions the mean is $\boldsymbol\mu$ and the covariance is $\boldsymbol\Sigma = \mathbf L\mathbf L^\top$, with $\mathbf L$ the lower-triangular Cholesky factor from the [Gaussian note](/notes/generative-models/gaussian-distributions#gaussians-in-pytorch).
+Real models never represent the data exactly, so which of these failures a loss prefers is a property of every generative model trained with it. To see it we fit a Gaussian $Q$ with trainable parameters to a target $P$ by gradient descent, with the KL divergence of the [entropy note](/notes/generative-models/entropy-and-divergences) as the loss and the [trainable Gaussian](/notes/generative-models/gaussian-distributions#gaussians-in-pytorch) as the model.
 
 ## How the parameters are trained
 
-One iteration of the loop, step by step:
+In one dimension the model is $Q = \mathcal N(\mu, \sigma^2)$ with parameters $\theta = (\mu, \log\sigma)$; storing $\sigma$ through its logarithm keeps it positive whatever the optimizer does. In two dimensions the parameters are the mean and the three raw entries of the Cholesky factor.
 
-- **The optimizer** is given the list of tensors to train. Each was created with `requires_grad=True`, so that `backward()` fills its `.grad`. In one dimension these are the mean and $\log\sigma$; in two dimensions the mean and the three raw entries of the Cholesky factor from the [Gaussian note](/notes/generative-models/gaussian-distributions#gaussians-in-pytorch). The target's parameters have no gradient and stay fixed.
-- **`Q`** is rebuilt from the current parameters at every iteration: $Q = \mathcal N(\mu, \sigma^2)$ with $\sigma = e^{\log\sigma}$.
-- **`qx`** holds the model density at the sample points, $q(x_i)$; **`px`** holds $p(x_i)$, the density of the true distribution at the same points.
-- **`loss`** is the sample estimate of the KL divergence built from `px` and `qx`.
-- **`loss.backward()`** computes the gradients $\partial\,\text{loss}/\partial\mu$ and $\partial\,\text{loss}/\partial\log\sigma = \sigma\,\partial\,\text{loss}/\partial\sigma$ by backpropagation and stores them in `.grad`.
-- **`optimizer.step()`** moves the parameters against the gradient. For plain SGD this is
+One iteration of the fitting loop rebuilds $Q$ from the current parameters, evaluates its log-density at fixed samples $x_i \sim P$, and computes the loss, a sample estimate of $D_{\mathrm{KL}}(P\,\|\,Q)$. Backpropagation then computes the gradient of the loss with respect to each parameter, and the optimizer moves the parameters against it. For plain gradient descent with learning rate $\eta$ the step is
 
 $$
-\begin{gathered}
-\mu \leftarrow \mu - \eta\,\frac{\partial\,\text{loss}}{\partial \mu},
-\\
-\log\sigma \leftarrow \log\sigma - \eta\,\frac{\partial\,\text{loss}}{\partial \log\sigma}.
-\end{gathered}
+\begin{aligned}
+\mu &\leftarrow \mu - \eta\,\frac{\partial\,\text{loss}}{\partial \mu}, \\
+\log\sigma &\leftarrow \log\sigma - \eta\,\frac{\partial\,\text{loss}}{\partial \log\sigma}.
+\end{aligned}
 $$
 
-[Adam](/notes/ml/stochastic-and-adaptive-optimizers#adam) ([Kingma and Ba, 2015](#references)) moves in a similar direction but rescales each coordinate's step by running estimates of the gradient's mean and magnitude. The KL fits below use Adam.
+[Adam](/notes/ml/stochastic-and-adaptive-optimizers#adam) ([Kingma and Ba, 2015](#references)) moves in a similar direction but rescales each coordinate's step by running estimates of the gradient's mean and magnitude; the PyTorch fits quoted below use it.
 
 <TrainingLoop />
 
-The 1-D fit in code:
-
-```python
-# helpers: kl_loss (the estimate below), get_parameters_1d (mu = 0, log_std = 0),
-# create_distr_1d, and target_1d, the 1-D two-mode mixture defined below
-train_mu, train_log_std = get_parameters_1d()   # requires_grad=True
-optimizer = torch.optim.Adam([train_mu, train_log_std], lr=0.01)
-
-x  = target_1d.sample((1000,))      # fixed samples x_i ~ P
-px = target_1d.log_prob(x).exp()    # p(x_i), known for a toy target
-
-for i in range(2000):
-    optimizer.zero_grad()           # clear .grad from the previous step
-    Q  = create_distr_1d(train_mu, train_log_std)   # Normal(mu, exp(log_std))
-    qx = Q.log_prob(x).exp()        # q(x_i); can underflow, see 'In code'
-    loss = kl_loss(px, qx)          # mean(log2 p(x_i) - log2 q(x_i))
-    loss.backward()                 # d loss / d mu, d loss / d log_std
-    optimizer.step()                # move against the gradient
-```
+In PyTorch the parameters are tensors created with `requires_grad=True`, `loss.backward()` fills their `.grad`, and `optimizer.step()` takes the step; the target's parameters carry no gradient and stay fixed. The Code section runs the same loop in NumPy with the gradients written out by hand.
 
 ### The loss is a Monte Carlo estimate of KL
 
-KL is an expectation under $P$, so it can be estimated by averaging over samples $x_1, \dots, x_N \sim P$:
+KL is an expectation under $P$, so we can estimate it by averaging over samples $x_1, \dots, x_N \sim P$:
 
 $$
 \begin{aligned}
-&D_{\mathrm{KL}}(P\,\|\,Q) = \int p(x)\log\frac{p(x)}{q(x)}\,dx \\
-&\quad= \mathbb E_{x\sim P}\big[\log p(x) - \log q(x)\big] \\
-&\quad\approx \frac1N\sum_{i=1}^{N}\big[\log p(x_i) - \log q(x_i)\big].
+D_{\mathrm{KL}}(P\,\|\,Q) &= \mathbb E_{x\sim P}\big[\log p(x) - \log q(x)\big] \\
+&\approx \frac1N\sum_{i=1}^{N}\big[\log p(x_i) - \log q(x_i)\big].
 \end{aligned}
 $$
 
-By the law of large numbers the average converges to the expectation as $N$ grows. The code above averages $\log_2 p(x_i) - \log_2 q(x_i)$, so its loss is in bits; changing the base only rescales the loss and its gradients by the constant $1/\ln 2 \approx 1.443$.
+By the law of large numbers the average converges to the expectation as $N$ grows. Averaging $\log_2$ instead of $\ln$ reports the loss in bits; it rescales the loss and its gradients by $1/\ln 2 \approx 1.443$.
 
 <MonteCarloKL />
 
-**Samples from another distribution.** If the samples come from a distribution $R$ with density $r$ instead of $P$, each term is reweighted by $p/r$ ([importance sampling](/notes/probability/monte-carlo#importance-sampling)):
+If the samples come from another distribution $R$ with density $r$, each term is reweighted by $w_i = p(x_i)/r(x_i)$, the [importance weight](/notes/probability/monte-carlo#importance-sampling); this needs $r > 0$ wherever $p > 0$.
+
+The estimate can be negative although KL never is. Fit a full-covariance 2-D Gaussian, five parameters, to 1000 fixed samples of $\mathcal N\big((-5,-5), \mathbf I\big)$: after 4800 Adam steps the loss reads $-0.0020$ bits. The model is fitted to the same samples on which the loss is evaluated. The target is one of the candidate Gaussians, so at the maximum-likelihood fit the average of $\log q$ over the samples is at least the average of $\log p$. How far below zero follows from Wilks' theorem ([Wilks, 1938](#references)). When the family contains $P$, its log-likelihood is smooth and the true parameters lie inside the parameter set, twice the gain in total log-likelihood of the fit over the true parameters is approximately $\chi^2$ with $k$ degrees of freedom for $k$ fitted parameters. The intuition: near its maximum the log-likelihood is a quadratic bowl, and the noise of the sample shifts the maximum by $k$ independent, roughly normal amounts, each of which adds half a squared standard normal to the gain. The loss is minus the gain divided by $N$, and a $\chi^2_k$ variable has mean $k$, so
 
 $$
 \begin{aligned}
-D_{\mathrm{KL}}(P\,\|\,Q) &\approx \frac1N\sum_{i=1}^{N} w_i\big[\log p(x_i) - \log q(x_i)\big], \\
-w_i &= \frac{p(x_i)}{r(x_i)}, \qquad x_i \sim R ,
+\mathbb E[\text{loss}] &\approx -\frac{\mathbb E[\chi^2_k]}{2N} = -\frac{k}{2N} \\
+&= -\frac{5}{2000} = -0.0025 \text{ nats} \\
+&= -0.0036 \text{ bits}.
 \end{aligned}
 $$
 
-which requires $r > 0$ wherever $p > 0$. With $R = P$ every weight is $1$ and the plain estimate returns.
-
-**An estimate can be negative.** KL is never negative, but its estimate on a finite sample can be. In a fit of a full-covariance 2-D Gaussian $Q$ (five parameters) to the target $\mathcal N\big((-5,-5), \mathbf I\big)$, with Adam on 1000 fixed samples, the loss after 4800 steps is $-0.0020$ bits. The reason is that $Q$ is fitted to the same samples on which the loss is evaluated. The target is one of the candidate Gaussians, so at the maximum-likelihood fit the average of $\log q$ over the samples is at least the average of $\log p$, and the estimate is $\le 0$. How far below zero follows from Wilks' theorem: twice the gain in total log-likelihood of the fit over the true parameters is approximately $\chi^2$-distributed with $k$ degrees of freedom for $k$ fitted parameters ([Wilks, 1938](#references)), so on average the estimate sits $k/(2N)$ nats below zero. Here that is $5/2000 = 0.0025$ nats, or $0.0036$ bits. In a simulation of 2000 such fits the estimate averages $-0.0037$ bits with a standard deviation of $0.0024$ bits, so $-0.0020$ is a typical value. An honest estimate of the fitted model's divergence needs fresh samples, as held-out data does for any model.
+In 2000 simulated fits the estimate averages $-0.0036$ bits with a standard deviation of $0.0023$, so $-0.0020$ is a typical value. An honest estimate of the fitted model's divergence needs fresh samples, as held-out data does for any model.
 
 ### What the gradients are
 
 For a 1-D Gaussian, $\log q(x) = -\log\sigma - \tfrac12\log 2\pi - \frac{(x-\mu)^2}{2\sigma^2}$. The term $\log p(x_i)$ does not depend on the parameters, so only $-\log q$ contributes (natural logarithms):
 
 $$
-\begin{gathered}
-\frac{\partial\,\text{loss}}{\partial \mu} = -\frac1N\sum_{i=1}^{N}\frac{x_i-\mu}{\sigma^2},
-\\
-\frac{\partial\,\text{loss}}{\partial \sigma} = \frac1N\sum_{i=1}^{N}\left[\frac1\sigma - \frac{(x_i-\mu)^2}{\sigma^3}\right].
-\end{gathered}
+\begin{aligned}
+\frac{\partial\,\text{loss}}{\partial \mu} &= -\frac1N\sum_{i=1}^{N}\frac{x_i-\mu}{\sigma^2}, \\
+\frac{\partial\,\text{loss}}{\partial \log\sigma} &= \frac1N\sum_{i=1}^{N}\left[1 - \frac{(x_i-\mu)^2}{\sigma^2}\right].
+\end{aligned}
 $$
 
-Both vanish when $\mu$ is the sample mean and $\sigma^2 = \frac1N\sum_i (x_i-\mu)^2$ the (biased) sample variance. These are the maximum-likelihood estimates, as the entropy note predicted. The *gradient* never needs $p$: the values $p(x_i)$ only make the reported number equal to the KL. With real data, where $p$ is unknown, we drop that constant and minimize the negative log-likelihood $-\frac1N\sum_i \log q(x_i)$ instead.
+The second line uses $\sigma^{-2} = e^{-2\log\sigma}$, whose derivative in $\log\sigma$ is $-2\sigma^{-2}$, and the derivative $1$ of $\log\sigma$ itself. Both vanish when $\mu$ is the sample mean and $\sigma^2 = \frac1N\sum_i (x_i-\mu)^2$ the biased sample variance: the maximum-likelihood estimates, as the entropy note predicted. The gradient never needs $p$; the values $p(x_i)$ only make the reported number equal to the KL. With real data, where $p$ is unknown, we drop that constant and minimize the negative log-likelihood $-\frac1N\sum_i \log q(x_i)$.
 
-The direction of the steps is easiest to see with the exact KL between two 1-D Gaussians:
+The exact KL between two 1-D Gaussians shows where the steps lead. Take $D_{\mathrm{KL}} = \mathbb E_P[\log p(x) - \log q(x)]$, write both log-densities as above, and use $\mathbb E_P[(x-\mu_P)^2] = \sigma_P^2$ and $\mathbb E_P[(x-\mu)^2] = \sigma_P^2 + (\mu_P-\mu)^2$. The constants $\tfrac12\log 2\pi$ cancel, and
 
 $$
 \begin{aligned}
@@ -120,187 +91,302 @@ $$
 \end{aligned}
 $$
 
-It follows from $D_{\mathrm{KL}} = \mathbb E_P[\log p(x) - \log q(x)]$ with the expression for $\log q$ above and the same expression for $\log p$ (with $\mu_P, \sigma_P$), using $\mathbb E_P[(x-\mu_P)^2] = \sigma_P^2$ and $\mathbb E_P[(x-\mu)^2] = \sigma_P^2 + (\mu_P-\mu)^2$. The constants $\tfrac12\log 2\pi$ cancel, and the term $-\tfrac12$ is $-\sigma_P^2/(2\sigma_P^2)$ from $\log p$.
+The last term is $-\sigma_P^2/(2\sigma_P^2)$, from $\log p$.
 
 <FittingTrajectory />
 
-With plain gradient descent on $(\mu, \log\sigma)$, as in the figure, the trajectory shows the priorities of the forward KL. While $Q$ is narrow and far away, most of $P$'s mass sits where $q \approx 0$, and $\log p - \log q$ is huge there. The cheapest fix is to widen $Q$: $\sigma$ jumps up in the first steps while $\mu$ only creeps. Once $Q$ covers $P$, $\mu$ moves across and $\sigma$ shrinks back to $P$'s width. The order comes from the gradient sizes: from the closed form, $\partial/\partial\log\sigma = 1 - \frac{\sigma_P^2 + (\mu_P-\mu)^2}{\sigma^2}$ grows like $(\mu_P-\mu)^2/\sigma^2$, while $\partial/\partial\mu = \frac{\mu-\mu_P}{\sigma^2}$ grows only like $\lvert\mu_P-\mu\rvert/\sigma^2$. Adam, which normalizes each coordinate's step, moves both at a similar rate and follows a different path to the same optimum.
+With plain gradient descent on $(\mu, \log\sigma)$ the trajectory shows the priorities of the forward KL. While $Q$ is narrow and far away, most of $P$'s mass sits where $q \approx 0$, and the cheapest fix is to widen $Q$: $\sigma$ jumps up in the first steps while $\mu$ only creeps. Once $Q$ covers $P$, $\mu$ moves across and $\sigma$ shrinks back. The order comes from the gradient sizes. From the closed form, $\partial/\partial\log\sigma = 1 - \big(\sigma_P^2 + (\mu_P-\mu)^2\big)/\sigma^2$ grows like $(\mu_P-\mu)^2/\sigma^2$, while $\partial/\partial\mu = (\mu-\mu_P)/\sigma^2$ grows only like $\lvert\mu_P-\mu\rvert/\sigma^2$. Adam, which normalizes each coordinate's step, moves both at a similar rate and reaches the same optimum by a different path.
 
 ## What KL assumes
 
-Start from the formula for continuous distributions ([Kullback and Leibler, 1951](#references)):
+The formula for continuous distributions ([Kullback and Leibler, 1951](#references)),
 
 $$
-D_{\mathrm{KL}}(P\,\|\,Q) = \int p(x)\,\log\frac{p(x)}{q(x)}\,dx .
+D_{\mathrm{KL}}(P\,\|\,Q) = \int p(x)\,\log\frac{p(x)}{q(x)}\,dx ,
 $$
 
-For it to be a meaningful, finite number, conditions (a)–(c) must hold; (d) and (e) are choices that must be made consistently ([Cover and Thomas, 2006](#references), §8.5; [Murphy, 2023](#references), §5.1).
+is a meaningful, finite number only under conditions (a)–(c) below; (d) and (e) are choices that must be made consistently ([Cover and Thomas, 2006](#references), §8.5; [Murphy, 2023](#references), §5.1).
 
 ### (a) Common support
 
-The **support** of a distribution is the set of its possible values, $\operatorname{supp} p = \lbrace x : p(x) > 0\rbrace$. If $p(x) > 0$ but $q(x) = 0$ on a region to which $P$ gives positive probability, then $\log\frac{p(x)}{q(x)} = \infty$ there and the divergence is infinite.
+The **support** of a distribution is the set of its possible values, $\operatorname{supp} p = \lbrace x : p(x) > 0\rbrace$. If $q(x) = 0$ on a region to which $P$ gives positive probability, $\log\frac{p(x)}{q(x)} = \infty$ there and the divergence is infinite. Formally, $D_{\mathrm{KL}}(P\,\|\,Q)$ is finite only if $P$ is **absolutely continuous** with respect to $Q$, written $P \ll Q$: wherever $P$ has mass, $Q$ must have mass too.
 
-Formally, $D_{\mathrm{KL}}(P\,\|\,Q)$ is finite only if $P$ is **absolutely continuous** with respect to $Q$, written $P \ll Q$: every set to which $Q$ gives probability zero also has $P$-probability zero. Wherever $P$ has mass, $Q$ must have mass too. This is one reason models trained by maximum likelihood use densities that are positive everywhere, such as Gaussians: a density with no holes avoids the infinities caused by support mismatch, since the per-sample loss $-\log q(x_i)$ stays finite at every observed point. Positivity does not guarantee a finite expected loss or KL: condition (b) below gives two densities that are positive everywhere and still have $D_{\mathrm{KL}} = \infty$. Positivity alone does not make a model blurry. But combined with the forward KL, which punishes any missed mass, a model that cannot represent the data spreads probability between and around the modes (see [One Gaussian, two modes](#one-gaussian-two-modes)). This is one explanation offered for blurry samples of likelihood-trained image models ([Theis, van den Oord and Bethge, 2016](#references)).
+This is one reason models trained by maximum likelihood use densities that are positive everywhere, such as Gaussians: the per-sample loss $-\log q(x_i)$ stays finite at every observed point. Positivity alone does not make a model blurry. Combined with the forward KL, which punishes any missed mass, it makes a model that cannot represent the data spread probability between and around the modes, which is one explanation offered for the blurry samples of likelihood-trained image models ([Theis, van den Oord and Bethge, 2016](#references)).
 
 <SupportMismatch />
 
-The condition is one-sided. Points where $q(x) > 0$ but $p(x) = 0$ contribute $0\cdot\log\frac{0}{q(x)} = 0$ to $D_{\mathrm{KL}}(P\,\|\,Q)$; they matter only for the reverse direction.
+The condition is one-sided. Points where $q(x) > 0$ but $p(x) = 0$ contribute $0$ to $D_{\mathrm{KL}}(P\,\|\,Q)$; they matter only for the reverse direction.
 
 ### (b) Integrability
 
-The integral must converge. Matching supports is not enough. For example, let $P$ be a standard Cauchy distribution and $Q = \mathcal N(0, \sigma^2)$. Both are positive everywhere, but $\log\frac{p}{q}$ grows like $\frac{x^2}{2\sigma^2}$ and $\mathbb E_P[x^2] = \infty$, so $D_{\mathrm{KL}}(P\,\|\,Q) = \infty$. A model with light tails cannot fit heavy-tailed data in KL.
+The integral must converge, and matching supports are not enough. Let $P$ be a standard Cauchy distribution and $Q = \mathcal N(0, \sigma^2)$. Both are positive everywhere, and with $p(x) = 1/\big(\pi(1 + x^2)\big)$
+
+$$
+\log\frac{p(x)}{q(x)} = \frac{x^2}{2\sigma^2} - \log(1 + x^2) + \log\frac{\sqrt{2\pi}\,\sigma}{\pi} .
+$$
+
+Under $P$ the middle term has the finite mean $2\ln 2$, while $\mathbb E_P[x^2] = \infty$, so $D_{\mathrm{KL}}(P\,\|\,Q) = \infty$. A model with light tails cannot fit heavy-tailed data in KL.
 
 ### (c) Normalized densities
 
-$p$ and $q$ must be probability densities (or probability mass functions): non-negative and integrating (or summing) to $1$. KL is not defined for raw scores such as a classifier's logits; they must go through a softmax first. A `torch.distributions` object returns normalized log-densities from `log_prob`.
+$p$ and $q$ must be probability densities or mass functions: non-negative and integrating to 1. Raw scores such as a classifier's logits go through a softmax first, and the `log_prob` of a `torch.distributions` object is already normalized.
 
 ### (d) Direction
 
-KL is not symmetric, $D_{\mathrm{KL}}(P\,\|\,Q) \ne D_{\mathrm{KL}}(Q\,\|\,P)$, so we must decide which distribution plays the truth and which the approximation:
-
-- $D_{\mathrm{KL}}(P\,\|\,Q)$, the **forward** KL, averages over $P$ and penalizes **missed modes**: $Q$ must cover everything where $P$ lives. This is the direction of maximum likelihood.
-- $D_{\mathrm{KL}}(Q\,\|\,P)$, the **reverse** KL, averages over $Q$ and penalizes **extra mass**: $Q$ must not spread to where $P \approx 0$. This is the direction used in [variational inference](/notes/bayesian-methods/variational-inference#the-evidence-lower-bound-and-the-reverse-kl), including the [VAE](/notes/generative-models/vae).
+KL is not symmetric, so we must decide which distribution plays the truth. The **forward** KL $D_{\mathrm{KL}}(P\,\|\,Q)$ averages over $P$ and penalizes missed modes: $Q$ must cover everything where $P$ lives. It is the direction of maximum likelihood. The **reverse** KL $D_{\mathrm{KL}}(Q\,\|\,P)$ averages over $Q$ and penalizes extra mass: $Q$ must not spread to where $P \approx 0$. It is the direction of [variational inference](/notes/bayesian-methods/variational-inference#the-evidence-lower-bound-and-the-reverse-kl), including the [VAE](/notes/generative-models/vae). The two are also called inclusive and exclusive KL, and their behaviour zero-avoiding, or mode-covering, and zero-forcing, or mode-seeking ([Murphy, 2023](#references), §5.1.4).
 
 <DirectionPenalties />
 
+Only the forward direction can be estimated from data alone. It needs samples from $P$ and $\log q$ at them; the reverse direction needs $\log p$, which real data never provides.
+
 ### (e) Continuous versus discrete
 
-For discrete distributions the integral becomes a sum, $D_{\mathrm{KL}}(P\,\|\,Q) = \sum_{x} p(x)\log\frac{p(x)}{q(x)}$. Mixing the two gives an infinite divergence. If $P$ has an atom at $x$, then $Q(\lbrace x\rbrace) = 0$ for any distribution $Q$ with a density, so $P$ is not absolutely continuous with respect to $Q$ and $D_{\mathrm{KL}}(P\,\|\,Q) = \infty$ by condition (a). This is why, for continuous data, maximum likelihood is read as the sample estimate of $D_{\mathrm{KL}}(P\,\|\,Q)$ for the underlying density $p$, not as the KL of the empirical distribution of the samples (compare the [entropy note](/notes/generative-models/entropy-and-divergences#why-cross-entropy-is-the-loss-we-minimize), where that reading is exact for discrete outcomes).
+For discrete distributions the integral becomes a sum. Mixing the two gives an infinite divergence: if $P$ has an atom at $x$, any $Q$ with a density gives $\lbrace x\rbrace$ probability zero, so $P \not\ll Q$ and $D_{\mathrm{KL}}(P\,\|\,Q) = \infty$ by condition (a). For continuous data, maximum likelihood is therefore read as a sample estimate of $D_{\mathrm{KL}}(P\,\|\,Q)$ for the underlying density $p$. Reading it as the KL of the empirical distribution of the samples works only for [discrete outcomes](/notes/generative-models/entropy-and-divergences#why-cross-entropy-is-the-loss-we-minimize).
 
-### Modelling assumptions
+### In code
 
-When KL is used as a training loss, a few more things are taken on faith:
+A Gaussian `Q` is positive everywhere, so (a) holds mathematically whatever the target, and it can still fail numerically. Computing `qx = Q.log_prob(x).exp()` and then `qx.log2()` underflows in [32-bit floating point](/notes/acos/floating-point#special-values) once $\log q(x)$ drops below about $-103$: for $\sigma \approx 1$, about 14 standard deviations from $\mu$. The loss is then infinite exactly when $Q$ starts far from $P$. Working with `log_prob` directly avoids it.
 
-- **Representability.** The family $Q_\theta$ can express the shape we need. A single Gaussian can match a single-Gaussian target exactly, but not a two-component mixture; the last section shows what happens then.
-- **Differentiability.** $\log q_\theta(x)$ must be differentiable in $\theta$, so that gradient descent applies. Reparameterizing $\sigma = e^{\log\sigma}$ also makes the parameters unconstrained, so a gradient step can never produce a negative $\sigma$.
-- **Computability.** The forward KL needs samples from $P$ and the value of $\log q$ at them. The reverse KL needs samples from $Q$ (reparameterized, for gradients) and the values of $\log q$ and $\log p$ at them. For real data only the first is available, which is why maximum likelihood uses the forward direction.
+The two-mode targets below need the same care. Their log-density $\log\big(\tfrac12 p_1(x) + \tfrac12 p_2(x)\big)$ is computed from the component log-densities $a = \log p_1(x) + \log\tfrac12$ and $b = \log p_2(x) + \log\tfrac12$ as
 
-<aside class="callout"><strong>Intuition.</strong> KL is the average, over points drawn from P, of log p − log q: positive where Q underestimates P's density, negative where it overestimates it, and non-negative overall. All the assumptions above exist so that this expectation is defined and finite.</aside>
+$$
+\operatorname{logaddexp}(a, b) = \max(a, b) + \log\big(1 + e^{-|a - b|}\big),
+$$
 
-**In code.** Each assumption has a concrete place in the code. $Q$ is a `Normal` or `MultivariateNormal`, positive everywhere, so (a) holds mathematically whatever the target. Numerically it can still fail. The code computes `qx = Q.log_prob(x).exp()` and then `qx.log2()`, and in [32-bit floating point](/notes/acos/floating-point#special-values) the exponential underflows to $0$ once $\log q(x)$ drops below about $-103$: for $\sigma \approx 1$ that is about $14$ standard deviations from $\mu$, and the threshold shifts with $\log\sigma$. This makes the loss infinite when $Q$ starts far from $P$. Working with `log_prob` directly avoids this. The same care applies to the two-component targets below. Their log-density $\log\big(\tfrac12 p_1(x) + \tfrac12 p_2(x)\big)$ is computed from the component log-densities $a = \log p_1(x) + \log\tfrac12$ and $b = \log p_2(x) + \log\tfrac12$ as $\operatorname{logaddexp}(a, b) = \max(a, b) + \log\big(1 + e^{-|a - b|}\big)$, the two-term case of the [stable log-sum-exp](/notes/math/conditioning-and-stability#log-sum-exp-and-the-stable-softmax), which never exponentiates a large negative number on its own and so stays finite far from both components. The covariance $\mathbf L\mathbf L^\top$ with an exponentiated diagonal keeps $Q$ a valid normalized density, as (c) requires. The target is a known Gaussian or mixture, so `px` can be evaluated. Finally, the loss averages over `x ~ P`, which fixes the direction to $D_{\mathrm{KL}}(P\,\|\,Q)$.
+the two-term case of the [stable log-sum-exp](/notes/math/conditioning-and-stability#log-sum-exp-and-the-stable-softmax), which stays finite far from both components.
 
 ## One Gaussian, two modes
 
-With a single Gaussian target, KL fitting simply recovers the target. The interesting case is a target that the model family **cannot represent**. In 2-D the target is an equal mixture of $\mathcal N\big((-5,-5), \mathbf I\big)$ and $\mathcal N\big((4,4), \mathbf I\big)$. In 1-D it is
+With a single Gaussian target, KL fitting recovers the target. The informative case is a target the family **cannot represent**. In 2-D it is an equal mixture of $\mathcal N\big((-5,-5), \mathbf I\big)$ and $\mathcal N\big((4,4), \mathbf I\big)$; in 1-D it is
 
 $$
 P = \tfrac12\,\mathcal N(-3,\, 0.5^2) + \tfrac12\,\mathcal N(-8,\, 0.5^2),
 $$
 
-and the model starts from $Q = \mathcal N(0, 1)$. Four losses are compared: forward KL, reverse KL, JS and a least-squares loss on density values. None of them is satisfactory, each for a different reason. The same trade-offs reappear across generative models, which is why this toy problem is worth understanding in detail ([Huszár, 2015](#references); [Theis, van den Oord and Bethge, 2016](#references)).
+and the model starts from $Q = \mathcal N(0, 1)$. We compare four losses: forward KL, reverse KL, JS and a least-squares loss on density values. None is satisfactory, each for its own reason, and the same trade-offs reappear across generative models ([Huszár, 2015](#references); [Theis, van den Oord and Bethge, 2016](#references); [Isachenko, lecture 5](#references)).
 
 ### Far from the target, the missed mode dominates
 
-The initial $Q = \mathcal N(0, 1)$ barely reaches the far mode at $-8$. A Gaussian is never exactly zero, but eight standard deviations from its mean it is zero for all practical purposes. There $\log\frac{p(x)}{q(x)}$ is huge, and the far mode dominates the whole divergence. If $Q$ were exactly zero there, the divergence would be infinite, as condition (a) says. For a Gaussian $Q$ the forward KL nevertheless stays finite, and its gradient in $\mu$, $(\mu - \mathbb E_P[x])/\sigma^2$, is large here. Overlap matters numerically, because $q$ underflows to $0$ in 32-bit floating point (see **In code** above), and for the bounded losses JS and least squares, whose gradients vanish without it (see the table below).
+The initial $Q = \mathcal N(0, 1)$ barely reaches the far mode at $-8$, eight standard deviations from its mean. There $\log\frac{p(x)}{q(x)}$ is huge, and that mode dominates the whole divergence, $17.9$ nats. For a Gaussian $Q$ the forward KL stays finite, and its gradient in $\mu$, $(\mu - \mathbb E_P[x])/\sigma^2 = 5.5$, is large. Overlap matters for the bounded losses, JS and least squares, whose gradients nearly vanish without it.
 
 <SupportProblem />
 
 ### Forward KL covers both modes; reverse KL picks one
 
-Minimizing $D_{\mathrm{KL}}(P\,\|\,Q)$ makes a single Gaussian **cover both modes, with a wide spread**. The loss averages $\log\frac{p}{q}$ over samples of $P$, so any region where $P$ has mass and $Q$ is small is punished heavily. For a Gaussian $Q$ the optimum is exact moment matching. Writing the forward KL as
+Minimizing $D_{\mathrm{KL}}(P\,\|\,Q)$ makes a single Gaussian cover both modes with a wide spread. Write the forward KL as
 
 $$
-D_{\mathrm{KL}}(P\,\|\,Q) = -H(P) - \mathbb E_P[\log q(x)],
+D_{\mathrm{KL}}(P\,\|\,Q) = -H(P) - \mathbb E_P[\log q(x)] .
 $$
 
-only the second term depends on $Q$, and for a Gaussian $\log q$ depends on $x$ only through $x$ and $xx^{\top}$. Setting the derivatives with respect to $\boldsymbol\mu$ and $\boldsymbol\Sigma$ to zero gives
+Only the second term depends on $Q$, and for a Gaussian $\log q$ depends on $x$ only through $x$ and $xx^{\top}$. Minimizing it over $\boldsymbol\mu$ and $\boldsymbol\Sigma$ gives exact moment matching ([Bishop, 2006](#references), §10.7), derived below:
 
 $$
 \begin{aligned}
 \boldsymbol\mu^\ast &= \mathbb E_P[x], \\
-\boldsymbol\Sigma^\ast &= \operatorname{Cov}_P[x]
+\boldsymbol\Sigma^\ast &= \operatorname{Cov}_P[x] .
 \end{aligned}
 $$
 
-([Bishop, 2006](#references), §10.7). For the 1-D target this gives $\mu^\ast = -5.5$ and $\sigma^{\ast2} = 0.25 + 2.5^2 = 6.5$, so $\sigma^\ast \approx 2.55$: each component contributes its own variance $0.25$, and the spread of the two means around $-5.5$ adds $2.5^2$. For the 2-D target it gives the mean $(-0.5, -0.5)$ and the covariance $\begin{pmatrix} 21.25 & 20.25 \\ 20.25 & 21.25\end{pmatrix}$: one elongated Gaussian along the diagonal through both modes, with its densest part in the empty gap between them. At this optimum the divergence is $1.170$ nats ($1.69$ bits). An Adam fit (learning rate $0.1$, 2000 fixed samples, started from $\mathcal N(\mathbf 0, \mathbf I)$) reaches exactly this picture, at an estimated $1.669$ bits after 4800 steps; the gap of $0.019$ bits is below the standard deviation of a 2000-sample estimate, about $0.023$ bits.
+<details>
+<summary>Derivation</summary>
 
-The reverse divergence $D_{\mathrm{KL}}(Q\,\|\,P)$ averages over samples of $Q$. It punishes $Q$ for putting mass where $P$ is small and does not care about parts of $P$ that $Q$ ignores, so $Q$ **locks onto one mode** ([Bishop, 2006](#references), §10.1.2, Figure 10.3; [Minka, 2005](#references)). For two equal, well-separated modes, sitting exactly on one of them costs only $D_{\mathrm{KL}}(Q\,\|\,P) \approx \ln 2$: on that mode $p \approx q/2$, so $\log\frac{q}{p} \approx \ln 2$ everywhere $Q$ has mass.
+Write $\mathbf m = \mathbb E_P[x]$ and $\mathbf C = \operatorname{Cov}_P[x]$, and assume $\mathbf C$ is positive definite. For $q = \mathcal N(\boldsymbol\mu, \boldsymbol\Sigma)$ in $d$ dimensions,
+
+$$
+\begin{aligned}
+-\mathbb E_P[\log q(x)] ={}& \tfrac12\log\det(2\pi\boldsymbol\Sigma) \\
+&+ \tfrac12\,\mathbb E_P\big[(x - \boldsymbol\mu)^{\top}\boldsymbol\Sigma^{-1}(x - \boldsymbol\mu)\big] .
+\end{aligned}
+$$
+
+Split $x - \boldsymbol\mu = (x - \mathbf m) + (\mathbf m - \boldsymbol\mu)$. The cross term averages to zero because $\mathbb E_P[x - \mathbf m] = 0$, and a scalar equals its trace, $\mathbb E[v^{\top}\boldsymbol\Sigma^{-1}v] = \operatorname{tr}\big(\boldsymbol\Sigma^{-1}\mathbb E[vv^{\top}]\big)$, so
+
+$$
+\begin{aligned}
+&\mathbb E_P\big[(x - \boldsymbol\mu)^{\top}\boldsymbol\Sigma^{-1}(x - \boldsymbol\mu)\big] \\
+&\quad= \operatorname{tr}(\boldsymbol\Sigma^{-1}\mathbf C) + (\mathbf m - \boldsymbol\mu)^{\top}\boldsymbol\Sigma^{-1}(\mathbf m - \boldsymbol\mu) .
+\end{aligned}
+$$
+
+The last term is $\ge 0$ and zero only at $\boldsymbol\mu = \mathbf m$, which fixes the mean. For the covariance let $\lambda_1, \dots, \lambda_d > 0$ be the eigenvalues of $\mathbf A = \mathbf C^{-1/2}\boldsymbol\Sigma\,\mathbf C^{-1/2}$. The cyclic property of the trace gives $\operatorname{tr}(\boldsymbol\Sigma^{-1}\mathbf C) = \operatorname{tr}(\mathbf A^{-1}) = \sum_i 1/\lambda_i$, and $\det\boldsymbol\Sigma = \det\mathbf C \cdot \prod_i \lambda_i$, so the part that depends on $\boldsymbol\Sigma$ is
+
+$$
+\tfrac12\log\det\mathbf C + \tfrac12\sum_{i=1}^d \Big(\log\lambda_i + \frac{1}{\lambda_i}\Big) .
+$$
+
+Each term $\log\lambda + 1/\lambda$ has derivative $(\lambda - 1)/\lambda^2$, negative for $\lambda < 1$ and positive for $\lambda > 1$, so it is smallest at $\lambda = 1$. All eigenvalues equal to 1 means $\mathbf A = \mathbf I$, that is $\boldsymbol\Sigma = \mathbf C$.
+
+</details>
+
+For the 1-D target, $\mu^\ast = -5.5$ and, by the [law of total variance](/notes/probability/conditional-expectation#the-law-of-total-variance), $\sigma^{\ast2} = 0.25 + 2.5^2 = 6.5$, so $\sigma^\ast \approx 2.55$: the average variance within a component is $0.25$, and the spread of the two means around $-5.5$ adds $2.5^2$. For the 2-D target the optimum has mean $(-0.5, -0.5)$. The same law adds the within-component covariance $\mathbf I$ to the covariance of the two means, which sit at $\pm(4.5, 4.5)$ from it and contribute $4.5^2 = 20.25$ to every entry:
+
+$$
+\boldsymbol\Sigma^\ast = \begin{pmatrix} 21.25 & 20.25 \\ 20.25 & 21.25\end{pmatrix},
+$$
+
+one elongated Gaussian along the diagonal through both modes, densest in the empty gap. Its divergence is $1.170$ nats, or $1.688$ bits. An Adam fit (learning rate $0.1$, 2000 fixed samples, started from $\mathcal N(\mathbf 0, \mathbf I)$) reaches this picture at an estimated $1.669$ bits after 4800 steps; the gap of $0.019$ bits is below the standard deviation of a 2000-sample estimate, about $0.023$ bits.
+
+The reverse divergence $D_{\mathrm{KL}}(Q\,\|\,P)$ averages over samples of $Q$. It punishes mass where $P$ is small and ignores parts of $P$ that $Q$ misses, so $Q$ locks onto one mode ([Bishop, 2006](#references), §10.1.2; [Minka, 2005](#references)). For two equal, well-separated modes, sitting exactly on one costs only $\ln 2$. If $Q$ stays near the first component $p_1$, where the second is negligible, then $p \approx p_1/2$ there and
+
+$$
+\begin{aligned}
+D_{\mathrm{KL}}(Q\,\|\,P) &\approx \mathbb E_Q\Big[\log\frac{q(x)}{p_1(x)/2}\Big] \\
+&= \ln 2 + D_{\mathrm{KL}}(Q\,\|\,p_1) .
+\end{aligned}
+$$
+
+The second term is zero for $Q = p_1$ and positive otherwise, so the best Gaussian is the mode itself, at $\ln 2$.
 
 <ForwardReverseKL />
 
 ### JS does not cover the modes either
 
-JS never blows up, but it does not fix mode coverage. A JS fit of the 2-D mixture with Adam (learning rate $0.1$, 5000 steps), started from $\boldsymbol\mu = (-2,-2)$, ends with $\boldsymbol\mu \approx (-4.99, -5.06)$ and a nearly unit covariance at a loss of $0.273$ bits. That is a Gaussian on the mode at $(-5,-5)$; the mode at $(4,4)$ is dropped. The loss in this run is a weighted variant, $0.7\,D_{\mathrm{KL}}(P\,\|\,M) + 0.3\,D_{\mathrm{KL}}(Q\,\|\,M)$ in bits. For it, exactly locking onto one mode gives $0.270$ bits, close to the value reached; for the symmetric JS it would give $\tfrac34\log_2\tfrac43 \approx 0.311$ bits. The 1-D target ends the same way. Plain gradient descent (learning rate $0.1$, 5000 fresh samples of each distribution per step) from $\mathcal N(0, 1)$ is at $\mu = -2.995$, $\sigma = 0.495$ after 1800 steps, on the nearer mode at $-3$, with the same weighted loss of $0.270$ bits. $Q$'s peak density there, $0.81$, is twice the target's $0.40$: all of $Q$'s mass sits on a mode that holds half of $P$'s. The symmetric JS behaves the same way: for the 1-D target its best single Gaussian also sits on one mode (see the table below).
-
-**Estimating JS from samples.** Each half of JS is an expectation under its own distribution,
+JS never blows up, and it still drops a mode. For the 1-D target the best single Gaussian under the symmetric JS, found by grid search, sits exactly on one mode, at $0.216$ nats against $0.255$ for the moment-matched Gaussian. Exactly on one mode, $Q = p_1$, the mixture is $M = \tfrac12(P + Q) = \tfrac34 p_1 + \tfrac14 p_2$. The modes are ten standard deviations apart, so wherever one component has mass the other is negligible, and each log ratio is a constant on its mode:
 
 $$
 \begin{aligned}
-D_{\mathrm{JS}}(P\,\|\,Q) &= \tfrac12\,\mathbb E_{x\sim P}\Big[\log\frac{p(x)}{m(x)}\Big] + \tfrac12\,\mathbb E_{y\sim Q}\Big[\log\frac{q(y)}{m(y)}\Big], \\
-m &= \tfrac12(p + q),
+D_{\mathrm{KL}}(Q\,\|\,M) &\approx \log_2\tfrac{1}{3/4} = \log_2\tfrac43, \\
+D_{\mathrm{KL}}(P\,\|\,M) &\approx \tfrac12\log_2\tfrac{1/2}{3/4} + \tfrac12\log_2\tfrac{1/2}{1/4} \\
+&= \tfrac12\log_2\tfrac43 .
 \end{aligned}
 $$
 
-so the estimate needs two samples: $x_1, \dots, x_N \sim P$ for the first term and $y_1, \dots, y_N \sim Q$ for the second, each averaged as in the KL estimate above. The mixture density is evaluated in log space, $\log m = \operatorname{logaddexp}\big(\log p + \log\tfrac12,\ \log q + \log\tfrac12\big)$, as for the two-component target. The second term depends on $Q$'s parameters also through the samples $y_j$. For its gradient to be correct, the samples must be drawn with the [reparameterization trick](/notes/generative-models/vae#the-reparameterization-trick), $y = \mu + \sigma\varepsilon$ with $\varepsilon \sim \mathcal N(0, 1)$, so that backpropagation sees how they move when $\mu$ and $\sigma$ change. The JS runs quoted above draw the $y_j$ without it, so their gradients miss this dependence.
+Their average is
 
-Boundedness has a second cost. When $Q$ and $P$ barely overlap, JS is already close to its maximum $\ln 2$ and almost flat, so its gradient is weak. For the 1-D target, at the initial $\mathcal N(0,1)$ it equals $0.645$ nats, already $93\%$ of $\ln 2$. The same saturation is the reason the original minimax GAN objective, which equals $2\,D_{\mathrm{JS}} - \ln 4$ when the discriminator is optimal, gives vanishing generator gradients ([Arjovsky and Bottou, 2017](#references), Theorem 2.4; see the [GAN note](/notes/generative-models/gans#step-2-substitute-the-optimal-discriminator-and-recognize-js) and [Wasserstein GANs](/notes/generative-models/wgan)).
+$$
+D_{\mathrm{JS}} \approx \tfrac34\log_2\tfrac43 \approx 0.311 \text{ bits}.
+$$
+
+Trained runs agree. A fit of the 2-D mixture with Adam (learning rate $0.1$, 5000 steps, 5000 fresh samples per step), started from $\boldsymbol\mu = (-2,-2)$, ends near $(-4.99, -5.06)$ with a nearly unit covariance, on the mode at $(-5,-5)$. In 1-D, plain gradient descent from $\mathcal N(0, 1)$ ends at $\mu = -2.995$, $\sigma = 0.495$ after 1800 steps, on the nearer mode; $Q$'s peak density there, $0.81$, is twice the target's $0.40$. Both runs minimized a weighted variant, $0.7\,D_{\mathrm{KL}}(P\,\|\,M) + 0.3\,D_{\mathrm{KL}}(Q\,\|\,M)$. With the two terms above its one-mode value is $(0.7 \cdot \tfrac12 + 0.3)\log_2\tfrac43 = 0.65\log_2\tfrac43 \approx 0.270$ bits. The final 1-D Gaussian has exactly this value, $0.270$ bits by numerical integration. The 2-D run's last estimate, $0.2734$ bits, is a sample estimate whose standard deviation at 5000 samples is about $0.008$ bits, so it agrees with $0.270$ up to noise.
+
+Each half of JS is an expectation under its own distribution:
+
+$$
+\begin{aligned}
+D_{\mathrm{JS}}(P\,\|\,Q) &= \tfrac12\,\mathbb E_{x\sim P}\Big[\log\frac{p(x)}{m(x)}\Big] \\
+&\quad + \tfrac12\,\mathbb E_{y\sim Q}\Big[\log\frac{q(y)}{m(y)}\Big],
+\end{aligned}
+$$
+
+with $m = \tfrac12(p + q)$ evaluated by `logaddexp`. The estimate needs samples of both $P$ and $Q$. The second term depends on $Q$'s parameters also through the samples $y_j$, so they must be drawn with the [reparameterization trick](/notes/generative-models/gaussian-distributions#the-reparameterization-view), $y = \mu + \sigma\varepsilon$; the runs above drew them without it, so their gradients miss that dependence.
+
+Boundedness has a second cost. When $Q$ and $P$ barely overlap, JS is already close to its maximum $\ln 2$ and almost flat. At the initial $\mathcal N(0, 1)$ it is $0.645$ nats, $93\%$ of $\ln 2$, and its gradient in $\mu$ is $0.070$ against $5.5$ for the forward KL. The same saturation gives the original minimax GAN its vanishing generator gradients ([Arjovsky and Bottou, 2017](#references), Theorem 2.4; see the [GAN note](/notes/generative-models/gans#step-2-substitute-the-optimal-discriminator-and-recognize-js) and [Wasserstein GANs](/notes/generative-models/wgan)).
 
 ### A least-squares loss on densities is sensitive to scale
 
-A naive alternative compares density *values* directly:
+A naive alternative compares density values directly, at samples $x_i \sim P$:
 
 $$
-\mathcal L_{\mathrm{LS}} = \frac1N \sum_{i=1}^{N} \bigl(q(x_i) - p(x_i)\bigr)^2 , \qquad x_i \sim P .
+\mathcal L_{\mathrm{LS}} = \frac1N \sum_{i=1}^{N} \bigl(q(x_i) - p(x_i)\bigr)^2 .
 $$
 
-Density values depend on the scale of the data. If every coordinate is stretched by a factor $c$, all densities are divided by $c^{d}$ in $d$ dimensions. The squared differences, and with them the loss, then shrink by $c^{2d}$, and the gradients shrink by a similar power. With plain SGD a learning rate that works for one scale fails for another. Adaptive optimizers such as Adam absorb a constant factor, but not the second problem: when $Q$ does not overlap $P$, $q(x_i) \approx 0$ at the data points and the loss stays near the constant $\mathbb E_P[p(x)^2]$, which gives almost no gradient. KL has neither problem. The ratio $p/q$, and hence the KL, does not change under rescaling. And $-\log q(x_i)$ grows like $(x_i-\mu)^2/2\sigma^2$ far from $\mu$, so the KL gradient grows rather than vanishes as $Q$ moves away from $P$ ($\lvert\partial/\partial\mu\rvert = 5.5$ at the initial $Q$ in the table below).
+Density values depend on the units of the data. Stretching every coordinate by $c$ divides all densities by $c^{d}$ in $d$ dimensions, so the loss shrinks by $c^{2d}$. Adam absorbs a constant factor, but not the second problem: when $Q$ does not overlap $P$, $q(x_i) \approx 0$ at the data points, and the loss sits near the constant $\mathbb E_P[p(x)^2]$ with almost no gradient. KL has neither problem. The ratio $p/q$ does not change under rescaling, and $-\log q(x_i)$ grows like $(x_i-\mu)^2/2\sigma^2$ far from $\mu$, so the pull grows as $Q$ moves away.
 
-The least-squares loss also has several minima. For the 1-D target its global minimum is the wide Gaussian of the table below ($\sigma \approx 2.53$), but a Gaussian on one mode, $\mathcal N(-3, 1.21^2)$, is a local minimum (loss $0.0495$ against $0.0470$). In 2-D, a Gaussian on one mode, $\mathcal N\big((4,4), 1.58^2\,\mathbf I\big)$, is a local minimum with loss $0.00113$; the lowest value a numerical search finds is $0.00102$, for a Gaussian centred at $(-0.5,-0.5)$ and stretched along the diagonal (standard deviation $6.5$ along it, $0.43$ across). Which minimum gradient descent reaches depends on the start. An Adam fit (learning rate $0.001$, 5000 steps, 1000 samples) started from $\mathcal N\big((1,1), \mathbf I\big)$, which overlaps only the mode at $(4,4)$, ends with $Q$ centred on that mode and wider than it; the mode at $(-5,-5)$ is ignored. Its samples contribute almost nothing to the gradient, because $q \approx 0$ there. $Q$ comes out wider than the component because a Gaussian holding all its mass on a mode of weight $\tfrac12$ would be twice as dense as $P$ there, and widening lowers its peak. A larger learning rate or four times as many steps end on the same mode.
+The least-squares loss also has several minima. In 1-D its global minimum, $0.0470$, is a wide Gaussian with $\sigma \approx 2.53$, close to the moment-matched one, and a Gaussian on one mode, $\mathcal N(-3.01, 1.21^2)$, is a local minimum at $0.0495$. In 2-D a Gaussian on one mode, $\mathcal N\big((4,4), 1.58^2\,\mathbf I\big)$, is a local minimum at $0.00113$, while the global one, $0.00102$, is centred at $(-0.5,-0.5)$ and stretched along the diagonal (standard deviation $6.5$ along it, $0.43$ across). An Adam fit started from $\mathcal N\big((1,1), \mathbf I\big)$, which overlaps only the mode at $(4,4)$, ends on that mode, wider than it; the other mode contributes almost no gradient, because $q \approx 0$ there.
 
 ### The four losses side by side
 
-1-D target above, natural logarithms. The least-squares loss $\mathbb E_P\big[(q-p)^2\big]$ is not in nats: it has units of squared density, so its value depends on the scale of the data.
+For the 1-D target, natural logarithms; the least-squares loss has units of squared density.
 
 | Single Gaussian $Q$ | $D_{\mathrm{KL}}(P\,\Vert\,Q)$ | $D_{\mathrm{KL}}(Q\,\Vert\,P)$ | $D_{\mathrm{JS}}$ | LS |
 | --- | --- | --- | --- | --- |
 | initial $\mathcal N(0, 1)$ | $17.88$ | $19.50$ | $0.645$ | $0.0901$ |
-| moment-matched $\mathcal N(-5.5,\, 6.5)$, $\sigma \approx 2.55$ | $\mathbf{0.936}$ | $3.709$ | $0.255$ | $\mathbf{0.0470}$ |
+| moment-matched $\mathcal N(-5.5,\, 6.5)$ | $\mathbf{0.936}$ | $3.709$ | $0.255$ | $\mathbf{0.0470}$ |
 | one mode $\mathcal N(-3,\, 0.5^2)$ | $24.31$ | $\mathbf{0.693}$ | $\mathbf{0.216}$ | $0.0919$ |
 | $\lvert\partial/\partial\mu\rvert$ at the initial $Q$ | $5.5$ | $12.0$ | $0.070$ | $0.0045$ |
 
-Bold marks the best of the three candidates for each loss. For KL, reverse KL and JS the bold entry is also the global optimum of the loss over all $(\mu, \sigma)$, found by grid search; the least-squares optimum is at $\sigma \approx 2.53$, essentially the moment-matched Gaussian. The values were computed by numerical integration. Forward KL and least squares prefer the wide Gaussian; reverse KL and JS prefer one mode. The last row shows how strongly each loss pulls the initial $Q$ towards the data: KL gives a strong signal, while JS and least squares are nearly flat.
+Bold marks the best candidate for each loss; for the two KLs and JS it is also the global optimum over all $(\mu, \sigma)$. Forward KL and least squares prefer the wide Gaussian, reverse KL and JS one mode. The last row shows how hard each loss pulls the initial $Q$: KL strongly, JS and least squares hardly at all.
 
-A forward-KL fit with Adam (learning rate $0.01$, 1000 fixed samples) lands on the moment-matched Gaussian: $\mu = -5.494$, $\sigma = 2.566$, with an estimated $1.300$ bits. The exact value at the optimum is $0.936$ nats, or $1.350$ bits; the difference of $0.05$ bits is less than two standard deviations of a 1000-sample estimate (about $0.03$ bits each).
+A forward-KL fit with Adam (learning rate $0.01$, 1000 fixed samples) lands on the moment-matched Gaussian, $\mu = -5.494$ and $\sigma = 2.566$, with an estimated $1.300$ bits against the exact $0.936$ nats, or $1.350$ bits. The difference, $0.050$ bits, is 1.6 times the standard deviation of a 1000-sample estimate, which is $0.032$ bits.
 
-### How the gradients behave during training
+The families of the course inherit these preferences. Flows and autoregressive models are trained by maximum likelihood, the forward KL, and spread mass rather than drop a mode. The VAE's encoder is fitted in the reverse direction and tends to under-cover its posterior. The original GAN minimizes JS with an optimal discriminator, and its samples are sharp while modes go missing; in GANs the alternating optimization adds [mode collapse](/notes/generative-models/gans#mode-collapse-and-how-to-fight-it) of its own.
 
-*Optional depth: how the gradient magnitudes evolve over two training runs, one of them with an incomplete JS estimator. The rest of the note does not depend on it.*
+## What you should remember
 
-The last row of the table is a snapshot at the start. Over a whole fit, KL and JS gradients behave differently (1-D target, magnitudes in bits per unit of $\mu$ and of $\log\sigma$):
+- The loss is a Monte Carlo average of $\log p - \log q$ over samples of $P$; its gradient needs only $\log q$, which makes it maximum likelihood.
+- An estimate on the training samples is biased low, by about $k/(2N)$ nats for $k$ parameters.
+- KL is finite only if $Q$ has mass wherever $P$ does, the tails are integrable and both are normalized.
+- Forward KL covers every mode and blurs; reverse KL and JS pick one mode and stay sharp.
+- JS saturates at $\ln 2$ and least squares depends on units; far from the data both give almost no gradient.
 
-- **Forward KL on fixed samples: large, smooth, zero at the end.** At the initial $\mathcal N(0, 1)$ the gradients are $7.9$ for $\mu$ and $51.6$ for $\log\sigma$ (from the gradient formulas above, $5.5$ and $35.75$ nats, divided by $\ln 2$). The $\log\sigma$ gradient, by far the larger, collapses first, once $Q$ is wide enough to cover both modes. The $\mu$ gradient shrinks more slowly and stays at a few tenths of a bit while $Q$ moves across. Because the samples are fixed, the loss is a deterministic function of $(\mu, \log\sigma)$, and both gradients fall to zero as the fit reaches its minimum.
-- **JS with fresh samples: small and noisy.** This run is a diagnostic, not a measurement of the true JS gradient: it draws the $y_j$ without the reparameterization trick, so its gradients miss the dependence of the second term on the samples. In the plain gradient-descent run above (learning rate $0.1$, 5000 new samples of $P$ and of $Q$ at every step), no gradient exceeds about $0.11$ bits. The magnitudes peak twice, around step 40 while $Q$ widens and around step 720 when it contracts onto the mode at $-3$. After that they do not decay but fluctuate between $0$ and about $0.04$ bits until the last of the 2000 steps. Each step estimates the loss from new samples, so its gradient carries Monte Carlo noise that does not vanish at the optimum, and with a constant learning rate the parameters keep responding to it.
+## Code
 
-Three effects are mixed here and should be kept apart. The geometry of the objective: JS is nearly flat far from the target, which the last row of the table shows from exact integrals, while KL gives a strong signal there and a clean stop at the optimum. The estimator: the JS run's gradients are incomplete, so the exact shape of its trajectory says little about the true JS gradient. The sampling: with fresh samples at every step, any estimated gradient keeps Monte Carlo noise at the optimum, so a fit with a constant learning rate never settles exactly.
+The 1-D fit of this note in NumPy, with the gradients of "What the gradients are" in place of autograd, followed by the table of the four losses by numerical integration. It uses NumPy and SciPy and runs in a few seconds.
 
-<aside class="callout"><strong>Takeaway.</strong> The choice of divergence decides what a model does when it cannot represent the data exactly, which is always the case for real data. Forward KL (maximum likelihood) covers everything and blurs; reverse KL and JS pick a subset and stay sharp, at the risk of missing modes. This trade-off is one explanation offered for the blurry samples of likelihood-trained models and for the sharper but less diverse samples of GANs ([Huszár, 2015](#references); [Theis, van den Oord and Bethge, 2016](#references)); in GANs, mode collapse also comes from the alternating optimization (see the [GAN note](/notes/generative-models/gans#training-as-a-picture)).</aside>
+```python
+import numpy as np
+from scipy.stats import norm
+
+# target P: equal mixture of N(-3, 0.5^2) and N(-8, 0.5^2); half of the samples from each
+rng = np.random.default_rng(0)
+x = np.concatenate([rng.normal(-3, 0.5, 500), rng.normal(-8, 0.5, 500)])
+log_p = lambda t: np.logaddexp(np.log(0.5) + norm.logpdf(t, -3, 0.5),
+                               np.log(0.5) + norm.logpdf(t, -8, 0.5))
+
+# forward KL on fixed samples, plain gradient descent on (mu, log sigma), from Q = N(0, 1)
+mu, log_s, lr = 0.0, 0.0, 0.05
+for step in range(3000):
+    s = np.exp(log_s)
+    g_mu = -np.mean(x - mu) / s**2                 # d loss / d mu
+    g_log_s = np.mean(1 - (x - mu)**2 / s**2)      # d loss / d log sigma
+    mu, log_s = mu - lr * g_mu, log_s - lr * g_log_s
+s = np.exp(log_s)
+kl = np.mean(log_p(x) - norm.logpdf(x, mu, s))     # the loss, in nats
+print(round(mu, 3), round(s, 3), round(x.mean(), 3), round(x.std(), 3), round(kl, 3))
+
+# the four losses for three candidate Gaussians, by numerical integration
+grid = np.linspace(-40, 30, 400_001)
+dx = grid[1] - grid[0]
+lp = log_p(grid)
+p = np.exp(lp)
+def losses(m, s):
+    lq = norm.logpdf(grid, m, s)
+    q = np.exp(lq)
+    lm = np.logaddexp(lp, lq) - np.log(2)          # log of the mixture M = (P + Q) / 2
+    fwd = np.sum(p * (lp - lq)) * dx
+    rev = np.sum(q * (lq - lp)) * dx
+    js = 0.5 * np.sum(p * (lp - lm)) * dx + 0.5 * np.sum(q * (lq - lm)) * dx
+    ls = np.sum(p * (q - p)**2) * dx
+    return np.round([fwd, rev, js, ls], 4)
+for m, sd in [(0, 1), (-5.5, np.sqrt(6.5)), (-3, 0.5)]:
+    print(losses(m, sd))
+```
+
+```text
+-5.524 2.558 -5.524 2.558 0.961
+[17.875  19.5     0.6455  0.0901]
+[0.9359 3.7091 0.2554 0.047 ]
+[24.3069  0.6931  0.2158  0.0919]
+```
+
+Gradient descent stops exactly at the sample mean and the biased sample standard deviation, the maximum-likelihood fit, with an estimated KL of $0.961$ nats against the exact $0.936$ at the moment-matched Gaussian.
 
 ## Notebook
 
-The experiments follow the [Distances between distributions notebook](https://github.com/HSE-LAMBDA/DeepGenerativeModels/blob/spring-2025-long/seminars/01_metrics-and-distances/distances.ipynb) (HSE-LAMBDA *Deep Generative Models*, pinned commit; cell numbers count every cell, markdown included, from 1). The run results quoted above come from its saved outputs; the exact divergences and gradients, the minima of the least-squares loss and the simulation of negative estimates were computed separately, as were the least-squares runs with `px` recomputed and the resumed KL gradient curve. Cells 1–11 (helpers, the single-Gaussian target and the initial $Q$) are described in the [Gaussian note](/notes/generative-models/gaussian-distributions#notebook).
+The experiments follow the [Distances between distributions notebook](https://github.com/HSE-LAMBDA/DeepGenerativeModels/blob/spring-2025-long/seminars/01_metrics-and-distances/distances.ipynb) of the HSE-LAMBDA *Deep Generative Models* course. Parts are named by the notebook's headings (its cells count from 1, markdown included); the numbers quoted are saved outputs of the run kept with the course. The helpers and the first target are described in the [Gaussian note](/notes/generative-models/gaussian-distributions#notebook).
 
-- **Cells 12–15**: the sample estimate of $D_{\mathrm{KL}}(P\,\|\,Q)$ (`kl_loss`, in bits; its `weights` argument takes importance weights and defaults to ones) and an Adam fit (learning rate 0.1, 5000 steps) of the 2-D model to the single target $\mathcal N((-5,-5), \mathbf I)$ on the 1000 samples `x` of cell 8. The last plot, at step 4800, is titled `KL = -0.0020`.
-- **Cells 16–19**: the two-component 2-D mixture with means $(-5,-5)$ and $(4,4)$, and the same KL fit applied to it, on 2000 fixed samples. `log_prob_mixture` uses `torch.logaddexp`. `sample_from_mixture` takes exactly half of the samples from each component, a stratified sample; i.i.d. draws from the mixture would split them binomially. The last plot, at step 4800, shows `KL mixture = 1.6688`.
-- **Cells 20–23**: the JS divergence and its Monte Carlo estimate (`js_div`: `x = P.sample(...)` for the first term, `y = sample(Q, ...)` for the second, `torch.logaddexp` for $\log m$), and a JS fit of the mixture started from $\boldsymbol\mu = (-2,-2)$ with 5000 samples per step. The last printout, at step 4900, reads `JS loss = 0.2734` and `mu = tensor([-4.9879, -5.0583])`. Two implementation details matter when re-running it. `js_div` returns the weighted $0.7/0.3$ combination rather than the symmetric ½–½ JS. It also draws the samples of $Q$ with `sample()` rather than `rsample()`, so the gradient ignores how those samples move when $Q$ changes.
-- **Cells 24–26**: `LSE_loss`, the mean squared error between $q(x_i)$ and $p(x_i)$, and an Adam fit (learning rate 0.001, 5000 steps) started from $\mathcal N((1,1), \mathbf I)$. The notebook cites the least-squares GAN paper ([Mao et al., 2017](#references)) as background, although that paper applies least squares to discriminator outputs, not to densities. The training cell draws fresh samples `x` but reuses the `px` left over from the JS cell, the target densities at 1000 *other* points, so `px` must be recomputed for the loss to compare the two densities at the same points. The last plot, at step 4800, reads `LSE = 0.0013`, with $Q$ on the mode at $(4,4)$. With `px` recomputed, the same fit still ends on that mode, at a loss of about $0.0011$ in a re-implementation.
-- **Cells 27–38**: the helpers of the code above (`get_parameters_1d` and `create_distr_1d` in cell 29, `target_1d` in cells 30–31) and the 1-D mixture $\tfrac12\mathcal N(-3, 0.5^2) + \tfrac12\mathcal N(-8, 0.5^2)$, fitted with KL (Adam, learning rate 0.01, 2000 steps, 1000 fixed samples) and from $\mathcal N(0, 1)$ with JS (SGD, learning rate 0.1, 2000 steps), with the gradient magnitudes of $\mu$ and $\log\sigma$ plotted over training (cells 35 and 38). The JS fit uses the same weighted `js_div`, with 5000 fresh samples per step. The saved plots show the KL fit at step 1500 (`Loss (KL) = 1.3001, mu = -5.494, std = 2.566`) and the JS fit at step 1800 (`JS = 0.2698`, `mu = -2.995, std = 0.495`). Cell 35's legend says `|grad sigma|`, but the curve is the gradient with respect to $\log\sigma$, as cell 38 labels it.
-- **The saved KL gradient curve does not start from $\mathcal N(0, 1)$.** Cell 33 creates the parameters at $\mathcal N(0, 1)$; cell 34 does not re-create them. The curve of cell 35 starts at $\lvert\partial/\partial\mu\rvert \approx 0.85$ and $\lvert\partial/\partial\log\sigma\rvert \approx 3.6$ bits, where a start from $\mathcal N(0, 1)$ gives $7.9$ and $51.6$. These are the values a fresh run reaches after about 200 steps, at $\mu \approx -1.1$, $\sigma \approx 2.7$, and the execution counts skip a number between cells 33 and 34: the saved run continued from where an earlier, interrupted run of cell 34 had left the parameters. A re-implementation that resumes from that point with a new optimizer reproduces the saved curve: $\lvert\partial/\partial\log\sigma\rvert$ falls to about $0$ within roughly 100 steps, $\lvert\partial/\partial\mu\rvert$ stays near $0.25$ until about step 400 and reaches $0$ by about step 750, and the fit is at $\mu \approx -5.50$, $\sigma \approx 2.56$ by step 1500. A fresh run is slower: by step 1500 it is still at $\mu \approx -4.1$. Re-run cell 33 before cell 34 to get the intended start.
+- The single-Gaussian part defines `kl_loss`, the sample estimate of KL in bits with optional importance weights, and fits the 2-D model to $\mathcal N((-5,-5), \mathbf I)$ with Adam (learning rate 0.1) on 1000 fixed samples; the last plot reads `KL = -0.0020` at step 4800.
+- The multimodal part fits the same model to the 2-D mixture on 2000 fixed samples, half from each component, and ends at `KL mixture = 1.6688`.
+- The Jensen–Shannon part estimates JS from samples of both distributions and ends at `JS loss = 0.2734` with `mu = [-4.9879, -5.0583]`. Its `js_div` returns the $0.7/0.3$ weighting and draws $Q$'s samples with `sample()` instead of `rsample()`, so the gradient misses their dependence on $Q$.
+- The MSE part fits the density least-squares loss with Adam (learning rate 0.001) from $\mathcal N((1,1), \mathbf I)$ and ends on the mode at $(4,4)$ with `LSE = 0.0013`. The training cell draws fresh samples but reuses `px` from the JS part, the target densities at other points; recompute `px` before running it.
+- The 1-D part fits the two-mode mixture with KL (Adam, learning rate 0.01, 1000 fixed samples; `mu = -5.494, std = 2.566` at step 1500) and with JS (SGD, learning rate 0.1; `mu = -2.995, std = 0.495` at step 1800), and plots the gradient magnitudes. The KL training cell does not re-create the parameters, and the execution counts show it continued an interrupted run, so its gradient curve starts mid-fit; re-create the parameters before re-running it.
 
 ## Next
 
-The model so far had five parameters and a closed-form density. Real generative models replace the five parameters with a neural network, and many give up the closed-form density. Training such networks brings its own machinery. The [next note](/notes/generative-models/training-background) collects the pieces used throughout the course: batch normalization, how gradients flow through deep stacks of layers, and the shapes of convolutions.
+The model so far had five parameters and a closed-form density. Real generative models replace the five parameters with a neural network, and many give up the closed-form density. The [next note](/notes/generative-models/training-background) collects the network machinery used throughout the course: normalization layers, how gradients flow through deep stacks, and the shapes of convolutions.
 
 ## References
 
 - S. Kullback, R. A. Leibler. [On Information and Sufficiency](https://doi.org/10.1214/aoms/1177729694). *Annals of Mathematical Statistics*, 22(1), 1951.
 - T. M. Cover, J. A. Thomas. [*Elements of Information Theory*](https://doi.org/10.1002/047174882X), 2nd ed. Wiley, 2006. §8.5: relative entropy for continuous distributions.
 - C. M. Bishop. [*Pattern Recognition and Machine Learning*](https://www.microsoft.com/en-us/research/publication/pattern-recognition-machine-learning/). Springer, 2006. §10.1.2 and Figure 10.3: forward versus reverse KL on a bimodal target; §10.7: moment matching.
-- K. P. Murphy. [*Probabilistic Machine Learning: Advanced Topics*](https://probml.github.io/pml-book/book2.html). MIT Press, 2023. §5.1: KL divergence, its properties and the forward/reverse distinction.
+- K. P. Murphy. [*Probabilistic Machine Learning: Advanced Topics*](https://probml.github.io/pml-book/book2.html). MIT Press, 2023. §5.1: KL divergence, its properties, and forward versus reverse KL on a bimodal target (§5.1.4).
+- R. Isachenko. [*Deep Generative Models*](https://github.com/r-isachenko/2025-DGM-MIPT-YSDA-course), MIPT/YSDA, 2025. Lecture 5: forward KL, reverse KL and JS fitted to a two-Gaussian mixture.
 - T. Minka. [Divergence measures and message passing](https://www.microsoft.com/en-us/research/publication/divergence-measures-and-message-passing/). Microsoft Research Technical Report MSR-TR-2005-173, 2005.
 - F. Huszár. [How (not) to train your generative model: scheduled sampling, likelihood, adversary?](https://arxiv.org/abs/1511.05101) arXiv:1511.05101, 2015.
 - L. Theis, A. van den Oord, M. Bethge. [A note on the evaluation of generative models](https://arxiv.org/abs/1511.01844). ICLR, 2016.
 - M. Arjovsky, L. Bottou. [Towards principled methods for training generative adversarial networks](https://arxiv.org/abs/1701.04862). ICLR, 2017. §2, Theorem 2.4: vanishing gradients of the minimax generator loss.
 - D. P. Kingma, J. Ba. [Adam: A method for stochastic optimization](https://arxiv.org/abs/1412.6980). ICLR, 2015.
 - S. S. Wilks. [The large-sample distribution of the likelihood ratio for testing composite hypotheses](https://doi.org/10.1214/aoms/1177732360). *Annals of Mathematical Statistics*, 9(1), 60–62, 1938.
-- X. Mao, Q. Li, H. Xie, R. Y. K. Lau, Z. Wang, S. P. Smolley. [Least squares generative adversarial networks](https://arxiv.org/abs/1611.04076). ICCV, 2017.
 - HSE-LAMBDA, *Deep Generative Models* course repository: [`distances.ipynb`](https://github.com/HSE-LAMBDA/DeepGenerativeModels/blob/spring-2025-long/seminars/01_metrics-and-distances/distances.ipynb).

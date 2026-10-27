@@ -1,173 +1,145 @@
 ---
 title: "Autoencoding GANs: adversarial autoencoders and α-GAN"
-description: "How to give a GAN an encoder and a VAE sharp samples: adversarial autoencoders replace the KL term with a discriminator on codes, α-GAN also replaces the pixel likelihood with an image discriminator while keeping an L1 reconstruction, α-WGAN trains both discriminators as WGAN-GP critics, how the four networks are trained and evaluated, and why latent interpolation should follow the sphere (slerp) rather than the chord (lerp)."
+description: "How to give a GAN an encoder and a VAE sharp samples: a discriminator on codes, a second one on images, Wasserstein critics for both, and why latent interpolation should follow the sphere."
 course: generative-models
 section: GANs
-order: 12
+order: 17
 status: published
-tags: [alpha-gan, adversarial-autoencoder, code-discriminator, aggregate-posterior, wgan-gp, latent-interpolation, slerp]
+tags: [alpha-gan, adversarial-autoencoder, code-discriminator, aggregate-posterior, density-ratio, wgan-gp, latent-interpolation, slerp]
 prerequisites: [Variational autoencoders, Generative adversarial networks, Wasserstein GANs and Lipschitz constraints]
 ---
 
 import AlphaFlow from '../../../components/figures/alpha-gan/AlphaFlow.astro';
 import LerpSlerp from '../../../components/figures/alpha-gan/LerpSlerp.astro';
 
-The [StyleGAN note](/notes/generative-models/stylegan) ended with control over generation but no way back: to find the code of a real image, StyleGAN has to solve an optimization problem. The WGAN and the scaling recipes left two older problems where they were. The two families of models met so far each solve half of the task. The [VAE](/notes/generative-models/vae) has an encoder, so every image has a code, and its reconstruction term forces the decoder to account for every training image; but its samples are blurry. The [GAN](/notes/generative-models/gans) has sharp samples, but there is no way back from an image to its code, and nothing stops the generator from dropping modes of the data. This note combines the two. The **adversarial autoencoder** replaces the VAE's KL term with a discriminator on codes. **α-GAN** also replaces the pixel likelihood with a discriminator on images, keeping an $L_1$ reconstruction term so that the encoder still guards against mode collapse. **α-WGAN** trains both discriminators as WGAN-GP critics.
+You have two photographs and want the sequence of images halfway between them. A GAN draws sharp images, but it has no way back from a photograph to its code; even [StyleGAN](/notes/generative-models/stylegan) must solve an optimization problem for each one. A [VAE](/notes/generative-models/vae) has an encoder, so every image has a code, but its samples are blurry. And nothing ties a GAN to every training image, so it can drop whole modes of the data.
 
-**Notation.** $x \in \mathbb R^D$ is an image and $P$ the data distribution, as in the WGAN note. $z \in \mathbb R^d$ is a code, with prior $p(z) = \mathcal N(0, I)$. The **encoder** $E$ is a deterministic network, $\hat z = E(x)$ is the code of $x$, the **generator** (decoder) $G$ maps codes to images, $\hat x = G(E(x))$ is the reconstruction of $x$, and $G(z)$ with $z \sim p(z)$ is a sample. The **aggregate posterior** $q(z)$ is the distribution of $E(x)$ for $x \sim P$. $D: \mathbb R^D \to \mathbb R$ is the image discriminator and $C: \mathbb R^d \to \mathbb R$ the code discriminator. Both output a real number, their **score**: a logit when they are trained as classifiers, so that $\sigma(D(x))$ is the probability that $x$ is real ($\sigma$ is the logistic sigmoid; in the GAN note $D(x)$ was this probability itself), and a critic value when they are trained with the Wasserstein loss. For $C$, "real" means drawn from the prior. $\lVert v \rVert_1 = \sum_i \lvert v_i \rvert$; implementations usually average over pixels instead of summing, which only rescales the weight $\lambda$ of the reconstruction term.
+Can one model keep the encoder and the coverage of a VAE and the sharpness of a GAN? The models below keep the VAE's encoder and reconstruction term and hand the troublesome parts of its objective to discriminators.
 
 ## What each family is missing
 
-The VAE trains its encoder and decoder on the ELBO, a reconstruction term minus a KL term ([VAE note](/notes/generative-models/vae#where-the-elbo-comes-from)):
+The VAE maximizes the ELBO, a reconstruction term minus a KL term ([VAE note](/notes/generative-models/vae#where-the-elbo-comes-from)):
 
 $$
 \mathcal L(x) = \mathbb E_{q(z \mid x)}\big[\log p(x \mid z)\big] - D_{\mathrm{KL}}\big(q(z \mid x)\,\|\,p(z)\big) .
 $$
 
-Each term has a cost and a benefit.
+With a Gaussian decoder $p(x \mid z) = \mathcal N(G(z), s^2 I)$ the first term is $-\lVert x - G(z)\rVert^2 / (2s^2)$ plus a constant, a squared error. Where several images are plausible for one code, its optimum is their average, since the derivative $2(a - \mathbb E x)$ of $\mathbb E\lVert x - a\rVert^2$ vanishes at $a = \mathbb E x$; and the average is blurry ([VAE note](/notes/generative-models/vae#what-the-organized-latent-space-buys)). Its benefit is coverage: every training image must be rebuilt from its code, so the model cannot quietly ignore part of the data.
 
-- **The likelihood term** with a Gaussian decoder is a squared error. Where several images are plausible for one code, its optimum is their average, which is blurry ([VAE note](/notes/generative-models/vae#what-the-organized-latent-space-buys)). Its benefit is a pressure toward coverage: every training image must be reconstructed from its code, which discourages the model from ignoring parts of the data. It is not a guarantee, since a finite trained model can still leave regions of the data poorly covered, and how blurry the result is depends on the decoder's likelihood and on how uncertain the image is given its code.
-- **The KL term** charges every image for an informative code. Averaged over the data, it splits into the mutual information between images and codes, which good reconstruction needs to be large, and the KL from the aggregate posterior to the prior, which is what sampling needs to be small ([VAE note](/notes/generative-models/vae#what-is-fixed-the-prior-not-the-posterior)). Only the second part is useful for generation.
+The KL term is worth splitting. Write $P$ for the data distribution and $q(z) = \mathbb E_{x \sim P}\, q(z \mid x)$ for the **aggregate posterior**, the distribution of codes over the whole dataset. Averaged over the data, the KL term splits into two parts, the "ELBO surgery" of [Isachenko (2025)](#references):
 
-A GAN avoids both terms. Its discriminator judges whole images, so blur is easy to detect and the samples are sharp. But a GAN has no encoder: it cannot reconstruct an image, find its code, or interpolate between two real images. And a GAN has no per-example reconstruction constraint: nothing ties the generator to each training image. Its ideal distributional objective, JS at the optimal discriminator, does penalize missing mass, but the alternating game does not enforce that ideal, so the generator can [collapse onto a few modes](/notes/generative-models/gans#mode-collapse-and-how-to-fight-it). With the non-saturating loss and an optimal discriminator, the generator's expected gradient contains a reverse KL, which punishes fake-looking samples heavily and missing modes only lightly ([GAN note](/notes/generative-models/gans#which-generator-loss-is-used-in-practice)). The Wasserstein loss of the previous note changes the gradient, but it adds no encoder, and the generator still learns only through the critic's values at its own samples, so nothing ties it to every training image.
+$$
+\begin{aligned}
+&\mathbb E_{x}\, D_{\mathrm{KL}}\big(q(z \mid x) \,\|\, p(z)\big) \\
+&\quad = I_q(x; z) + D_{\mathrm{KL}}\big(q(z) \,\|\, p(z)\big) .
+\end{aligned}
+$$
 
-The models below keep the VAE's encoder and its reconstruction term, and hand the troublesome parts of the ELBO to discriminators: first the KL term, then the likelihood.
+The first part, the mutual information between images and codes, charges every image for an informative code, although good reconstruction needs that information. Only the second part, the mismatch between the cloud of codes and the prior, matters for sampling: prior samples decode well only if they land where the codes of real images lie. The [VAE note](/notes/generative-models/vae#what-is-fixed-the-prior-not-the-posterior) derives the split by writing $q(z \mid x)/p(z) = \big(q(z)/p(z)\big) \cdot \big(q(z \mid x)/q(z)\big)$ inside the logarithm and averaging each factor's log over images and codes: the first gives the marginal KL, the second the mutual information.
+
+A GAN avoids both terms. Its discriminator judges whole images, so blur is easy to detect and the samples are sharp. But there is no encoder, and there is no per-image constraint: the generator learns only through the discriminator's verdicts on its own samples, so it can [collapse onto a few modes](/notes/generative-models/gans#mode-collapse-and-how-to-fight-it). The Wasserstein loss of the [previous note](/notes/generative-models/wgan) changes the gradient but adds neither an encoder nor a tie to each training image.
 
 ## Adversarial autoencoders: a discriminator on codes
 
-The **adversarial autoencoder** (AAE) of [Makhzani et al. (2015)](#references) is an ordinary autoencoder with a third network attached to its code. The code distribution it shapes is the aggregate posterior (Eq. 1),
+The **adversarial autoencoder** (AAE) of [Makhzani et al. (2015)](#references) is an ordinary autoencoder with a third network attached to its code. The **encoder** $E$ maps an image to a code $\hat z = E(x)$, the **generator** (decoder) $G$ maps it back to the reconstruction $\hat x = G(E(x))$, and the **code discriminator** $C$ tells codes from samples of the prior $p(z) = \mathcal N(0, I)$. For a deterministic encoder, $q(z)$ is the distribution of $E(x)$.
+
+Each minibatch has two phases. In the reconstruction phase, $E$ and $G$ minimize $\mathbb E_{x}\lVert x - G(E(x))\rVert_2^2$. In the regularization phase, $C$ learns to label prior samples real and codes fake,
 
 $$
-q(z) = \int q(z \mid x)\, P(x)\, dx ,
+\begin{aligned}
+\mathcal L_C ={}& -\mathbb E_{z \sim p}\log \sigma\big(C(z)\big)\\
+&- \mathbb E_{x \sim P}\log\Big(1 - \sigma\big(C(E(x))\big)\Big),
+\end{aligned}
 $$
 
-which for a deterministic encoder is simply the distribution of $E(x)$. Training alternates two phases on every minibatch (Section 2).
-
-1. **Reconstruction phase.** $E$ and $G$ minimize the reconstruction error, the squared error in the paper's experiments: $\mathbb E_{x \sim P}\lVert x - G(E(x))\rVert_2^2$.
-2. **Regularization phase.** The code discriminator learns to label prior samples real and codes fake,
-
-   $$
-   \begin{aligned}
-   \mathcal L_C ={}& -\mathbb E_{z \sim p}\log \sigma\big(C(z)\big)\\
-   &- \mathbb E_{x \sim P}\log\Big(1 - \sigma\big(C(E(x))\big)\Big),
-   \end{aligned}
-   $$
-
-   and then the encoder, which plays the generator of this small GAN, is updated to fool it, for example with the non-saturating loss $-\mathbb E_{x}\log\sigma\big(C(E(x))\big)$.
+and then the encoder, the generator of this small GAN, is updated to fool it, for example with the non-saturating loss $-\mathbb E_{x}\log\sigma\big(C(E(x))\big)$. Here $C$ outputs a real number, its **score**, and $\sigma$ is the logistic sigmoid, so $\sigma(C(z))$ is the probability that $z$ came from the prior.
 
 ### What the code discriminator matches
 
-$C$ sees one code at a time, mixed with codes of other images, and never learns which image a code came from. It therefore compares the whole cloud of codes with the prior: $q(z)$ against $p(z)$, not each image's code against the prior. Its optimum follows from the [optimal-discriminator argument of the GAN note](/notes/generative-models/gans#step-1-the-optimal-discriminator-for-a-fixed-generator) applied to codes, $\sigma(C^*(z)) = p(z) / \big(p(z) + q(z)\big)$, which in terms of the score is a log density ratio:
+$C$ sees one code at a time, mixed with the codes of other images, and never learns which image a code came from. It therefore compares the whole cloud of codes with the prior: $q(z)$ against $p(z)$. The [optimal-discriminator argument](/notes/generative-models/gans#step-1-the-optimal-discriminator-for-a-fixed-generator) applied to codes gives $\sigma(C^*(z)) = p(z) / \big(p(z) + q(z)\big)$. Inverting the sigmoid, $C = \log\big(\sigma(C)/(1 - \sigma(C))\big)$, gives the score
 
 $$
 C^*(z) = \log \frac{p(z)}{q(z)} .
 $$
 
-With the minimax loss and an optimal $C$, the encoder minimizes $2\,D_{\mathrm{JS}}(p\,\|\,q) - 2\ln 2$, by the same substitution as in the GAN note. Compared with the VAE, the AAE keeps the part of the KL term that sampling needs, the mismatch between $q(z)$ and $p(z)$, measured here by JS rather than KL, and drops the part that penalizes informative codes. Makhzani et al. make the same comparison by writing the VAE's average KL term as the cross-entropy between $q(z)$ and $p(z)$ minus the average entropy of the posteriors $q(z \mid x)$, and replacing both terms with the adversarial game (Section 2.1, Eq. 2).
+A classifier's logit estimates a log density ratio; this **density-ratio trick** is the tool behind every model below. Substituting $C^*$ into the minimax loss, as in [step 2 of the GAN note](/notes/generative-models/gans#step-2-substitute-the-optimal-discriminator-and-recognize-js), leaves $2\,D_{\mathrm{JS}}(p \,\|\, q) - 2\ln 2$, so the encoder minimizes the Jensen–Shannon divergence between $q(z)$ and $p(z)$. Compared with the ELBO, the AAE keeps the marginal mismatch, measured by JS instead of KL, and drops the mutual-information penalty on informative codes. In the InfoVAE family of objectives it is the member that keeps only the marginal term and measures it by JS ([Zhao, Song and Ermon, 2019](#references), Section 4; [Murphy, 2023](#references), Section 21.3.2).
 
-Three consequences follow.
+The discriminator needs only samples from the prior, never its density, so any prior that can be sampled will do, such as a mixture of ten 2-D Gaussians. With a 2-D Gaussian prior, the codes of held-out MNIST digits fill the prior without gaps, while a VAE with the same architecture leaves regions where no image is encoded ([Makhzani et al., 2015](#references), Figure 2). Those holes are where prior samples decode poorly.
 
-- **Any prior that can be sampled.** The VAE's closed-form KL needs the prior's density; the discriminator needs only samples from it. The paper imposes a mixture of ten 2-D Gaussians and a swiss roll on MNIST codes (Sections 2.1 and 2.3).
-- **Fewer holes.** With a 2-D Gaussian prior on MNIST, the codes of held-out images fill the prior without gaps, while a VAE with the same architecture leaves regions where no image is encoded (Figure 2). Holes in $q(z)$ are where prior samples decode poorly.
-- **A deterministic encoder suffices, within limits.** The paper tried deterministic, Gaussian and noise-input encoders and found similar test likelihoods, so it reports the deterministic one (Section 2). Its only source of randomness is the data, and for a finite training set $q(z)$ is a cloud of points. The authors therefore recommend a code dimension close to the intrinsic dimension of the data (5 to 8 for MNIST, 10 to 20 for faces and house numbers) and a Gaussian encoder for much larger codes (Appendix A.1).
+A cheaper alternative penalizes the batch mean and variance of each code coordinate. [Rosca et al. (2017)](#references) tried it: the means moved toward zero, but the coordinates stayed strongly correlated, which a per-coordinate penalty cannot see. The discriminator, which sees whole code vectors, gave decorrelated codes.
 
-The AAE also supports semi-supervised classification and clustering by attaching a second discriminator to a categorical part of the code (Sections 5–6); this note follows only its generative use.
+The AAE leaves the decoder's training signal alone: $G$ still learns only from a pixel error, so its outputs carry the same averaging as a VAE decoder.
 
-**Why a discriminator rather than a moment penalty?** A cheaper way to pull codes toward $\mathcal N(0, I)$ is to penalize the batch means and variances of each coordinate. [Rosca et al. (2017)](#references) tried exactly that in place of the code discriminator (Appendix D). The penalty brought the coordinate means closer to zero, but the coordinates stayed strongly correlated, because a per-coordinate penalty cannot see correlations; the discriminator, which sees whole code vectors, produced decorrelated codes.
-
-What the AAE does not change is the decoder's training signal. $G$ still learns only from a pixel reconstruction error, so its outputs carry the same averaging as a VAE decoder.
+There is a different way to give a GAN an encoder, with no reconstruction at all. BiGAN and ALI train one discriminator on pairs, telling $(x, E(x))$ with real $x$ from $(G(z), z)$ with prior $z$ ([Murphy, 2023](#references), Section 26.5). For deterministic $E$ and $G$ and an optimal discriminator, the encoder–generator objective is $2\,D_{\mathrm{JS}} - 2\ln 2$ between the two joint distributions, by the same substitution as for the AAE. It is minimal only when they coincide, and then $G(E(x)) = x$ for almost every data point and $E(G(z)) = z$ for almost every code ([Donahue, Krähenbühl and Darrell, 2017](#references), Proposition 2 and Theorems 1–2, proofs in their Section 3 and Appendix A). The intuition: a pair $(x, E(x))$ and a pair $(G(z), z)$ can be indistinguishable only if each map undoes the other. The models below keep the reconstruction term instead, because it is what ties the generator to every training image.
 
 ## α-GAN: a discriminator on images as well \{#alpha-gan-a-discriminator-on-images-as-well\}
 
-[Rosca et al. (2017)](#references) start again from the ELBO and replace each of its terms with something a discriminator can estimate (Section 3).
+[Rosca et al. (2017)](#references) start again from the ELBO and replace each term with something a discriminator can estimate. The KL term becomes a code discriminator, as in the AAE: by the density-ratio trick, $-D_{\mathrm{KL}}(q\,\|\,p) = \mathbb E_q \log\big(p(z)/q(z)\big) \approx \mathbb E_q\, C(z)$. Since $C$ compares the aggregate $q(z)$ with $p(z)$, this is the marginal KL, the part sampling needs.
 
-- **The KL term** becomes a code discriminator, as in the AAE: $-D_{\mathrm{KL}}(q\,\|\,p) = \mathbb E_q \log\big(p(z)/q(z)\big) \approx \mathbb E_q\, C(z)$, the expected score of a classifier whose optimum is the log ratio (Eq. 6). Because $C$ compares the aggregate $q(z)$ with $p(z)$, what is estimated is the marginal KL, the part singled out above.
-- **The likelihood term** gets two candidates (Eq. 7). One is an explicit Laplace likelihood, $p(x \mid z) \propto \exp\big(-\lambda\lVert x - G(z)\rVert_1\big)$, whose negative logarithm is the $L_1$ reconstruction loss $\lambda\lVert x - G(z)\rVert_1$ plus a constant. The other is a *synthetic likelihood*: the score $D(G(z))$ of an image discriminator trained to tell data from decoded images, which is large when the decoded image looks real.
-
-The two candidates fail in opposite ways. The discriminator gives sharp images but, as in any GAN, allows mode collapse. The $L_1$ term assigns mass to every training image but blurs; per pixel, its optimum is the median of the plausible values, where the squared error's is their mean. α-GAN uses both, weighted (Eq. 8). Written with scores and a deterministic encoder, $E$ and $G$ maximize
+The likelihood term gets two candidates that fail in opposite ways. One is a Laplace likelihood, $p(x \mid z) = (\lambda/2)^D \exp\big(-\lambda\lVert x - G(z)\rVert_1\big)$ for $D$ pixels, whose negative logarithm is the $L_1$ reconstruction loss $\lambda\lVert x - G(z)\rVert_1$ plus a constant. It covers every training image but blurs: per pixel, the derivative of $\mathbb E\lvert x - a\rvert$ in $a$ is $P(x < a) - P(x > a)$, so its optimum is the median of the plausible values, where the squared error's is their mean. The other is a *synthetic likelihood*: the score $D(\hat x)$ of an **image discriminator** $D$ trained to tell data from decoded images. It gives sharp images but, as in any GAN, allows mode collapse. α-GAN uses both. With a deterministic encoder, $E$ and $G$ maximize
 
 $$
-\mathbb E_{x \sim P}\Big[-\lambda\big\lVert x - G(E(x))\big\rVert_1 + D\big(G(E(x))\big) + C\big(E(x)\big)\Big] .
+\mathbb E_{x \sim P}\Big[-\lambda\big\lVert x - \hat x\big\rVert_1 + D(\hat x) + C(\hat z)\Big] .
 $$
 
-Two practical changes complete the method (Section 3, "Improved techniques").
+The adversarial terms are plain scores because of the loss Rosca et al. use on the generator side, $-\log\sigma(s) + \log\big(1 - \sigma(s)\big)$, the sum of the non-saturating and the minimax losses. With $\sigma(s) = 1/(1 + e^{-s})$ we have $1 - \sigma(s) = e^{-s}/(1 + e^{-s})$, so $\sigma(s)/(1 - \sigma(s)) = e^s$, and taking logarithms,
 
-1. **The adversarial loss of $E$ and $G$ is minus the score.** Write $s$ for a score and $\sigma(s)$ for the classifier's probability. Since $\sigma(s)/(1 - \sigma(s)) = e^s$,
+$$
+-\log\sigma(s) + \log\big(1 - \sigma(s)\big) = -s .
+$$
 
-   $$
-   -\log\sigma(s) + \log\big(1 - \sigma(s)\big) = -s .
-   $$
+The loss is minus the logit. Its gradient with respect to the logit is $-1$ for every $s$, so it never saturates. Its two parts do: from $\sigma' = \sigma(1 - \sigma)$, the derivative of $\log(1 - \sigma(s))$ is $-\sigma(s)$ and that of $-\log\sigma(s)$ is $-(1 - \sigma(s))$, so at $\sigma(s) = 0.05$ they give $-0.05$ and $-0.95$, the comparison of the [GAN note](/notes/generative-models/gans#which-generator-loss-is-used-in-practice).
 
-   The left side is the loss Rosca et al. use for both generators of their game (Algorithm 1, $R_D$ and $R_C$), and the right side shows it is simply minus the logit. Its gradient with respect to the logit is $-1$ for every $s$, so it never saturates: at $\sigma(s) = 0.05$ the minimax loss gives $-0.05$ per logit and the non-saturating loss $-0.95$ ([GAN note](/notes/generative-models/gans#which-generator-loss-is-used-in-practice)). With an optimal classifier the logit is $\log\big(P(x)/Q(x)\big)$, where $Q$ is the distribution of the fakes, so the expected loss on fakes is $\mathbb E_Q\big[\log (Q/P)\big] = D_{\mathrm{KL}}(Q\,\|\,P)$, a reverse KL.
-2. **Samples are fakes too.** The image discriminator receives samples $G(z)$, $z \sim p(z)$, as fakes in addition to reconstructions; one discriminator handles both. Rosca et al. justify it with Jensen's inequality, $\log p(x) = \log \int p(x \mid z)\,p(z)\,dz \ge \mathbb E_{p(z)}\log p(x \mid z)$, whose right side contains decoded prior samples, and replace that likelihood with the synthetic one as before.
-
-### The four losses
-
-Each network minimizes its own loss with the others held fixed (Algorithm 1, Eqs. 11, 13, 15 and 17, written here with scores):
+The image discriminator also receives samples $G(z)$, $z \sim p(z)$, as fakes next to the reconstructions, so that samples are pushed toward the data as well as reconstructions. With $\hat z = E(x)$ and $\hat x = G(\hat z)$, each network minimizes its own loss with the others fixed:
 
 $$
 \begin{aligned}
 \mathcal L_E &= \mathbb E_{x}\big[\lambda\lVert x - \hat x\rVert_1 - C(\hat z)\big],\\
-\mathcal L_G &= \mathbb E_{x}\big[\lambda\lVert x - \hat x\rVert_1 - D(\hat x)\big] - \mathbb E_{z}\big[D(G(z))\big],\\
+\mathcal L_G &= \mathbb E_{x}\big[\lambda\lVert x - \hat x\rVert_1 - D(\hat x)\big] - \mathbb E_{z}\, D(G(z)),\\
 \mathcal L_D &= -\mathbb E_{x}\Big[\log\sigma\big(D(x)\big) + \log\big(1 - \sigma(D(\hat x))\big)\Big]\\
-&\quad - \mathbb E_{z}\Big[\log\big(1 - \sigma(D(G(z)))\big)\Big],\\
-\mathcal L_C &= -\mathbb E_{x}\Big[\log\big(1 - \sigma(C(\hat z))\big)\Big] - \mathbb E_{z}\Big[\log\sigma\big(C(z)\big)\Big].
+&\quad - \mathbb E_{z}\log\big(1 - \sigma(D(G(z)))\big),\\
+\mathcal L_C &= -\mathbb E_{x}\log\big(1 - \sigma(C(\hat z))\big) - \mathbb E_{z}\log\sigma\big(C(z)\big).
 \end{aligned}
 $$
 
-- The **encoder** must make codes from which $G$ can rebuild the image, and codes that the code discriminator takes for prior samples.
-- The **generator** must rebuild the image from its code, and make both its reconstructions and its samples look real to $D$.
-- The **image discriminator** separates data from both kinds of fakes, and the **code discriminator** separates prior samples from codes, each with the ordinary binary cross-entropy of the GAN note.
-
-**What the image discriminator's score estimates.** $\mathcal L_D$ weights the real images once and each of the two kinds of fakes once, so the fakes carry twice the weight. The pointwise optimum is then $\sigma(D^*) = P/(P + Q_{\mathrm{rec}} + Q_{\mathrm{gen}})$, with $Q_{\mathrm{rec}}$ and $Q_{\mathrm{gen}}$ the distributions of reconstructions and samples. With their even mixture $M = \tfrac12(Q_{\mathrm{rec}} + Q_{\mathrm{gen}})$ the optimal logit is $D^* = \log(P/M) - \log 2$, not the balanced $\log(P/Q)$ of item 1 above. The offset $-\log 2$ is a constant, so it leaves the gradients that $E$ and $G$ receive unchanged, but it shifts scores and probabilities: when both kinds of fakes match the data, $\sigma(D^*) = 1/3$, not $1/2$. The α-WGAN below balances the two sides differently, with a factor 2 on the real term.
-
-In the experiments, $\lambda$ was swept over 1, 5, 10 and 50, separately for the encoder and the generator, with weight 1 on both adversarial terms (Appendix H.1). Encoder and generator were updated twice per update of the two discriminators (Section 6). All models used Adam with $\beta = (0.5, 0.9)$ and batches of 64, and the code discriminator was a three-layer MLP with 750 units per layer (Appendix H).
+The two discriminators train with the binary cross-entropy of the GAN note.
 
 ### Why all three parts are needed
 
-Suppose both matching conditions hold exactly: the codes are distributed as the prior, $q = p$, and every image is reconstructed, $G(E(x)) = x$ for $x \sim P$. Then for $z \sim p(z)$, $G(z)$ has the same distribution as $G(E(x))$ with $x \sim P$, because $z$ and $E(x)$ have the same distribution and the same function $G$ is applied to both. That distribution is $P$ itself. So the samples are distributed as the data. The code discriminator enforces the first condition, the reconstruction term the second, and since both hold only approximately, the image discriminator also checks the samples directly.
+Suppose both matching conditions hold without error: the codes are distributed as the prior, $q = p$, and every image is reconstructed, $G(E(x)) = x$. Then for $z \sim p(z)$, $G(z)$ has the distribution of $G(E(x))$ with $x \sim P$, because $z$ and $E(x)$ have the same distribution and the same $G$ is applied to both: $P(G(z) \in A) = P(z \in G^{-1}(A))$ depends only on the distribution of $z$. And $G(E(x)) = x$ has distribution $P$ itself, so the samples are distributed as the data.
 
-The same argument shows what each term prevents.
+Each term guards one condition. The code discriminator enforces the first; without it the codes could sit anywhere in $\mathbb R^d$, and prior samples would land where $G$ never learned anything, the failure of a plain autoencoder. The reconstruction term enforces the second, and it is what discourages mode collapse: a generator that dropped a mode could not rebuild the images of that mode, and its $L_1$ loss would grow. Both hold only approximately, so the image discriminator checks the samples directly, and by judging the reconstructions it pushes $G$ toward a sharp image near $x$ instead of the blurry median.
 
-- **Mode collapse.** A generator that collapsed onto a few modes could not reconstruct images from the other modes, and the $L_1$ term would be large. Rosca et al. give this as the reason the reconstruction term discourages mode collapse (Section 3, after Eq. 9).
-- **Blur.** Reconstructions are judged by $D$, so an averaged reconstruction is easy to reject, and $G$ is pushed toward a sharp image that is close to $x$ in $L_1$ rather than equal to the pixel median. The weight $\lambda$ sets the balance.
-- **Holes.** Without the code discriminator the codes could occupy any region of $\mathbb R^d$, and prior samples would land where $G$ never learned anything, the failure of a plain autoencoder.
-
-On ColorMNIST, CelebA and CIFAR-10, α-GAN was competitive with DCGAN ([Radford, Metz and Chintala, 2016](#references)), WGAN-GP and the autoencoder-based AGE ([Ulyanov, Vedaldi and Lempitsky, 2017](#references)), but not uniformly better. An independent Wasserstein critic trained on held-out data rated WGAN-GP best on all three datasets; on CIFAR-10, α-GAN reached the best ImageNet-based Inception Score, with a wide spread over hyperparameters (Section 6, Figures 2 and 5). Its reconstructions were better than AGE's (Appendix C). The authors found the architectures to be the most decisive factor of all.
+On ColorMNIST, CelebA and CIFAR-10, α-GAN was competitive with DCGAN ([Radford, Metz and Chintala, 2016](#references)) and WGAN-GP, but not uniformly better, and its reconstructions beat those of the autoencoder-based AGE ([Ulyanov, Vedaldi and Lempitsky, 2017](#references)).
 
 ## α-WGAN: two Wasserstein critics \{#alpha-wgan-two-wasserstein-critics\}
 
-The losses of $E$ and $G$ above are already minus a score, which is exactly the form of the WGAN generator loss $-\mathbb E f(G(z))$ ([WGAN note](/notes/generative-models/wgan#wgan-losses)). Only the training of the discriminators distinguishes α-GAN from a Wasserstein version. [Kwon, Han and Kim (2019)](#references) keep the encoder and generator losses and train both $D$ and $C$ as Wasserstein critics with the [gradient penalty](/notes/generative-models/wgan#wgan-gp-gradient-penalty); they call the model 3D-α-WGAN-GP. Their losses (Section 2, Eqs. 1–3; the encoder loss is given in the text) read, with $\lambda_{\mathrm{GP}}$ the penalty weight,
+The generator-side losses of α-GAN are already minus a score, the form of the [WGAN generator loss](/notes/generative-models/wgan#wgan-losses). Only the training of the discriminators separates α-GAN from a Wasserstein version. [Kwon, Han and Kim (2019)](#references) keep the encoder and generator losses and train both $D$ and $C$ as critics with the [gradient penalty](/notes/generative-models/wgan#wgan-gp-gradient-penalty). With $\lambda_{\mathrm{GP}}$ the penalty weight,
 
 $$
 \begin{aligned}
-\mathcal L_D ={}& \mathbb E_{x}\big[D(\hat x)\big] + \mathbb E_{z}\big[D(G(z))\big] - 2\,\mathbb E_{x}\big[D(x)\big]\\
+\mathcal L_D ={}& \mathbb E_{x} D(\hat x) + \mathbb E_{z} D(G(z)) - 2\,\mathbb E_{x} D(x)\\
 &+ \lambda_{\mathrm{GP}}\,\mathrm{GP}_D,\\
-\mathcal L_C ={}& \mathbb E_{x}\big[C(\hat z)\big] - \mathbb E_{z}\big[C(z)\big] + \lambda_{\mathrm{GP}}\,\mathrm{GP}_C,\\
-\mathcal L_{EG} ={}& \lambda\,\mathbb E_{x}\lVert x - \hat x\rVert_1 - \mathbb E_{x}\big[D(\hat x)\big]\\
-&- \mathbb E_{z}\big[D(G(z))\big] - \mathbb E_{x}\big[C(\hat z)\big].
+\mathcal L_C ={}& \mathbb E_{x} C(\hat z) - \mathbb E_{z} C(z) + \lambda_{\mathrm{GP}}\,\mathrm{GP}_C,\\
+\mathcal L_{EG} ={}& \lambda\,\mathbb E_{x}\lVert x - \hat x\rVert_1 - \mathbb E_{x} D(\hat x)\\
+&- \mathbb E_{z} D(G(z)) - \mathbb E_{x} C(\hat z).
 \end{aligned}
 $$
 
-The penalties are those of WGAN-GP, evaluated on random points between real and fake inputs:
+The penalties are those of WGAN-GP, on random points between real and fake inputs:
 
 $$
 \begin{aligned}
-\mathrm{GP}_D &= \mathbb E_{\tilde x}\Big[\big(\lVert\nabla_{\tilde x} D(\tilde x)\rVert_2 - 1\big)^2\Big],\\
-\mathrm{GP}_C &= \mathbb E_{\tilde z}\Big[\big(\lVert\nabla_{\tilde z} C(\tilde z)\rVert_2 - 1\big)^2\Big].
+\mathrm{GP}_D &= \mathbb E_{\tilde x}\big(\lVert\nabla_{\tilde x} D(\tilde x)\rVert_2 - 1\big)^2,\\
+\mathrm{GP}_C &= \mathbb E_{\tilde z}\big(\lVert\nabla_{\tilde z} C(\tilde z)\rVert_2 - 1\big)^2.
 \end{aligned}
 $$
 
-Here $\tilde x = \alpha x + (1 - \alpha)\,x_{\mathrm f}$ lies between a real image $x$ and a fake one $x_{\mathrm f}$, and $\tilde z = \alpha z + (1 - \alpha)\,\hat z$ between a prior sample and a code, with $\alpha \sim U(0, 1)$ drawn per example; the tilde replaces the WGAN note's hat, which here denotes a reconstruction. Kwon et al. use $\lambda = \lambda_{\mathrm{GP}} = 10$.
+Here $\tilde x = \alpha x + (1 - \alpha)\,x_{\mathrm f}$ lies between a real image $x$ and a fake $x_{\mathrm f}$, and $\tilde z = \alpha z + (1 - \alpha)\,\hat z$ between a prior sample and a code, with $\alpha \sim U(0, 1)$ per example. Kwon et al. use $\lambda = \lambda_{\mathrm{GP}} = 10$.
 
 <AlphaFlow />
 
-1. **Reconstruction.** $E$ encodes $x$, $G$ decodes the code, and $\lambda\lVert x - \hat x\rVert_1$ trains both.
-2. **Sampling.** The same $G$ decodes prior samples into new images.
-3. **Code critic.** $\mathcal L_C$ is the WGAN critic loss on codes with the prior as the real distribution, so without the penalty $-\mathcal L_C$ estimates $W_1(p, q)$, with the caveats about the critic's Lipschitz constant from the WGAN note. The encoder's term $-\mathbb E\, C(\hat z)$ moves codes to where the critic scores them as prior samples.
-4. **Image critic.** $\mathcal L_D$ is two WGAN critic losses that share one critic, $\big[\mathbb E D(\hat x) - \mathbb E D(x)\big] + \big[\mathbb E D(G(z)) - \mathbb E D(x)\big]$; the real term appears in both comparisons, hence the factor 2. Write $Q_{\mathrm{rec}}$ and $Q_{\mathrm{gen}}$ for the distributions of reconstructions and samples. The two fake terms together are $2\,\mathbb E D$ under their even mixture $M = \tfrac12(Q_{\mathrm{rec}} + Q_{\mathrm{gen}})$, so over 1-Lipschitz critics the best value of $-\mathcal L_D$ without the penalty is $2\,W_1(P, M)$, which by convexity of $W_1$ is at most $W_1(P, Q_{\mathrm{rec}}) + W_1(P, Q_{\mathrm{gen}})$.
-
-$E$ and $G$ are optimized as one network on the sum $\mathcal L_{EG}$ (Section 2, "Training"). Each term reaches the networks it depends on:
+The image critic's loss is two WGAN comparisons sharing one critic, reconstructions against data and samples against data, hence the factor 2 on the real term. $E$ and $G$ are optimized as one network on the sum $\mathcal L_{EG}$, so each term reaches the networks it depends on:
 
 | Term of $\mathcal L_{EG}$ | Trains | Asks for |
 | --- | --- | --- |
@@ -176,172 +148,165 @@ $E$ and $G$ are optimized as one network on the sum $\mathcal L_{EG}$ (Section 2
 | $-D(G(z))$ | $G$ | samples that look real |
 | $-C(\hat z)$ | $E$ | codes that look like prior samples |
 
-The second row differs from α-GAN's Algorithm 1, where the encoder's loss has no image term; with a summed loss the gradient of $-D(\hat x)$ also flows into the encoder.
-
-**Why a Wasserstein critic for the codes too?** Early in training the codes of a deterministic encoder can sit far from the prior, concentrated on a small region. A classifier then separates them easily and its logit can become flat around the codes, the situation the WGAN note started from, while a Lipschitz critic keeps a slope of norm about 1 that points the codes toward the prior. The worked example below compares the two when the distributions overlap: the classifier's gradient shrinks with the shift, the critic's does not. Kwon et al. motivate the change by the instability of their model with the classifier losses.
-
-Their application was 3D brain MRI volumes of $64^3$ voxels, trained with Adam at learning rate $2 \cdot 10^{-4}$ for all four networks, batches of 4 and the generator updated twice per step (Sections 2 and 4). With 100-dimensional codes the model collapsed; 1000-dimensional codes worked best. Its samples had the lowest maximum mean discrepancy to the data among the compared models, and a pairwise MS-SSIM of 0.829 against 0.846 for real volumes, where a WGAN-GP baseline reached 0.996, a sign of near-identical samples (Table 1).
+Why a Wasserstein critic for the codes too? Early in training the codes of a deterministic encoder can sit far from the prior. A classifier then separates them easily, and an optimal one is constant on the codes, the case of non-overlapping supports in the [GAN note](/notes/generative-models/gans#where-it-breaks-supports-that-do-not-overlap), where the generator's gradient vanishes. The gradient penalty instead holds the critic's slope near 1 between codes and prior samples, so it keeps pointing the codes toward the prior. Kwon et al. made the change because their model, trained on 3D brain MRI volumes, was unstable with the classifier losses.
 
 ## Worked example: a code critic in one dimension
 
-A toy example shows what the two kinds of code critic tell the encoder. Take $d = 1$, prior $p = \mathcal N(0, 1)$, and suppose every code is shifted by $\mu = 0.5$, so $q = \mathcal N(0.5, 1)$.
+Take $d = 1$, prior $p = \mathcal N(0, 1)$, and suppose every code is shifted by $\mu$, so $q = \mathcal N(\mu, 1)$. What does each critic tell the encoder?
 
-**Classifier critic (α-GAN).** The optimal score is the log ratio of the two densities,
+The classifier's optimal score is the log ratio:
 
 $$
-C^*(z) = \log\frac{p(z)}{q(z)} = -\frac{z^2}{2} + \frac{(z - 0.5)^2}{2} = -0.5\,z + 0.125 .
+\begin{aligned}
+C^*(z) &= \log\frac{p(z)}{q(z)} \\
+&= -\frac{z^2}{2} + \frac{(z - \mu)^2}{2} \\
+&= -\mu z + \frac{\mu^2}{2} .
+\end{aligned}
 $$
 
-Its mean over the codes is $\mathbb E_q C^* = -0.5 \cdot 0.5 + 0.125 = -0.125$, which is $-D_{\mathrm{KL}}(q\,\|\,p) = -\mu^2/2$, as the KL between unit-variance Gaussians whose means differ by $\mu$ should be. The encoder's loss $-\mathbb E_q C^*(\hat z)$ is $0.125$, and with the critic held fixed, its derivative with respect to the code shift is $-\mathbb E\,[\partial C^*/\partial z] = 0.5$: exactly $\partial D_{\mathrm{KL}}/\partial\mu = \mu$. As the codes approach the prior, this gradient shrinks with $\mu$: at $\mu = 0.05$ it is $0.05$.
+Its mean over the codes, using $\mathbb E_q z = \mu$, is $\mathbb E_q C^* = -\mu^2 + \mu^2/2 = -\mu^2/2$. By the definition of KL, $\mathbb E_q \log(p/q) = -D_{\mathrm{KL}}(q\,\|\,p)$, so this is also a computation of the KL between unit-variance Gaussians whose means differ by $\mu$: $\mu^2/2$. With the critic held fixed, the encoder's loss $-\mathbb E_q C^*$ has derivative $\mu$ with respect to the shift.
 
-**Wasserstein critic (α-WGAN).** Here $W_1(p, q) = \lvert\mu\rvert = 0.5$, and $f(z) = -z$ is an optimal 1-Lipschitz critic: $\mathbb E_p f - \mathbb E_q f = 0 + 0.5 = 0.5$. Its gradient has norm 1 everywhere, so the penalty $\mathrm{GP}_C$ is zero, and $\mathcal L_C = \mathbb E_q f - \mathbb E_p f = -0.5 = -W_1$. The encoder's loss $-\mathbb E_q f(\hat z) = \mathbb E_q z = 0.5$ has derivative 1 with respect to $\mu$, whatever the size of the shift: the critic keeps pushing at the same rate until the codes are centred.
+For the Wasserstein critic, take $\mu > 0$ and $f(z) = -z$, which is 1-Lipschitz and gives $\mathbb E_p f - \mathbb E_q f = 0 + \mu = \mu$. By the [Kantorovich–Rubinstein duality](/notes/generative-models/wgan#the-dual-form), $W_1(p, q)$ is the supremum of this difference over 1-Lipschitz functions, so $W_1 \ge \mu$; moving every point by $\mu$ is a transport plan of cost $\mu$, so $W_1 \le \mu$. Hence $W_1 = \mu$ and $f$ is optimal. Its gradient has norm 1 everywhere, so $\mathrm{GP}_C = 0$. The encoder's loss $-\mathbb E_q f = \mu$ has derivative 1.
+
+| Shift $\mu$ | Classifier: gradient on the shift | Critic: gradient on the shift |
+| --- | --- | --- |
+| 0.5 | 0.5 | 1 |
+| 0.05 | 0.05 | 1 |
+
+The classifier's push fades as the codes approach the prior; the critic keeps pushing at the same rate until the codes are centred. Toy numbers, with each critic at its optimum for the current codes.
 
 ## Training: four networks, three optimizers
 
-One training step has two parts.
+One training step has two parts. First, one update of $E$ and $G$ on $\mathcal L_{EG}$ with the critics fixed. Then updates of $D$ on $\mathcal L_D$ and of $C$ on $\mathcal L_C$, in which reconstructions, samples and codes enter as constants. The ratio between the parts is a choice: WGAN-GP takes 5 critic steps per generator step, each on a fresh real minibatch, while α-GAN updated the encoder and generator twice per discriminator step.
 
-1. **Encoder and generator.** One update of $E$ and $G$ on $\mathcal L_{EG}$, with $D$ and $C$ fixed.
-2. **Critics.** Updates of $D$ on $\mathcal L_D$ and of $C$ on $\mathcal L_C$. The reconstructions, samples and codes enter these losses as constants, so the critic steps do not move $E$ or $G$.
-
-The ratio between the two parts is a choice. WGAN-GP takes $n_{\text{critic}} = 5$ critic steps per generator step, so that the critic stays close to optimal; α-GAN instead updated the encoder and generator twice per discriminator step, and Kwon et al. updated the generator twice. Each critic step should see a fresh minibatch of real data, as in WGAN-GP's algorithm.
-
-**Why separate optimizers?** Each player minimizes a different loss, and the losses pull in opposite directions. Suppose $\mathcal L_D$ and $\mathcal L_{EG}$ were summed and all parameters optimized together. The gradient with respect to $D$'s parameters would then be
+Why not one optimizer for everything? Suppose $\mathcal L_D$ and $\mathcal L_{EG}$ were summed and all parameters optimized together. The gradient with respect to $D$'s parameters, ignoring the penalty, would be
 
 $$
 \begin{aligned}
 &\nabla\big(\mathbb E D(\hat x) + \mathbb E D(G(z)) - 2\,\mathbb E D(x)\big)\\
-&\quad + \nabla\big(-\mathbb E D(\hat x) - \mathbb E D(G(z))\big) = -2\,\nabla\,\mathbb E D(x),
+&\quad + \nabla\big(-\mathbb E D(\hat x) - \mathbb E D(G(z))\big)\\
+&= -2\,\nabla\,\mathbb E D(x) .
 \end{aligned}
 $$
 
-ignoring the penalty: the terms on fakes cancel, and the critic would only learn to raise its score on real data. Each loss therefore gets its own optimizer over its own parameters: one for $E$ and $G$ together, which minimize one summed loss, one for $D$ and one for $C$. Separate optimizers also allow different learning rates; Rosca et al. used different learning-rate sweeps for the generator and encoder and for the two discriminators (Appendix H, Table 2).
+The terms on fakes cancel, and the critic would only learn to raise its score on real data. Each player therefore gets its own optimizer over its own parameters: one for $E$ and $G$ together, one for $D$, one for $C$.
 
-### Learning-rate schedule and early stopping
-
-A common [schedule](/notes/deep-learning/optimizing-deep-networks#learning-rate-schedules-and-warm-up) is **cosine annealing with warm restarts** ([Loshchilov and Hutter, 2017](#references), Eq. 5). Within the $i$-th cycle of length $T_i$, the learning rate falls from $\eta_{\max}$ to $\eta_{\min}$ along half a cosine,
-
-$$
-\eta_t = \eta_{\min} + \tfrac12\big(\eta_{\max} - \eta_{\min}\big)\Big(1 + \cos\frac{\pi\, T_{\text{cur}}}{T_i}\Big),
-$$
-
-where $T_{\text{cur}}$ counts the epochs since the last restart; then it jumps back to $\eta_{\max}$ and the next cycle is $T_{\text{mult}}$ times longer. With $T_0 = 10$ epochs, $T_{\text{mult}} = 2$, $\eta_{\max} = 2 \cdot 10^{-4}$, $\eta_{\min} = 0$ and one update per epoch, the cycles last 10, 20 and 40 epochs, the restarts open epochs 11, 31 and 71, and the rate during epoch 10 is $4.9 \cdot 10^{-6}$. The restarts let training leave a poor region, but they temporarily worsen performance, as Loshchilov and Hutter note (Section 3).
-
-**Early stopping** ends training when a validation quantity has not improved for a set number of epochs, the *patience*, and keeps the best checkpoint. For an autoencoding GAN the choice of quantity is the hard part.
-
-- The **reconstruction error on held-out images** is a meaningful, stable number, but it measures the autoencoder, not the samples: a run can keep improving its reconstructions while its samples collapse, or the reverse.
-- **Raw adversarial scores**, such as the generator's term $-\mathbb E\, D(G(z))$, are unsuitable. A critic's scores carry an arbitrary additive offset that drifts as the critic trains, so their values cannot be compared between epochs. A real-minus-fake gap cancels that offset: for a consistently constrained critic trained close to optimality, the WGAN gap can be tracked within one run, with the caveats of the [WGAN note](/notes/generative-models/wgan#wgan-losses), though it is still not comparable between runs with different critics.
-- With warm restarts, a patience shorter than the next cycle can stop a run right after a restart. In the example above, a best value at epoch 10 and a patience of 10 stop training at epoch 20, when the learning rate of the second cycle is still $1.2 \cdot 10^{-4}$.
-- The data used to choose the checkpoint must be a validation split, not the test set on which results are reported.
-
-### What to monitor and how to evaluate
-
-Four networks can fail separately, so each loss term is logged on its own: the reconstruction error, the three adversarial terms, the two critic losses and the two penalties. Per-network gradient statistics, as norms or histograms, show when one player's gradients [vanish or explode](/notes/generative-models/training-background#vanishing-and-exploding-gradients). Copying every gradient off the GPU after every step is expensive, so such statistics are usually logged at intervals.
-
-An autoencoding GAN is checked from three sides.
-
-- **Reconstructions** of held-out images, shown next to the originals, test $E$ and $G$ as an autoencoder.
-- **Samples** from the prior test $G$ together with the code matching. They are judged with the metrics of the evaluation notes, such as the [Inception Score](/notes/generative-models/inception-score) and [FID](/notes/generative-models/fid). Rosca et al. also trained an independent WGAN-GP critic to separate held-out data from samples (Section 5).
-- **Interpolations** between the codes of two real images test the space between codes, the subject of the next section.
+Four networks can fail separately, so log every loss term on its own. The reconstruction error on held-out images is a stable number for choosing checkpoints, but it measures the autoencoder, and a run can keep improving it while its samples collapse. Raw critic scores cannot be compared between epochs. Replace $D$ by $D + c$ for a constant $c$: in $\mathcal L_D$ the two fake terms gain $2c$ and the real term loses $2c$, and the penalty sees only gradients, so no loss changes. The same holds for $C$. Nothing fixes the level of the scores, and it drifts with the optimizer's steps; only differences such as $\mathbb E\, D(x) - \mathbb E\, D(\hat x)$ carry meaning. Judge the model from three sides: reconstructions of held-out images, samples from the prior with the metrics of the [evaluation notes](/notes/generative-models/fid), and interpolations between real images.
 
 ## Latent interpolation: lerp or slerp?
 
-With an encoder we can walk between two real images: encode them, $z_0 = E(x_0)$ and $z_1 = E(x_1)$, move along a path $z_t$ from $z_0$ to $z_1$, and decode $G(z_t)$. A smooth sequence of images suggests that the model has organized its code space rather than memorized the training set. The simplest path is **linear interpolation** (lerp),
+With an encoder we can walk between two real images: encode them, $z_0 = E(x_0)$ and $z_1 = E(x_1)$, move along a path $z_t$, and decode $G(z_t)$. The simplest path is **linear interpolation** (lerp), $z_t = (1 - t)\,z_0 + t\,z_1$ for $t \in [0, 1]$.
+
+**Spherical linear interpolation** (slerp) follows a great circle instead ([Shoemake, 1985](#references); [White, 2016](#references)). With $\Omega$ the angle between $z_0$ and $z_1$,
 
 $$
-z_t = (1 - t)\,z_0 + t\,z_1, \qquad t \in [0, 1].
+\begin{aligned}
+\cos\Omega &= \frac{\langle z_0, z_1\rangle}{\lVert z_0\rVert\,\lVert z_1\rVert}, \\
+z_t &= \frac{\sin\big((1 - t)\,\Omega\big)}{\sin\Omega}\, z_0 + \frac{\sin(t\,\Omega)}{\sin\Omega}\, z_1 .
+\end{aligned}
 $$
 
-**Spherical linear interpolation** (slerp) instead follows a great circle. With $\Omega$ the angle between $z_0$ and $z_1$, $\cos\Omega = \langle z_0, z_1\rangle / (\lVert z_0\rVert\,\lVert z_1\rVert)$,
+Why is this a great circle? Let $z_0$ and $z_1$ have the same length $r$, and write $z_1 = r(\cos\Omega\, u + \sin\Omega\, v)$ with $u = z_0/r$ and $v$ a unit vector orthogonal to $u$ in their plane. Call the two coefficients $a$ and $b$. The sine difference formula gives $\sin\big((1 - t)\Omega\big) = \sin\Omega\cos t\Omega - \cos\Omega \sin t\Omega$, so
 
 $$
-z_t = \frac{\sin\big((1 - t)\,\Omega\big)}{\sin\Omega}\, z_0 + \frac{\sin(t\,\Omega)}{\sin\Omega}\, z_1 .
+\begin{aligned}
+z_t &= r\big[(a + b\cos\Omega)\, u + b\sin\Omega\, v\big] \\
+&= r\big[\cos(t\Omega)\, u + \sin(t\Omega)\, v\big] .
+\end{aligned}
 $$
 
-The formula comes from animating rotations ([Shoemake, 1985](#references)); [White (2016)](#references) proposed it for the latent spaces of generative models. When $z_0$ and $z_1$ have the same length $r$, every point of the path has length $r$. The formula breaks down when $\sin\Omega$ is close to zero, which happens in two different cases. If the vectors are nearly parallel ($\Omega \approx 0$), implementations fall back to lerp: as $\Omega \to 0$ the slerp coefficients tend to $1 - t$ and $t$, so lerp is a small-angle approximation, accurate to second order in $\Omega$, not the same path. If they are nearly antipodal ($\Omega \approx \pi$), the great circle is not unique and lerp would pass near the origin; then a path has to be chosen explicitly, for example through a direction orthogonal to $z_0$, or the degenerate pair reported or resampled.
+The point turns from $z_0$ toward $z_1$ at the angle $t\Omega$ and keeps the length $r$, since $\cos^2 + \sin^2 = 1$. As $\Omega \to 0$ the coefficients $\sin(k\Omega)/\sin\Omega$ tend to $k$, because $\sin x / x \to 1$: to $1 - t$ and $t$, so implementations fall back to lerp for nearly parallel vectors. For nearly antipodal ones the great circle is not unique, and a path has to be chosen explicitly.
 
-**Why the difference matters.** In high dimension, samples of $\mathcal N(0, I_d)$ lie in a thin shell: their squared length has mean $d$ and variance $2d$, so the length is close to $\sqrt d$ with a spread of about $0.71$ ([The multivariate Gaussian](/notes/probability/multivariate-gaussian#high-dimensions-the-shell)). For $d = 128$ the mean length is $11.29$. Two independent samples are also nearly orthogonal: the cosine of their angle has mean 0 and standard deviation $1/\sqrt d = 0.088$, about $5°$. Their lerp midpoint $(z_0 + z_1)/2$ is a sum of independent Gaussians, distributed as $\mathcal N(0, \tfrac12 I)$, so its length is close to $\sqrt{d/2} = 8.0$ (mean $7.98$, spread $0.50$). Under the prior, a squared length of at most $d/2 = 64$ has probability $4 \times 10^{-7}$: the midpoint lies $4.7$ standard deviations inside the shell, in a region that training on $z \sim p(z)$ almost never visits. Along the whole path the mean squared length is $d\big((1 - t)^2 + t^2\big)$, smallest at the midpoint. Slerp between two nearly orthogonal vectors keeps the length between $\lVert z_0\rVert$ and $\lVert z_1\rVert$: at $\Omega = 90°$ its squared length is $\cos^2(\pi t/2)\lVert z_0\rVert^2 + \sin^2(\pi t/2)\lVert z_1\rVert^2$.
+Why does the difference matter? In high dimension, samples of $\mathcal N(0, I_d)$ lie in a thin shell: the [multivariate Gaussian note](/notes/probability/multivariate-gaussian#high-dimensions-the-shell) shows that $\lVert z\rVert^2$, a sum of $d$ independent squared standard normals, has mean $d$ and variance $2d$. A first-order Taylor expansion of the square root turns this into a length near $\sqrt d$ with standard deviation about $\sqrt{2d}/(2\sqrt d) = 1/\sqrt 2 = 0.71$. Two independent samples are nearly orthogonal: $\langle z_0, z_1\rangle = \sum_i z_{0i} z_{1i}$ is a sum of $d$ independent terms of mean 0 and variance 1, so it has standard deviation $\sqrt d$, and dividing by $\lVert z_0\rVert\,\lVert z_1\rVert \approx d$ gives a cosine with standard deviation $1/\sqrt d$. Their lerp midpoint $(z_0 + z_1)/2$ is an [affine map](/notes/probability/multivariate-gaussian#affine-maps) of the pair, with covariance $\tfrac14(I + I) = \tfrac12 I$, so its length is close to $\sqrt{d/2}$:
+
+| For $d = 128$ | Value |
+| --- | --- |
+| mean length of a prior sample (chi distribution) | 11.29, spread 0.71 |
+| angle between two samples, $1/\sqrt{128} = 0.088$ rad | $90° \pm 5°$ |
+| mean length of the lerp midpoint | 7.98, spread 0.50 |
+| prior probability of a squared length $\le d/2$ ($\chi^2_{128}$ distribution function) | $4 \times 10^{-7}$ |
+
+The midpoint lies $(11.29 - 7.98)/0.71 = 4.7$ standard deviations inside the shell, in a region that training on $z \sim p(z)$ almost never visits. Slerp keeps the length typical even when the two lengths differ: at $\Omega = 90°$ its two terms are orthogonal, so by Pythagoras $\lVert z_t\rVert^2 = \cos^2(\pi t/2)\lVert z_0\rVert^2 + \sin^2(\pi t/2)\lVert z_1\rVert^2$, a weighted average of the two squared lengths.
 
 <LerpSlerp />
 
-<aside class="callout"><strong>High density is not the same as typical.</strong> The lerp midpoint has a higher prior density than any typical sample: the log-density of $\mathcal N(0, I)$ is $-\lVert z\rVert^2/2$ up to a constant, so at squared length $d/2$ it exceeds the value at squared length $d$ by $d/4 = 32$ nats for $d = 128$. Yet points of that length almost never occur, because the volume near the centre is tiny. A generator is trained on what the prior produces, not on where its density peaks. White (2016) shows interpolations of a DCGAN in which the lerp midpoints decode to weak images and the slerp midpoints do not (Section 2.1, Figure 2).</aside>
+<aside class="callout"><strong>High density is not the same as typical.</strong> The lerp midpoint has a higher prior density than any typical sample: the log-density of $\mathcal N(0, I)$ is $-\lVert z\rVert^2/2$ plus a constant, so at squared length $d/2$ it exceeds its value at squared length $d$ by $d/4 = 32$ nats. Yet points of that length almost never occur, because the volume near the centre is tiny. A generator learns what the prior produces.</aside>
 
-**Worked example.** In two dimensions take $z_0 = (3, 0)$ and $z_1 = (0, 3)$. The lerp midpoint is $(1.5, 1.5)$, of length $3/\sqrt 2 = 2.12$. For slerp, $\Omega = 90°$ and both coefficients at $t = \tfrac12$ are $\sin 45° / \sin 90° = 0.707$, so the midpoint is $(2.12, 2.12)$, of length 3. In two dimensions the shrinkage is only an illustration, since random pairs are not orthogonal and the shell is not thin. In 128 dimensions almost every pair is close to orthogonal and the shell is thin, so the same factor $1/\sqrt 2$ moves almost every lerp midpoint out of it.
+In two dimensions take $z_0 = (3, 0)$ and $z_1 = (0, 3)$. The lerp midpoint is $(1.5, 1.5)$, of length $3/\sqrt 2 = 2.12$. For slerp, $\Omega = 90°$ and both coefficients at $t = \tfrac12$ are $\sin 45° / \sin 90° = 0.707$, so the midpoint is $(2.12, 2.12)$, of length 3. In two dimensions this is only an illustration; in 128, almost every pair is nearly orthogonal, and the same factor $1/\sqrt 2$ moves almost every lerp midpoint out of the shell.
 
-For an autoencoding GAN the endpoints are codes of real images, not prior samples. If the code critic has matched $q(z)$ to the prior, codes have prior-like lengths, codes of unrelated images are nearly orthogonal, and the argument carries over; codes of similar images are close in angle, and then the two paths nearly coincide. Slerp only keeps the length typical. It does not guarantee that the path avoids regions where $q(z)$ has holes; White calls these dead zones and suggests staying near encodings of held-out data (Section 2.3).
+For an autoencoding GAN the endpoints are codes of real images. If the code critic has matched $q(z)$ to the prior, codes have prior-like lengths and codes of unrelated images are nearly orthogonal, so the argument carries over; codes of similar images are close in angle, and the two paths nearly coincide. Slerp only keeps the length typical. It does not keep the path away from holes in $q(z)$, which White calls dead zones. Linear interpolation is still common, for example in the VAE examples of [Murphy (2023](#references), Section 20.3.5), and with a non-Gaussian latent, such as StyleGAN's $\mathcal W$, the shell argument does not apply.
+
+## Where it breaks
+
+Rosca et al. found every model they tested, α-GAN and the baselines alike, sensitive to the architectures: minor changes led to catastrophic mode collapse, whatever the other hyperparameters. An autoencoding GAN has four networks, three optimizers, the weights $\lambda$ and $\lambda_{\mathrm{GP}}$ and the update ratios, and the reconstruction term does not remove that sensitivity. A large $\lambda$ brings back the blur of the pixel loss; a small one weakens the guard against mode collapse.
+
+The code size shows the tension concretely. The AAE paper ties a deterministic encoder's code dimension to the intrinsic dimension of the data, 5 to 8 for MNIST ([Makhzani et al., 2015](#references), Appendix A.1). A count of volumes shows why the code should not be larger. Suppose the images lie on a surface described by $m$ coordinates $u \in [0, 1]^m$, and the encoder is $L$-Lipschitz in them. Its codes then form a set of zero volume in $\mathbb R^d$ whenever $d > m$, so the prior gives that set probability zero.
+
+<details>
+<summary>Derivation: the codes have zero volume</summary>
+
+Cut the cube of coordinates into $n^m$ small cubes of side $1/n$. Each has diameter $\sqrt m / n$, so by the Lipschitz bound its codes lie in a ball of radius $L\sqrt m / n$. With $V_d$ the volume of the unit ball in $\mathbb R^d$, adding up the balls gives
+
+$$
+\begin{aligned}
+\operatorname{vol}(\text{codes}) &\le n^m\, V_d \big(L\sqrt m / n\big)^d \\
+&= V_d\, (L\sqrt m)^d\, n^{m - d} .
+\end{aligned}
+$$
+
+The bound holds for every $n$, and for $d > m$ it tends to 0 as $n \to \infty$.
+
+</details>
+
+For $d > m$ the cloud of codes and the prior therefore have [supports that do not overlap](/notes/generative-models/gans#where-it-breaks-supports-that-do-not-overlap): prior samples land off the surface of codes, where $G$ never learned anything. A stochastic encoder adds noise that fills the $d - m$ missing directions, which is why the AAE paper recommends one for codes of size 1000. The code cannot be too small either: if two images share a code, $G$ can return only one of them, and the reconstruction term grows. Kwon et al., with brain volumes, saw their model collapse with 100-dimensional codes and needed 1000. Neither number transfers: the code must be large enough for the decoder to rebuild every image and small enough for a critic to match its distribution to the prior, and only the held-out reconstructions and samples tell where that range lies.
 
 ## What changed
 
 | | WGAN-GP | AAE | α-GAN | α-WGAN |
 | --- | --- | --- | --- | --- |
 | Networks | $G$, critic | $E$, $G$, $C$ | $E$, $G$, $D$, $C$ | $E$, $G$, $D$, $C$ |
-| Encoder | none | deterministic or Gaussian | deterministic or implicit | deterministic |
-| Codes matched to the prior by | — | classifier on codes | classifier on codes | WGAN-GP critic on codes |
+| Codes matched to the prior by | — | a classifier on codes | a classifier on codes | a WGAN-GP critic on codes |
 | Pixel term | none | squared error | $\lambda\lVert x - \hat x\rVert_1$ | $\lambda\lVert x - \hat x\rVert_1$ |
 | Image adversary sees | samples | — | reconstructions and samples | reconstructions and samples |
-| Adversarial loss of $E$, $G$ | $-f(G(z))$ | fool $C$ on codes | minus the logit | minus the critic value |
 | Guard against mode collapse | none | reconstruction | reconstruction | reconstruction |
-| Can reconstruct and interpolate real images | no | yes | yes | yes |
+| Can encode real images | no | yes | yes | yes |
 
-## Limitations
+## What you should remember
 
-- **Many moving parts.** Four networks, three optimizers, the weights $\lambda$ and $\lambda_{\mathrm{GP}}$, the update ratios and the learning rates all interact. Rosca et al. found every model they tested sensitive to the architectures, with minor changes leading to catastrophic mode collapse (Section 6).
-- **No uniform gain in sample quality.** In their sweeps an independent critic rated WGAN-GP above α-GAN on all three datasets; the encoder and the coverage are paid for with tuning.
-- **The reconstruction weight is a trade-off.** A large $\lambda$ brings back the blur of the pixel loss in the reconstructions; a small one weakens the guard against mode collapse.
-- **The code distribution is matched only approximately.** With a deterministic encoder and a finite training set, $q(z)$ is a cloud of points, so the ratio and the KL that the classifier estimates exist only for a smoothed version of it, and holes remain possible. The advice on code size differs: the AAE paper recommends codes near the intrinsic dimension for deterministic encoders, while Kwon et al. needed 1000 dimensions to avoid collapse.
-- **Gradient penalty and batch normalization.** The penalty is computed per example; batch normalization in a critic makes each output depend on the whole batch, which is why WGAN-GP recommends against it ([Gulrajani et al., 2017](#references), Section 4). Kwon et al. nevertheless used batch normalization in their critics.
-- **Evaluation stays indirect.** There is still no likelihood, the reconstruction error measures only the autoencoder, and the critic losses cannot be compared between epochs or models.
-
-## Summary
-
-- A VAE has an encoder and covers the data but blurs; a GAN is sharp but has no encoder and can drop modes. Autoencoding GANs keep the encoder and a reconstruction term and replace the troublesome parts of the ELBO with discriminators.
-- The adversarial autoencoder replaces the KL term with a discriminator on codes. It matches the aggregate posterior $q(z)$ to the prior, the part of the KL that sampling needs, and requires only samples from the prior.
-- α-GAN also replaces the pixel likelihood with an image discriminator that sees reconstructions and samples, and keeps $\lambda\lVert x - \hat x\rVert_1$. The adversarial loss of $E$ and $G$ is minus the logit. Matched codes plus exact reconstruction would make the samples distributed as the data; the reconstruction term discourages mode collapse.
-- α-WGAN trains both discriminators as WGAN-GP critics and optimizes $E$ and $G$ on one summed loss, with $\lambda = \lambda_{\mathrm{GP}} = 10$.
-- Training needs one optimizer per player, a stable validation signal (held-out reconstruction error, with the critics' values not comparable over time) and three checks: reconstructions, samples and interpolations.
-- Interpolate with slerp: in $d$ dimensions prior samples have length close to $\sqrt d$, and the lerp midpoint of two of them has length close to $\sqrt{d/2}$, outside the shell the generator was trained on.
+- Averaged over data, the VAE's KL is $I_q(x; z) + D_{\mathrm{KL}}(q(z)\,\|\,p(z))$; sampling needs only the second part.
+- A classifier's optimal logit is $\log(p/q)$: a code discriminator estimates the marginal mismatch from samples.
+- α-GAN: maximize $-\lambda\lVert x - \hat x\rVert_1 + D(\hat x) + C(\hat z)$; matched codes plus exact reconstruction give samples distributed as the data.
+- The loss $-\log\sigma(s) + \log(1 - \sigma(s)) = -s$ never saturates.
+- α-WGAN: both discriminators are WGAN-GP critics; one optimizer per player.
+- Interpolate Gaussian codes with slerp: a lerp midpoint has length near $\sqrt{d/2}$, outside the shell of radius $\sqrt d$.
 
 ## Notebook
 
-The [α-WGAN notebook](https://github.com/HSE-LAMBDA/DeepGenerativeModels/blob/spring-2025-long/seminars/07_alpha-WGAN/alpha-WGAN.ipynb) of the HSE-LAMBDA *Deep Generative Models* repository trains an α-WGAN on CIFAR-10 (cell numbers count every cell, markdown included, from 1). It has no saved outputs, so it documents the procedure rather than results.
+The [α-WGAN notebook](https://github.com/HSE-LAMBDA/DeepGenerativeModels/blob/spring-2025-long/seminars/07_alpha-WGAN/alpha-WGAN.ipynb) of the HSE-LAMBDA *Deep Generative Models* course trains an α-WGAN on CIFAR-10. Cell numbers count every cell, markdown included, from 1. The notebook has no saved outputs, so it documents the procedure rather than results.
 
-- **Cells 1–4: setup.** Cell 1 outlines the notebook. Cell 3 starts a Comet.ml experiment with the project, workspace and API key read from a local `cfg.yaml`; the global `experiment` is used later inside `save_checkpoint` and `train_alphawgan`, so the notebook does not run without a Comet account unless those calls are removed. Cell 4 imports the libraries and picks CUDA, Apple MPS or the CPU.
-- **Cells 5–6: data.** CIFAR-10 train (50,000 images) and test (10,000) splits, resized from $32 \times 32$ to $64 \times 64$ and scaled to $[-1, 1]$; batch size 128 with a shuffled training loader, so an epoch has 391 batches, the last of 80 images. Upsampling adds no detail and quadruples the cost of every convolution.
-- **Cells 7–8: building blocks.** Cell 7 names the four networks and shows an architecture diagram. Cell 8 defines `ChannelsToLinear` (flatten, then a linear layer), `LinearToChannels2d` (a linear layer reshaped into feature maps) and `ResBlock`: two $3 \times 3$ convolutions with batch normalization, Xavier-normal initialization, and the input added before the last activation.
-- **Cells 9–12: encoder and generator.** The encoder is a $5 \times 5$ convolution, three average-poolings ($64 \to 8$) interleaved with residual blocks, and a linear map to a code of size $d$ with no output activation. The generator mirrors it: a linear map to $8 \times 8$ feature maps, three nearest-neighbour $\times 2$ upsamplings with residual blocks, a $1 \times 1$ convolution to RGB and tanh. With the `base_channels = 256` of cell 24 the flattened features have $256 \cdot 8 \cdot 8 = 16{,}384$ entries; the inline comments give the numbers for the default 128 channels.
-- **Cells 13–14: critics.** `ImageDiscriminator` has the encoder's layout with LeakyReLU(0.2) and a single output; its residual blocks contain batch normalization. `CodeDiscriminator` is an MLP $d \to 700 \to 700 \to 1$ with LeakyReLU(0.2), no normalization and Xavier initialization; Rosca et al. used 750 units.
-- **Cell 15: `gradient_penalty`.** One $\alpha \sim U(0, 1)$ per example, broadcast over the remaining dimensions, interpolates detached and marked as requiring gradients, `autograd.grad` with `create_graph=True`, the per-example $L_2$ norm, and $\lambda_{\mathrm{GP}} \cdot \mathrm{mean}\big((\lVert g\rVert_2 - 1)^2\big)$. The same function serves images and codes.
-- **Cells 16–17: the `AlphaWGAN` class.** `sample_prior` draws $z \sim \mathcal N(0, I)$; `rec_loss` is the mean absolute error over all pixels, so $\lambda$ multiplies a per-pixel average (class default 40, set to 10 in cell 24). `autoencoder_loss` returns $\lambda \cdot L_1$, $-\mathrm{mean}\,C(E(x))$ and $-\mathrm{mean}\,D(G(z))$; `discriminator_loss` returns the WGAN loss of $D$ on real images against detached samples $G(z)$ plus $\mathrm{GP}_D$; `code_discriminator_loss` the WGAN loss of $C$ on prior samples against detached codes plus $\mathrm{GP}_C$. `forward` encodes, generates, samples (given an integer count) or reconstructs.
-- **Cells 18–22: training utilities.** `save_checkpoint` saves the weights and logs them to Comet; `evaluate_alphagan` averages the three encoder–generator terms over a loader in evaluation mode without gradients; `EarlyStopping` keeps the checkpoint with the lowest monitored loss and stops after `patience` epochs without improvement; `visualize_samples` decodes prior samples. `train_alphawgan` creates three AdamW optimizers (encoder and generator together, $D$, $C$) and three `CosineAnnealingWarmRestarts` schedulers with $T_0 = 10$ and $T_{\text{mult}} = 2$, stepped once per epoch. Each batch makes one encoder–generator step on the sum of the three terms, then `n_critic` rounds of one $D$ step and one $C$ step on the same real batch; after every backward pass it logs to Comet a histogram of the gradient of every parameter of the networks just updated. Each epoch it averages the losses, evaluates on the test split, logs the metrics and a figure of samples, saves a checkpoint every `checkpoint_every` epochs and applies early stopping with patience 10 to the validation reconstruction loss.
-- **Cells 23–29: configuration and run.** $d = 128$, `base_channels = 256`, $\lambda = 10$, $\lambda_{\mathrm{GP}} = 10$; cell 26 reloads `checkpoints/checkpoint_best.pth` if it exists (weights only, so the optimizers and schedulers start fresh). Training runs for up to 100 epochs with learning rate $2 \cdot 10^{-4}$, betas $(0, 0.9)$, $n_{\text{critic}} = 5$ and a checkpoint every 10 epochs (overriding the function's defaults of $8 \cdot 10^{-4}$ and 3 critic rounds); cell 28 logs the hyperparameters. The schedule gives the cycles of 10, 20 and 40 epochs computed in the body, with restarts at epochs 11, 31 and 71.
-- **Cells 30–36: evaluation.** `visualize_reconstructions` shows 16 test images above their reconstructions; cells 32–33 plot the validation and training reconstruction losses ($\lambda$-scaled, without labels or legend); cell 34 reloads the best checkpoint; cells 35–36 show 16 samples and the reconstructions.
-- **Cells 37–39: interpolation.** `slerp` implements the formula above on the unnormalized codes, with the angle from their directions and a fallback to lerp when $\sin\Omega < 10^{-6}$; `lerp` is the straight line. `interpolate_latent` encodes the first `num_images` images of a batch and decodes 7 equally spaced points between each pair of consecutive codes. Cell 39 uses the first four test images (the test loader is not shuffled), giving three rows of seven images with slerp; `method="lerp"` switches to the straight line.
-
-**Issues.**
-
-- **Reconstructions never reach the image critic.** `discriminator_loss` compares real images only with samples $G(z)$, and `autoencoder_loss` has no $-D(\hat x)$ term. α-GAN (Algorithm 1) and α-WGAN (Kwon et al., Eqs. 1–2) both treat reconstructions as fakes. As written, reconstructions are trained by the $L_1$ term alone, so they keep its averaging, and the model is an adversarial autoencoder with an extra critic on samples. The full version adds `D(x_rec.detach())` to the critic loss with the real term weighted by 2, and $-D(\hat x)$ to the encoder–generator loss.
-- **The markdown of cell 16 says the adversarial losses are binary cross-entropies;** the code uses Wasserstein losses with gradient penalties. The docstring of `train_alphawgan` mentions gradient clipping, which the code does not do.
-- **Batch normalization in the image critic** conflicts with the per-example gradient penalty, and real images, samples and interpolates pass through it as three separate batches with different statistics. WGAN-GP recommends a critic without batch normalization, for example with layer normalization; the code critic, which has none, is fine.
-- **The critic steps reuse one real batch.** All five rounds see the same `x`; only the prior samples are redrawn. WGAN-GP draws a fresh real minibatch for every critic step.
-- **Two crashes on a fresh run.** `EarlyStopping` initializes `np.Inf`, which NumPy 2.0 removed (`np.inf` is the current name). Its first call, at the end of epoch 1, saves to `checkpoints/checkpoint_best.pth` before anything has created the `checkpoints` directory (`save_checkpoint`, which creates it, first runs at epoch 10), and `torch.save` raises an error for a missing parent directory; `EarlyStopping` needs its own `os.makedirs`.
-- **Early stopping selects on the test split** and watches only the reconstruction loss. Its patience of 10 epochs is shorter than the second warm-restart cycle, so a best value at epoch 10 stops the run at epoch 20 while the learning rate is still $1.2 \cdot 10^{-4}$. The validation adversarial terms in `evaluate_alphagan` are scores of changing critics and cannot be compared between epochs.
-- **Stale or fragile calls.** `make_grid(..., range=(-1, 1))` in cell 38 uses the argument name that torchvision renamed to `value_range` (the other cells already use the new name). `torch.load` in cells 26 and 34 has no `map_location`, so a checkpoint saved on a GPU does not load on a machine without CUDA.
-- **Wasted work.** The encoder–generator backward pass also fills the gradients of $D$ and $C$; they are cleared before the critic steps, so the results are unaffected. The critic steps compute $G(z)$ and $E(x)$ with gradient tracking before detaching them, in training mode, so they also update the batch-normalization statistics of $E$ and $G$. Logging gradient histograms after each of the 11 backward passes of a batch, with the epoch as the step, copies the gradients to the CPU $391 \times 11$ times per epoch.
-- **Smaller points.** AdamW ([Loshchilov and Hutter, 2019](#references)) applies its default weight decay of 0.01 to all networks, critics included, where the papers use Adam. `ResBlock` enables convolution biases exactly when a normalization layer follows (`bias=(norm_layer is not None)`), the reverse of the usual choice; the redundant biases are harmless. The markdown of cell 37 explains slerp by a latent space that "often lies on a hypersphere when normalized"; the precise reason is that Gaussian samples concentrate near the sphere of radius $\sqrt d$.
+- Setup and data (cells 1–6): logging goes to Comet.ml, which the training code calls, so the notebook needs an account or those calls removed. CIFAR-10 is resized to $64 \times 64$ and scaled to $[-1, 1]$.
+- Networks (cells 7–14): a residual encoder and a mirrored generator; an image critic with batch normalization, which WGAN-GP advises against because its penalty is per example ([Gulrajani et al., 2017](#references)); and an MLP code critic.
+- Losses (cells 15–17): one gradient-penalty function serves both critics. Reconstructions never reach the image critic, and the encoder–generator loss has no $-D(\hat x)$ term, so the model is an adversarial autoencoder with an extra critic on samples; the full α-WGAN adds the reconstructions to the critic loss with the real term doubled.
+- Training loop (cells 18–22): three AdamW optimizers with cosine warm restarts ($T_0 = 10$ epochs, doubling), each scheduler stepped once at the end of an epoch; one encoder–generator step, then `n_critic` rounds of a $D$ and a $C$ step on the same real batch. Early stopping watches the reconstruction loss on the test split with a patience of 10 epochs: a best value at epoch 10, just before the first restart, stops the run at epoch 20. PyTorch's schedule sets the rate to $\eta_{\max} \cdot \tfrac12\big(1 + \cos(\pi T_{\text{cur}} / T_i)\big)$, with $T_i$ the length of the current cycle and $T_{\text{cur}}$ the epochs since its start. Epoch 20 runs after 19 steps, 10 of which closed the first cycle, so $T_{\text{cur}} = 9$, $T_i = 20$, and the rate is $2 \cdot 10^{-4} \cdot \tfrac12\big(1 + \cos(9\pi/20)\big) = 10^{-4} \cdot 1.156 \approx 1.2 \cdot 10^{-4}$. On a fresh run it also crashes twice: `np.Inf` no longer exists in NumPy 2, and the first checkpoint is saved before its directory is created.
+- Configuration and run (cells 23–29): $d = 128$, `base_channels = 256`, $\lambda = \lambda_{\mathrm{GP}} = 10$, learning rate $2 \cdot 10^{-4}$, betas $(0, 0.9)$, $n_{\text{critic}} = 5$, up to 100 epochs.
+- Evaluation and interpolation (cells 30–39): samples, test reconstructions, loss curves, and slerp in seven steps between the codes of consecutive test images.
 
 ## Next
 
-So far every GAN in the course has generated images from noise, and the encoder of this note only gave that noise a meaning. Rosca et al. point out a relation to the next model (Section 4): in image space α-GAN matches reconstructions to images point by point and in distribution, but in code space it only matches distributions; adding a pointwise code reconstruction $\lVert z - E(G(z))\rVert$ would make it resemble CycleGAN. The [next note](/notes/generative-models/cyclegan) replaces the code space by a second image domain: two generators translate images between domains without paired examples, adversarial losses make each translation look like the other domain, and a cycle of reconstructions ties every output to its input.
+So far every GAN in the course has generated images from noise, and the encoder of this note only gave that noise a meaning. Rosca et al. point out that α-GAN matches images to their reconstructions point by point, but codes only in distribution; adding a pointwise code reconstruction $\lVert z - E(G(z))\rVert$ would make it resemble CycleGAN. The [next note](/notes/generative-models/cyclegan) replaces the code space by a second image domain: two generators translate images between domains without paired examples, and a cycle of reconstructions ties every output to its input.
 
 ## References
 
-- A. Makhzani, J. Shlens, N. Jaitly, I. Goodfellow, B. Frey. [Adversarial autoencoders](https://arxiv.org/abs/1511.05644). arXiv:1511.05644, 2015. The aggregate posterior is Eq. 1; the comparison with the VAE is Section 2.1; experimental details are in Appendix A.
-- M. Rosca, B. Lakshminarayanan, D. Warde-Farley, S. Mohamed. [Variational approaches for auto-encoding generative adversarial networks](https://arxiv.org/abs/1706.04987). arXiv:1706.04987, 2017. α-GAN: Section 3, Eqs. 6–9; Algorithm 1 and the hyperparameters are in Appendices B and H.
-- G. Kwon, C. Han, D.-S. Kim. [Generation of 3D brain MRI using auto-encoding generative adversarial networks](https://doi.org/10.1007/978-3-030-32248-9_14). MICCAI, 2019, pp. 118–126; [arXiv:1908.02498](https://arxiv.org/abs/1908.02498). The α-WGAN losses are Eqs. 1–3.
-- I. Gulrajani, F. Ahmed, M. Arjovsky, V. Dumoulin, A. Courville. [Improved training of Wasserstein GANs](https://arxiv.org/abs/1704.00028). NeurIPS, 2017.
-- T. White. [Sampling generative networks](https://arxiv.org/abs/1609.04468). arXiv:1609.04468, 2016. Slerp for latent spaces: Section 2.1; dead zones: Section 2.3.
+- A. Makhzani, J. Shlens, N. Jaitly, I. Goodfellow, B. Frey. [Adversarial autoencoders](https://arxiv.org/abs/1511.05644). arXiv:1511.05644, 2015. Section 2: the aggregate posterior and the training phases; Figure 2: codes of a VAE and an AAE; Appendix A.1: code dimension for deterministic encoders.
+- M. Rosca, B. Lakshminarayanan, D. Warde-Farley, S. Mohamed. [Variational approaches for auto-encoding generative adversarial networks](https://arxiv.org/abs/1706.04987). arXiv:1706.04987, 2017. α-GAN: Section 3, Eqs. 6–9; Section 6: results and the sensitivity to architectures; Algorithm 1; Appendix D: the moment penalty on codes.
+- G. Kwon, C. Han, D.-S. Kim. [Generation of 3D brain MRI using auto-encoding generative adversarial networks](https://arxiv.org/abs/1908.02498). MICCAI, 2019. The α-WGAN losses, Eqs. 1–3; code sizes 100 and 1000.
+- I. Gulrajani, F. Ahmed, M. Arjovsky, V. Dumoulin, A. Courville. [Improved training of Wasserstein GANs](https://arxiv.org/abs/1704.00028). NeurIPS, 2017. Section 4: no batch normalization in the critic.
+- T. White. [Sampling generative networks](https://arxiv.org/abs/1609.04468). arXiv:1609.04468, 2016. Section 2.1: slerp; dead zones in the latent space.
 - K. Shoemake. [Animating rotation with quaternion curves](https://doi.org/10.1145/325165.325242). SIGGRAPH, *Computer Graphics* 19(3), 245–254, 1985.
-- I. Loshchilov, F. Hutter. [SGDR: Stochastic gradient descent with warm restarts](https://arxiv.org/abs/1608.03983). ICLR, 2017. The schedule is Eq. 5, Section 3.
-- I. Loshchilov, F. Hutter. [Decoupled weight decay regularization](https://arxiv.org/abs/1711.05101). ICLR, 2019. AdamW.
 - A. Radford, L. Metz, S. Chintala. [Unsupervised representation learning with deep convolutional generative adversarial networks](https://arxiv.org/abs/1511.06434). ICLR, 2016. DCGAN.
+- J. Donahue, P. Krähenbühl, T. Darrell. [Adversarial feature learning](https://arxiv.org/abs/1605.09782). ICLR, 2017. BiGAN; Proposition 2: the objective as a Jensen–Shannon divergence; Theorems 1–2: the optimal joint distributions match and the encoder inverts the generator.
 - D. Ulyanov, A. Vedaldi, V. Lempitsky. [It takes (only) two: adversarial generator-encoder networks](https://arxiv.org/abs/1704.02304). arXiv:1704.02304, 2017. AGE.
-- HSE-LAMBDA, *Deep Generative Models* course repository: [`alpha-WGAN.ipynb`](https://github.com/HSE-LAMBDA/DeepGenerativeModels/blob/spring-2025-long/seminars/07_alpha-WGAN/alpha-WGAN.ipynb).
+- K. P. Murphy. [*Probabilistic Machine Learning: Advanced Topics*](https://probml.github.io/pml-book/book2.html). MIT Press, 2023. Section 20.3.5: latent space interpolation; Section 21.3.2: InfoVAE; Section 26.5: inference with GANs (BiGAN, ALI).
+- S. Zhao, J. Song, S. Ermon. [InfoVAE: Balancing learning and inference in variational autoencoders](https://arxiv.org/abs/1706.02262). AAAI, 2019. Section 4: the InfoVAE family; the adversarial autoencoder as its member with Jensen–Shannon divergence.
+- R. Isachenko. [*Deep Generative Models*, lecture 4](https://github.com/r-isachenko/2025-DGM-MIPT-YSDA-course). MIPT and YSDA, 2025. ELBO surgery: the average KL as mutual information plus the marginal KL.
+- A. Ryzhikov et al. [Lecture 5: α-GAN, AAE](https://github.com/HSE-LAMBDA/DeepGenerativeModels/blob/spring-2025-long/lectures/07_Lecture_alphaGAN-AAE.pdf). HSE *Deep Generative Models*, spring 2025. The density-ratio view of the code discriminator.

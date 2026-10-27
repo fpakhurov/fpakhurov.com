@@ -1,6 +1,6 @@
 ---
 title: Energy-based models
-description: "Any network with a scalar output defines a density, up to an unknown normalizing constant, by exponentiating minus its output: the likelihood gradient with its positive and negative phases, contrastive divergence with short Langevin chains and a replay buffer, why the energies drift and how an L2 term holds them, why training diverges, the sampling-free estimators NCE and score matching, and uses from out-of-distribution detection to JEM and composed energies."
+description: "Any network with one scalar output defines a density up to an unknown constant. How to train it: the likelihood gradient and its negative phase, short Langevin chains with a replay buffer, and the sampling-free NCE and score matching."
 course: generative-models
 section: Energy-Based Models
 order: 24
@@ -12,13 +12,20 @@ prerequisites: [Maximum likelihood, "Sampling unnormalized densities: MALA, Hami
 import TrainingStep from '../../../components/figures/energy-based-models/TrainingStep.astro';
 import ShortRunBias from '../../../components/figures/energy-based-models/ShortRunBias.astro';
 
-The [previous note](/notes/generative-models/mcmc-samplers) drew samples from a density known only up to a constant, with MALA, Hamiltonian Monte Carlo and NUTS. There the target was fixed. An **energy-based model** (EBM) makes it learnable: a neural network $E_\theta(x)$ with one scalar output defines the density $p_\theta(x) = e^{-E_\theta(x)}/Z_\theta$, and training moves $\theta$ until that density fits the data ([LeCun et al., 2006](#references)). Nothing restricts the architecture: no invertibility as in flows, no ordering of the pixels as in autoregressive models, no encoder as in a VAE. The price is the normalizer $Z_\theta$. The likelihood cannot be evaluated, its gradient needs samples from the model, and so every training step runs a Markov chain on the model being trained. This note derives that gradient, builds the standard recipe around it (short Langevin chains, a replay buffer, a penalty on the energies), explains why training is unstable, gives two estimators that need no samples during training, and ends with what energies are used for besides generation.
-
-**Notation.** $x \in \mathbb R^d$ is a data point, for example an MNIST image with $d = 784$ pixel values in $[-1, 1]$. $P$ is the data distribution with density $p$. The **energy** $E_\theta: \mathbb R^d \to \mathbb R$ is a network with parameters $\theta$, and the model density is $p_\theta(x) = e^{-E_\theta(x)}/Z_\theta$ with the **partition function** $Z_\theta = \int e^{-E_\theta(x)}\,dx$. Data samples $x^+ \sim P$ are the positive examples; samples $x^-$ meant to come from $p_\theta$ are the negative examples. $\nabla_\theta$ is the gradient with respect to the parameters and $\nabla_x$ with respect to the input. One Langevin step of size $\varepsilon$ is $x \leftarrow x - \tfrac{\varepsilon}{2}\nabla_x E_\theta(x) + \sqrt{\varepsilon}\,z$ with $z \sim \mathcal N(0, I)$, as in the [probability course](/notes/probability/markov-chain-monte-carlo#langevin-dynamics), and $K$ is the number of steps of a chain. The second argument of $\mathcal N$ is the variance.
+Take a small convolutional network that reads a $28 \times 28$ image and outputs one number, $E_\theta(x)$, trained to be low on digits and high on everything else: blank pages, noise, scribbles. Is it a generative model of digits? It is, once we exponentiate: $e^{-E_\theta(x)}$ is large exactly where the network says "digit", and normalizing it gives a density over images. The [previous note](/notes/generative-models/mcmc-samplers) sampled such a density for a fixed energy. Here the energy is learned from data, and the normalizing constant, which nobody can compute, changes with every update of $\theta$. How do we fit a density whose likelihood we cannot evaluate?
 
 ## An energy defines a density
 
-Low energy means high probability. Exponentiation turns any real-valued $E_\theta$ into a positive function, and dividing by $Z_\theta$ makes it integrate to one. This is the Boltzmann, or Gibbs, distribution of statistical physics at temperature 1. The only condition is that $Z_\theta$ be finite: the energy must grow fast enough at infinity, or the domain must be bounded, as it is for images with pixels in $[-1, 1]$. The quadratic energy $E(x) = x^2/2$ gives $Z = \sqrt{2\pi}$ and $p = \mathcal N(0, 1)$; a network can draw any landscape, with as many valleys as the data have modes.
+An **energy-based model** (EBM) is a network $E_\theta: \mathbb R^d \to \mathbb R$ with parameters $\theta$ together with the density
+
+$$
+\begin{aligned}
+p_\theta(x) &= \frac{e^{-E_\theta(x)}}{Z_\theta} , \\
+Z_\theta &= \int e^{-E_\theta(x)}\, dx .
+\end{aligned}
+$$
+
+$Z_\theta$ is the **partition function**. Low energy means high probability. $Z_\theta$ must be finite: the energy grows fast enough at infinity, or the domain is bounded, as for pixels in $[-1, 1]$. The energy $E(x) = x^2/2$ gives $Z = \sqrt{2\pi}$ and $p = \mathcal N(0, 1)$; a network can draw a valley for every mode of the data. Nothing restricts the architecture: no invertibility as in flows, no pixel ordering as in autoregressive models, no encoder as in a VAE ([LeCun et al., 2006](#references)).
 
 Only differences of energy matter:
 
@@ -26,225 +33,274 @@ $$
 \frac{p_\theta(x)}{p_\theta(y)} = e^{E_\theta(y) - E_\theta(x)} .
 $$
 
-Adding a constant $c$ to the energy multiplies $Z_\theta$ by $e^{-c}$ and leaves $p_\theta$ unchanged. This freedom returns below as the offset problem.
+Adding a constant $c$ to the energy multiplies $Z_\theta$ by $e^{-c}$ and leaves $p_\theta$ unchanged. This freedom returns later as the offset problem.
 
-Why not compute $Z_\theta$? It is an integral over $\mathbb R^d$. A grid with just 10 points per pixel of an MNIST image has $10^{784}$ nodes. Everything below is therefore arranged so that $Z_\theta$ cancels or is never needed.
-
-### Decisions need no normalizer
-
-Many uses of an energy compare values and never normalize them. With an energy $E_\theta(x, y)$ of an input $x$ and an answer $y$, inference is $\hat y = \arg\min_y E_\theta(x, y)$: classification when $y$ is a label, restoration when $x$ is a noisy image and $y$ a clean one ([LeCun et al., 2006](#references), Section 1.1 and Figure 2). Only the order of the energies matters, so $Z$ never appears. Image EBMs do the same with Langevin dynamics: started at a corrupted test image, the chain removes salt-and-pepper noise or fills a masked region ([Du and Mordatch, 2019](#references), Section 4.2). A density, and with it $Z$, is needed when the model must generate samples, report a likelihood, or be combined with other models on a common scale.
+Why not compute $Z_\theta$? A grid with only 10 points per pixel of an MNIST image has $10^{784}$ nodes. Inference $\hat y = \arg\min_y E_\theta(x, y)$ with an energy of an input and an answer only compares energies and never needs it ([LeCun et al., 2006](#references), Section 1.1); sampling, likelihoods and maximum-likelihood training do.
 
 ## The likelihood gradient: positive and negative phases
 
-Maximum likelihood minimizes the negative log-likelihood, which equals the KL divergence from the data to the model up to a constant ([entropy note](/notes/generative-models/entropy-and-divergences#why-cross-entropy-is-the-loss-we-minimize)). For an EBM, $\log p_\theta(x) = -E_\theta(x) - \log Z_\theta$, so
+Maximum likelihood minimizes the expected negative log-likelihood over the data distribution $P$, which equals the KL divergence from the data to the model up to a constant ([entropy note](/notes/generative-models/entropy-and-divergences#why-cross-entropy-is-the-loss-we-minimize)). Since $\log p_\theta(x) = -E_\theta(x) - \log Z_\theta$,
 
 $$
 \begin{aligned}
-\mathcal L(\theta) &= -\mathbb E_{x\sim P}\log p_\theta(x)\\
-&= \mathbb E_{x\sim P}\,E_\theta(x) + \log Z_\theta .
+\mathcal L(\theta) &= -\mathbb E_{x \sim P} \log p_\theta(x) \\
+&= \mathbb E_{x \sim P}\, E_\theta(x) + \log Z_\theta .
 \end{aligned}
 $$
 
-The first term is an average over the data; its gradient is $\mathbb E_{x\sim P}\nabla_\theta E_\theta(x)$. The second term is where the difficulty lives. Three steps:
-
-1. The chain rule for the logarithm: $\nabla_\theta \log Z_\theta = \nabla_\theta Z_\theta / Z_\theta$.
-2. Differentiate under the integral sign, which is allowed when $E_\theta$ is differentiable in $\theta$ and the gradient of the integrand is bounded by an integrable function: $\nabla_\theta Z_\theta = \int \nabla_\theta e^{-E_\theta(x)}\,dx = \int e^{-E_\theta(x)}\big(-\nabla_\theta E_\theta(x)\big)\,dx$.
-3. Divide by $Z_\theta$ and recognize the model density $e^{-E_\theta(x)}/Z_\theta = p_\theta(x)$:
+The gradient of the first term averages $\nabla_\theta E_\theta$ over the data. The second term is the difficulty:
 
 $$
 \begin{aligned}
-\nabla_\theta \log Z_\theta &= \int p_\theta(x)\big(-\nabla_\theta E_\theta(x)\big)\,dx\\
-&= -\mathbb E_{x\sim p_\theta}\nabla_\theta E_\theta(x) .
+\nabla_\theta \log Z_\theta
+&= \frac{1}{Z_\theta}\, \nabla_\theta Z_\theta \\
+&= \frac{1}{Z_\theta} \int \nabla_\theta\, e^{-E_\theta(x)}\, dx \\
+&= \frac{1}{Z_\theta} \int e^{-E_\theta(x)} \big(-\nabla_\theta E_\theta(x)\big)\, dx \\
+&= \int p_\theta(x) \big(-\nabla_\theta E_\theta(x)\big)\, dx \\
+&= -\mathbb E_{x \sim p_\theta}\, \nabla_\theta E_\theta(x) .
 \end{aligned}
 $$
 
-Together,
+Line by line: the chain rule for the logarithm; differentiation under the integral sign, allowed when $E_\theta$ is differentiable in $\theta$ and the gradient of the integrand is bounded by an integrable function of $x$; the chain rule for the exponential; the definition of $p_\theta$, with $1/Z_\theta$ moved inside; the definition of an expectation.
+
+For a single data point this gives the gradient of the log-likelihood,
+
+$$
+\nabla_\theta \log p_\theta(x) = -\nabla_\theta E_\theta(x) + \mathbb E_{x' \sim p_\theta}\, \nabla_\theta E_\theta(x') ,
+$$
+
+and averaging over the data gives the gradient of the loss in two **phases** ([Song and Kingma, 2021](#references), Section 3):
 
 $$
 \begin{aligned}
-\nabla_\theta \mathcal L(\theta) = {}& \underbrace{\mathbb E_{x^+\sim P}\,\nabla_\theta E_\theta(x^+)}_{\text{positive phase}}\\
-&- \underbrace{\mathbb E_{x^-\sim p_\theta}\,\nabla_\theta E_\theta(x^-)}_{\text{negative phase}} ,
+\nabla_\theta \mathcal L(\theta) = {}& \underbrace{\mathbb E_{x^+ \sim P}\, \nabla_\theta E_\theta(x^+)}_{\text{positive phase}} \\
+&- \underbrace{\mathbb E_{x^- \sim p_\theta}\, \nabla_\theta E_\theta(x^-)}_{\text{negative phase}} .
 \end{aligned}
 $$
 
-and the gradient of the log-likelihood is the same with the sign flipped, $-\mathbb E_P \nabla_\theta E_\theta(x^+) + \mathbb E_{p_\theta}\nabla_\theta E_\theta(x^-)$. A gradient step $\theta \leftarrow \theta - \eta\,\nabla_\theta\mathcal L$ lowers the energy at the data and raises it at the model's own samples: the negative phase pulls up the energy of every point in proportion to its probability under the model ([LeCun et al., 2006](#references), Section 2.2.4). The update stops when the two expectations agree, $\mathbb E_P\nabla_\theta E_\theta = \mathbb E_{p_\theta}\nabla_\theta E_\theta$: maximum likelihood matches the averages of the statistics $\nabla_\theta E_\theta(x)$ under the data and under the model. The derivation holds for any architecture ([Song and Kingma, 2021](#references), Section 3).
+Data points $x^+$ are the positive examples, model samples $x^-$ the negative ones. A step $\theta \leftarrow \theta - \eta\, \nabla_\theta \mathcal L$ lowers the energy at the data and raises it where the model puts its mass, until the two averages of $\nabla_\theta E_\theta$ agree.
 
-**Worked example: three states.** Let $x \in \{a, b, c\}$ and let the energy be a table, $\theta = (E_a, E_b, E_c) = (0, 1, 2)$. Then $Z = 1 + e^{-1} + e^{-2} = 1.503$ and $p_\theta = (0.665, 0.245, 0.090)$. Let the data be $P = (0.5, 0.3, 0.2)$. For a table, $\partial E_\theta(x)/\partial E_j$ is 1 if $x = j$ and 0 otherwise, so the two phases are $P(j)$ and $p_\theta(j)$:
+**Worked example: three states.** Let $x \in \{a, b, c\}$ and let the energy be a table, $\theta = (E_a, E_b, E_c) = (0, 1, 2)$, with data frequencies $P = (0.5, 0.3, 0.2)$. For a table, $\partial E_\theta(x)/\partial E_j$ is 1 if $x = j$ and 0 otherwise, so the positive phase is $P(j)$ and the negative phase is $p_\theta(j)$:
 
-$$
-\frac{\partial \mathcal L}{\partial E_j} = P(j) - p_\theta(j) = (-0.165,\ 0.055,\ 0.110) .
-$$
+| Quantity | $a$ | $b$ | $c$ |
+| --- | --- | --- | --- |
+| model $p_\theta = e^{-E}/Z$, with $Z = 1.503$ | $0.665$ | $0.245$ | $0.090$ |
+| gradient $P(j) - p_\theta(j)$ | $-0.165$ | $0.055$ | $0.110$ |
+| energy after a step of size 1 | $0.165$ | $0.945$ | $1.890$ |
+| model after the step | $0.611$ | $0.280$ | $0.109$ |
 
-A step against this gradient raises $E_a$, where the model puts too much mass, and lowers $E_b$ and $E_c$. With step size 1 the energies become $(0.165, 0.945, 1.890)$ and $p_\theta = (0.611, 0.280, 0.109)$, closer to $P$. The fixed point is $p_\theta = P$, that is $E_j = -\log P(j) + \text{const}$. The three components of the gradient sum to zero, so the mean energy stays at 1: the gradient never moves the overall level of the energies.
+The step raises $E_a$, where the model has too much mass, and the model moves towards $P$; the fixed point is $E_j = -\log P(j) + \text{const}$. The gradient components sum to zero, so the mean energy stays at 1: the gradient never moves the overall level of the energies.
 
-<aside class="callout"><strong>The loss behind the gradient.</strong> In code the gradient comes from the surrogate loss $\mathcal L_{\text{CD}}(\theta) = \frac1N\sum_i E_\theta(x^+_i) - \frac1N\sum_i E_\theta(x^-_i)$, with the negative samples $x^-_i$ treated as constants: no gradient flows through the sampler. Its gradient is a Monte Carlo estimate of the expression above. Its value is not the negative log-likelihood. It is close to zero whenever samples and data receive similar energies, so it does not show whether training is making progress. With $f = -E_\theta$ it has the form of the <a href="/notes/generative-models/wgan#wgan-losses">WGAN critic loss</a>; the difference is that the negative examples come from MCMC on the critic itself rather than from a generator network (<a href="#references">Du and Mordatch, 2019</a>, Section 3.1).</aside>
+<aside class="callout"><strong>The loss behind the gradient.</strong> In code the gradient comes from the surrogate $\frac1N\sum_i E_\theta(x^+_i) - \frac1N\sum_i E_\theta(x^-_i)$ with the samples $x^-_i$ treated as constants: no gradient flows through the sampler. Its value is not the negative log-likelihood and stays near zero once samples and data get similar energies. With $f = -E_\theta$ it has the form of the <a href="/notes/generative-models/wgan#wgan-losses">WGAN critic loss</a>, with negatives drawn by MCMC on the critic itself instead of a generator (<a href="#references">Du and Mordatch, 2019</a>, Section 3.1).</aside>
 
 ## Why the negative phase needs samples from the model
 
-The positive phase is an average over the training set. The negative phase is an average under $p_\theta$: the distribution being trained, which changes after every update and whose normalizer is unknown. [Importance sampling](/notes/probability/monte-carlo#importance-sampling) would need a proposal close to $p_\theta$ in $d$ dimensions, which is as hard as the original problem. What remains is Markov chain Monte Carlo, which needs only
+The negative phase averages under $p_\theta$, which changes after every update and has an unknown normalizer. [Importance sampling](/notes/probability/monte-carlo#importance-sampling) would need a proposal close to $p_\theta$ in 784 dimensions, as hard as the original problem. What remains is Markov chain Monte Carlo, which needs only the score:
 
 $$
-\nabla_x \log p_\theta(x) = -\nabla_x E_\theta(x) - \underbrace{\nabla_x \log Z_\theta}_{=\,0} ,
+\nabla_x \log p_\theta(x) = -\nabla_x E_\theta(x) - \underbrace{\nabla_x \log Z_\theta}_{=\,0} .
 $$
 
-since $Z_\theta$ depends on $\theta$ but not on $x$. **Langevin dynamics**,
+**Langevin dynamics**, the Euler step of the [MALA section](/notes/generative-models/mcmc-samplers#mala) without the accept test, is the usual choice for images:
 
 $$
-\begin{gathered}
-x_{k+1} = x_k - \frac{\varepsilon}{2}\,\nabla_x E_\theta(x_k) + \sqrt{\varepsilon}\,z_k,\\
-z_k \sim \mathcal N(0, I),
-\end{gathered}
+x_{k+1} = x_k - \frac{\varepsilon}{2}\, \nabla_x E_\theta(x_k) + \sqrt{\varepsilon}\, z_k ,
 $$
 
-is the usual choice for images: each step costs one gradient of the energy network with respect to its input, a forward and a backward pass ([Du and Mordatch, 2019](#references), Section 3). The distribution of $x_K$ approaches $p_\theta$ as $\varepsilon \to 0$ and $K \to \infty$; MALA and HMC from the [previous note](/notes/generative-models/mcmc-samplers) remove the step-size bias at the cost of a density ratio, which for an EBM is $e^{E_\theta(x) - E_\theta(x')}$ and also free of $Z_\theta$. The EBM literature often calls the sampler **SGLD**, after the stochastic gradient Langevin dynamics of [Welling and Teh (2011)](#references), who used Langevin steps with minibatch gradients to sample model parameters from a posterior. Here the gradient is exact and the chain runs in data space.
+with fresh noise $z_k \sim \mathcal N(0, I)$. Each step costs one input gradient of the network, a forward and a backward pass, and the distribution of $x_K$ approaches $p_\theta$ as $\varepsilon \to 0$ and $K \to \infty$ ([Du and Mordatch, 2019](#references), Section 3). The EBM literature often calls it **SGLD**, after [Welling and Teh (2011)](#references).
 
-The obstacle is cost. On a multimodal energy, such as one that fits images, Langevin chains mix slowly: chains from different starts get trapped in different modes ([Nijkamp et al., 2019](#references), Section 1.1). A long chain would be needed after every parameter update. The methods below shorten the chains and pay for it with bias.
+A long chain after every update is unaffordable, and with many modes Langevin chains mix slowly anyway. The methods below shorten the chains and pay with bias.
 
 ## Contrastive divergence: stopping the chains early
 
-[Hinton (2002)](#references) proposed to stop the chains early. **Contrastive divergence** (CD-$k$) starts each chain at a data point, runs only $k$ steps (one full Gibbs step in the original work on products of experts) and uses the endpoints as negative examples. It does not follow the likelihood gradient. Write $P_0 = P$ for the data, $P_1$ for the distribution after one step of the chain and $P_\infty = p_\theta$ for its equilibrium. CD-1 follows, after dropping a term that is usually small, the gradient of
+**Contrastive divergence** (CD-$k$, [Hinton, 2002](#references)) starts each chain at a data point, runs only $k$ steps of an MCMC kernel $T$ that leaves $p_\theta$ invariant, and uses the endpoints as negative examples. Write $P_0 = P$ for the data, $P_1$ for the distribution after one step and $P_\infty = p_\theta$ for the equilibrium. CD-1 follows approximately the gradient of
 
 $$
-D_{\mathrm{KL}}(P_0\,\|\,P_\infty) - D_{\mathrm{KL}}(P_1\,\|\,P_\infty) .
+D_{\mathrm{KL}}(P_0 \,\|\, P_\infty) - D_{\mathrm{KL}}(P_1 \,\|\, P_\infty) .
 $$
 
-The difference is never negative, because a step of a Markov chain cannot increase the KL divergence to its stationary distribution. For a chain whose transitions all have positive probability, it is zero only when $P_1 = P_0$, which means the data are already the equilibrium: the model is perfect ([Hinton, 2002](#references), Section 3). In words, CD asks that the chain not walk away from the data.
+Differentiating both divergences (below), the intractable averages over $p_\theta$ cancel. What remains is $\mathbb E_{P_0} \nabla_\theta E_\theta - \mathbb E_{P_1} \nabla_\theta E_\theta$, which needs only data and one-step samples, minus a term from the dependence of $P_1$ on $\theta$. CD-1 drops that term, which Hinton found in simulations to be small and seldom opposed to the other two ([Hinton, 2002](#references), Section 3).
 
-Modern image EBMs keep the short chains but start them from noise: uniform noise in the pixel range, followed by $K$ Langevin steps on the current energy, with $K$ between about 10 and 100 ([Du and Mordatch, 2019](#references); [Nijkamp et al., 2019](#references)). The gradient estimate is the same, with $x^-$ the chain endpoints. Because the endpoints are not samples from $p_\theta$, the estimate is biased ([Song and Kingma, 2021](#references), Section 3).
+<details>
+<summary>Derivation</summary>
+
+Both divergences depend on $\theta$ through $P_\infty = p_\theta$, and the second also through $P_1$, because the kernel $T$ depends on $\theta$. With sums over a discrete state space (integrals otherwise), the likelihood gradient above, taken at a fixed first argument, gives the first two terms of each line; the last term of the second line differentiates $\sum_x P_1 \log(P_1/p_\theta)$ through $P_1$, where the extra $\sum_x \nabla_\theta P_1(x)$ is zero because $P_1$ sums to one:
+
+$$
+\begin{aligned}
+\nabla_\theta D_{\mathrm{KL}}(P_0 \,\|\, p_\theta) &= \mathbb E_{P_0} \nabla_\theta E_\theta - \mathbb E_{p_\theta} \nabla_\theta E_\theta , \\
+\nabla_\theta D_{\mathrm{KL}}(P_1 \,\|\, p_\theta) &= \mathbb E_{P_1} \nabla_\theta E_\theta - \mathbb E_{p_\theta} \nabla_\theta E_\theta \\
+&\quad + \textstyle\sum_x \nabla_\theta P_1(x)\, \log \dfrac{P_1(x)}{p_\theta(x)} .
+\end{aligned}
+$$
+
+</details>
+
+The difference is never negative: one step of a chain cannot move a distribution farther from its stationary distribution. Take the joint distributions $P_0(x_0)\,T(x_1 \mid x_0)$ and $P_\infty(x_0)\,T(x_1 \mid x_0)$; their marginals of $x_1$ are $P_1$ and $P_\infty$, since $P_\infty$ is stationary. The chain rule of the KL divergence splits their divergence in two ways:
+
+$$
+\begin{aligned}
+D_{\mathrm{KL}}^{\text{joint}} &= D_{\mathrm{KL}}(P_0 \,\|\, P_\infty) + 0 \\
+&= D_{\mathrm{KL}}(P_1 \,\|\, P_\infty) \\
+&\quad + \mathbb E_{x_1 \sim P_1} D_{\mathrm{KL}}\big(P_0(\cdot \mid x_1) \,\|\, P_\infty(\cdot \mid x_1)\big) .
+\end{aligned}
+$$
+
+The first split conditions on $x_0$, where both conditionals are $T$; in the second the last term is not negative. Hence $D_{\mathrm{KL}}(P_1 \,\|\, P_\infty) \le D_{\mathrm{KL}}(P_0 \,\|\, P_\infty)$. When every transition has positive probability, equality holds only for $P_0 = P_\infty$, a perfect model ([Hinton, 2002](#references), Section 3): CD asks that the chain not walk away from the data.
+
+<details>
+<summary>Derivation</summary>
+
+Equality needs the last term to vanish, and a KL divergence is zero only when its arguments are equal: $P_0(x_0 \mid x_1) = P_\infty(x_0 \mid x_1)$ for every $x_1$ that $P_1$ reaches. When every transition has positive probability, write both sides by Bayes' rule, $P_0(x_0)\, T(x_1 \mid x_0)/P_1(x_1) = P_\infty(x_0)\, T(x_1 \mid x_0)/P_\infty(x_1)$, and cancel $T$. Then $P_0(x_0)/P_\infty(x_0) = P_1(x_1)/P_\infty(x_1)$ for all $x_0$ and $x_1$, so the ratio is a constant, and it is 1 because both distributions sum to one.
+
+</details>
+
+Image EBMs keep short chains but start them from uniform noise, with about 10 to 100 Langevin steps ([Du and Mordatch, 2019](#references); [Nijkamp et al., 2019](#references)). The endpoints are not samples of $p_\theta$, so the gradient estimate is biased ([Song and Kingma, 2021](#references), Section 3).
 
 ### What short chains learn
 
-The bias has a definite direction, and a one-parameter example shows it exactly. Let the data be $\mathcal N(0, 1)$ and the energy $E_v(x) = x^2/(2v)$, so that $p_v = \mathcal N(0, v)$ and the right answer is $v = 1$. Since $\partial E_v/\partial v = -x^2/(2v^2)$, the CD gradient is
+A one-parameter toy example shows the direction of the bias exactly. Let the data be $\mathcal N(0, 1)$ and the energy $E_v(x) = x^2/(2v)$, so that $p_v = \mathcal N(0, v)$ and the right answer is $v = 1$. Since $\partial E_v/\partial v = -x^2/(2v^2)$, the CD gradient is
 
 $$
 \frac{\partial \mathcal L_{\text{CD}}}{\partial v} = -\frac{1}{2v^2}\Big(\mathbb E\,(x^+)^2 - \mathbb E\,(x^-)^2\Big) .
 $$
 
-Training stops where the negative samples have the second moment of the data, $\mathbb E(x^-)^2 = 1$, whatever $v$ that takes. Let the negative samples come from $K$ Langevin steps started at $U(-3, 3)$, whose variance is 3. Each step multiplies $x$ by $a = 1 - \varepsilon/(2v)$, with $0 < a < 1$ for $v > \varepsilon/2$, and adds independent noise of variance $\varepsilon$, so after $K$ steps
+Training stops where $\mathbb E\,(x^-)^2 = 1$, the data's second moment, whatever $v$ that takes. Let the negatives come from $K$ Langevin steps started at $U(-3, 3)$, whose variance is 3. Each step multiplies $x$ by $a = 1 - \varepsilon/(2v)$ and adds independent noise of variance $\varepsilon$, so after $K$ steps the variance is a geometric sum:
 
 $$
-\operatorname{Var} x^- = 3\,a^{2K} + \varepsilon\,\frac{1 - a^{2K}}{1 - a^2} .
+\operatorname{Var} x^- = 3\,a^{2K} + \varepsilon\, \frac{1 - a^{2K}}{1 - a^2} .
 $$
 
-With $\varepsilon = 0.01$ and $K = 10$ the chain has barely contracted the noise, and the only way to bring its output variance down to 1 is a steep energy: CD stops at $v = 0.088$, a model with standard deviation 0.30 instead of 1. With $K = 100$ it stops at $v = 0.58$. With $K = 1000$ it stops at $0.997$, essentially the long-run value $0.9975$ of unadjusted Langevin with this step size, slightly below 1 because of its discretization bias. The short chain's samples match the data in variance, the only statistic this energy can see; the model's density does not. [Nijkamp et al. (2019)](#references) describe the same effect for image EBMs trained with short chains from noise: the result is a poor density but a good sampler, a fixed number of Langevin steps that turns noise into realistic images.
+| Steps $K$ | where CD stops, $v^*$ | model standard deviation |
+| --- | --- | --- |
+| 10 | $0.088$ | $0.30$ |
+| 100 | $0.58$ | $0.76$ |
+| 1000 | $0.997$ | $0.999$ |
+
+With $\varepsilon = 0.01$ and $K = 10$ the chain has barely contracted its starting noise, so only a steep energy brings its output variance down to 1: a model three times too narrow. Even $K = 1000$ stops at $0.997$, the long-run value of unadjusted Langevin with this step. The samples match the data; the density does not. [Nijkamp et al. (2019)](#references) read such a model as a learned sampler: a fixed number of Langevin steps that turns noise into images.
 
 <ShortRunBias />
 
 ## Persistent chains and the replay buffer
 
-Chains restarted at every step throw away the work of the previous step. **Persistent contrastive divergence** ([Tieleman, 2008](#references)) keeps them: each training step continues the chains from where the last one stopped. The parameters change little between steps, so a chain close to equilibrium for the old model stays close for the new one, and the effective length of the chains grows over training. A **replay buffer** generalizes this to a pool of past samples ([Du and Mordatch, 2019](#references), Section 3.2). A chain starts from a stored sample with probability 0.95 and from uniform noise otherwise, runs $K$ Langevin steps, and its endpoint goes back into the buffer. The stored samples let refinement continue across training steps, so short chains suffice. The fresh noise keeps exploring and stops the buffer from collapsing onto a few images. Du and Mordatch found the buffer essential: on continuous MNIST, training with plain persistent chains instead gave a markedly worse likelihood, and training was insensitive to the buffer size above about 10,000 samples (Appendices A.3 and A.4).
+Restarted chains throw away the previous update's work. **Persistent contrastive divergence** ([Tieleman, 2008](#references)) continues each chain where the last update left it: the parameters change little, so a chain near equilibrium for the old model stays near it for the new one. A **replay buffer** keeps a pool of past samples instead ([Du and Mordatch, 2019](#references), Section 3.2): a chain starts from a stored sample with probability 0.95 and from uniform noise otherwise, runs $K$ Langevin steps, and its endpoint goes back into the buffer. Stored samples keep refining, and fresh noise keeps exploring.
 
-In the Gaussian example the buffer makes the age of a sample geometric: it has run $n$ rounds of $K$ steps with probability $0.05 \cdot 0.95^{\,n-1}$, 20 rounds on average. CD then stops at $v = 0.52$ for $K = 10$ instead of $0.088$, and at $0.94$ for $K = 100$ instead of $0.58$, the blue curve in the figure above. The fresh 5% keep a bias: they enter the negative phase after only $K$ steps.
+In the toy example the buffer makes the age of a sample geometric: it has run $n$ rounds of $K$ steps with probability $0.05 \cdot 0.95^{\,n-1}$, 20 rounds on average. Averaging the variance formula above over these ages and solving $\mathbb E\,(x^-)^2 = 1$ for $v$ numerically (steps below), CD stops at $v^* = 0.52$ for $K = 10$ and at $0.94$ for $K = 100$, the blue curve in the figure; the fresh 5% keep some bias.
 
-### One training step
+<details>
+<summary>Derivation</summary>
 
-A configuration that trains a small convolutional energy on MNIST (four stride-2 convolutions with Swish activations and two linear layers, 76,993 parameters; pixels in $[-1, 1]$) puts these pieces together. The figure shows one step; the numbers match its badges.
-
-<TrainingStep />
-
-1. **Starts.** 128 chains. Each starts from a stored sample with probability 0.95 or from uniform noise on $[-1, 1]^{784}$ with probability 0.05, about 6.4 fresh starts per batch. The buffer holds up to 8192 images.
-2. **Langevin steps.** 60 steps with the network's parameters held fixed. Each step adds Gaussian noise of standard deviation 0.005, clamps the pixels to $[-1, 1]$, moves against the energy gradient with step size 10 after clipping every component of the gradient to $\pm 0.03$, and clamps again. The gradient step moves a pixel by at most 0.3.
-3. **Two phases.** The network scores a batch of 128 data images $x^+$ and the 128 samples $x^-$.
-4. **Loss and update.** $\mathcal L = \text{mean}\,E_\theta(x^+) - \text{mean}\,E_\theta(x^-) + \alpha\,\text{mean}\big(E_\theta(x^+)^2 + E_\theta(x^-)^2\big)$ with $\alpha = 0.1$, the penalty explained in the next section, minimized by Adam with $\beta_1 = 0$ and learning rate $10^{-4}$.
-5. **Write back.** The samples go to the front of the buffer; beyond 8192 images the oldest drop out.
-
-Du and Mordatch's CIFAR-10 setting is close: 60 steps of size 10, gradient components clipped to 0.01, noise of standard deviation 0.005, a buffer of 10,000 images, penalty weight 1, Adam with $\beta_1 = 0$, $\beta_2 = 0.999$ and learning rate $10^{-4}$, and spectral normalization in all layers, with images scaled to $[0, 1]$ ([Du and Mordatch, 2019](#references), Appendix A.11).
-
-<aside class="callout"><strong>Not quite Langevin.</strong> The sampler in step 2 is not a Langevin sampler of $p_\theta$. A drift step $\eta = 10$ on $\nabla_x E_\theta$ would need noise of standard deviation $\sqrt{2\eta} = 4.47$; the noise used is 0.005, 894 times smaller. A drift step $\eta$ and a noise level $s$ chosen separately give the unadjusted Langevin update formally associated with the sharpened density $\propto p_\theta(x)^{1/T}$: matching $x - \eta\nabla_x E_\theta + s\,z$ with $x - \frac{\varepsilon}{2}\nabla_x (E_\theta/T) + \sqrt{\varepsilon}\,z$ gives $\varepsilon = s^2$ and temperature $T = s^2/(2\eta)$, here $1.25 \cdot 10^{-6}$. This temperature describes the ratio of noise to drift, not the law of the samples. Even without clipping, a finite-step unadjusted chain has a stationary distribution different from $p_\theta^{1/T}$ (the [shadow-energy callout](/notes/generative-models/mcmc-samplers#one-hmc-iteration) of the samplers note gives the Gaussian case), the clipping and clamping change it further, and 60 steps from a buffer are far from stationarity. Ignoring the clipping, the chain is gradient descent on the energy with a little noise, and its endpoints sit near local minima. The relaxation is standard: with the proper ratio, the noise drowns the gradient at any step size large enough to move the chain (<a href="#references">Grathwohl et al., 2019</a>, Appendix H.1). Du and Mordatch found that very low noise gave poor results and high noise made the sampler fail early in training, and recommend fixing the noise at 0.005 and tuning the step size, typically 10 to 100 (Appendix A.12). The lesson of the Gaussian example applies with more force: the trained energy is best read as a function whose short descent from noise produces data, not as a calibrated density.</aside>
-
-**Generating after training.** New images come from chains started at uniform noise and run longer than during training, for example 256 steps instead of 60: generation happens once rather than at every update, and it has no buffer to start from. Du and Mordatch instead sample at test time from a replay buffer, with somewhat more noise than in training, because low noise makes the chains settle into a few high-probability images (Appendix A.2).
-
-## The offset problem: why energies drift
-
-The CD loss depends only on differences between energies. Shift every energy by the same constant and $\mathcal L_{\text{CD}}$ is unchanged, and so is $p_\theta$. In the three-state example the gradient components sum to zero; for a network whose last layer has a bias $b$, every energy depends on $b$ with derivative 1, so $\partial\mathcal L_{\text{CD}}/\partial b = 1 - 1 = 0$ exactly. Nothing in the loss holds the overall level of the energies, and the other parameters move it freely as a side effect of their updates. The scale is not held either: whenever the sampler lags behind the model, the network can widen the gap $E_\theta(x^-) - E_\theta(x^+)$ by making all energies larger in magnitude. In practice the difference between positive and negative energies stays meaningful while the values themselves drift to numerically unstable sizes ([Du and Mordatch, 2019](#references), Section 3.3).
-
-**The L2 term.** Add a small multiple $\alpha \ll 1$ of the mean squared energy of both batches:
+With the model held at $v$, a sample of age $n$ has run $nK$ steps from the uniform start, so its variance is the formula above with $K$ replaced by $nK$, and the buffer is a mixture of these zero-mean distributions. Its second moment averages their variances over the ages; with $r = a^{2K}$ the geometric series gives
 
 $$
 \begin{aligned}
-\mathcal L(\theta) = {}& \frac1N\sum_{i=1}^N \Big[E_\theta(x_i^+) - E_\theta(x_i^-)\Big]\\
-&+ \frac{\alpha}{N}\sum_{i=1}^N\Big[E_\theta(x_i^+)^2 + E_\theta(x_i^-)^2\Big] .
+\mathbb E\,(x^-)^2 &= \sum_{n \ge 1} 0.05 \cdot 0.95^{\,n-1} \Big(3 r^n + \varepsilon\, \frac{1 - r^n}{1 - a^2}\Big) \\
+&= 3 S + \varepsilon\, \frac{1 - S}{1 - a^2} , \qquad S = \frac{0.05\, r}{1 - 0.95\, r} .
 \end{aligned}
 $$
 
-It does two things. When the samples look like the data, both batches have the same distribution of energies, the CD term vanishes in expectation, and the penalty pulls the common level to zero, so data end up with energies near 0. When the samples do not look like the data, the penalty bounds the gap.
+</details>
 
-**Worked example.** Suppose the network could set one energy $E^+$ for all data and one energy $E^-$ for all samples. It would minimize $E^+ - E^- + \alpha\big((E^+)^2 + (E^-)^2\big)$. Setting both derivatives to zero gives $1 + 2\alpha E^+ = 0$ and $-1 + 2\alpha E^- = 0$, so $E^\pm = \mp 1/(2\alpha)$. With $\alpha = 0.1$ the energies stop at $\mp 5$, a gap of 10; with $\alpha = 1$ at $\mp 0.5$. Without the penalty there is no minimum: the loss decreases without bound as $E^+ \to -\infty$ and $E^- \to +\infty$.
+### One training step
 
-The penalty is not part of the likelihood and shifts the optimum slightly, which is why $\alpha$ is kept small: 0.1 works for the MNIST configuration above, and Du and Mordatch use 1 on CIFAR-10. They combine it with spectral normalization of all layers, which bounds the Lipschitz constant of the energy and keeps its gradients from changing sharply ([WGAN note](/notes/generative-models/wgan#sn-gan-spectral-normalization)). Du and Mordatch also credit both with keeping $e^{-E_\theta}$ integrable (Section 3.3).
+A small convolutional energy on MNIST (four stride-2 convolutions with Swish, two linear layers, 76,993 parameters, pixels in $[-1, 1]$) puts the pieces together:
 
-## Practical choices
+<TrainingStep />
 
-- **Smooth activations.** The sampler follows $\nabla_x E_\theta$. For a ReLU network the energy is piecewise linear in $x$, and its input gradient jumps between linear regions. Smooth activations such as Swish, $x\,\sigma(x)$, keep the gradient field smooth; Du and Mordatch report that Swish noticeably improves stability (Appendix A.12).
-- **No normalization layers.** Du and Mordatch found that batch, group, layer, pixel and other normalization layers appeared to hurt sampling, and suggest that they make a Langevin step depend on other data points (Appendix A.12). That mechanism fits batch normalization, whose statistics mix the examples of a batch. Group, layer and pixel normalization compute their statistics within one example, so they create no such dependence, and why they hurt is not established.
-- **No momentum.** The negative samples are regenerated from the current model at every step, so the loss surface moves with the parameters, and momentum keeps pushing in directions computed for an earlier surface. Adam with $\beta_1 = 0$ is the usual setting (Appendix A.11).
-- **A little noise on the data.** The samples always carry sampler noise, while many data pixels are exactly at the edge of the range (the black background of MNIST). Adding comparable noise to the data, standard deviation 0.005 in the MNIST configuration and 0.03 in JEM ([Grathwohl et al., 2019](#references), Appendix A), keeps the energy from separating the two by such a trivial cue.
-- **Watch samples, not the loss.** The CD term and the penalty settle near zero early and stay there, because the negative samples follow the model. Progress shows elsewhere: in images generated from noise every few epochs, in the contents of the buffer, which are what the model currently treats as negatives, and in the mean energy of uniform noise, which should keep rising.
+1. 128 chains start from the buffer (up to 8192 images) with probability 0.95, or from uniform noise on $[-1, 1]^{784}$.
+2. 60 Langevin steps with $\theta$ fixed: noise of standard deviation 0.005, then a step of size 10 against the energy gradient clipped to $\pm 0.03$ per component, pixels clamped to $[-1, 1]$.
+3. The network scores 128 data images $x^+$ and the 128 samples $x^-$.
+4. The loss, $\text{mean}\, E_\theta(x^+) - \text{mean}\, E_\theta(x^-)$ plus $\alpha = 0.1$ times the mean squared energies (next section), takes an Adam step ($\beta_1 = 0$, learning rate $10^{-4}$).
+5. The samples go back to the buffer, and the oldest drop out.
 
-## Instability
+<aside class="callout"><strong>Not quite Langevin.</strong> A Langevin step of $p_\theta$ with drift step $\eta = 10$ needs noise of standard deviation $\sqrt{2\eta} = 4.47$, 894 times more than is used. Matching $x - \eta \nabla_x E_\theta + s z$ with the Langevin step of $p_\theta^{1/T}$, noise $\sqrt\varepsilon = s$ and drift $\varepsilon/(2T) = \eta$, gives $T = s^2/(2\eta) = 1.25 \cdot 10^{-6}$: with clipping, the chain is gradient descent on the energy with a little noise, the regime Du and Mordatch recommend (Appendix A.12).</aside>
 
-EBM training diverges easily ([Grathwohl et al., 2019](#references), Section 6 and Appendix H.3). The typical failure starts when the energy surface develops many sharp local minima. Chains from noise fall into the nearest one and stay noise-like. The negative phase keeps raising the energy where they sit and the positive phase keeps lowering it at the data, so the gap grows while the samples stop improving. The model then gives high probability to the training data, the sampler produces only noise, and the gradient field has become useless for sampling. A warning sign is negative samples whose energies are much larger than those of training data ([Du and Mordatch, 2019](#references), Appendix A.12).
+New images come from chains started at uniform noise and run longer, for example 256 steps.
 
-Remedies, roughly from the cheapest:
+## The offset problem: why energies drift
 
-- the L2 term and spectral normalization, which bound the energies and their gradients;
-- a smaller learning rate, or more Langevin steps per update. Grathwohl et al. found these the only two changes that consistently stabilized a diverging model. At their scale, chains restarted from noise needed 80 steps per update for stable training, and even those models diverged late in training; persistent chains with 20 steps were four times faster but less stable (Appendices H.2 and H.3);
-- restarting from an earlier checkpoint that had not yet diverged, possibly with a different random seed (Appendix H.3).
+The CD loss depends only on differences between energies. For a network whose last layer has a bias $b$, every energy has derivative 1 in $b$, so the two phases cancel and $\partial \mathcal L_{\text{CD}}/\partial b = 1 - 1 = 0$ exactly: nothing holds the overall level, and the other parameters move it freely. Nor is the scale: while the sampler lags behind the model, the network can widen the gap $E_\theta(x^-) - E_\theta(x^+)$ by making all energies larger, and the values drift to numerically unstable sizes ([Du and Mordatch, 2019](#references), Section 3.3).
 
-The most sensitive hyperparameters are those of the sampler: step size, number of steps and noise level, followed by the learning rate and the width of the network. Du and Mordatch found the step size the most sensitive, with a usable range of two to three orders of magnitude (Appendix A.12).
-
-## Evaluating a model without its normalizer
-
-Without $Z_\theta$ there is no likelihood to report. **Annealed importance sampling** ([Neal, 2001](#references)) estimates it by moving from a tractable distribution $p_0$ to $p_\theta$ through intermediate densities proportional to $p_0(x)^{1-\beta}\,e^{-\beta E_\theta(x)}$ for $\beta$ from 0 to 1, with MCMC steps at each stage and importance weights that multiply along the path; the average weight is an unbiased estimate of $Z_\theta/Z_0$. It works on small problems. [Du and Mordatch (2019)](#references) obtained lower and upper bounds on the likelihood of continuous MNIST this way, but on CIFAR-10 more than 300,000 chains run for two days still left a large gap between the bounds (Appendix A.3). Image EBMs are therefore judged by their samples, with [FID](/notes/generative-models/fid) for example, and by the tasks in the last sections.
-
-## Noise-contrastive estimation: learning Z by classification
-
-The two estimators in this and the next section need no samples from the model during training. **Noise-contrastive estimation** (NCE, [Gutmann and Hyvärinen, 2010](#references)) treats the log-normalizer as one more parameter. The model is
-
-$$
-\log p_m(x) = -E_\theta(x) + c ,
-$$
-
-where $c$ estimates $-\log Z_\theta$. Choose a **noise distribution** $p_n$ that is easy to sample and whose density can be evaluated, for example a Gaussian. Draw as many noise samples as data samples and train a logistic regression that tells them apart, with the logit fixed to the log-ratio of model and noise:
-
-$$
-\begin{gathered}
-h(x) = \sigma\big(\log p_m(x) - \log p_n(x)\big) = \frac{p_m(x)}{p_m(x) + p_n(x)},\\
-J(\theta, c) = \tfrac12\,\mathbb E_{x\sim P}\log h(x)\\
-+ \tfrac12\,\mathbb E_{y\sim p_n}\log\big(1 - h(y)\big) .
-\end{gathered}
-$$
-
-$J$ is the log-likelihood of the labels "data" and "noise" ([Gutmann and Hyvärinen, 2010](#references), Section 2.2). Why does a classifier learn a density? With equal numbers of data and noise samples, the true probability that a point $x$ is data is $p(x)/(p(x) + p_n(x)) = \sigma\big(\log p(x) - \log p_n(x)\big)$. The best classifier has $\log p_m = \log p$ exactly, normalization included. Gutmann and Hyvärinen show that $J$, as a function of $\log p_m$, has its maximum at $\log p$ and no other extremum, provided $p_n > 0$ wherever $p > 0$ (Theorem 1), and that the estimate of $(\theta, c)$ is consistent under conditions analogous to those of maximum likelihood (Theorem 2). At the population optimum of a well-specified model, one whose family contains the data density, the fitted $e^{-E_\theta + c}$ therefore integrates to one without any constraint, and $c$ equals $-\log Z_\theta$. With finite samples $c$ is an estimate, so the normalization holds only approximately, and for a misspecified energy the best fit need not integrate to one at all: $c$ is then a learned parameter, not a numerical guarantee.
-
-Maximum likelihood cannot do this: with $c$ free, the likelihood grows without bound as $c \to \infty$, since nothing forces $e^{-E_\theta + c}$ to integrate to one (Section 1). The classification objective does. A $c$ that is too large makes the classifier call noise "data" as well, and it pays for that on the noise samples.
-
-**Worked example.** Data $\mathcal N(0, 1)$, noise $p_n = \mathcal N(0, 4)$, and an energy with the right shape, $E(x) = x^2/2$, so the only unknown is $c$. The correct value is $c^* = -\log\sqrt{2\pi} = -0.919$. At $x = 0$ the true probability of "data" is $0.399/(0.399 + 0.199) = 0.667$, and with $c^*$ the classifier gives $h(0) = \sigma(-0.919 + 1.612) = 0.667$. The unnormalized model, $c = 0$, gives $h(0) = \sigma(1.612) = 0.834$: too confident, so the logistic loss lowers $c$. Maximizing the population objective $J$ over $c$ numerically returns $-0.919$.
-
-The noise distribution decides how much the model learns. It should be easy to sample, have a density that can be evaluated, and be close to the data. If the noise equals the data distribution, the asymptotic covariance of the estimate is twice the Cramér–Rao bound (Section 2.4). Far noise makes the task trivial: uniform noise is told apart from digits by a few crude features, such as smoothness or saturated background pixels, and the energy learns nothing finer. Better noise comes from a preliminary model of the data, for example a flow ([Song and Kingma, 2021](#references), Section 5). Seen from the [GAN note](/notes/generative-models/gans), NCE is a discriminator trained against a fixed generator $p_n$, with its logit constrained to $\log p_m - \log p_n$; that constraint turns the discriminator into a density.
-
-## Score matching: no samples and no Z
-
-The score of an EBM does not involve $Z_\theta$: $\nabla_x \log p_\theta(x) = -\nabla_x E_\theta(x)$, as shown above. Fitting the model's score to the data's score, by minimizing the Fisher divergence $\tfrac12\,\mathbb E_P\big\|\nabla_x \log p(x) + \nabla_x E_\theta(x)\big\|^2$, therefore trains the energy with neither the normalizer nor samples ([Hyvärinen, 2005](#references)). The data score is unknown. The [score matching note](/notes/generative-models/score-matching) removes it by integration by parts and derives the cheaper [sliced and denoising versions](/notes/generative-models/score-matching#two-cheaper-objectives). For an energy, Hyvärinen's objective is $\mathbb E_P\big[\tfrac12\|\nabla_x E_\theta(x)\|^2 - \Delta_x E_\theta(x)\big]$ up to a constant, with $\Delta_x$ the Laplacian, the trace of the Hessian; denoising score matching regresses $-\nabla_x E_\theta(x + \sigma\varepsilon)$ onto $-\varepsilon/\sigma$. Either way the loss contains the gradient of the energy with respect to its input, so each training step differentiates twice, and generation still needs Langevin dynamics. The two sampling-free estimators are related: NCE whose noise is the data shifted by a small vector, with a slightly modified classifier, reduces to sliced score matching as the shift goes to zero ([Song and Kingma, 2021](#references), Section 5.1).
-
-## Out-of-distribution detection
-
-An energy trained with a negative phase is low on the data and has been pushed up wherever its own samples went. That makes $E_\theta(x)$ a natural detector of unusual inputs: flag $x$ as out of distribution when its energy exceeds a threshold chosen on held-out data. A classifier's confidence is a weak substitute, since modern classifiers tend to be overconfident ([Grathwohl et al., 2019](#references), Section 5.2). Four caveats apply.
-
-- **High density is not typicality.** Flows, VAEs and PixelCNNs trained on CIFAR-10 assign higher likelihood to SVHN house numbers than to CIFAR-10 test images ([Nalisnick et al., 2019](#references)). A likelihood model is not automatically an outlier detector.
-- **EBMs do better, not well.** In the AUROC of separating CIFAR-10 test images from other data (0.5 is chance), an EBM scores 0.63 against SVHN, where PixelCNN++ scores 0.32 and Glow 0.24; averaged over five kinds of outliers, 0.62 against 0.47 and 0.42. The same EBM scores 0.30 on constant images and 0.48 on textures, below chance ([Du and Mordatch, 2019](#references), Section 4.4 and Figure 10).
-- **Only what the sampler visited was pushed up.** Uniform noise, where the chains start, gets a high energy. Changes the sampler never produced, such as a rotated or shrunken digit, may raise the energy only slightly.
-- **Energies have no common scale.** The threshold must be calibrated for each model; the L2 term keeps data energies near zero, which helps choose it.
-
-[Grathwohl et al. (2019)](#references) propose a different score for EBMs, the norm of the input gradient $\|\nabla_x \log p_\theta(x)\|$, with the intuition that a typical input lies where the density changes slowly, so that a large gradient flags a point of high density but low mass (Section 5.3.3). The intuition is not a general property of typical sets. For $\mathcal N(0, I_d)$ the score is $-x$: on the [typical shell](/notes/probability/multivariate-gaussian#high-dimensions-the-shell) its norm is about $\sqrt d$, 28 for $d = 784$, while at the centre, the point of highest density and an atypical one, it is 0. The gradient norm is therefore an empirical detector whose behaviour depends on the model and the data, and its threshold and direction have to be calibrated on held-out in- and out-of-distribution examples, like the energy itself.
-
-## JEM: your classifier is secretly an EBM
-
-A classifier with $C$ classes outputs logits $f_\theta(x) \in \mathbb R^C$ and class probabilities $p_\theta(y \mid x) = \operatorname{softmax}(f_\theta(x))_y$. [Grathwohl et al. (2019)](#references) read the same logits as the negative energy of the pair $(x, y)$:
+The fix is a small multiple $\alpha$ of the mean squared energy of both batches:
 
 $$
 \begin{aligned}
-p_\theta(x, y) &= \frac{e^{f_\theta(x)[y]}}{Z_\theta}, \\
+\mathcal L(\theta) = {}& \frac1N \sum_{i=1}^N \Big[E_\theta(x_i^+) - E_\theta(x_i^-)\Big] \\
+&+ \frac{\alpha}{N} \sum_{i=1}^N \Big[E_\theta(x_i^+)^2 + E_\theta(x_i^-)^2\Big] .
+\end{aligned}
+$$
+
+When the samples look like the data, the first term vanishes in expectation and the penalty pulls the common level to zero. When they do not, it bounds the gap. Suppose the network could set one energy $E^+$ for all data and one energy $E^-$ for all samples. Setting both derivatives of $E^+ - E^- + \alpha\big((E^+)^2 + (E^-)^2\big)$ to zero gives
+
+$$
+\begin{aligned}
+1 + 2\alpha E^+ &= 0 , \\
+-1 + 2\alpha E^- &= 0 ,
+\end{aligned}
+$$
+
+so $E^\pm = \mp 1/(2\alpha)$: $\mp 5$ for $\alpha = 0.1$, a gap of 10, and $\mp 0.5$ for $\alpha = 1$. Without the penalty the loss has no minimum. The penalty is not part of the likelihood, so $\alpha$ is kept small: 0.1 here, 1 in Du and Mordatch's CIFAR-10 setting, together with [spectral normalization](/notes/generative-models/wgan#sn-gan-spectral-normalization) of all layers (Section 3.3).
+
+## Where training breaks
+
+EBM training diverges easily ([Grathwohl et al., 2020](#references), Appendix H). In the typical failure the energy surface develops many sharp local minima, and chains from noise fall into the nearest one and stay noise-like. The negative phase keeps raising the energy where they sit and the positive phase keeps lowering it at the data, so the gap grows while the samples stop improving. The warning sign is negative samples with energies much larger than those of the data ([Du and Mordatch, 2019](#references), Appendix A.12). The loss settles near zero early and shows nothing; watch the generated images, the buffer and the mean energy of uniform noise instead. What helps, roughly from the cheapest:
+
+- the L2 penalty and spectral normalization, which bound the energies and their gradients;
+- smooth activations such as Swish, $x\,\sigma(x)$, which keep the input gradient smooth (Appendix A.12);
+- no normalization layers, which hurt sampling (Appendix A.12); with batch normalization an image's energy even depends on the rest of the batch;
+- Adam with $\beta_1 = 0$, since the loss surface moves with the negative samples and momentum keeps pushing in stale directions;
+- a smaller learning rate or more Langevin steps per update (Grathwohl et al., Appendix H);
+- restarting from an earlier checkpoint that had not yet diverged.
+
+## Evaluating a model without its normalizer
+
+Without $Z_\theta$ there is no likelihood to report. **Annealed importance sampling** ([Neal, 2001](#references)) estimates $Z_\theta/Z_0$ by moving from a tractable $p_0$ to $p_\theta$ through $p_0(x)^{1-\beta} e^{-\beta E_\theta(x)}$, $\beta$ from 0 to 1, with MCMC steps and importance weights along the way; on CIFAR-10 its bounds stayed far apart ([Du and Mordatch, 2019](#references), Appendix A.3). Image EBMs are judged by their samples, with [FID](/notes/generative-models/fid) for example, and by the tasks below.
+
+## Noise-contrastive estimation: learning Z by classification
+
+Two estimators avoid sampling from the model during training. **Noise-contrastive estimation** (NCE, [Gutmann and Hyvärinen, 2010](#references)) treats the log-normalizer as one more parameter $c$, an estimate of $-\log Z_\theta$:
+
+$$
+\log p_m(x) = -E_\theta(x) + c .
+$$
+
+Choose a **noise distribution** $p_n$ that is easy to sample and to evaluate, such as a Gaussian, draw as many noise samples as data, and train a logistic regression to tell them apart, its logit fixed to the log-ratio of model and noise:
+
+$$
+\begin{aligned}
+h(x) &= \sigma\big(\log p_m(x) - \log p_n(x)\big) , \\
+J(\theta, c) &= \tfrac12\, \mathbb E_{x \sim P} \log h(x) \\
+&\quad + \tfrac12\, \mathbb E_{y \sim p_n} \log\big(1 - h(y)\big) .
+\end{aligned}
+$$
+
+$J$ is the log-likelihood of the labels "data" and "noise". Why does a classifier learn a density? With equal numbers of both, the Bayes-optimal probability that $x$ is data is $p(x)/(p(x) + p_n(x)) = \sigma\big(\log p(x) - \log p_n(x)\big)$, where $p$ is the data density, so the best classifier of the constrained form has $\log p_m = \log p$, normalization included. Gutmann and Hyvärinen prove that this is the only maximum of $J$ over $\log p_m$, provided $p_n > 0$ wherever $p > 0$ (Theorem 1), and that the estimate is consistent (Theorem 2): if the model family contains the data density, the fitted $e^{-E_\theta + c}$ integrates to one in the large-sample limit, without any constraint. Maximum likelihood cannot learn $c$, since the likelihood grows without bound in it; in NCE a $c$ that is too large makes the classifier call noise "data" and pays for it.
+
+**Worked example.** Data $\mathcal N(0, 1)$, noise $p_n = \mathcal N(0, 4)$, and an energy with the right shape, $E(x) = x^2/2$, so the only unknown is $c$; the correct value is $c^* = -\log\sqrt{2\pi} = -0.919$. At $x = 0$ the true probability of "data" is $0.399/(0.399 + 0.199) = 0.667$. With $c^*$ the classifier gives $h(0) = \sigma(-0.919 + 1.612) = 0.667$, since $\log p_n(0) = -1.612$. The unnormalized model, $c = 0$, gives $h(0) = \sigma(1.612) = 0.834$, too confident, so the loss lowers $c$; maximizing $J$ numerically returns $-0.919$.
+
+The noise decides how much the model learns. Noise equal to the data gives an asymptotic covariance twice the Cramér–Rao bound ([Gutmann and Hyvärinen, 2010](#references), Section 2.4); far noise, such as uniform noise against digits, is told apart by crude features, and the energy learns nothing finer. NCE is the discriminator of a [GAN](/notes/generative-models/gans) trained against a fixed generator $p_n$ whose density is known, with its logit constrained to $\log p_m - \log p_n$; the constraint turns the discriminator into a density, and there is no minimax game ([Ermon, 2023](#references), lecture 12).
+
+## Score matching: no samples and no Z
+
+The score of an EBM, $\nabla_x \log p_\theta(x) = -\nabla_x E_\theta(x)$, does not involve $Z_\theta$. Fitting it to the data's score by minimizing the Fisher divergence
+
+$$
+\tfrac12\, \mathbb E_{x \sim P} \big\|\nabla_x \log p(x) + \nabla_x E_\theta(x)\big\|^2
+$$
+
+trains the energy with neither the normalizer nor model samples ([Hyvärinen, 2005](#references)). The unknown data score is removed in the [score matching note](/notes/generative-models/score-matching) by integration by parts, which gives $\mathbb E_P\big[\tfrac12\|\nabla_x E_\theta\|^2 - \Delta_x E_\theta\big]$ plus a constant, with $\Delta_x$ the Laplacian, and derives the cheaper [sliced and denoising versions](/notes/generative-models/score-matching#two-cheaper-objectives). Either way the loss contains the input gradient of the energy, so each training step differentiates twice, and generation still needs Langevin dynamics.
+
+## Out-of-distribution detection
+
+An energy trained with a negative phase is low on the data and pushed up wherever its samples went, so $E_\theta(x)$ can flag unusual inputs: those whose energy exceeds a threshold chosen on held-out data. Likelihood models are not automatically such detectors. Separating CIFAR-10 test images from SVHN house numbers by log-likelihood, PixelCNN++ and Glow reach an area under the ROC curve of 0.32 and 0.24, below the 0.5 of chance, because they give the house numbers higher likelihood; an EBM reaches 0.63 ([Du and Mordatch, 2019](#references), Section 4.4). The same EBM scores 0.30 on constant images: only what its sampler visited was pushed up. Energies also have no common scale, so the threshold must be calibrated per model.
+
+## JEM: your classifier is secretly an EBM
+
+A classifier with $C$ classes outputs logits $f_\theta(x) \in \mathbb R^C$ and probabilities $p_\theta(y \mid x) = \operatorname{softmax}(f_\theta(x))_y$. [Grathwohl et al. (2020)](#references) read the same logits as the negative energy of the pair $(x, y)$:
+
+$$
+\begin{aligned}
+p_\theta(x, y) &= \frac{e^{f_\theta(x)[y]}}{Z_\theta} , \\
 E_\theta(x, y) &= -f_\theta(x)[y] .
 \end{aligned}
 $$
@@ -253,17 +309,16 @@ Summing over $y$ gives a density of the input alone,
 
 $$
 \begin{aligned}
-p_\theta(x) &= \frac{1}{Z_\theta}\sum_y e^{f_\theta(x)[y]},\\
-E_\theta(x) &= -\log\sum_y e^{f_\theta(x)[y]}\\
-&= -\operatorname{logsumexp}_y f_\theta(x)[y] ,
+p_\theta(x) &= \frac{1}{Z_\theta} \sum_y e^{f_\theta(x)[y]} , \\
+E_\theta(x) &= -\operatorname{logsumexp}_y f_\theta(x)[y] ,
 \end{aligned}
 $$
 
-with the energy computed by the [stable log-sum-exp](/notes/math/conditioning-and-stability#log-sum-exp-and-the-stable-softmax), and dividing the joint by the marginal cancels $Z_\theta$ and returns the softmax: $p_\theta(y \mid x)$ is the classifier as before. Adding the same constant to all logits of an input leaves the classifier unchanged but changes $p_\theta(x)$. This degree of freedom, unused by ordinary training, is where the density lives; the model is called a **joint energy-based model**, JEM.
+with the energy computed by the [stable log-sum-exp](/notes/math/conditioning-and-stability#log-sum-exp-and-the-stable-softmax). Dividing the joint by the marginal cancels $Z_\theta$ and returns the softmax, so the classifier is unchanged. A constant added to all logits of an input leaves the classifier alone but changes $p_\theta(x)$; this freedom, unused by ordinary training, holds the density of a **joint energy-based model** (JEM).
 
-**Worked example.** Logits $(2, 0, -1)$ give class probabilities $(0.844, 0.114, 0.042)$, $\operatorname{logsumexp} = 2.170$ and $E(x) = -2.170$. Logits $(3, 1, 0)$ give the same probabilities and $E(x) = -3.170$. The classifier cannot tell the two inputs apart; under $p_\theta(x)$ the second is $e \approx 2.72$ times more probable.
+**Worked example.** Logits $(2, 0, -1)$ give class probabilities $(0.844, 0.114, 0.042)$ and $E(x) = -\operatorname{logsumexp} = -2.170$. Logits $(3, 1, 0)$ give the same probabilities and $E(x) = -3.170$. The classifier cannot tell the two inputs apart; under $p_\theta(x)$ the second is $e \approx 2.72$ times more probable.
 
-JEM trains with $\log p_\theta(x, y) = \log p_\theta(x) + \log p_\theta(y \mid x)$: cross-entropy for the classifier term, which is exact, plus the EBM gradient for $\log p_\theta(x)$ with energy $-\operatorname{logsumexp}$, its negative samples drawn by Langevin steps from a replay buffer of 10,000 images, 20 steps per update, 5% of the chains restarted from uniform noise, noise of standard deviation 0.01 (Section 4 and Appendix A). A WideResNet-28-10 without batch normalization trained this way on CIFAR-10 reaches 92.9% accuracy together with an Inception Score of 8.76 and an FID of 38.4 (Table 1). The joint training also improves [calibration](/notes/bayesian-methods/bayesian-deep-learning#calibration-and-inputs-far-from-the-data), out-of-distribution detection and [adversarial robustness](/notes/deep-learning/adversarial-examples) over the same classifier trained alone (Section 5). The cost is the EBM's: each Langevin step costs about as much as a classifier training step, and the models regularly diverged and had to be restarted with lower learning rates or stronger regularization (Sections 6 and 7).
+JEM trains with $\log p_\theta(x, y) = \log p_\theta(x) + \log p_\theta(y \mid x)$: cross-entropy for the second term, the EBM gradient with a replay buffer for the first. On CIFAR-10 the resulting classifier keeps 92.9% accuracy while also generating images (Table 1), and is better [calibrated](/notes/bayesian-methods/bayesian-deep-learning#calibration-and-inputs-far-from-the-data) than the same network trained alone (Section 5.2). The cost is the EBM's: Langevin steps at every update, and frequent divergence.
 
 ## Composing energies
 
@@ -271,98 +326,49 @@ Adding energies multiplies densities:
 
 $$
 \begin{aligned}
-E_{A+B}(x) &= E_A(x) + E_B(x)\\
-\Longrightarrow\quad p_{A+B}(x) &\propto e^{-E_A(x)}\,e^{-E_B(x)} \propto p_A(x)\,p_B(x) ,
+E_{A+B}(x) &= E_A(x) + E_B(x) , \\
+p_{A+B}(x) &\propto e^{-E_A(x)}\, e^{-E_B(x)} \propto p_A(x)\, p_B(x) .
 \end{aligned}
 $$
 
-a **product of experts** ([Hinton, 2002](#references)). The product is large only where both factors are, so a sum of energies acts as a logical AND of the constraints the energies encode. The score of the sum is the sum of the scores, so Langevin dynamics on the composed model needs only the gradients of the parts and no new training.
+This is a **product of experts** ([Hinton, 2002](#references)): large only where both factors are, a logical AND of the constraints the energies encode. The score of the sum is the sum of the scores, so Langevin dynamics on the composed model needs no new training. For example, $E_A(x) = x^2/2$ is $\mathcal N(0, 1)$ and $E_B(x) = (x - 2)^2/2$ is $\mathcal N(2, 1)$; their sum is $x^2 - 2x + 2 = (x - 1)^2 + 1$, the energy of $\mathcal N(1, \tfrac12)$, which sits between the two and is narrower than either. Separately trained energies are in arbitrary units, so a weight on each term changes the result.
 
-**Worked example.** $E_A(x) = x^2/2$ is $\mathcal N(0, 1)$ and $E_B(x) = (x - 2)^2/2$ is $\mathcal N(2, 1)$. Their sum is $x^2 - 2x + 2 = (x - 1)^2 + 1$, the energy of $\mathcal N(1, \tfrac12)$: the product sits between the two and is narrower than either.
+## What you should remember
 
-[Du and Mordatch (2019)](#references) train separate conditional energies for the scale, position and rotation of a shape and generate images with all three attributes by Langevin dynamics on the sum; summed energies, fine-tuned on the training sets, also produce combinations of size and position never seen together in training (Section 7). The parts must be on comparable scales. Separately trained energies are measured in arbitrary units ([LeCun et al., 2006](#references), Section 1.3), and a weight on one term, equivalently a temperature, changes the result.
-
-## What changed
-
-| | WGAN critic | EBM, MCMC training | NCE | Score matching |
-| --- | --- | --- | --- | --- |
-| Network output | critic score $f(x)$ | energy $E_\theta(x)$ | energy and a constant $c$ | energy; its input gradient is the score |
-| Negative examples | from a generator network | Langevin chains on $E_\theta$, often from a buffer | samples of a fixed noise density | none |
-| Gradient through the sampler | yes, the generator is trained | none | none | no sampler |
-| Normalizer $Z_\theta$ | not defined | never computed | learned as $-c$ | cancels |
-| What keeps it in check | Lipschitz constraint | L2 on energies, spectral normalization | noise close to the data | second derivatives or a noise level |
-| Sampling after training | one generator pass | Langevin dynamics | Langevin dynamics | Langevin dynamics |
-| Typical failure | critic not Lipschitz | divergence; density shaped by the sampler | trivial classification against far noise | cost of the Hessian trace; score of noised data |
-
-## Limitations
-
-- **Sampling inside training.** Every update runs $K$ forward and backward passes of the network for the sampler, 60 in the MNIST configuration, so training is tens of times slower than training a classifier of the same size ([Grathwohl et al., 2019](#references), Section 7).
-- **Biased gradients.** Short chains, and the relaxed sampler at a temperature near $10^{-6}$, do not sample $p_\theta$. The learned density is shaped by the sampler, as the Gaussian example shows, and is not a calibrated likelihood.
-- **Instability.** Training diverges without the penalty, spectral normalization and careful tuning of the sampler, and sometimes despite them.
-- **No likelihood for free.** Reporting $\log p_\theta(x)$ needs $Z_\theta$, and annealed importance sampling is too slow for images of CIFAR-10 size.
-- **Slow generation.** Hundreds of Langevin steps per sample, and long chains explore modes slowly; Du and Mordatch found mode exploration with Langevin dynamics "took a very long time" for unconditional CIFAR-10 (Section 4.1).
-- **The sampling-free estimators have their own costs.** NCE depends on a noise distribution close to the data, which is hard to find for images; score matching needs second derivatives or a noise level, and sampling still needs Langevin dynamics.
-
-## Summary
-
-- An energy network defines $p_\theta(x) = e^{-E_\theta(x)}/Z_\theta$. Only energy differences matter; $Z_\theta$ is an intractable integral.
-- The likelihood gradient is $\mathbb E_P\nabla_\theta E_\theta(x^+) - \mathbb E_{p_\theta}\nabla_\theta E_\theta(x^-)$: lower the energy at the data, raise it at the model's samples. The negative phase needs samples from the model, which come from Langevin dynamics on $-\nabla_x E_\theta$.
-- Contrastive divergence stops the chains after $K$ steps. Short chains bias the model: it learns an energy whose $K$-step sampler reproduces the data, not the data density. Persistent chains and a replay buffer (95% old samples, 5% fresh noise) lengthen the chains at no extra cost.
-- The loss sees only energy differences, so the level and scale of the energies drift; an L2 penalty $\alpha\,\text{mean}(E^2)$ pins the level near zero and caps the gap at about $1/\alpha$.
-- Training is unstable; smooth activations, no normalization layers, Adam without momentum, small learning rates and more sampling steps help.
-- NCE learns $E_\theta$ and $\log Z_\theta$ by classifying data against noise; score matching fits $-\nabla_x E_\theta$ to the data score. Neither samples during training.
-- Energies detect outliers (with caveats), any classifier is an EBM with $E(x) = -\operatorname{logsumexp}_y f_\theta(x)[y]$ (JEM), and adding energies multiplies densities.
+- $p_\theta = e^{-E_\theta}/Z_\theta$: only energy differences matter, and $Z_\theta$ is intractable.
+- $\nabla_\theta \log p_\theta(x) = -\nabla_\theta E_\theta(x) + \mathbb E_{p_\theta}\nabla_\theta E_\theta$: lower the energy at data, raise it at model samples.
+- Short Langevin chains bias the model towards an energy whose $K$-step sampler matches the data.
+- A replay buffer (95% old samples, 5% noise) lengthens the chains for free; $\alpha\,\text{mean}(E^2)$ pins the energy level and caps the gap at about $1/\alpha$.
+- NCE learns $E_\theta$ and $\log Z_\theta$ by classifying data against noise; score matching fits $-\nabla_x E_\theta$. Neither samples during training.
+- Any classifier is an EBM with $E(x) = -\operatorname{logsumexp}_y f_\theta(x)[y]$; adding energies multiplies densities.
 
 ## Notebook
 
-The [EBM notebook](https://github.com/HSE-LAMBDA/DeepGenerativeModels/blob/spring-2025-long/seminars/05_Energy-Based-Models-and-MCMC/EBM.ipynb) of the HSE-LAMBDA *Deep Generative Models* repository trains the MNIST configuration of this note (cell numbers count every cell, markdown included, from 1). It follows [Tutorial 8](https://github.com/phlippe/uvadlc_notebooks/blob/master/docs/tutorial_notebooks/tutorial8/Deep_Energy_Models.ipynb), *Deep Energy-Based Generative Models*, of the University of Amsterdam Deep Learning course by Phillip Lippe, and uses PyTorch Lightning. The notebook writes the model density as $q_\theta$ where this note writes $p_\theta$.
+The [EBM notebook](https://github.com/HSE-LAMBDA/DeepGenerativeModels/blob/spring-2025-long/seminars/05_Energy-Based-Models-and-MCMC/EBM.ipynb) of the HSE-LAMBDA *Deep Generative Models* course trains the MNIST configuration of this note in PyTorch Lightning, following [Lippe's tutorial](#references). Cell numbers count every cell, markdown included, from 1. No code cell has saved outputs; the network outputs $f_\theta = -E_\theta$, which it calls a score.
 
-- **Cells 1–3: theory.** The energy and partition function; the score and score matching, with denoising and sliced score matching named; NCE with the ratio $r_\theta(x) = e^{-E_\theta(x)}/q_0(x)$ for a noise density $q_0$; the derivation of the likelihood gradient, as in this note; and Langevin sampling with $K$ between 10 and 60. Cell 2 also names SGLD and annealed importance sampling, which the notebook does not implement.
-- **Cells 4–6: setup.** Imports, seed 42, the device (CUDA, Apple MPS or CPU), and a download of the original tutorial's pretrained MNIST checkpoint and TensorBoard log. When the checkpoint is present, cell 27 loads it and skips training.
-- **Cell 7: uses beyond generation.** Classification and denoising as minimizing $E(X, Y)$ over the answer $Y$, with an embedded figure.
-- **Cells 8–9: data.** MNIST, 60,000 training and 10,000 test images of $28 \times 28$, scaled to $[-1, 1]$ so that the sampler can clamp to a fixed range. The training loader has batch size 128, shuffling and `drop_last=True` (468 batches per epoch); the test loader, batch size 256, serves as the validation set.
-- **Cells 10–12: model.** `CNNModel`: convolutions $1 \to 16$ (kernel 5, stride 2, padding 4: $28 \to 16$), $16 \to 32$, $32 \to 64$ and $64 \to 64$ (kernel 3, stride 2: $8$, $4$, $2$), Swish after each, then $256 \to 64 \to 1$ with Swish between; 76,993 parameters, no normalization layers. Cell 12 states that the network outputs $f_\theta = -E_\theta$, so a "score" in the notebook is a negative energy.
-- **Cells 13–14: sampler and buffer.** `Sampler` starts with a buffer of 128 uniform images. Each call draws $n_{\text{new}} \sim \text{Binomial}(128, 0.05)$ fresh uniform images and the rest with replacement from the buffer (`random.choices`), then runs `generate_samples`: parameters frozen and the model in evaluation mode, 60 steps of noise (standard deviation 0.005), clamp, a gradient step of size 10 on $E_\theta = -f_\theta$ with each component clipped to $\pm 0.03$, clamp. New samples are prepended and the buffer is cut to 8192 images, which it reaches after 63 training steps.
-- **Cells 15–19: training.** Cell 16 explains the offset problem, the L2 term with weight $\alpha$ and practical tips (balance step size and noise, $\alpha$ of 0.1 or 0.01, short versus long chains, a large buffer). `DeepEnergyModel` (cell 18) uses Adam with learning rate $10^{-4}$ and betas $(0, 0.999)$ and a step decay of the learning rate by 0.97 per epoch. Each training step adds noise of standard deviation 0.005 to the data, draws 128 samples, and computes `cdiv_loss = mean f(x⁻) − mean f(x⁺)`, which is $\text{mean}\,E(x^+) - \text{mean}\,E(x^-)$, and `reg_loss` $= \alpha\,\text{mean}(f(x^+)^2 + f(x^-)^2)$ with the default $\alpha = 0.1$. Validation compares test images with uniform noise, logging $\text{mean}\,f(\text{noise}) - \text{mean}\,f(\text{test})$. There is no test step (cell 19).
-- **Cells 20–25: callbacks.** `GenerateCallback` runs 256 steps of size 10 from uniform noise for 8 images every 5 epochs and logs 8 intermediate stages; `SamplerCallback` logs 32 random buffer images every 5 epochs; `OutlierCallback` logs the mean $f_\theta$ of 1024 uniform images every epoch.
-- **Cells 26–28: running.** A Lightning trainer for 60 epochs with gradient-norm clipping at 0.1, a checkpoint chosen by the lowest validation value (the epoch that best separates test digits from uniform noise, not the one with the best samples), the three callbacks and a learning-rate monitor. One epoch costs 468 training steps of 60 sampler passes each, 28,080 passes of the network on batches of 128.
-- **Cells 29–34: TensorBoard.** Loads the downloaded log. Cell 33 embeds a screenshot; cell 34 notes that the CD term and the penalty converge to about zero quickly, and that progress shows in the samples and in the falling score of random images.
-- **Cells 35–39: generation.** With seed 43, 4 chains from uniform noise run 256 steps of size 10; the plot shows the start and every 32nd step. Cell 39 describes the plots of the original tutorial (an 8 and a 2), not plots saved here.
-- **Cells 40–54: out-of-distribution detection.** Cell 40 motivates the task and cites JEM. Cells 41 and 43 print the mean $f_\theta$ of 128 uniform images and of a training batch; cell 44 says the latter is near 0 because of the penalty. Cells 45–53 compare the first test image with three changed versions: Gaussian noise of standard deviation 0.3, clamped (cell 49); `flip(dims=(1, 2))` (cell 51); the digit subsampled by 2 and placed in the bottom-right quadrant of a black image (cell 53). The text reports a large drop of the score for noise and small drops for the other two.
-- **Cell 55: instability.** Divergence as described in this note; reloading a stable checkpoint as a last resort; the sensitive hyperparameters (step size, number of steps, noise, learning rate, width).
-- **Cells 56–57**: conclusion; cell 57 is empty.
+- Model and sampler (cells 8–14): the Swish CNN with 76,993 parameters, a buffer of 8192 images with 5% fresh starts, 60 steps of size 10 with gradients clipped to $\pm 0.03$ and noise 0.005.
+- Training (cells 15–28): the loss above, Adam with betas $(0, 0.999)$, 60 epochs; the checkpoint is the epoch that best separates test digits from noise, not the one with the best samples.
+- Generation and outlier checks (cells 35–54): 256 Langevin steps from noise, and energies of a test digit against noisy, flipped and shrunk copies.
 
-No code cell has saved outputs, so the notebook documents the procedure only. The rendered page of the original tutorial shows a run of the pretrained checkpoint: a mean score of −17.88 for uniform noise and −0.00 for training images, and for the test image 0.03 against −0.07 (noise), −0.00 (flip) and −0.02 (shrunk) ([Lippe, 2025](#references)).
-
-Notebook issues:
-
-- **The sampler is not Langevin dynamics.** The markdown of cells 3 and 13 writes the update as $x - \eta\nabla_x E + \omega$, $\omega \sim \mathcal N(0, \sigma)$, without relating $\sigma$ to $\eta$, and states that small $\eta$ and large $K$ give samples from the model. That holds only when the noise variance is $2\eta$, that is, for $x - \frac{\varepsilon}{2}\nabla_x E + \sqrt{\varepsilon}\,z$. With step 10 and noise 0.005 the update is the one formally associated with $p_\theta^{1/T}$, $T = 1.25 \cdot 10^{-6}$, but with clipping, clamping and 60 steps its samples follow no such density, as explained in the callout above.
-- **Contrastive divergence or not.** Cell 3 calls the method contrastive divergence. Hinton's CD starts the chains at the data; the notebook starts them from a buffer and noise, which is persistent CD with a replay buffer ([Du and Mordatch, 2019](#references)).
-- **NCE noise.** Cell 3 suggests replay buffers as a noise source for NCE. NCE needs the log-density of the noise, and a buffer of MCMC samples has none.
-- **Denoising score matching** (cell 3) is described as predicting the clean image from the noisy one; the objective regresses the model score onto $-(\tilde x - x)/\sigma^2$, which is equivalent to predicting the noise, or the clean image, up to a known affine map.
-- **The L2 formula** in cell 16 places the sum over $i$ on the first square only; it should cover both, $\frac1N\sum_i\big[E_\theta(x_i^+)^2 + E_\theta(x_i^-)^2\big]$, which is what the code computes.
-- **Callbacks never run with current Lightning.** The three callbacks override `on_epoch_end`, a hook that PyTorch Lightning 2.x no longer has, so nothing is generated or logged during training; the hook to use is `on_train_epoch_end`.
-- **`make_grid(..., range=(-1, 1))`** in cells 21, 23, 38 and 45 uses an argument that current torchvision has replaced by `value_range`; the call raises a `TypeError`, so the plots of cell 38 and the comparisons of cells 49, 51 and 53 fail until it is renamed.
-- **The "flip" is a rotation.** `flip(dims=(1, 2))` on a $1 \times 28 \times 28$ image reverses both height and width, a rotation by 180°; a mirror image is `flip(dims=(2,))`.
-- **Comments that do not match the code.** Cell 9 promises a split of the training set into training and validation parts and smaller batches for training; there is no split, the test set is the validation set, and training uses the same loader. Cell 13 mentions uniform or Gaussian starts; the code uses uniform noise only. Cell 7 repeats the section number 2.5.
+Issues: the callbacks override `on_epoch_end`, which PyTorch Lightning 2.x no longer calls, so nothing is logged; `make_grid(..., range=...)` must become `value_range`; `flip(dims=(1, 2))` is a 180° rotation, not a mirror image; and cell 3 calls the method contrastive divergence, though it is persistent CD with a buffer.
 
 ## Next
 
-Training an energy-based model runs biased short MCMC chains inside every parameter update, and the model it produces is shaped as much by its sampler as by its data. Diffusion models avoid this loop. They fix a noising process that turns data into Gaussian noise and learn to undo it one small step at a time, which is a regression with no sampling during training. The [next note](/notes/generative-models/ddpm-forward-process) builds that forward process. The [score matching note](/notes/generative-models/score-matching) shows later that the network a diffusion model trains is, up to a known scale factor, the score, the negative gradient of an energy, of the noised data.
+An energy-based model is trained with biased short MCMC chains inside every update and is shaped as much by its sampler as by its data. Diffusion models avoid this loop: they fix a process that turns data into noise and learn to undo it step by step, a regression with no sampling in training. The [next note](/notes/generative-models/ddpm-forward-process) builds that forward process; the [score matching note](/notes/generative-models/score-matching) shows that the trained network is, up to a known scale, the score of the noised data: the negative gradient of an energy.
 
 ## References
 
-- Y. LeCun, S. Chopra, R. Hadsell, M. Ranzato, F. J. Huang. [A Tutorial on Energy-Based Learning](http://yann.lecun.com/exdb/publis/pdf/lecun-06.pdf). In G. Bakır, T. Hofmann, B. Schölkopf, A. Smola, B. Taskar (eds.), *Predicting Structured Data*, MIT Press, 2006. Section 1.1: inference by energy minimization; Section 1.3: the Gibbs distribution and uncalibrated energies; Section 2.2.4: the negative log-likelihood loss.
+- Y. LeCun, S. Chopra, R. Hadsell, M. Ranzato, F. J. Huang. [A Tutorial on Energy-Based Learning](http://yann.lecun.com/exdb/publis/pdf/lecun-06.pdf). In G. Bakır, T. Hofmann, B. Schölkopf, A. Smola, B. Taskar (eds.), *Predicting Structured Data*, MIT Press, 2006. Section 1.1: inference by energy minimization.
+- Y. Song, D. P. Kingma. [How to Train Your Energy-Based Models](https://arxiv.org/abs/2101.03288). arXiv:2101.03288, 2021. Section 3: the gradient of the log-normalizer, Langevin MCMC, contrastive divergence and its bias; Section 4: score matching.
+- S. Ermon. *Deep Generative Models* (CS236), Stanford, Fall 2023. [Lecture 12](https://deepgenerativemodels.github.io/assets/slides/cs236_lecture12.pdf): sampling from EBMs, score matching, noise-contrastive estimation and its comparison with GANs.
 - G. E. Hinton. [Training Products of Experts by Minimizing Contrastive Divergence](https://doi.org/10.1162/089976602760128018). *Neural Computation*, 14(8), 1771–1800, 2002. Section 3: contrastive divergence.
 - T. Tieleman. [Training Restricted Boltzmann Machines using Approximations to the Likelihood Gradient](https://doi.org/10.1145/1390156.1390290). ICML, 2008. Persistent contrastive divergence.
+- Y. Du, I. Mordatch. [Implicit Generation and Modeling with Energy-Based Models](https://arxiv.org/abs/1903.08689). NeurIPS, 2019. Section 3: Langevin sampling, the replay buffer, the L2 term and spectral normalization; Section 4.4: out-of-distribution detection; Appendices A.3 and A.12: likelihood estimates, training tips.
+- E. Nijkamp, M. Hill, S.-C. Zhu, Y. N. Wu. [Learning Non-Convergent Non-Persistent Short-Run MCMC Toward Energy-Based Model](https://arxiv.org/abs/1904.09770). NeurIPS, 2019.
+- M. Welling, Y. W. Teh. [Bayesian Learning via Stochastic Gradient Langevin Dynamics](https://icml.cc/2011/papers/398_icmlpaper.pdf). ICML, 2011.
 - M. Gutmann, A. Hyvärinen. [Noise-contrastive estimation: A new estimation principle for unnormalized statistical models](https://proceedings.mlr.press/v9/gutmann10a.html). AISTATS, PMLR 9, 297–304, 2010. Theorems 1 and 2; Section 2.4: the choice of noise.
 - A. Hyvärinen. [Estimation of Non-Normalized Statistical Models by Score Matching](https://jmlr.org/papers/v6/hyvarinen05a.html). *Journal of Machine Learning Research*, 6, 2005.
-- Y. Du, I. Mordatch. [Implicit Generation and Modeling with Energy-Based Models](https://arxiv.org/abs/1903.08689). NeurIPS, 2019. Section 3: Langevin sampling, the replay buffer and the L2 term (Algorithm 1); Section 4.4: out-of-distribution detection; Section 7: composition; Appendices A.3, A.4, A.11 and A.12: likelihood estimates, sensitivity, hyperparameters and training tips.
-- E. Nijkamp, M. Hill, S.-C. Zhu, Y. N. Wu. [Learning Non-Convergent Non-Persistent Short-Run MCMC Toward Energy-Based Model](https://arxiv.org/abs/1904.09770). NeurIPS, 2019.
-- Y. Song, D. P. Kingma. [How to Train Your Energy-Based Models](https://arxiv.org/abs/2101.03288). arXiv:2101.03288, 2021. Section 3: maximum likelihood with MCMC; Section 5: noise-contrastive estimation and its connection to score matching.
-- W. Grathwohl, K.-C. Wang, J.-H. Jacobsen, D. Duvenaud, M. Norouzi, K. Swersky. [Your Classifier is Secretly an Energy Based Model and You Should Treat it Like One](https://arxiv.org/abs/1912.03263). ICLR, 2020. Table 1, Section 5.3 and Appendices A and H.
-- M. Welling, Y. W. Teh. [Bayesian Learning via Stochastic Gradient Langevin Dynamics](https://icml.cc/2011/papers/398_icmlpaper.pdf). ICML, 2011.
 - R. M. Neal. [Annealed Importance Sampling](https://doi.org/10.1023/A:1008923215028). *Statistics and Computing*, 11(2), 125–139, 2001.
-- E. Nalisnick, A. Matsukawa, Y. W. Teh, D. Gorur, B. Lakshminarayanan. [Do Deep Generative Models Know What They Don't Know?](https://arxiv.org/abs/1810.09136) ICLR, 2019.
-- P. Lippe. [Tutorial 8: Deep Energy-Based Generative Models](https://uvadlc-notebooks.readthedocs.io/en/latest/tutorial_notebooks/tutorial8/Deep_Energy_Models.html). In *UvA Deep Learning Tutorials*, University of Amsterdam, 2025 (the year of the series' suggested citation).
+- W. Grathwohl, K.-C. Wang, J.-H. Jacobsen, D. Duvenaud, M. Norouzi, K. Swersky. [Your Classifier is Secretly an Energy Based Model and You Should Treat it Like One](https://arxiv.org/abs/1912.03263). ICLR, 2020. Table 1, Section 5.2 and Appendix H.
+- P. Lippe. [Tutorial 8: Deep Energy-Based Generative Models](https://uvadlc-notebooks.readthedocs.io/en/latest/tutorial_notebooks/tutorial8/Deep_Energy_Models.html). In *UvA Deep Learning Tutorials*, University of Amsterdam.
 - HSE-LAMBDA, *Deep Generative Models* course repository: [`EBM.ipynb`](https://github.com/HSE-LAMBDA/DeepGenerativeModels/blob/spring-2025-long/seminars/05_Energy-Based-Models-and-MCMC/EBM.ipynb).

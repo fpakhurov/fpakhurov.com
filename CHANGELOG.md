@@ -4,6 +4,34 @@ Notable changes to the site, newest first. Each entry gives the date, what chang
 
 ## 2026-10-27
 
+- **Generative Models rewritten, a new note, and every step derived.** 34 notes, English and Russian.
+  - **Content comparison.** Each note was compared by content with the BMML lecture notes (lectures 5–6, the owner's primary reference), the HSE/ШАД Deep Generative Models course, Isachenko's MIPT/ШАД course, Stanford CS236, MIT 6.S978, Murphy's *Advanced Topics* and Bishop & Bishop, then rewritten in the new style.
+  - **Order.** The Evaluation section now comes before the GANs, so that GANs are judged with tools the reader already has.
+  - **New note:** continuous-time diffusion and flow matching. It covers:
+    - the VP SDE as the limit of DDPM;
+    - the Fokker–Planck equation, the probability-flow ODE and the reverse SDE;
+    - conditional flow matching and rectified flow;
+    - a short section on discrete diffusion.
+  - **Length.** The GAN-branch notes, at 5,800–7,300 words, and audio generation, at 7,300, are cut to about 3,500 words each. Paper ablations and locator recitals are removed. Each note keeps its mechanism, the key derivation, one worked example and one worked failure.
+  - **The derivation audit.** Every formula and claim is derived in place, linked to the anchor that derives it, or stated precisely with a reference whose numbers were checked. Long proofs fold under their claims. New derivations include:
+    - the closed-form Gaussian KL of the VAE and the Fréchet distance with its trace term;
+    - the optimal discriminator, the JS divergence and Fenchel–Moreau for f-GANs;
+    - the weak direction of Kantorovich–Rubinstein duality;
+    - the DDPM posterior, the ELBO split and the gap between the exact loss and the simple loss;
+    - the Fokker–Planck equation;
+    - the blind spot of masked convolutions.
+  - **Errors fixed, among others:**
+    - L₀ in the DDPM bound depends on the decoder, so it is not a constant;
+    - the NCSN objective was missing its 1/L factor;
+    - −V/2, not −V, in the GAN loss;
+    - a CycleGAN comparison figure taken from the opposite direction;
+    - the DALL·E tokenizer grid is 32×32;
+    - the one-step rectified-flow claim now reports FID 12.21 for reflow alone and 4.85 with distillation;
+    - the reverse diffusion step is not one bump at small t;
+    - several paper table and section locators.
+  - **Independence.** The course no longer requires NLP: self-attention is introduced in place, and the NLP note is optional background.
+  - **Equations.** On a desktop screen no display equation in the course scrolls sideways (0 of 1,104, with all folds open).
+
 - **Bayesian Methods and Probability: gaps closed.** A point-by-point comparison with the BMML lecture-notes material showed what the courses stated thinly or left out. Every addition is derived, in English and Russian.
   - **Bayesian Methods:**
     - Metropolis–Hastings on a posterior (the evidence cancels in the ratio, a rejection repeats the state and still counts), with a worked coin example;
