@@ -2,6 +2,70 @@
 
 Notable changes to the site, newest first. Each entry gives the date, what changed and why.
 
+## 2026-10-27
+
+- **Bayesian Methods and Probability: gaps closed.** A point-by-point comparison with the BMML lecture-notes material showed what the courses stated thinly or left out. Every addition is derived, in English and Russian.
+  - **Bayesian Methods:**
+    - Metropolis–Hastings on a posterior (the evidence cancels in the ratio, a rejection repeats the state and still counts), with a worked coin example;
+    - for PPCA, the mean estimate, the solution with fixed noise and the case with no maximum;
+    - EM does not need an exponential family, its M-step need not be concave, and Bayesian PCA's E-step needs the posterior covariance of the codes;
+    - full Bayes over hyperparameters, set against a point estimate and empirical Bayes;
+    - a gamma prior on the precision when the mean is known, and the Fisher–Neyman factorization;
+    - the EM update of the noise precision in the RVM;
+    - an intercept with its own flat prior;
+    - the comparison of the two readings of probability now says that exact frequentist intervals exist at small n (the t-interval, Clopper–Pearson).
+  - **Probability:**
+    - Metropolis–Hastings separates the proposal from the transition kernel, including the rejection mass, and has a worked example; detailed balance is sufficient, not necessary;
+    - the variance of an MCMC average at a finite chain length, the integrated autocorrelation time, and why no burn-in fits every chain;
+    - Markov chains: the kernel form, period, the ergodic theorem, and a new section on countable and continuous state spaces;
+    - rejection sampling: the acceptance rate and the density of accepted points;
+    - the self-normalized importance-sampling estimator;
+    - new Gamma and Beta sections;
+    - the Cauchy distribution by inverse transform.
+  - Each derivation has one home: the conjugate-priors note now links the beta constant and the gamma moments instead of repeating them.
+
+- **Mathematics for ML: every step derived or linked.** All 16 notes were audited in English and Russian against one rule: each formula and claim is derived in place, linked to the anchor that derives it, or stated precisely with a checked reference. Long proofs fold under their claims.
+  - **Added derivations:**
+    - continuous partial derivatives imply differentiability, and Schwarz's theorem;
+    - Fubini on a rectangle, with an outline of the change of variables (Lebl, Theorem 10.7.2);
+    - the convergence rates of gradient descent from L-smoothness, strong convexity, PL and Armijo backtracking, and the Newton bounds;
+    - parallel gradients at a constrained optimum through the implicit function theorem, and KKT under LICQ;
+    - for conjugate gradient, A-orthogonality, Krylov optimality and the √κ rate from Chebyshev polynomials.
+  - **Errors fixed:**
+    - a generator maps into more dimensions, not fewer;
+    - the observed speed of gradient descent is now predicted from the local condition number (2,970 steps predicted, 2,727 taken);
+    - Boyd's shadow prices are §5.4.4, not §5.6;
+    - the value of 2 sin²(x/2)/x² at x = 10⁻⁴;
+    - the partitioning problem's duality gap is now certified (0.60).
+  - **References.** Theorem and section numbers that could not be checked against the source were removed.
+  - **Equations.** On a desktop screen no display equation in the course scrolls sideways (0 of 736).
+
+- **Bayesian Methods rewritten, checked against the BMML lecture notes, and audited for every step.**
+  - **Content comparison.** All 15 notes were compared with the Vetrov–Kropotov course, the HSE course, Bishop, Murphy and Cambridge 4F13, then rewritten in English and Russian in the new style.
+  - **The owner's lecture notes.** Then came a pass against the lecture notes «Байесовские методы в анализе данных» (2026, [github.com/bmml-team/bmml_ftda](https://github.com/bmml-team/bmml_ftda)), which the owner chose as the course's primary reference. It added:
+    - observers with different knowledge;
+    - finding a conjugate prior from the likelihood;
+    - the three-dice Occam example;
+    - EM for crowd labels (GLAD): on simulated data, 61 errors in 1,000 items against 133 for a majority vote;
+    - prediction and the evidence from Gibbs draws.
+  - **The derivation audit.** Every formula and claim is derived in place, linked to the anchor that derives it, or stated precisely with a checked reference; long derivations fold under their claims. Bayes' formula with an extra condition is now derived both ways, and sequential updating has its explicit normalizer.
+  - **Errors fixed:**
+    - the GP evidence "local maximum" was the optimizer's bound;
+    - a positive definite Hessian is not necessary at a strict maximum;
+    - the inverted «в 1 − ηλ раз» wording;
+    - a backwards support condition and a wrong claim about the two KL directions in VI;
+    - the training error said to fall at every step;
+    - the predictive said to be always wider than the likelihood;
+    - a PyTorch-only code block, now NumPy.
+  - **Structure:**
+    - model selection no longer uses a result from the next note;
+    - each repeated derivation has one home;
+    - the section with LDA is renamed "Nonparametric and Topic Models";
+    - Gaussian processes gain expectation propagation, with a factor-graph figure.
+  - **Equations.** On a desktop screen no display equation in the course scrolls sideways (0 of 287).
+
+- **Derivations fold under their claims, and every step must be explained.** Long derivations and proofs now sit in a block that opens on a click, marked by a rule on the left, so the text keeps its pace while every step stays on the page. The writing guide gains the rule the courses are being checked against: every formula and claim is derived in place, linked to the exact anchor where it is derived, stated as a definition, or (when the proof is beyond the course) stated precisely with its intuition and a specific reference. "It can be shown" and "it is known" never replace a step.
+
 ## 2026-10-26
 
 - **Mathematics for Machine Learning rewritten in the new style, with a new note.** Each of the 15 notes was compared, by content, with the matching lectures of the HSE matrix-computations and optimization courses, Strang's MIT courses, Boyd and Vandenberghe, and Deisenroth, Faisal and Ong. Each was then rewritten in English and Russian under the approved rules.

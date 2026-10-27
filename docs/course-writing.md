@@ -94,6 +94,18 @@ A note should leave the reader able to explain the method, derive its key formul
 
 ## 9. Formatting details
 
+- A derivation or proof that would break the flow folds under its claim, as a footnote that opens on a click. Leave a blank line after `<summary>` and before `</details>`, so that markdown and math inside render:
+
+  ```mdx
+  <details>
+  <summary>Derivation: why the bound holds</summary>
+
+  …steps…
+
+  </details>
+  ```
+
+  The claim and its result stay in the text; only the steps fold. In Russian the label starts with «Вывод:» or «Доказательство:».
 - Display math is set as in a book. One relation per line: several updates or definitions go into one `aligned` block with `&` before each relation sign, never side by side with `\qquad`. A derivation is an `aligned` chain, one step per line, with a short `\text{(reason)}` beside a step that needs one. Number with `\tag{n}` only the equations the text refers to later.
 - Any formula with a fraction, a sum, an integral or a root goes on its own line, unless it is a short symbol definition. A worked example with more than a few numbers becomes an aligned display or a small table (quantity, formula, value), followed by one sentence that reads it.
 - Long display equations overflow the reading column on narrow screens. Split them as above, or move conditions into the sentence before the display.

@@ -96,6 +96,7 @@ export const courses: Record<CourseKey, Course> = {
         'Independence': 'Независимость',
         'Discrete distributions': 'Дискретные распределения',
         'Continuous distributions': 'Непрерывные распределения',
+        'Gamma and beta distributions': 'Гамма- и бета-распределения',
         'Functions of random variables': 'Функции от случайных величин',
         'Expectation and variance': 'Математическое ожидание и дисперсия',
         'Moment and characteristic functions': 'Производящие и характеристические функции',
@@ -119,7 +120,7 @@ export const courses: Record<CourseKey, Course> = {
     },
     sections: [
       { title: 'Foundations', summary: 'What probability is, how to count it, and how information changes it.', outcome: 'Tell an event from a model and from evidence, and update a probability with Bayes\' formula.', topics: [noteTopic('What probability is', 'probability/what-probability-is'), noteTopic('Outcomes, events and counting', 'probability/outcomes-events-and-counting'), noteTopic('Kolmogorov\'s axioms', 'probability/kolmogorovs-axioms'), noteTopic('Conditional probability and Bayes\' formula', 'probability/conditional-probability-and-bayes'), noteTopic('Independence', 'probability/conditional-probability-and-bayes', 'independence')] },
-      { title: 'Random Variables', summary: 'Numbers produced by chance, and how to summarize them.', outcome: 'Pick a distribution for a quantity, find the distribution of a function of it, and compute its mean and variance.', topics: [noteTopic('Discrete distributions', 'probability/discrete-distributions'), noteTopic('Continuous distributions', 'probability/continuous-distributions'), noteTopic('Functions of random variables', 'probability/functions-of-random-variables'), noteTopic('Expectation and variance', 'probability/expectation-and-variance'), noteTopic('Moment and characteristic functions', 'probability/expectation-and-variance', 'moment-and-characteristic-functions')] },
+      { title: 'Random Variables', summary: 'Numbers produced by chance, and how to summarize them.', outcome: 'Pick a distribution for a quantity, find the distribution of a function of it, and compute its mean and variance.', topics: [noteTopic('Discrete distributions', 'probability/discrete-distributions'), noteTopic('Continuous distributions', 'probability/continuous-distributions'), noteTopic('Gamma and beta distributions', 'probability/continuous-distributions', 'gamma'), noteTopic('Functions of random variables', 'probability/functions-of-random-variables'), noteTopic('Expectation and variance', 'probability/expectation-and-variance'), noteTopic('Moment and characteristic functions', 'probability/expectation-and-variance', 'moment-and-characteristic-functions')] },
       { title: 'Several Random Variables', summary: 'How random quantities depend on each other.', outcome: 'Work with joint and conditional distributions and the Gaussian in several dimensions; explain why least squares predicts a conditional mean and why zero covariance is not independence in general.', topics: [noteTopic('Joint distributions and independence', 'probability/joint-distributions'), noteTopic('Covariance and correlation', 'probability/joint-distributions', 'covariance-and-correlation'), noteTopic('The multivariate Gaussian', 'probability/multivariate-gaussian'), noteTopic('Conditional expectation', 'probability/conditional-expectation')] },
       { title: 'Limit Theorems', summary: 'Why averages work, how fast, and why the Gaussian is everywhere.', outcome: 'Say how far an average can be from its expectation, exactly, by a finite-sample bound or asymptotically, and under which conditions.', topics: [noteTopic('Inequalities and concentration', 'probability/inequalities-and-concentration'), noteTopic('The law of large numbers', 'probability/law-of-large-numbers'), noteTopic('The central limit theorem', 'probability/central-limit-theorem'), noteTopic('Modes of convergence', 'probability/central-limit-theorem', 'modes-of-convergence')] },
       { title: 'From Probability to Statistics', summary: 'From data back to the distribution that produced it.', outcome: 'Estimate a parameter by maximum likelihood or Bayes, attach an interval to it and run a test, keeping effect size and decision error apart.', topics: [noteTopic('Estimators: bias and variance', 'probability/estimators'), noteTopic('Maximum likelihood', 'probability/maximum-likelihood'), noteTopic('Bayesian inference', 'probability/bayesian-inference'), noteTopic('Confidence intervals and the bootstrap', 'probability/confidence-intervals-and-bootstrap'), noteTopic('Hypothesis tests and A/B testing', 'probability/hypothesis-tests')] },
@@ -408,7 +409,7 @@ export const courses: Record<CourseKey, Course> = {
       { label: 'Modelling', section: 'Bayesian Modelling' },
       { label: 'Linear models', section: 'Bayesian Linear Models' },
       { label: 'Approximate inference', section: 'Latent Variables and Approximate Inference' },
-      { label: 'Nonparametrics', section: 'Nonparametric Models' },
+      { label: 'Nonparametrics and topics', section: 'Nonparametric and Topic Models' },
       { label: 'Scalable inference', section: 'Scalable Inference' },
     ],
     ru: {
@@ -416,7 +417,7 @@ export const courses: Record<CourseKey, Course> = {
       shortTitle: 'Байес',
       description: 'Построение вероятностных моделей из стандартных блоков и вычисление их апостериорных распределений: сопряжённые распределения, байесовский выбор модели, линейные модели с автоматическим определением релевантности, EM, вариационный вывод и сэмплирование по Гиббсу, гауссовские процессы и процессы Дирихле, вариационный вывод на больших данных.',
       entry: 'Что нужно знать: теорию вероятностей, особенно байесовский вывод, многомерное нормальное распределение и марковские методы Монте-Карло, и машинное обучение, особенно линейные модели, EM-алгоритм и ядра; а также симметричные матрицы и матричное дифференцирование из курса математики. Каждая заметка заканчивается разделом «Код» на NumPy и SciPy. Курс подводит к вариационным методам и сэмплированию из курса по генеративным моделям.',
-      progression: ['Моделирование', 'Линейные модели', 'Приближённый вывод', 'Непараметрика', 'Масштабируемый вывод'],
+      progression: ['Моделирование', 'Линейные модели', 'Приближённый вывод', 'Непараметрика и темы', 'Масштабируемый вывод'],
       labels: {
         'Bayesian Modelling': 'Байесовское моделирование',
         'Probability as a degree of belief, priors that make inference exact, and choosing between models by their evidence.': 'Вероятность как степень уверенности, априорные распределения, при которых вывод точен, и выбор между моделями по их обоснованности.',
@@ -435,8 +436,9 @@ export const courses: Record<CourseKey, Course> = {
         'Write the evidence lower bound, derive mean-field updates for a simple model, and run a Gibbs sampler, knowing what each approximation gives up.': 'Записывать нижнюю оценку обоснованности, выводить обновления среднего поля для простой модели и запускать сэмплер Гиббса, понимая, чем жертвует каждое приближение.',
         'EM and Bayesian PCA': 'EM-алгоритм и байесовский метод главных компонент',
         'Variational inference': 'Вариационный вывод',
+        'Metropolis–Hastings on a posterior': 'Метрополис–Гастингс на апостериорном распределении',
         'Gibbs sampling': 'Сэмплирование по Гиббсу',
-        'Nonparametric Models': 'Непараметрические модели',
+        'Nonparametric and Topic Models': 'Непараметрические и тематические модели',
         'Models whose complexity grows with the data: Gaussian and Dirichlet processes, and topic models.': 'Модели, сложность которых растёт вместе с данными: гауссовские процессы, процессы Дирихле и тематические модели.',
         'Fit a Gaussian process and read its uncertainty, explain the Chinese restaurant process, and infer topics with LDA.': 'Обучать гауссовский процесс и читать его неопределённость, объяснять китайский ресторанный процесс и выделять темы с помощью LDA.',
         'Gaussian processes': 'Гауссовские процессы',
@@ -466,9 +468,10 @@ export const courses: Record<CourseKey, Course> = {
       { title: 'Latent Variables and Approximate Inference', summary: 'When the posterior has no closed form: EM, variational inference and sampling.', outcome: 'Write the evidence lower bound, derive mean-field updates for a simple model, and run a Gibbs sampler, knowing what each approximation gives up.', topics: [
         noteTopic('EM and Bayesian PCA', 'bayesian-methods/em-and-bayesian-pca'),
         noteTopic('Variational inference', 'bayesian-methods/variational-inference'),
+        noteTopic('Metropolis–Hastings on a posterior', 'bayesian-methods/gibbs-sampling', 'metropolis-hastings-on-a-posterior'),
         noteTopic('Gibbs sampling', 'bayesian-methods/gibbs-sampling'),
       ] },
-      { title: 'Nonparametric Models', summary: 'Models whose complexity grows with the data: Gaussian and Dirichlet processes, and topic models.', outcome: 'Fit a Gaussian process and read its uncertainty, explain the Chinese restaurant process, and infer topics with LDA.', topics: [
+      { title: 'Nonparametric and Topic Models', summary: 'Models whose complexity grows with the data: Gaussian and Dirichlet processes, and topic models.', outcome: 'Fit a Gaussian process and read its uncertainty, explain the Chinese restaurant process, and infer topics with LDA.', topics: [
         noteTopic('Gaussian processes', 'bayesian-methods/gaussian-processes'),
         noteTopic('Dirichlet processes', 'bayesian-methods/dirichlet-processes'),
         noteTopic('Latent Dirichlet allocation', 'bayesian-methods/latent-dirichlet-allocation'),
