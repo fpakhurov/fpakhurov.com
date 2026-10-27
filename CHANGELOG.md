@@ -4,6 +4,26 @@ Notable changes to the site, newest first. Each entry gives the date, what chang
 
 ## 2026-10-27
 
+- **Bayesian Methods and Probability: gaps closed.** A point-by-point comparison with the BMML lecture-notes material showed what the courses stated thinly or left out. Every addition is derived, in English and Russian.
+  - **Bayesian Methods:**
+    - Metropolis–Hastings on a posterior (the evidence cancels in the ratio, a rejection repeats the state and still counts), with a worked coin example;
+    - for PPCA, the mean estimate, the solution with fixed noise and the case with no maximum;
+    - EM does not need an exponential family, its M-step need not be concave, and Bayesian PCA's E-step needs the posterior covariance of the codes;
+    - full Bayes over hyperparameters, set against a point estimate and empirical Bayes;
+    - a gamma prior on the precision when the mean is known, and the Fisher–Neyman factorization;
+    - the EM update of the noise precision in the RVM;
+    - an intercept with its own flat prior;
+    - the comparison of the two readings of probability now says that exact frequentist intervals exist at small n (the t-interval, Clopper–Pearson).
+  - **Probability:**
+    - Metropolis–Hastings separates the proposal from the transition kernel, including the rejection mass, and has a worked example; detailed balance is sufficient, not necessary;
+    - the variance of an MCMC average at a finite chain length, the integrated autocorrelation time, and why no burn-in fits every chain;
+    - Markov chains: the kernel form, period, the ergodic theorem, and a new section on countable and continuous state spaces;
+    - rejection sampling: the acceptance rate and the density of accepted points;
+    - the self-normalized importance-sampling estimator;
+    - new Gamma and Beta sections;
+    - the Cauchy distribution by inverse transform.
+  - Each derivation has one home: the conjugate-priors note now links the beta constant and the gamma moments instead of repeating them.
+
 - **Mathematics for ML: every step derived or linked.** All 16 notes were audited in English and Russian against one rule: each formula and claim is derived in place, linked to the anchor that derives it, or stated precisely with a checked reference. Long proofs fold under their claims.
   - **Added derivations:**
     - continuous partial derivatives imply differentiability, and Schwarz's theorem;
