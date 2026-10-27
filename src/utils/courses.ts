@@ -408,7 +408,7 @@ export const courses: Record<CourseKey, Course> = {
       { label: 'Modelling', section: 'Bayesian Modelling' },
       { label: 'Linear models', section: 'Bayesian Linear Models' },
       { label: 'Approximate inference', section: 'Latent Variables and Approximate Inference' },
-      { label: 'Nonparametrics', section: 'Nonparametric Models' },
+      { label: 'Nonparametrics and topics', section: 'Nonparametric and Topic Models' },
       { label: 'Scalable inference', section: 'Scalable Inference' },
     ],
     ru: {
@@ -416,7 +416,7 @@ export const courses: Record<CourseKey, Course> = {
       shortTitle: 'Байес',
       description: 'Построение вероятностных моделей из стандартных блоков и вычисление их апостериорных распределений: сопряжённые распределения, байесовский выбор модели, линейные модели с автоматическим определением релевантности, EM, вариационный вывод и сэмплирование по Гиббсу, гауссовские процессы и процессы Дирихле, вариационный вывод на больших данных.',
       entry: 'Что нужно знать: теорию вероятностей, особенно байесовский вывод, многомерное нормальное распределение и марковские методы Монте-Карло, и машинное обучение, особенно линейные модели, EM-алгоритм и ядра; а также симметричные матрицы и матричное дифференцирование из курса математики. Каждая заметка заканчивается разделом «Код» на NumPy и SciPy. Курс подводит к вариационным методам и сэмплированию из курса по генеративным моделям.',
-      progression: ['Моделирование', 'Линейные модели', 'Приближённый вывод', 'Непараметрика', 'Масштабируемый вывод'],
+      progression: ['Моделирование', 'Линейные модели', 'Приближённый вывод', 'Непараметрика и темы', 'Масштабируемый вывод'],
       labels: {
         'Bayesian Modelling': 'Байесовское моделирование',
         'Probability as a degree of belief, priors that make inference exact, and choosing between models by their evidence.': 'Вероятность как степень уверенности, априорные распределения, при которых вывод точен, и выбор между моделями по их обоснованности.',
@@ -436,7 +436,7 @@ export const courses: Record<CourseKey, Course> = {
         'EM and Bayesian PCA': 'EM-алгоритм и байесовский метод главных компонент',
         'Variational inference': 'Вариационный вывод',
         'Gibbs sampling': 'Сэмплирование по Гиббсу',
-        'Nonparametric Models': 'Непараметрические модели',
+        'Nonparametric and Topic Models': 'Непараметрические и тематические модели',
         'Models whose complexity grows with the data: Gaussian and Dirichlet processes, and topic models.': 'Модели, сложность которых растёт вместе с данными: гауссовские процессы, процессы Дирихле и тематические модели.',
         'Fit a Gaussian process and read its uncertainty, explain the Chinese restaurant process, and infer topics with LDA.': 'Обучать гауссовский процесс и читать его неопределённость, объяснять китайский ресторанный процесс и выделять темы с помощью LDA.',
         'Gaussian processes': 'Гауссовские процессы',
@@ -468,7 +468,7 @@ export const courses: Record<CourseKey, Course> = {
         noteTopic('Variational inference', 'bayesian-methods/variational-inference'),
         noteTopic('Gibbs sampling', 'bayesian-methods/gibbs-sampling'),
       ] },
-      { title: 'Nonparametric Models', summary: 'Models whose complexity grows with the data: Gaussian and Dirichlet processes, and topic models.', outcome: 'Fit a Gaussian process and read its uncertainty, explain the Chinese restaurant process, and infer topics with LDA.', topics: [
+      { title: 'Nonparametric and Topic Models', summary: 'Models whose complexity grows with the data: Gaussian and Dirichlet processes, and topic models.', outcome: 'Fit a Gaussian process and read its uncertainty, explain the Chinese restaurant process, and infer topics with LDA.', topics: [
         noteTopic('Gaussian processes', 'bayesian-methods/gaussian-processes'),
         noteTopic('Dirichlet processes', 'bayesian-methods/dirichlet-processes'),
         noteTopic('Latent Dirichlet allocation', 'bayesian-methods/latent-dirichlet-allocation'),
