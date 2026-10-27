@@ -1,73 +1,136 @@
 ---
 title: "Autoregressive models: PixelRNN and PixelCNN"
-description: "Write the density of an image as a product of one-dimensional conditionals, each a softmax over pixel values: the exact likelihood, bits per dimension, parallel training and sequential sampling, recurrent (PixelRNN) and masked convolutional (PixelCNN) networks, the blind spot, Gated PixelCNN and PixelCNN++."
+description: "Write the probability of an image as a product of one-pixel conditionals: the exact likelihood, bits per dimension, masked convolutions and their blind spot, Gated PixelCNN, PixelCNN++ and WaveNet."
 course: generative-models
 section: Autoregressive Models
-order: 30
+order: 31
 status: published
-tags: [autoregressive, pixelcnn, pixelrnn, masked-convolution, likelihood, bits-per-dimension]
-prerequisites: ["Entropy, cross-entropy and KL divergence", "Normalizing flows: change of variables"]
+tags: [autoregressive, pixelcnn, pixelrnn, wavenet, masked-convolution, likelihood, bits-per-dimension]
+prerequisites: ["Conditional probability", "Entropy, cross-entropy and KL divergence", "Normalizing flows: change of variables"]
 ---
 
 import Masks from '../../../components/figures/autoregressive-models/Masks.astro';
 import BlindSpot from '../../../components/figures/autoregressive-models/BlindSpot.astro';
 
-The families of this course deal with the intractable likelihood in different ways: a VAE bounds it, a GAN avoids it, a flow computes it through an invertible map, diffusion bounds it again. **Autoregressive models** remove the difficulty at its source. They write the density of an image as a product of one-dimensional conditional distributions, each a softmax over a few hundred values and therefore normalized by construction. The likelihood is exact, training is a cross-entropy loss, and the price is paid at sampling time, one pixel after another.
+How many numbers does it take to write down a distribution over black-and-white images of $28 \times 28$ pixels? Each image is one of $2^{784}$ patterns, and a table of their probabilities needs $2^{784} - 1$ free entries, the last one fixed by the sum. Since $784 \log_{10} 2 \approx 236$, that is about $10^{236}$ numbers, far more than the roughly $10^{80}$ atoms in the observable universe, for an image smaller than a postage stamp.
 
-**Notation.** An image is a vector of $n$ values $x = (x_1, \dots, x_n)$ in a fixed order, usually row by row from the top left, and for colour images red, green and blue within each pixel. $x_{<i} = (x_1, \dots, x_{i-1})$ are the values before position $i$. Values are integers in $\{0, \dots, 255\}$ unless stated otherwise.
+Every family of this course has a way around this. A VAE bounds the likelihood, a GAN avoids it, a flow computes it through an invertible map. **Autoregressive models** keep the exact probability and change how it is written: as a product of one-dimensional conditionals, each predicting one pixel from the pixels before it. Each conditional is small and normalized by construction, so the likelihood of an image is exact and cheap to compute. The price is paid at sampling time, one pixel after another.
 
 ## The chain rule as a model
 
-Any joint distribution can be written as
+Take three binary pixels $x = (x_1, x_2, x_3)$. Their joint distribution is a table of 8 probabilities. We can fill the same table in three steps: the probability of $x_1$, then of $x_2$ given $x_1$, then of $x_3$ given both. Why does the product of these three give the joint?
+
+The [definition of conditional probability](/notes/probability/conditional-probability-and-bayes#the-chain-rule), $P(A \mid B) = P(A \cap B) / P(B)$ for $P(B) > 0$, rearranges to $P(A \cap B) = P(B)\, P(A \mid B)$. Apply it with $A = \{X_n = x_n\}$ and $B = \{X_1 = x_1, \dots, X_{n-1} = x_{n-1}\}$, then again to the shorter prefix, and so on down to $x_1$:
 
 $$
 \begin{aligned}
-p(x) &= \prod_{i=1}^{n} p(x_i \mid x_{<i}), \\
-\log p(x) &= \sum_{i=1}^{n} \log p(x_i \mid x_{<i}).
+p(x_1, \dots, x_n)
+&= p(x_1, \dots, x_{n-1})\, p(x_n \mid x_{<n}) \\
+&= p(x_1, \dots, x_{n-2})\, p(x_{n-1} \mid x_{<n-1})\, p(x_n \mid x_{<n}) \\
+&\;\;\vdots \\
+&= \prod_{i=1}^{n} p(x_i \mid x_{<i}) ,
 \end{aligned}
 $$
 
-This is the chain rule of probability, not an assumption: it holds for every distribution and every ordering of the coordinates. A model becomes restrictive only through the way the conditionals are parameterized. Maximum likelihood, which the [KL note](/notes/generative-models/fitting-distributions-with-kl) derives from minimizing $D_{\mathrm{KL}}(p_{\text{data}} \,\|\, p_\theta)$, becomes a sum of $n$ classification losses: at every position, predict the next value from the previous ones, and pay the [cross-entropy](/notes/generative-models/entropy-and-divergences#why-cross-entropy-is-the-loss-we-minimize) of the true value.
+where $x_{<i} = (x_1, \dots, x_{i-1})$, and $x_{<1}$ is empty. This is the **chain rule of probability**. Each step needs the prefix to have positive probability; if it has none, both sides are zero. Taking logarithms turns the product into a sum,
 
-The whole difficulty is in representing the conditionals compactly. Take binary images of $n$ pixels. A table of the joint distribution has $2^n - 1$ free numbers, and so do the tables of all conditionals together, since the conditional of pixel $i$ needs one number for each of the $2^{i-1}$ histories. The **fully visible sigmoid belief network** replaces each table by a logistic regression,
+$$
+\log p(x) = \sum_{i=1}^{n} \log p(x_i \mid x_{<i}) .
+$$
+
+The chain rule is an identity: it holds for every distribution and every ordering of the coordinates, so writing a model this way assumes nothing. An image is ordered row by row from the top left, and in colour images red, green and blue within each pixel; values are integers in $\{0, \dots, 255\}$.
+
+### Counting parameters
+
+The factorization alone saves nothing. For binary pixels, the conditional of pixel $i$ needs one probability for each of the $2^{i-1}$ histories, and the geometric sum gives the size of the full table again:
+
+$$
+\sum_{i=1}^{n} 2^{i-1} = 2^n - 1 .
+$$
+
+The savings come from how the conditionals are represented. Dropping all dependence leaves $n$ numbers and a model of independent pixels; keeping only the previous pixel, a first-order Markov chain, leaves $1 + 2(n - 1)$. Both throw away the structure of images. The **fully visible sigmoid belief network** keeps every dependence and replaces each table by a logistic regression,
 
 $$
 p(x_i = 1 \mid x_{<i}) = \sigma\Big(\alpha_i + \sum_{j<i} \alpha_{ij} x_j\Big),
 $$
 
-with $i$ parameters for pixel $i$ and $n(n+1)/2$ in total. For the $28 \times 28$ images of MNIST, $n = 784$, that is 307,720 parameters instead of $2^{784} - 1$. Later models share more: NADE ([Larochelle and Murray, 2011](#references)) computes all conditionals with one hidden layer whose weights are reused across positions, and MADE ([Germain et al., 2015](#references)) gets them all from one pass of an autoencoder whose weights are masked so that output $i$ depends only on inputs before $i$; the same masks build the [autoregressive flows](/notes/generative-models/flow-architectures#b-autoregressive-layers-maf-iaf). PixelRNN and PixelCNN go further and reuse one recurrent or convolutional network at every position, so the number of parameters no longer depends on the size of the image.
+with $i$ parameters for pixel $i$ and $n(n+1)/2$ in total ([CS236 notes](#references)):
 
-Sampling follows the product: draw $x_1$, then $x_2$ given $x_1$, and so on. Each draw is the [inverse-CDF method](/notes/generative-models/generative-modeling#step-2-any-one-dimensional-distribution-by-inverting-the-cdf) for a discrete variable: take $u \sim \mathcal U(0, 1)$ and return the smallest value whose cumulative probability reaches $u$. An autoregressive model is still noise plus a learned transformation, with $n$ uniform numbers as the noise.
+| Model of 784 binary pixels | Free parameters |
+| --- | --- |
+| full table | $2^{784} - 1$ |
+| independent pixels | $784$ |
+| first-order Markov chain | $1567$ |
+| logistic conditionals (FVSBN) | $307{,}720$ |
+
+Later models share more. NADE ([Larochelle and Murray, 2011](#references)) computes all conditionals with one hidden layer whose weights are reused across positions; MADE ([Germain et al., 2015](#references)) gets them all from one pass of an autoencoder whose weights are masked so that output $i$ depends only on inputs before $i$, the same masks that build the [autoregressive flows](/notes/generative-models/flow-architectures#b-autoregressive-layers-maf-iaf). PixelRNN and PixelCNN reuse one recurrent or convolutional network at every position, so the number of parameters no longer depends on the size of the image.
+
+### Why the exact likelihood is tractable
+
+An [energy-based model](/notes/generative-models/energy-based-models#an-energy-defines-a-density) writes $p(x) = \tilde p(x)/Z$, and its normalizer $Z = \sum_x \tilde p(x)$ runs over every image: $256^{3072}$ terms for a $32 \times 32$ colour image. An autoregressive model never needs such a sum. Each conditional is a softmax over the values of one pixel, so it sums to one by construction, and that is enough for the whole product. Sum over the last pixel first; it appears only in the last factor, so distributivity pulls the other factors out:
+
+$$
+\begin{aligned}
+\sum_{x} \prod_{i=1}^{n} p(x_i \mid x_{<i})
+&= \sum_{x_{<n}} \prod_{i=1}^{n-1} p(x_i \mid x_{<i}) \sum_{x_n} p(x_n \mid x_{<n}) \\
+&= \sum_{x_{<n}} \prod_{i=1}^{n-1} p(x_i \mid x_{<i}) \cdot 1 \\
+&= \dots = 1 .
+\end{aligned}
+$$
+
+Repeating the step for $x_{n-1}, \dots, x_1$ gives 1. So the product is a normalized distribution for any network that outputs normalized conditionals, and evaluating $\log p(x)$ costs $n$ softmaxes of a few hundred values each, $3072 \cdot 256$ numbers for the colour image, instead of a sum over $256^{3072}$ images.
+
+**Worked example.** Give the three binary pixels logistic conditionals (toy numbers):
+
+$$
+\begin{aligned}
+p(x_1 = 1) &= \sigma(0) = 0.5, \\
+p(x_2 = 1 \mid x_1) &= \sigma(-1 + 2x_1), \\
+p(x_3 = 1 \mid x_1, x_2) &= \sigma(-2 + 1.5x_1 + 1.5x_2) .
+\end{aligned}
+$$
+
+For the image $(1, 1, 0)$ the factors are $0.5$, $\sigma(1) = 0.731$ and $1 - \sigma(1) = 0.269$, so $p(1, 1, 0) = 0.0983$. The Code section evaluates all eight images the same way and finds that they sum to 1, with no normalizer computed anywhere.
+
+Maximum likelihood, which the [KL note](/notes/generative-models/fitting-distributions-with-kl#the-loss-is-a-monte-carlo-estimate-of-kl) derives from minimizing $D_{\mathrm{KL}}(p_{\text{data}} \,\|\, p_\theta)$, becomes a sum of $n$ classification losses: at every position, predict the next value from the previous ones, and pay the [cross-entropy](/notes/generative-models/entropy-and-divergences#why-cross-entropy-is-the-loss-we-minimize) of the true value.
+
+Sampling follows the product: draw $x_1$, then $x_2$ given $x_1$, and so on. Each draw is the [inverse-CDF method](/notes/generative-models/generative-modeling#step-2-any-one-dimensional-distribution-by-inverting-the-cdf) for a discrete variable: take $u \sim \mathcal U(0, 1)$ and return the smallest value whose cumulative probability reaches $u$.
 
 ## Pixels as discrete values
 
-PixelRNN ([van den Oord, Kalchbrenner and Kavukcuoglu, 2016](#references)) treats each colour value as a category and predicts it with a 256-way softmax. A discrete distribution needs no assumption about its shape, so it can be multimodal or skewed, and it assigns probabilities rather than densities: $\log p(x) \le 0$ and no dequantization is needed, unlike the continuous densities of [flows](/notes/generative-models/normalizing-flows#images-dequantization-rescaling-and-bits-per-dimension).
+PixelRNN ([van den Oord, Kalchbrenner and Kavukcuoglu, 2016](#references)) treats each colour value as a category and predicts it with a 256-way softmax. A categorical distribution assumes no shape, so it can be multimodal or skewed, and it gives probabilities rather than densities: $\log p(x) \le 0$, and no dequantization is needed, unlike the continuous densities of [flows](/notes/generative-models/normalizing-flows#images-dequantization-rescaling-and-bits-per-dimension).
 
-Likelihoods of image models are reported in **bits per dimension**:
+Likelihoods of image models are reported in **bits per dimension**, the negative log-likelihood in base 2 divided by the number of values:
 
 $$
 \text{bits/dim} = -\frac{\log_2 p(x)}{n} = -\frac{\ln p(x)}{n \ln 2},
 $$
 
-averaged over test images. A model that spreads probability uniformly over 256 values gets exactly 8 bits/dim. The number has a direct meaning: with arithmetic coding, a model with $b$ bits/dim compresses images losslessly to about $b \cdot n$ bits. On CIFAR-10, $n = 32 \cdot 32 \cdot 3 = 3072$, and the best PixelRNN reaches 3.00 bits/dim: $3.00 \cdot 3072 = 9216$ bits, about 1.1 KiB per image, or 37.5% of the 24,576 bits of the raw image.
+where the second form is the change of base $\log_2 y = \ln y / \ln 2$. A model that spreads probability uniformly over 256 values gives each image $256^{-n}$, so $-\log_2 256^{-n} / n = 8$ bits/dim. The number is a compressed size. Shannon–Fano–Elias coding gives an outcome of probability $p(x)$ a codeword of $\lceil -\log_2 p(x) \rceil + 1 < -\log_2 p(x) + 2$ bits, and arithmetic coding builds that codeword for a whole sequence from its conditionals one value at a time. So a coder driven by the model stores an image in fewer than $-\log_2 p(x) + 2$ bits ([Cover and Thomas, 2006](#references), Sections 5.9 and 13.3).
 
-A model that predicts fewer levels solves a coarser problem. With 10 levels of grey a uniform guess costs $\ln 10 \approx 2.30$ nats or $\log_2 10 \approx 3.32$ bits per pixel, and such numbers cannot be compared with bits/dim over 256 values.
+On CIFAR-10, $n = 32 \cdot 32 \cdot 3 = 3072$, and the best PixelRNN reaches 3.00 bits/dim:
+
+| Quantity | Value |
+| --- | --- |
+| raw image, $8 \cdot 3072$ | 24,576 bits |
+| at 3.00 bits/dim, $3.00 \cdot 3072$ | 9,216 bits, about 1.1 KiB |
+| ratio | 37.5% |
+
+A model that predicts fewer levels solves a coarser problem. With 10 levels of grey a uniform guess costs $\log_2 10 \approx 3.32$ bits per pixel, and such numbers cannot be compared with bits/dim over 256 values.
 
 ## Parallel training, sequential sampling
 
-During training the whole image is known. If the network is built so that its output at position $i$ depends only on the inputs $x_{<i}$, a single forward pass on the real image yields all $n$ conditionals at once, and the loss is their sum. Feeding the true previous values rather than the model's own samples is called **teacher forcing**, and it makes training as parallel as for any convolutional network.
+During training the whole image is known. If the network is built so that its output at position $i$ depends only on the inputs $x_{<i}$, one forward pass on the real image yields all $n$ conditionals at once, and the loss is their sum. Feeding the true previous values rather than the model's own samples is called **teacher forcing**, and it makes training as parallel as for any convolutional network.
 
-Sampling cannot be parallel: $x_{i+1}$ is computed from $x_i$, which must be sampled first. A model that predicts one value at a time needs $n$ network passes for a sample, 3072 for a CIFAR-10 image and $89 \cdot 60 = 5340$ for a grey image of $89 \times 60$ pixels. A model that predicts a whole pixel per pass, such as [PixelCNN++](#pixelcnn-plus-plus) below, needs one pass per pixel, 1024 for CIFAR-10, and draws the three values of the pixel from the predicted parameters; the positions are still sequential. A plain implementation also recomputes the whole image at every pass, although only one output is used. This asymmetry, cheap density and expensive sampling, is the same as for the masked autoregressive flow.
+Sampling cannot be parallel: $x_{i+1}$ is computed from $x_i$, which must be sampled first. A model that predicts one value per pass needs $n$ passes for a sample, 3072 for a CIFAR-10 image. A plain implementation also recomputes the whole image at every pass, although only one output is used. The masked autoregressive flow has the same asymmetry: cheap density, expensive sampling.
 
 ## PixelRNN and PixelCNN
 
-The two networks of [van den Oord, Kalchbrenner and Kavukcuoglu (2016)](#references) differ in how the output at position $i$ collects information from all of $x_{<i}$ while seeing nothing of $x_i$ and later values.
+The networks of [van den Oord, Kalchbrenner and Kavukcuoglu (2016)](#references) differ in how the output at position $i$ collects information from $x_{<i}$ while seeing nothing of $x_i$ and later values.
 
 ### Recurrent layers
 
-**Row LSTM** processes the image row by row from top to bottom and computes the state of a whole row at once. The input-to-state part is a $k \times 1$ convolution along the row ($k \ge 3$), and the state-to-state part is a one-dimensional convolution over the previous row of states. Each step looks a little to the left and right in the row above, so the context of a pixel is a triangle above it and misses part of the available past.
-
-**Diagonal BiLSTM** captures the whole past. It skews the input map, shifting each row one position to the right of the previous one, so that the diagonals of the image become columns of an $n \times (2n-1)$ map. The state-to-state convolution is $2 \times 1$ along these columns, and two LSTMs scan in opposite directions; the output of the right-to-left one is shifted down a row before the two are added, so that no future pixel leaks in. The models use up to 12 layers with residual connections between them. The recurrences run sequentially over rows or diagonals even during training, which makes both models slow to train.
+**Row LSTM** processes the image row by row and computes the state of a whole row at once, with a one-dimensional convolution over the previous row of states. Each step looks a little to the left and right in the row above, so the context of a pixel is a triangle above it and misses part of the past. **Diagonal BiLSTM** captures the whole past. It shifts each row one position to the right of the previous one, so that diagonals of the image become columns, and scans them with two LSTMs in opposite directions. Both recurrences run sequentially over rows or diagonals even during training.
 
 ### Masked convolutions
 
@@ -77,31 +140,49 @@ $$
 M_{uv} = \begin{cases} 1, & u < c \text{ or } (u = c \text{ and } v < c), \\ 0, & \text{otherwise}, \end{cases}
 $$
 
-so a position sees the rows above it and the pixels to its left. The first layer uses **mask A**, which excludes the centre, because its input at the centre is the value to be predicted. The later layers use **mask B**, which includes it: after the first layer, the feature at position $i$ has been computed from $x_{<i}$ only, and passing it on is safe. The PixelCNN of the paper has fifteen layers, a $7 \times 7$ first layer with mask A followed by residual blocks with $3 \times 3$ convolutions. Training is fully parallel; sampling is not.
+so a position sees the rows above it and the pixels to its left. The first layer uses **mask A**, which excludes the centre, because its input at the centre is the value to be predicted. The later layers use **mask B**, which includes it: after the first layer, the feature at position $i$ has been computed from $x_{<i}$ only, and passing it on is safe. The paper's PixelCNN has fifteen layers, a $7 \times 7$ first layer with mask A followed by $3 \times 3$ layers with mask B.
 
 <Masks />
 
 ### Colour channels
 
-With colour, each pixel holds three values ordered R, G, B, and the factorization goes over all $3 \times$ (number of pixels) of them:
+With colour, each pixel $x_i$ holds three values, and the chain rule goes over all of them:
 
 $$
-p(x_i \mid x_{<i}) = p(x_{i,R} \mid x_{<i})\; p(x_{i,G} \mid x_{<i}, x_{i,R})\; p(x_{i,B} \mid x_{<i}, x_{i,R}, x_{i,G}),
+\begin{aligned}
+p(x_i \mid x_{<i}) = {}& p(x_{i,R} \mid x_{<i}) \\
+&\cdot p(x_{i,G} \mid x_{<i}, x_{i,R}) \\
+&\cdot p(x_{i,B} \mid x_{<i}, x_{i,R}, x_{i,G}) .
+\end{aligned}
 $$
 
-where $x_i$ is now the whole pixel. The feature maps of every layer are split into three groups, one per colour. Mask A lets the red group see no value of the current pixel, the green group see red, and the blue group see red and green; mask B in addition connects each group to itself.
-
-The simplest alternative models the channels independently, for example with three grey-level models, one per channel. Each channel is then a plausible image on its own, but nothing ties the three together: in a sample, the red, green and blue values of a pixel, and the edges they draw, need not agree. A milder version conditions every channel on all earlier pixels of all channels but drops the dependence among the three values of the current pixel. The chain rule needs that dependence, so this version is an assumption rather than a factorization. A model that keeps the dependence either follows the channel order inside the masks, as above, or, as PixelCNN++ does below, predicts the three values of a pixel jointly with a simple dependence between them.
+The feature maps of every layer are split into three groups, one per colour. Mask A lets the red group see no value of the current pixel, the green group see red, and the blue group see red and green; mask B in addition connects each group to itself. Dropping the dependence among the three values of the current pixel would be an assumption, and in samples the three channels of a pixel, and the edges they draw, would not have to agree.
 
 ### The blind spot
 
-Stacking masked convolutions does not give the full past. A $3 \times 3$ mask reaches one row up and one column to each side, or one column to the left in the current row. After $L$ layers, the row $a$ steps above the target is covered from $L$ columns to the left up to only $a$ columns to the right, whatever $L$ is. The pixels further right in the rows just above stay out of reach at any depth. Within the window of $L$ rows and $\pm L$ columns, this **blind spot** holds $L(L-1)/2$ of the $2L(L+1)$ earlier pixels, 6 of 40 for $L = 4$; its share grows toward a quarter, the figure [van den Oord et al. (2016b)](#references) give. The Code section below finds the same 6 pixels by differentiating a randomly initialized network.
+Stacking masked convolutions does not give the whole past. Describe an input pixel by its offset from the target: $a$ rows up and $b$ columns to the right, with $b < 0$ to the left. A $3 \times 3$ mask lets one layer read the row above at column shifts $-1$, $0$ or $+1$, written $\nwarrow$, $\uparrow$ and $\nearrow$, or the current row at shift $-1$, written $\leftarrow$, plus the centre under mask B. A dependency through $L$ layers is a sequence of $L$ such moves. Counting the moves of each kind, $n_\nearrow$ and so on:
+
+$$
+\begin{aligned}
+a &= n_\nwarrow + n_\uparrow + n_\nearrow \le L, \\
+b &= n_\nearrow - n_\nwarrow - n_\leftarrow \\
+&\le n_\nearrow \le a .
+\end{aligned}
+$$
+
+No move in the current row goes right, so only the $\nearrow$ moves raise $b$, and each of them also raises $a$. The row $a$ steps above the target is therefore covered up to only $a$ columns to the right, whatever $L$ is. Every other pixel of the window is reached: $a$ upward moves, $\nearrow$ to gain columns and $\nwarrow$ to lose them, and $\leftarrow$ or centre moves for the remaining layers reach any $b$ from $-L$ to $a$. Within the window of $L$ rows above and $\pm L$ columns, the earlier pixels number $L(2L + 1)$ in the rows above plus $L$ in the current row, $2L(L+1)$ in all, and the unreachable triangle at the upper right holds
+
+$$
+\sum_{a=1}^{L-1} (L - a) = \frac{L(L-1)}{2}
+$$
+
+of them: 6 of 40 for $L = 4$. As $L$ grows the share tends to $\tfrac{L^2/2}{2L^2} = \tfrac14$, the share of the receptive field that [van den Oord et al. (2016b)](#references), Section 2.2, say this **blind spot** can cover. The Code section finds the same 6 pixels by perturbing the input of a random network.
 
 <BlindSpot />
 
 ## Gated PixelCNN
 
-[van den Oord et al. (2016b)](#references) close the gap between PixelCNN and PixelRNN with two changes. The first fixes the blind spot with two stacks of convolutions. A **vertical stack** is not masked within its window and sees all rows above the current one, so its receptive field grows as a rectangle. A **horizontal stack** sees the current row up to the current pixel. After each layer the vertical stack feeds the horizontal one, never the other way round: information from the horizontal stack would carry pixels to the right of or below the target into the vertical stack.
+[van den Oord et al. (2016b)](#references) close the gap between PixelCNN and PixelRNN with two changes. The first removes the blind spot with two stacks of convolutions. A **vertical stack** is unmasked within its window and sees all rows above the current one, so its receptive field grows as a rectangle. A **horizontal stack** sees the current row up to the current pixel. After each layer the vertical stack feeds the horizontal one, never the other way round. The vertical stack is the context for every pixel of a row and spreads over columns on both sides; if it took in the horizontal stack's features of that row, a pixel would see pixels to its right in its own row, which come later in raster order.
 
 The second change replaces the ReLUs between layers with multiplicative units, a stand-in for the gates of an LSTM:
 
@@ -109,27 +190,39 @@ $$
 y = \tanh(W_{k,f} * x) \odot \sigma(W_{k,g} * x),
 $$
 
-where $*$ is a convolution, $k$ the layer and $\odot$ the element-wise product. A condition enters as an extra term inside both nonlinearities: for a vector $h$, such as a one-hot class label, $y = \tanh(W_{k,f} * x + V_{k,f}^\top h) \odot \sigma(W_{k,g} * x + V_{k,g}^\top h)$, and for a spatial map $s$ the products $V^\top h$ become convolutions $V * s$. The conditional model is $p(x \mid h) = \prod_i p(x_i \mid x_{<i}, h)$.
+where $*$ is a convolution, $k$ the layer and $\odot$ the element-wise product. A condition $h$, such as a one-hot class label, enters as an extra term inside both nonlinearities,
 
-On CIFAR-10 the Gated PixelCNN reaches 3.03 bits/dim, against 3.14 for PixelCNN and 3.00 for PixelRNN. On ImageNet it is slightly better than PixelRNN, 3.83 against 3.86 bits/dim at $32 \times 32$ and 3.57 against 3.63 at $64 \times 64$, and it matches the Row LSTM in less than half the training time (60 hours on 32 GPUs). The ImageNet model has 20 layers of 384 units with $5 \times 5$ filters.
+$$
+y = \tanh(W_{k,f} * x + V_{k,f}^\top h) \odot \sigma(W_{k,g} * x + V_{k,g}^\top h),
+$$
+
+and the model becomes $p(x \mid h) = \prod_i p(x_i \mid x_{<i}, h)$. For a spatial condition $s$, the products $V^\top h$ become $1 \times 1$ convolutions $V * s$. On CIFAR-10 the Gated PixelCNN reaches 3.03 bits/dim, against 3.14 for PixelCNN and 3.00 for PixelRNN, and it matches the Row LSTM in less than half the training time.
 
 ## PixelCNN++ \{#pixelcnn-plus-plus\}
 
-A 256-way softmax knows nothing about the order of its classes: 127 and 128 are as unrelated as 0 and 255 until the network learns otherwise, a value never seen in training gets almost no probability, and the output layer has $3 \cdot 256 = 768$ numbers per pixel. PixelCNN++ ([Salimans et al., 2017](#references)) assumes a continuous intensity $\nu$ with a mixture of $K$ logistic distributions and models the observed value as $\nu$ rounded to an integer:
+A 256-way softmax knows nothing about the order of its classes: 127 and 128 are as unrelated as 0 and 255 until the network learns otherwise, and a value never seen in training gets almost no probability. PixelCNN++ ([Salimans et al., 2017](#references)) assumes a continuous intensity $\nu$ with a mixture of $K$ logistic distributions and models the observed value as $\nu$ rounded to an integer. The probability of a value is then the mass of the interval that rounds to it, a difference of two logistic CDFs:
 
 $$
 P(x \mid \pi, \mu, s) = \sum_{k=1}^{K} \pi_k \Big[\sigma\Big(\frac{x + 0.5 - \mu_k}{s_k}\Big) - \sigma\Big(\frac{x - 0.5 - \mu_k}{s_k}\Big)\Big],
 $$
 
-where $\sigma$ is the logistic sigmoid, the CDF of the logistic distribution. For $x = 0$ the term $x - 0.5$ is replaced by $-\infty$, and for $x = 255$ the term $x + 0.5$ by $+\infty$, so the probabilities sum to one over $\{0, \dots, 255\}$ and the edges collect the mass of everything beyond them. With one component, $\mu = 127.3$ and $s = 2$, the values 126, 127, 128 and 129 get probabilities 0.112, 0.124, 0.121 and 0.105: neighbours are close automatically. With $\mu = 254$ and $s = 2$, the edge value 255 gets 0.438 and 254 gets 0.124, which suits the excess of saturated pixels in real photographs.
+where $\sigma$ is the logistic sigmoid, the CDF of the logistic distribution. For $x = 0$ the term $x - 0.5$ is replaced by $-\infty$, and for $x = 255$ the term $x + 0.5$ by $+\infty$. The intervals then tile the real line, so the probabilities sum to one over $\{0, \dots, 255\}$, and the edges collect the mass beyond them.
 
-The other changes:
+With one component, $\mu = 127.3$ and $s = 2$, the values 126, 127, 128 and 129 get probabilities 0.112, 0.124, 0.121 and 0.105: neighbours are close automatically. With $\mu = 254$ and $s = 2$, the edge value 255 gets 0.438 and 254 gets 0.124, which suits the excess of saturated pixels in real photographs.
 
-- **Whole pixels.** The network conditions on whole pixels above and to the left and predicts the three channels of a pixel together. The mixture indicator is shared by the channels, and inside a component the means depend linearly on the channels already drawn: $\mu_G + \alpha R$ and $\mu_B + \beta R + \gamma G$, with $\alpha, \beta, \gamma$ produced by the network. The output is $10K$ numbers per pixel ($K$ weights, a mean and a scale for each channel and component, and three coefficients per component), 50 for $K = 5$, which the paper finds sufficient.
-- **Downsampling** with stride-2 convolutions instead of dilated convolutions to see large regions at several resolutions, with **short-cut connections** that carry the full-resolution features past the downsampled layers; without them the model fails to train.
-- **Dropout** on the residual path. Without it the training loss falls below 2.0 bits per sub-pixel and the test loss rises above 6.0.
+The network conditions on whole pixels above and to the left and predicts the three channels of a pixel together. The mixture indicator is shared by the channels, and inside a component the means depend linearly on the channels already drawn, $\mu_G + \alpha R$ and $\mu_B + \beta R + \gamma G$. That is $10K$ outputs per pixel: $K$ weights, a mean and a scale for each channel and component, and three coefficients per component. With $K = 5$, downsampling with short-cut connections in place of dilated convolutions, and dropout, PixelCNN++ reaches 2.92 bits/dim on CIFAR-10. Without dropout its training loss falls below 2.0 bits and the test loss rises above 6.0.
 
-PixelCNN++ reaches 2.92 bits/dim on CIFAR-10. The same model trained on images with added uniform noise, a continuous density instead of the rounding, gives a bound of 3.11.
+## WaveNet: the same idea in one dimension
+
+Audio is a one-dimensional sequence of samples, and WaveNet ([van den Oord et al., 2016c](#references)) models it with the same chain rule, $p(x) = \prod_t p(x_t \mid x_{<t})$. A **causal convolution**, the one-dimensional mask, lets the output at time $t$ see only earlier samples. Raw audio has 16-bit samples; WaveNet first compresses them with the μ-law $f(x) = \operatorname{sign}(x) \ln(1 + 255|x|)/\ln 256$ and quantizes to 256 values, so each conditional is again a 256-way softmax.
+
+Speech needs a long context, and plain causal convolutions grow it slowly. A **dilated** convolution with dilation $\delta$ and kernel size 2 reads the samples $t$ and $t - \delta$, so a layer adds $\delta$ samples to the receptive field. With dilations $1, 2, 4, \dots, 512$ in ten layers,
+
+$$
+1 + \sum_{l=0}^{9} 2^l = 1 + (2^{10} - 1) = 1024
+$$
+
+samples, about 64 ms at 16 kHz, where ten undilated layers would see 11. The cost of sampling is the PixelCNN's: one network pass per sample, 16,000 per second of audio. The [audio note](/notes/generative-models/audio-generation) places WaveNet among today's speech generators.
 
 ## How the likelihoods compare
 
@@ -147,106 +240,117 @@ Test negative log-likelihood on CIFAR-10, in bits per dimension ([van den Oord e
 | Diagonal BiLSTM (PixelRNN) | 3.00 |
 | PixelCNN++ | 2.92 |
 
-For several years after 2016 autoregressive models held the best likelihoods on these benchmarks. A likelihood measures how well the model compresses the test set, which is not the same as how good its samples look: the [evaluation notes](/notes/generative-models/inception-score) measure that separately, and a model can win on one and lose on the other.
+In this table every autoregressive model has a lower test negative log-likelihood than every flow. A likelihood measures how well the model compresses the test set, which is a different question from how good its samples look; the [evaluation notes](/notes/generative-models/inception-score) measure the second, and a model can win on one and lose on the other.
 
-## Strengths and limits
+## Where it breaks
 
-- **Exact likelihood and simple training.** The loss is a sum of cross-entropies with no bound, no adversary and no Jacobian, and it can be monitored on held-out data.
-- **Slow sampling.** One network evaluation per position: $n$ for one image with a sub-pixel model, one per pixel ($n/3$ for colour) when the network predicts whole pixels as PixelCNN++ does, with the channel values then drawn from its output. Either way the cost grows with resolution. Diffusion also needs many passes, but their number is set by the noise schedule, not by the number of pixels.
-- **No latent code.** Nothing summarizes an image in a few numbers, and the ordering is arbitrary: the model must learn global structure from left-to-right, top-to-bottom prediction. PixelVAE ([Gulrajani et al., 2017](#references)) combines the two ideas: a VAE whose decoder is a PixelCNN. It needs far fewer autoregressive layers than a PixelCNN alone, and its codes are more compressed than those of a plain VAE while still capturing most of the structure of the image.
-- **Strong priors.** Over a small grid of discrete codes, an autoregressive model is an excellent prior. This is its role in [VQ-VAE](/notes/generative-models/vae-variants#vq-vae-a-discrete-latent-code), which fits a PixelCNN over the code indices, and the starting point of the next note.
+Sampling is the bottleneck. A $256 \times 256$ colour image is $196{,}608$ values; a sub-pixel model needs that many network passes, and one that predicts whole pixels, as PixelCNN++ does, still needs $65{,}536$. Each pass waits for the previous one, so no amount of parallel hardware shortens the chain. Diffusion also needs many passes, but their number is set by the noise schedule, independent of the number of pixels.
+
+The ordering is arbitrary and there is no latent code. Nothing summarizes an image in a few numbers, and the model must learn global structure from top-left-to-bottom-right prediction. Two remedies point to the next note. PixelVAE ([Gulrajani et al., 2017](#references)) uses a PixelCNN as the decoder of a VAE, so that the latent carries global structure and the autoregressive part fills in detail. And over a small grid of discrete codes an autoregressive model is an excellent prior: [VQ-VAE](/notes/generative-models/vae-variants#vq-vae-a-discrete-latent-code) fits a PixelCNN over its code indices.
+
+## What you should remember
+
+- Chain rule: $p(x) = \prod_i p(x_i \mid x_{<i})$, an identity for any order.
+- Normalized conditionals make the product normalized: the likelihood is exact, $n$ softmaxes.
+- Training is parallel with teacher forcing; sampling takes one pass per value.
+- Mask A hides the current value, mask B passes features on; stacked masks leave a blind spot, fixed by vertical and horizontal stacks.
+- Bits/dim $= -\log_2 p(x)/n$, 8 for a uniform model over 256 values.
+- PixelCNN++: a discretized logistic mixture; WaveNet: dilated causal convolutions on audio.
 
 ## Notebook
 
-The [PixelCNN notebook](https://github.com/HSE-LAMBDA/DeepGenerativeModels/blob/spring-2025-long/seminars/08_Autoregressive-Models/PixelCNN.ipynb) of the HSE-LAMBDA *Deep Generative Models* repository trains a small PixelCNN on movie posters (cell numbers count every cell from 1). It has no saved outputs, so it documents the procedure rather than results.
+The [PixelCNN notebook](https://github.com/HSE-LAMBDA/DeepGenerativeModels/blob/spring-2025-long/seminars/08_Autoregressive-Models/PixelCNN.ipynb) of the HSE-LAMBDA *Deep Generative Models* course trains a small PixelCNN on movie posters, with the key functions left as tasks. Cell numbers count every cell, markdown included, from 1; the notebook has no saved outputs, so it documents the procedure and no results are quoted from it.
 
-- **Cells 1–3**: setup. Posters of $268 \times 182$ pixels are downscaled by 3 to $89 \times 60$; batches of 32.
-- **Cells 4–5, task 1**: `bucketize` maps 0–255 to 10 levels by integer division by 26 and clamping at 9. The buckets are not quite equal, as the docstring says: levels 0–8 hold 26 values each and level 9 the 22 values 234–255. The task text gives the shape as batch × channels × width × height; the tensors are batch × channels × height × width.
-- **Cells 6–7, task 2**: resize, convert to grey, `ToTensor`, multiply by 255 and bucketize. The product returns the exact integers here, so no pixel lands in a wrong bucket.
-- **Cells 9–13**: `CustomImageDataset` lists the image files in `../data/movie-genre-from-its-poster/posters/`, the folder name of the Kaggle *Movie Genre from its Poster* dataset of IMDB posters. It opens every file once with PIL's `verify()` and skips those it cannot read, converts each image to RGB before the transforms, and returns a dummy label 0 with every image so that the default loader works. The last 100 files in sorted order are the validation set. The validation loader drops the last incomplete batch, so 96 of them are used.
-- **Cells 15–19, task 3**: `make_mask` and `MaskedCNN`, which multiplies `weight.data` by the mask in place on every forward pass. This works: the masked weights still receive gradients and the optimizer moves them between steps, but the next forward pass zeroes them again, the same effect as the PixelRNN paper's zeroing after each update. Multiplying in the forward pass without `.data`, as in the Code section, keeps their gradients at zero.
-- **Cells 20–21, task 4**: a model of one mask-A layer, one mask-B layer and a $1 \times 1$ output to 10 logits per pixel. Two masked layers see little: each prediction reaches at most $2 \lfloor k/2 \rfloor$ rows up, 6 of the 89 rows for $7 \times 7$ kernels. The model receives the level indices 0–9 as floats without rescaling.
-- **Cells 23–24**: Adam, cross-entropy over the 10 levels and 50 epochs. After every epoch two validation posters are completed from row 10 and column 10: the region below and to the right is zeroed and refilled pixel by pixel, $79 \cdot 50 = 3950$ network passes for the region, while the pixels left of column 10 in the lower rows stay real. The loss is in nats per pixel, with the uniform guess at $\ln 10 \approx 2.30$; it measures the 10-level problem and is not comparable with bits/dim over 256 values.
-- **Cell 25**: eight completions from row 30 and column 30, $59 \cdot 30 = 1770$ network passes for the batch.
-- **Cell 26**: the question about colour images, answered in [Colour channels](#colour-channels) above.
+- **Data** (cells 2–14): posters downscaled to $89 \times 60$ grey images and bucketized into 10 levels by integer division by 26 with clamping at 9, so level 9 holds the 22 values 234–255 and the others 26 each.
+- **Masks and the masked layer** (cells 15–19): `MaskedCNN` multiplies `weight.data` by the mask on every forward pass, which zeroes the masked weights again after each optimizer step.
+- **The model** (cells 20–21): one mask-A layer, one mask-B layer and a $1 \times 1$ output to 10 logits per pixel; two $k \times k$ masked layers reach only $2\lfloor k/2 \rfloor$ rows up, a small part of an 89-row poster.
+- **Training and completion** (cells 22–25): Adam and cross-entropy over the 10 levels for 50 epochs, then completion of posters from row 10 and column 10 pixel by pixel; the loss is in nats per pixel, with $\ln 10 \approx 2.30$ for a uniform guess.
+- **The final question** (cell 26): how to handle colour, answered in [Colour channels](#colour-channels).
 
 ## Code
 
-A PixelCNN for grey images with `levels` values per pixel, in PyTorch, and a check of its receptive field:
+The worked example of three pixels with a check that the product sums to 1, and a PixelCNN in NumPy whose receptive field is found by perturbing one input pixel at a time. It runs in a second.
 
 ```python
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+import itertools
+import numpy as np
 
-def make_mask(include_center, height, width):
-    mask = torch.zeros(height, width)
-    mask[: height // 2] = 1                       # rows above the centre
-    mask[height // 2, : width // 2] = 1           # left of the centre in its row
-    if include_center:
-        mask[height // 2, width // 2] = 1
-    return mask
+sig = lambda z: 1 / (1 + np.exp(-z))
 
-class MaskedConv2d(nn.Conv2d):
-    def __init__(self, include_center, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.register_buffer('mask', make_mask(include_center, *self.kernel_size))
+def p3(x):                                    # chain rule with logistic conditionals
+    x1, x2, x3 = x
+    q = [sig(0.0), sig(-1 + 2 * x1), sig(-2 + 1.5 * x1 + 1.5 * x2)]
+    return np.prod([qi if xi else 1 - qi for qi, xi in zip(q, x)])
 
-    def forward(self, x):
-        return F.conv2d(x, self.weight * self.mask, self.bias, padding=self.padding)
+print(round(p3((1, 1, 0)), 4), round(sum(p3(x) for x in itertools.product([0, 1], repeat=3)), 10))
+# 0.0983 1.0
 
-class PixelCNN(nn.Module):
-    def __init__(self, levels=10, hidden=64, layers=4, k=3):
-        super().__init__()
-        self.levels = levels
-        blocks = [MaskedConv2d(False, 1, hidden, k, padding=k // 2), nn.ReLU()]
-        for _ in range(layers - 1):
-            blocks += [MaskedConv2d(True, hidden, hidden, k, padding=k // 2), nn.ReLU()]
-        self.net = nn.Sequential(*blocks, nn.Conv2d(hidden, levels, 1))
+def mask(k, include_center):
+    m = np.zeros((k, k))
+    m[: k // 2] = 1                           # rows above the centre
+    m[k // 2, : k // 2] = 1                   # left of the centre in its row
+    m[k // 2, k // 2] = include_center
+    return m
 
-    def forward(self, x):                         # x: [B, 1, H, W] with integer levels
-        return self.net(x.float() / (self.levels - 1))   # logits: [B, levels, H, W]
+def masked_conv(x, w, m):                     # x: [C, H, W], w: [C_out, C, k, k]
+    k = w.shape[-1]
+    H, W = x.shape[1:]
+    xp = np.pad(x, ((0, 0), (k // 2, k // 2), (k // 2, k // 2)))
+    out = np.zeros((w.shape[0], H, W))
+    for u in range(k):
+        for v in range(k):
+            if m[u, v]:
+                out += np.einsum('oc,chw->ohw', w[:, :, u, v], xp[:, u:u + H, v:v + W])
+    return out
 
-    @torch.no_grad()
-    def sample(self, x, start=(0, 0)):            # fill x in raster order from start
-        x = x.clone()
-        H, W = x.shape[-2:]
-        for i in range(start[0], H):
-            for j in range(start[1] if i == start[0] else 0, W):
-                probs = self(x)[:, :, i, j].softmax(dim=1)
-                x[:, 0, i, j] = torch.multinomial(probs, 1).squeeze(1)
-        return x
+rng = np.random.default_rng(0)
+layers, hidden = 4, 16
+ws = [rng.normal(size=(hidden, 1 if l == 0 else hidden, 3, 3)) for l in range(layers)]
+ms = [mask(3, l > 0) for l in range(layers)]  # mask A first, then mask B
 
-# training step: loss = F.cross_entropy(model(x), x.long().squeeze(1)), in nats per pixel
+def pixelcnn(x):
+    h = x[None]
+    for w, m in zip(ws, ms):
+        h = np.tanh(masked_conv(h, w, m))
+    return h
 
-torch.manual_seed(0)
-model = PixelCNN()
-x = torch.randint(0, 10, (1, 1, 11, 11)).float().requires_grad_(True)
-model(x)[0, :, 5, 5].sum().backward()             # which inputs reach the output at (5, 5)?
-print((x.grad[0, 0, 1:6, 1:10] != 0).int())
+x = rng.normal(size=(11, 11))
+base = pixelcnn(x)[:, 5, 5]
+field = np.zeros((11, 11), dtype=int)
+for i in range(11):
+    for j in range(11):
+        y = x.copy(); y[i, j] += 1.0          # does pixel (i, j) change the output at (5, 5)?
+        field[i, j] = np.abs(pixelcnn(y)[:, 5, 5] - base).max() > 1e-12
+print(field[1:6, 1:10])
+print('blind spot:', int((field[1:5, 1:10] == 0).sum()))
 ```
 
 The printed window covers the four rows above position $(5, 5)$, its own row and four columns to each side:
 
 ```
-tensor([[1, 1, 1, 1, 1, 1, 1, 1, 1],
-        [1, 1, 1, 1, 1, 1, 1, 1, 0],
-        [1, 1, 1, 1, 1, 1, 1, 0, 0],
-        [1, 1, 1, 1, 1, 1, 0, 0, 0],
-        [1, 1, 1, 1, 0, 0, 0, 0, 0]], dtype=torch.int32)
+[[1 1 1 1 1 1 1 1 1]
+ [1 1 1 1 1 1 1 1 0]
+ [1 1 1 1 1 1 1 0 0]
+ [1 1 1 1 1 1 0 0 0]
+ [1 1 1 1 0 0 0 0 0]]
+blind spot: 6
 ```
 
-No input at or after $(5, 5)$ in raster order has a nonzero gradient, and the zeros in the rows above are the 6 pixels of the blind spot in the figure.
+No input at or after $(5, 5)$ in raster order changes the output, and the zeros in the rows above are the 6 pixels of the blind spot.
 
 ## Next
 
-PixelCNN predicts one pixel from a fixed neighbourhood. [Autoregressive transformers](/notes/generative-models/autoregressive-transformers) replace the convolutions with self-attention, which sees the whole past at every layer, and, for large images, move from pixels to the discrete codes of a VQ autoencoder: a grid of 256 to 1024 tokens describes a $256 \times 256$ image and can be continued from a text prompt.
+PixelCNN predicts each pixel from a fixed neighbourhood, and a $256 \times 256$ image is a chain of hundreds of thousands of steps. [Autoregressive transformers](/notes/generative-models/autoregressive-transformers) replace the convolutions with causal self-attention, which sees the whole past at every layer, and shorten the chain by modelling the discrete codes of a learned autoencoder instead of pixels.
 
 ## References
 
-- A. van den Oord, N. Kalchbrenner, K. Kavukcuoglu. [Pixel Recurrent Neural Networks](https://arxiv.org/abs/1601.06759). ICML, 2016. (2016a)
-- A. van den Oord, N. Kalchbrenner, O. Vinyals, L. Espeholt, A. Graves, K. Kavukcuoglu. [Conditional Image Generation with PixelCNN Decoders](https://arxiv.org/abs/1606.05328). NeurIPS, 2016. (2016b)
-- T. Salimans, A. Karpathy, X. Chen, D. P. Kingma. [PixelCNN++: Improving the PixelCNN with Discretized Logistic Mixture Likelihood and Other Modifications](https://arxiv.org/abs/1701.05517). ICLR, 2017.
+- A. van den Oord, N. Kalchbrenner, K. Kavukcuoglu. [Pixel Recurrent Neural Networks](https://arxiv.org/abs/1601.06759). ICML, 2016. (2016a) Section 2 (the factorization and the softmax), Section 3 (Row LSTM, Diagonal BiLSTM, PixelCNN, masks), Table 5.
+- A. van den Oord, N. Kalchbrenner, O. Vinyals, L. Espeholt, A. Graves, K. Kavukcuoglu. [Conditional Image Generation with PixelCNN Decoders](https://arxiv.org/abs/1606.05328). NeurIPS, 2016. (2016b) Section 2 (gated units, the blind spot, conditioning).
+- A. van den Oord, S. Dieleman, H. Zen, K. Simonyan, O. Vinyals, A. Graves, N. Kalchbrenner, A. Senior, K. Kavukcuoglu. [WaveNet: A Generative Model for Raw Audio](https://arxiv.org/abs/1609.03499). arXiv, 2016. (2016c) Sections 2.1–2.2 (dilated causal convolutions, μ-law).
+- T. Salimans, A. Karpathy, X. Chen, D. P. Kingma. [PixelCNN++: Improving the PixelCNN with Discretized Logistic Mixture Likelihood and Other Modifications](https://arxiv.org/abs/1701.05517). ICLR, 2017. Section 2, Table 1 and Section 3.4.4 (training without dropout).
 - H. Larochelle, I. Murray. [The Neural Autoregressive Distribution Estimator](https://proceedings.mlr.press/v15/larochelle11a.html). AISTATS, 2011.
 - M. Germain, K. Gregor, I. Murray, H. Larochelle. [MADE: Masked Autoencoder for Distribution Estimation](https://arxiv.org/abs/1502.03509). ICML, 2015.
 - I. Gulrajani, K. Kumar, F. Ahmed, A. A. Taiga, F. Visin, D. Vazquez, A. Courville. [PixelVAE: A Latent Variable Model for Natural Images](https://arxiv.org/abs/1611.05013). ICLR, 2017.
+- S. Ermon, A. Grover et al. [Autoregressive models](https://deepgenerativemodels.github.io/notes/autoregressive/), CS236 course notes, Stanford University (the FVSBN, NADE and their parameter counts).
+- R. Isachenko. *Deep Generative Models*, MIPT and Yandex School of Data Analysis, 2025, [lecture 1](https://github.com/r-isachenko/2025-DGM-MIPT-YSDA-course) (histogram, Markov and autoregressive parameter counts).
+- T. M. Cover, J. A. Thomas. [*Elements of Information Theory*](https://doi.org/10.1002/047174882X), 2nd ed. Wiley, 2006. Section 5.9 (Shannon–Fano–Elias coding) and Section 13.3 (arithmetic coding).

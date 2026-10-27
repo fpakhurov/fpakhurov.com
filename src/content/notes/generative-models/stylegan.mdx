@@ -1,414 +1,387 @@
 ---
 title: "StyleGAN: a style-based generator"
-description: "How to make a GAN controllable: InfoGAN's mutual-information code, StyleGAN's mapping network, learned constant, per-layer AdaIN styles, noise inputs, style mixing, truncation in W and its two disentanglement metrics, StyleGAN2's weight demodulation, path-length and lazy regularization and skip architectures, and StyleGAN3's alias-free generator."
+description: "How to make the code of a GAN mean something: InfoGAN's information term, StyleGAN's mapping network and per-layer styles, StyleGAN2's weight demodulation, and StyleGAN3's alias-free layers."
 course: generative-models
 section: GANs
-order: 11
+order: 16
 status: published
-tags: [stylegan, stylegan2, stylegan3, infogan, mutual-information, disentanglement, mapping-network, adain, weight-demodulation, truncation-trick, perceptual-path-length, ffhq, gan]
-prerequisites: [Generative adversarial networks, "Scaling GANs: progressive growing, self-attention and BigGAN", "StarGAN: one generator for many domains", LPIPS]
+tags: [stylegan, stylegan2, stylegan3, infogan, mutual-information, disentanglement, mapping-network, adain, weight-demodulation, truncation-trick, perceptual-path-length, aliasing, ffhq, gan]
+prerequisites: [Generative adversarial networks, "Scaling GANs: progressive growing, self-attention and BigGAN", LPIPS]
 ---
 
 import StyleFlow from '../../../components/figures/stylegan/StyleFlow.astro';
 import Demodulation from '../../../components/figures/stylegan/Demodulation.astro';
 
-The [previous note](/notes/generative-models/gan-scaling) ended with GANs that produce convincing faces at $1024 \times 1024$ and sharp ImageNet samples. The quality came from scale: growing the networks during training, attention, larger batches and models. Control did not come with it. Apart from a class label, the generator's only input is one noise vector $z$, nothing says what each direction of $z$ means, and moving $z$ in any direction changes many attributes of the image at once. This note follows two answers. **InfoGAN** ([Chen et al., 2016](#references)) keeps the generator and changes the objective: part of the input must be readable back from the image. **StyleGAN** ([Karras, Laine and Aila, 2019](#references)) keeps the objective and changes the generator: the code no longer enters at the input but sets the "style" of every layer, and a separate noise input takes care of random detail. Two follow-ups repair what StyleGAN broke: **StyleGAN2** ([Karras et al., 2020](#references)) removes its blob artifacts and smooths its latent space, and **StyleGAN3** ([Karras et al., 2021](#references)) stops fine detail from sticking to the pixel grid.
+Move a face generator's input $z$ a little along one coordinate: the head turns, but the person, the hair and the light change too. You would like one direction to change only the pose. The scaled-up GANs of the [previous note](/notes/generative-models/gan-scaling) draw convincing faces at $1024 \times 1024$, yet nothing ties a direction of $z$ to one attribute.
 
-**Notation.** $P$ is the data distribution and $D$ the discriminator, as in the [GAN note](/notes/generative-models/gans). The input latent is $z \in \mathcal Z = \mathbb R^{512}$ with $z \sim \mathcal N(0, I)$. In StyleGAN, a **mapping network** $f: \mathcal Z \to \mathcal W$ gives the intermediate latent $w = f(z) \in \mathcal W = \mathbb R^{512}$, the **synthesis network** $g$ turns $w$ into an image, and the generator is $G = g \circ f$. A learned affine map $A_\ell$ turns $w$ into the **style** $y_\ell = (y_{s,\ell}, y_{b,\ell})$ of layer $\ell$: one scale and one bias per channel. In the InfoGAN part, $c$ is a **latent code** given to the generator next to $z$, $x = G(z, c)$, and $q_\phi(c \mid x)$ is an auxiliary network that guesses $c$ from $x$ (called $Q$ in the paper; $Q$ is the model distribution elsewhere in the course). $H$ is [entropy](/notes/generative-models/entropy-and-divergences#entropy-expected-surprise) and $D_{\mathrm{KL}}$ the [KL divergence](/notes/generative-models/entropy-and-divergences#kullbackleibler-divergence), in nats.
+Two ways give such control without labels. **InfoGAN** ([Chen et al., 2016](#references)) changes the objective: part of the input must be readable back from the image. **StyleGAN** ([Karras, Laine and Aila, 2019](#references)) changes the generator: the code sets the "style" of every layer, and a separate noise input supplies random detail. Its two successors repair what it broke.
 
 ## Why z is entangled
 
-Take a face generator and move $z$ along one coordinate. A trained GAN can change several things at once: the head turns, but the face also becomes a different person, the hair changes length and the lighting moves. We would like a representation in which one direction changes one factor of variation (pose) and leaves the others (identity) alone: a **disentangled** one, in the sense of the [β-VAE note](/notes/generative-models/vae-variants#what-β-buys-and-what-it-does-not). Nothing in the GAN objective asks for this. The discriminator judges whole images; it rewards realistic outputs, not a tidy use of $z$.
+We call a representation **disentangled** when one direction changes one factor of variation (pose) and leaves the others (identity) alone, as in the [β-VAE note](/notes/generative-models/vae-variants#what-β-buys-and-what-it-does-not). The GAN objective does not ask for it: $D$ judges whole images, however the generator uses $z$.
 
-There is also a structural reason, which the StyleGAN paper makes explicit ([Karras, Laine and Aila, 2019](#references), Section 4 and Figure 6). The generator maps a fixed distribution, $\mathcal N(0, I)$, to the data. Every region of $\mathcal Z$ is sampled, so every region must produce a realistic image, with the frequencies of the training set. Suppose two factors, masculinity and hair length, are encoded on two axes, and the training set has no long-haired men. A mapping that kept the axes straight would sample that missing corner. To avoid it, the map from $\mathcal Z$ to image factors must curve so that the forbidden combination has no preimage, and a curved map means that moving along one axis of $\mathcal Z$ changes both factors. With real datasets, where factors are correlated, some entanglement of $\mathcal Z$ is unavoidable.
+There is also a structural reason ([Karras, Laine and Aila, 2019](#references)). The generator maps the fixed $\mathcal N(0, I)$ to the data, so every region of $z$-space must give a realistic image, at the frequencies of the training set. With masculinity and hair length on two axes and no long-haired men in the data, straight axes would sample the missing corner; the map must curve, and along it one axis of $z$ changes both factors.
 
 ## InfoGAN: a code the image must reveal
 
-InfoGAN splits the input into incompressible noise $z$ and a code $c = (c_1, \dots, c_M)$ with a factorized prior $p(c) = \prod_i p(c_i)$, and feeds both to the generator, $x = G(z, c)$ ([Chen et al., 2016](#references), Section 4). A plain GAN could ignore $c$: the solution $p_G(x \mid c) = p_G(x)$ satisfies the discriminator just as well. InfoGAN therefore asks for high **mutual information** between the code and the image,
-
-$$
-\begin{gathered}
-I(c; x) = H(c) - H(c \mid x),\\
-H(c \mid x) = -\mathbb E_{(c, x)} \log p(c \mid x),
-\end{gathered}
-$$
-
-the drop in uncertainty about $c$ once the image is seen. $I = 0$ when $x$ is independent of $c$; it is largest when $c$ can be read off $x$ exactly. The objective adds it to the GAN game with a weight $\lambda$,
-
-$$
-\min_G \max_D \; V(D, G) - \lambda\, I\big(c; G(z, c)\big),
-$$
-
-where $V$ is the GAN value function.
-
-### A lower bound on mutual information
-
-The posterior $p(c \mid x)$ of the generator is unknown, so $I$ cannot be computed. InfoGAN bounds it with an auxiliary distribution $q_\phi(c \mid x)$ (Section 5). Add and subtract $\log q_\phi$ inside the conditional entropy:
+InfoGAN splits the input into noise $z$ and a code $c = (c_1, \dots, c_M)$ with a factorized prior $p(c) = \prod_i p(c_i)$ and generates $x = G(z, c)$. A plain GAN could ignore $c$, since an image distribution independent of $c$ fools the discriminator as well, so InfoGAN asks for a large **mutual information** between the code and the image,
 
 $$
 \begin{aligned}
--H(c \mid x) &= \mathbb E_{x}\, \mathbb E_{c \sim p(c \mid x)} \log p(c \mid x)\\
-&= \mathbb E_{x}\, \mathbb E_{c \sim p(c \mid x)} \log q_\phi(c \mid x)\\
-&\quad + \mathbb E_x\, D_{\mathrm{KL}}\big(p(\cdot \mid x)\,\|\,q_\phi(\cdot \mid x)\big)\\
-&\ge \mathbb E_{x}\, \mathbb E_{c \sim p(c \mid x)} \log q_\phi(c \mid x),
+I(c; x) &= H(c) - H(c \mid x), \\
+H(c \mid x) &= -\mathbb E_{(c, x)} \log p(c \mid x),
 \end{aligned}
 $$
 
-because a KL divergence is non-negative. The remaining expectation is over pairs $(c, x)$ from the joint distribution of the generator. That joint can be sampled in the forward direction, $c \sim p(c)$, $z \sim p(z)$, $x = G(z, c)$, without ever sampling the posterior (the paper's Lemma 5.1 states this change of order). Adding $H(c)$ gives the variational lower bound
+where $H$ is [entropy](/notes/generative-models/entropy-and-divergences#entropy-expected-surprise) in nats: $I$ is the drop in uncertainty about $c$ once the image is seen, zero when $x$ is independent of $c$. With the GAN value function $V$ and a weight $\lambda$, the game is
+
+$$
+\min_G \max_D \; V(D, G) - \lambda\, I\big(c; G(z, c)\big) .
+$$
+
+### A lower bound on mutual information
+
+The generator's posterior $p(c \mid x)$ is unknown, so InfoGAN adds an auxiliary network $q_\phi(c \mid x)$ that guesses the code from the image. Write $\log p = \log q_\phi + \log(p/q_\phi)$ inside the conditional entropy; averaged over $c \sim p(c \mid x)$, the second term is the KL divergence from $p(\cdot \mid x)$ to $q_\phi(\cdot \mid x)$, by definition:
 
 $$
 \begin{aligned}
-\mathcal L_I(G, q_\phi) &= \mathbb E_{c \sim p(c),\, z \sim p(z)} \log q_\phi\big(c \mid G(z, c)\big) + H(c)\\
+-H(c \mid x) &= \mathbb E_{x}\, \mathbb E_{c \sim p(c \mid x)} \log p(c \mid x) \\
+&= \mathbb E_{x}\, \mathbb E_{c \sim p(c \mid x)} \log q_\phi(c \mid x) \\
+&\quad + \mathbb E_x\, D_{\mathrm{KL}}\big(p(\cdot \mid x) \,\|\, q_\phi(\cdot \mid x)\big) \\
+&\ge \mathbb E_{x}\, \mathbb E_{c \sim p(c \mid x)} \log q_\phi(c \mid x) .
+\end{aligned}
+$$
+
+The last step drops the KL term, which is never negative (the [entropy note](/notes/generative-models/entropy-and-divergences#kullbackleibler-divergence) proves $D_{\mathrm{KL}} \ge 0$ by Jensen's inequality) and zero only when the distributions coincide. The remaining expectation is over $p(x)\,p(c \mid x) = p(c)\,p(x \mid c)$ by the product rule, so pairs are sampled forwards, $c \sim p(c)$, $z \sim p(z)$, $x = G(z, c)$, and the posterior is never needed. Adding $H(c)$ gives the bound
+
+$$
+\begin{aligned}
+\mathcal L_I(G, q_\phi) &= \mathbb E_{c,\, z} \log q_\phi\big(c \mid G(z, c)\big) + H(c) \\
 &\le I\big(c; G(z, c)\big),
 \end{aligned}
 $$
 
-which is tight when $q_\phi$ equals the posterior. The prior $p(c)$ is fixed, so $H(c)$ is a constant. The InfoGAN game is
+tight when $q_\phi$ equals the posterior. $H(c)$ is a constant, so the game becomes
 
 $$
 \min_{G,\, q_\phi} \max_D \; V(D, G) - \lambda\, \mathcal L_I(G, q_\phi) .
 $$
 
-Maximizing $\mathcal L_I$ over $q_\phi$ fits the guesser to the current generator; maximizing it over $G$ pushes the generator to make $c$ easy to guess. The trick is the one behind the [ELBO](/notes/generative-models/vae#where-the-elbo-comes-from): a KL divergence to an approximate posterior is dropped because it is non-negative. There it bounds a likelihood, here an information.
+Over $q_\phi$ this fits the guesser to the generator; over $G$ it makes the code easy to guess. Dropping a non-negative KL to an approximate posterior also gives the [ELBO](/notes/generative-models/vae#where-the-elbo-comes-from).
 
-**In practice** $q_\phi$ shares all convolutional layers with the discriminator and adds one fully connected head, so the cost over a GAN is small (Section 6). For a categorical code the head is a softmax and $-\log q_\phi$ is a cross-entropy. For a continuous code the head outputs the mean $\mu(x)$ and standard deviation $\sigma(x)$ of a factorized Gaussian, and
+The guesser shares all convolutional layers with the discriminator and adds one head: a softmax for a categorical code, so $-\log q_\phi$ is a cross-entropy, and for a continuous code a mean $\mu(x)$ and a standard deviation $\sigma(x)$, with
 
 $$
-\log q_\phi(c \mid x) = -\frac{(c - \mu(x))^2}{2\sigma(x)^2} - \ln \sigma(x) - \tfrac12 \ln 2\pi :
+\log q_\phi(c \mid x) = -\frac{(c - \mu(x))^2}{2\sigma(x)^2} - \ln \sigma(x) - \tfrac12 \ln 2\pi ,
 $$
 
-a squared error between the code and its estimate, weighted by the network's confidence. The weight is $\lambda = 1$ for discrete codes; with continuous codes a smaller $\lambda$ is used, because the term then involves a differential entropy and its scale differs from that of the GAN objective (Section 6).
+a squared error weighted by the network's confidence.
 
-**Worked example (toy numbers).** A uniform categorical code with $K = 10$ values has $H(c) = \ln 10 \approx 2.303$ nats. Since $\log q_\phi \le 0$ for a discrete distribution, $\mathcal L_I \le \ln 10$, with equality only when $q_\phi$ puts probability 1 on the true $c$ for every generated image: the code is then fully recoverable, and the bound equals the largest possible mutual information. For a continuous code $c = 0.6$ and a guess $\mu = 0.5$, $\sigma = 0.2$, the term is $-0.1250 + 1.6094 - 0.9189 = 0.5655$. It is positive because a density can exceed 1; only differences of such terms matter.
+Toy numbers: a uniform 10-way code has $H(c) = \ln 10 = 2.303$ nats, and $\mathcal L_I \le \ln 10$ because $\log q_\phi \le 0$ for a discrete code. A continuous code $c = 0.6$ guessed as $\mu = 0.5$, $\sigma = 0.2$ gives the term $-0.1250 + 1.6094 - 0.9189 = 0.5655$, positive because a density can exceed 1.
 
 ### What InfoGAN found
 
-On MNIST the code is one categorical variable with 10 values and two continuous ones uniform on $[-1, 1]$, next to 62 noise variables (Section 7 and Appendix C.1). The lower bound quickly reaches $H(c) \approx 2.30$, while a regular GAN trained with the same auxiliary network keeps almost no information about $c$ in its images (Section 7.1, Figure 1). Without any label, the categorical code sorts the digits by class: matched to digit types, it classifies MNIST with a 5% error rate. One continuous code controls the rotation of the digit and the other its width, and the generator adjusts stroke thickness and style to keep the result natural; traversing the codes from $-2$ to $2$, outside the training range, still gives meaningful digits (Section 7.2, Figure 2). On 3D-rendered faces, continuous codes find azimuth, elevation, lighting and the width of the face; on chairs, rotation and width; on SVHN, lighting and the context digits next to the central one; and on CelebA, with ten categorical codes of ten values each, pose, glasses, hair style and emotion (Figures 3–6).
+On MNIST, with one 10-way and two continuous codes and no labels, the categorical code sorts the digits by class (a 5% error when matched to digit types), and the continuous codes control rotation and width. On faces, codes find pose, lighting and glasses.
 
 ### Where InfoGAN stops
 
-- **The codes are chosen by hand.** How many codes, of which type and with which prior is a design decision made before training: one 10-way and two continuous codes for MNIST, five continuous codes for 3D faces. Which factor each code ends up controlling is not chosen; for 3D faces and chairs, the paper shows for each factor the run, out of five, that most resembles earlier supervised results (Figures 3–4).
-- **Mutual information asks for less than disentanglement.** It says that $c$ can be read from the image. It does not say that each $c_i$ controls a single factor, nor that the factor is absent from $z$.
-- **The rest of the input stays as entangled as before.** Most of the generator's input is $z$, and InfoGAN says nothing about it. The experiments use images of $28 \times 28$ to $64 \times 64$ pixels.
+The codes are designed by hand, and which factor each one controls can change between runs. Mutual information also asks for less than disentanglement: $c$ must be readable from the image, but nothing says that each $c_i$ controls a single factor absent from $z$. Most of the input is still the entangled $z$, and the experiments stop at $64 \times 64$.
 
-StyleGAN takes a different route: instead of a regularizer that asks a fixed generator to behave, it changes where and how the code enters the network.
+StyleGAN takes the other route: it changes where and how the code enters the network.
 
 ## StyleGAN: a style-based generator
 
-A traditional generator, such as the one of [Progressive GAN](/notes/generative-models/gan-scaling#progan-growing-the-networks), feeds the latent code through its input layer only. StyleGAN removes that input layer altogether ([Karras, Laine and Aila, 2019](#references), Section 2 and Figure 1). The code goes through a mapping network to an intermediate latent $w$, $w$ sets the style of every convolution layer, the synthesis starts from a constant, and per-pixel noise supplies random detail. The discriminator and the loss are not changed; every change is in the generator.
+A traditional generator, such as [Progressive GAN](/notes/generative-models/gan-scaling#progan-growing-the-networks), feeds the code through its first layer only. StyleGAN instead sends $z \in \mathbb R^{512}$ through a **mapping network** $f$, an 8-layer MLP, to $w = f(z) \in \mathcal W = \mathbb R^{512}$. The **synthesis network** $g$ starts from a learned $4 \times 4 \times 512$ constant, and $w$ reaches each of its 18 layers, two per resolution from $4^2$ to $1024^2$, as a style; $G = g \circ f$. The discriminator is that of Progressive GAN.
 
 <StyleFlow />
 
-1. **Mapping network.** The normalized $z$ passes through $f$, an 8-layer MLP, and becomes $w \in \mathcal W$; both have 512 dimensions.
-2. **Constant input.** Synthesis starts from a learned $4 \times 4 \times 512$ tensor.
-3. **Styles.** A learned affine map $A_\ell$ per layer turns $w$ into the style $y_\ell$, which enters through AdaIN after each convolution.
-4. **Noise.** A learned per-channel scale $B$ broadcasts a single-channel Gaussian noise image to all channels; it is added after each convolution.
-5. **Blocks.** Two layers per resolution from $4^2$ to $1024^2$, 18 in all. A block upsamples, then twice convolves, adds noise and applies AdaIN; the $4 \times 4$ block skips the upsampling and its first convolution, acting directly on the constant. A $1 \times 1$ convolution turns the last feature map into RGB. The generator has 26.2 million parameters, against 23.1 million for the traditional one.
-
 ### The mapping network and the space W
 
-The argument of the [first section](#why-z-is-entangled) applies to $\mathcal Z$ because $\mathcal Z$ has a fixed distribution that must match the data. $\mathcal W$ has no such constraint. Its sampling density is whatever $f$ makes of $\mathcal N(0, I)$, so $f$ can absorb the curving that the data force and leave $\mathcal W$ closer to straight axes: in the example above, the missing combination can simply be a region of $\mathcal W$ that $f$ never reaches. The authors argue that training pushes in this direction, because it should be easier for the synthesis network to generate realistic images from a disentangled representation than from an entangled one (Section 4). It is a hypothesis, tested below with two metrics.
+The [entanglement argument](#why-z-is-entangled) applies to $z$ because its distribution is fixed. The density of $\mathcal W$ is whatever $f$ makes of $\mathcal N(0, I)$, so $f$ can absorb the curving the data force: the missing combination of factors can be a region of $\mathcal W$ that $f$ never reaches, while the axes of $\mathcal W$ stay straight.
 
-The mapping network is trained with a learning rate 100 times lower than the rest, because deeper mapping networks were unstable at high learning rates (Appendix C). Its depth matters. On FFHQ, a style-based generator without a mapping network, driven directly by $z$, reaches FID 5.06; with an 8-layer one, 4.40. Adding an 8-layer mapping network in front of a traditional generator also improves its FID, from 5.25 to 4.87, and makes the intermediate space far better separable than its input space (Table 4; the separability score is defined [below](#linear-separability)).
-
-### A learned constant instead of an input layer
-
-After the mapping network and AdaIN were added, the network no longer benefited from receiving the code at its first layer. StyleGAN therefore starts synthesis from a learned $4 \times 4 \times 512$ constant, initialized to ones (Section 2.1 and Appendix C), and the image depends on $w$ only through the styles. This step left FID about the same on FFHQ and improved it on CelebA-HQ (configurations C and D in the table [below](#results-on-ffhq)), and it makes the role of the styles clean: all image content is set by them and by the noise.
+Nothing forces training to use this freedom; the authors argue that a disentangled $\mathcal W$ is easier to render, and the two metrics [below](#measuring-disentanglement-without-an-encoder) test the claim.
 
 ### Styles through AdaIN
 
-Each style $y = (y_s, y_b) = A_\ell(w)$ controls the layer through adaptive instance normalization, defined for channel $i$ of a feature map $x$ as (Section 2, Eq. 1)
+A learned affine map $A_\ell$ turns $w$ into the style $y_\ell = (y_s, y_b)$ of layer $\ell$: one scale and one bias per channel. The style acts through **adaptive instance normalization** ([Huang and Belongie, 2017](#references)), defined for channel $i$ of a feature map $x$ as
 
 $$
 \mathrm{AdaIN}(x_i, y) = y_{s,i}\,\frac{x_i - \mu(x_i)}{\sigma(x_i)} + y_{b,i},
 $$
 
-where $\mu(x_i)$ and $\sigma(x_i)$ are the mean and standard deviation of channel $i$ over its spatial positions, as in [instance normalization](/notes/generative-models/training-background#instance-normalization). AdaIN, with a worked example, is in the [StarGAN note](/notes/generative-models/stargan#how-the-style-enters-adain), where StarGAN v2 injects its style code the same way. The style has two numbers per channel, so its dimension is twice the number of feature maps of the layer, and the biases of $y_s$ start at one (Appendix C).
+where $\mu(x_i)$ and $\sigma(x_i)$ are the mean and standard deviation of channel $i$ over its spatial positions, as in [instance normalization](/notes/generative-models/training-background#instance-normalization).
 
-Why styles act locally follows from the normalization. AdaIN first sets every channel to zero mean and unit variance, and only then applies the new scale and bias. The statistics that a style imposes therefore do not survive the next AdaIN, which normalizes them away again. Each style controls one convolution, until the next AdaIN overrides it (Section 3). The style is also spatially invariant: one scale and one bias for a whole feature map. It changes what the next convolution emphasizes everywhere at once, which suits global aspects such as pose, lighting and the overall look.
+For example, a channel $(1, 3, 5, 7)$ normalizes to $(-1.342, -0.447, 0.447, 1.342)$ whatever its scale, since multiplying it by 10 scales $x_i - \mu(x_i)$ and $\sigma(x_i)$ alike; the style $y_s = 2$, $y_b = 0.5$ then gives $(-2.18, -0.39, 1.39, 3.18)$.
+
+So AdaIN erases the mean and scale that earlier layers chose, and each style controls one convolution, up to the next AdaIN. A style is also spatially uniform, which suits global aspects such as pose, lighting and the overall look.
+
+With styles in place, the code at the first layer no longer helped: a learned constant instead moved FID from 5.34 to 5.07 on CelebA-HQ and from 4.85 to 4.88 on FFHQ ([Karras, Laine and Aila, 2019](#references), Table 1). All image content then comes from the styles and the noise.
 
 ### Noise for stochastic detail
 
-Much of a portrait is random in a harmless way: the exact placement of hairs, stubble, freckles and pores can be redrawn without changing how we perceive the face. A traditional generator has to produce such variation from its input, which costs capacity and often shows as repeated patterns. StyleGAN gives each layer a fresh single-channel image of uncorrelated Gaussian noise, scaled per channel by learned factors ($B$ in the figure) and added after the convolution, before the nonlinearity (Section 2 and Figure 1).
+Much of a portrait is harmlessly random: hairs, freckles and pores. Instead of spending capacity to produce it from the input, StyleGAN adds to each layer a fresh single-channel image of Gaussian noise, scaled per channel by learned factors $B$.
 
-The network learns to use the two inputs for different things without being told (Sections 3.2–3.3). Redrawing the noise for a fixed $w$ leaves identity and pose intact and moves hairs, parts of the silhouette and the background; noise only in the coarse layers ($4^2$ to $32^2$) gives large-scale curls, noise only in the fine layers ($64^2$ to $1024^2$) fine curls and skin pores, and no noise at all gives a featureless, painterly look (Figures 4–5). The style scales whole feature maps, so it is the natural channel for global decisions; the noise is independent at every pixel, and controlling pose through it would give spatially inconsistent images, which the discriminator penalizes.
+Redrawing the noise for a fixed $w$ moves individual hairs and keeps identity and pose; without noise the images look painterly. A style scales whole maps, the natural channel for global decisions; pose driven by independent per-pixel noise would vary inconsistently across the image, which the discriminator would penalize.
 
 ### Style mixing: coarse, middle and fine styles
 
-Every layer receives its own style, so nothing forces them all to come from the same $w$. **Style mixing** runs two codes $z_1, z_2$ through the mapping network and uses $w_1$ for the layers before a crossover point and $w_2$ after it. During training, StyleGAN does this for a fixed share of the images, with a random crossover, as a regularizer: it prevents the network from assuming that adjacent styles are correlated (Section 3.1). The effect shows when several codes are mixed at test time. FID on FFHQ with 1 to 4 random codes and random crossovers (Table 2):
+Nothing forces all layers to use the same $w$. **Style mixing** maps $z_1, z_2$ to $w_1, w_2$ and switches from $w_1$ to $w_2$ at a random crossover layer, on 90% of the training images, so the network cannot assume adjacent styles are correlated. Single-code FID stays at 4.40 against 4.42 on FFHQ; two-code images improve from 8.22 to 5.11 ([Karras, Laine and Aila, 2019](#references), Table 2).
 
-| Mixing during training | 1 code | 2 codes | 3 codes | 4 codes |
-| --- | --- | --- | --- | --- |
-| 0% (configuration E) | 4.42 | 8.22 | 12.88 | 17.41 |
-| 50% | 4.41 | 6.10 | 8.71 | 11.61 |
-| 90% (configuration F) | 4.40 | 5.11 | 6.88 | 9.03 |
-| 100% | 4.83 | 5.17 | 6.63 | 8.40 |
+Mixing two faces shows what each group of layers controls:
 
-At 90% the single-code quality is unchanged and the network tolerates mixing far better. Mixing two faces shows what each group of layers controls (Figure 3):
+- coarse styles, $4^2$ to $8^2$: pose, general hair style, face shape and eyeglasses;
+- middle styles, $16^2$ to $32^2$: smaller facial features, hair style, eyes open or closed;
+- fine styles, $64^2$ to $1024^2$: mainly the colour scheme and microstructure.
 
-- **coarse styles** ($4^2$ to $8^2$): pose, general hair style, face shape and eyeglasses;
-- **middle styles** ($16^2$ to $32^2$): smaller facial features, hair style, eyes open or closed;
-- **fine styles** ($64^2$ to $1024^2$): mainly the colour scheme and microstructure.
-
-The coarse layers decide the layout, the fine ones the texture. The separation is a property of the trained network, not of a label: on LSUN bedrooms the coarse styles set the camera viewpoint, the middle ones the furniture and the fine ones colours and materials (Appendix E). Feeding a separate code to every layer defines the extended space $\mathcal W^+$, which the [drag-editing note](/notes/generative-models/drag-editing#the-stylegan2-generator-in-brief) uses for editing.
+The coarse layers decide the layout, the fine ones the texture; on bedrooms, the viewpoint and the materials. A separate $w$ per layer defines the extended space $\mathcal W^+$, which the [drag-editing note](/notes/generative-models/drag-editing#the-stylegan2-generator-in-brief) uses.
 
 ### Truncation in W
 
-Regions of low data density are hard to learn for any generative model, and sampling only from the well-learned centre of the latent space improves average quality at the cost of variety. StyleGAN does this in $\mathcal W$ (Appendix B). Compute the centre of mass $\bar w = \mathbb E_{z \sim p(z)} f(z)$ and move each sample toward it:
+Low-density regions are poorly learned, so sampling near the centre trades variety for quality. StyleGAN shrinks each $w$ toward the centre of mass, with $\psi < 1$:
 
 $$
-w' = \bar w + \psi\,(w - \bar w), \qquad \psi < 1 .
+\begin{aligned}
+\bar w &= \mathbb E_{z \sim p(z)} f(z), \\
+w' &= \bar w + \psi\,(w - \bar w) .
+\end{aligned}
 $$
 
-$\psi$ multiplies every deviation from $\bar w$: at $\psi = 0.7$ each $w$ keeps 70% of its distance from the centre, and the squared distance 49%. It is a shrink, not a rejection. At $\psi = 0$ every sample becomes the "mean face" of FFHQ, which looks similar for all trained networks; negative $\psi$ gives an "anti-face", in which viewpoint, glasses, age, colouring, hair length and often gender flip (Figure 8). The [truncation trick of BigGAN](/notes/generative-models/gan-scaling#the-truncation-trick) acts on $z$, and Brock et al. found that only some networks tolerate it, even with orthogonal regularization; truncation in $\mathcal W$ works reliably without changes to the loss (Appendix B). Because each layer has its own style, truncation can also be applied to the coarse layers only, leaving the fine detail untouched: the uncurated samples of the paper use $\psi = 0.7$ for $4^2$ to $32^2$ (Figure 2). All FIDs are computed without truncation.
-
-### Results on FFHQ
-
-The paper also introduces **FFHQ** (Flickr-Faces-HQ): 70,000 face images at $1024 \times 1024$, crawled from Flickr under permissive licenses, automatically aligned and cropped, with much more variation in age, ethnicity, background and accessories than CelebA-HQ (Appendix A). FID, lower is better, computed against 50,000 images drawn from the training set and reported at its lowest value during training (Table 1):
-
-| Configuration | CelebA-HQ | FFHQ |
-| --- | --- | --- |
-| A. Progressive GAN baseline | 7.79 | 8.04 |
-| B. + bilinear resampling, longer training, tuning | 6.11 | 5.25 |
-| C. + mapping network and styles | 5.34 | 4.85 |
-| D. + learned constant, no input layer | 5.07 | 4.88 |
-| E. + noise inputs | 5.06 | 4.42 |
-| F. + mixing regularization | 5.17 | 4.40 |
-
-On FFHQ, configurations B–F use the non-saturating loss with the [R1 penalty](/notes/generative-models/stargan#r1-a-penalty-on-real-images-only) ($\gamma = 10$), and CelebA-HQ uses WGAN-GP. From the improved traditional baseline B to the style-based E, FID drops by 15.8% on FFHQ and 17.2% on CelebA-HQ. Training took about a week on eight Tesla V100 GPUs (Appendix C). On LSUN, FID was 2.65 for bedrooms at $256^2$, 3.27 for cars at $512 \times 384$ and 8.53 for cats at $256^2$ (Figures 10–12).
+At $\psi = 0.7$ each $w$ keeps 70% of its distance from the centre; at $\psi = 0$ every sample is the "mean face", and a negative $\psi$ flips viewpoint, glasses, age and hair length. Unlike the [truncation trick of BigGAN](/notes/generative-models/gan-scaling#the-truncation-trick) in $z$, it needs no change to the loss and can be applied to the coarse layers only.
 
 ## Measuring disentanglement without an encoder
 
-Existing disentanglement metrics need an encoder from images to latent codes, which a GAN does not have. StyleGAN proposes two that need neither an encoder nor known factors of variation (Section 4).
+Most disentanglement metrics need an encoder, which a GAN lacks; StyleGAN proposes two that need neither an encoder nor known factors.
 
-### Perceptual path length
-
-If a latent space is entangled, interpolating between two codes can produce features that are absent at both ends, a sign of a curved path through image space. **Perceptual path length** (PPL) measures how much the image changes along small steps of an interpolation, with the [LPIPS](/notes/generative-models/lpips) distance $d$. In $\mathcal Z$, with [slerp](/notes/generative-models/alpha-gan#latent-interpolation-lerp-or-slerp) because $z$ is Gaussian (Section 4.1, Eq. 2),
+**Perceptual path length** (PPL) asks how fast the image changes along an interpolation; in an entangled space a path can pass through features absent at both ends. With the [LPIPS](/notes/generative-models/lpips) distance $d$ ([Zhang et al., 2018](#references)), $w_1 = f(z_1)$, $w_2 = f(z_2)$, $t \sim U(0, 1)$ and $\varepsilon = 10^{-4}$,
 
 $$
 \begin{aligned}
-l_{\mathcal Z} = \mathbb E\Big[\frac{1}{\varepsilon^2}\, d\big(&G(\mathrm{slerp}(z_1, z_2; t)),\\
-&G(\mathrm{slerp}(z_1, z_2; t + \varepsilon))\big)\Big],
+l_{\mathcal W} = \mathbb E\Big[\tfrac{1}{\varepsilon^2}\, d\big(&g(\mathrm{lerp}(w_1, w_2; t)),\\
+&g(\mathrm{lerp}(w_1, w_2; t + \varepsilon))\big)\Big] .
 \end{aligned}
 $$
 
-with $z_1, z_2 \sim p(z)$, $t \sim U(0, 1)$ and $\varepsilon = 10^{-4}$. In $\mathcal W$ the vectors are not normalized, so the interpolation is linear (Eq. 3):
+In $z$-space [slerp](/notes/generative-models/alpha-gan#latent-interpolation-lerp-or-slerp) replaces lerp, since a straight line between two Gaussian samples dips inside their shell. Why divide by $\varepsilon^2$? LPIPS is a weighted sum of squared differences of normalized features ([LPIPS note](/notes/generative-models/lpips#the-formula)), and to first order (Taylor) a small step changes the features by $\varepsilon$ times their derivative along the path. So $d \approx \varepsilon^2 \times$ (squared speed).
 
-$$
-\begin{aligned}
-l_{\mathcal W} = \mathbb E\Big[\frac{1}{\varepsilon^2}\, d\big(&g(\mathrm{lerp}(f(z_1), f(z_2); t)),\\
-&g(\mathrm{lerp}(f(z_1), f(z_2); t + \varepsilon))\big)\Big].
-\end{aligned}
-$$
+**Linear separability** asks whether a binary attribute such as gender is cut off by a hyperplane in the latent space. Attribute classifiers label generated images, a linear SVM predicts each label from the code, and the score is the exponential of the summed conditional entropies of the labels given the side: 1 when every attribute is linear.
 
-LPIPS is a squared distance, so for a smooth path $d \approx \varepsilon^2 \times$ (squared speed of the image along the path), and dividing by $\varepsilon^2$ leaves the mean squared perceptual speed. The expectation uses 100,000 samples, and the images are cropped to the face. A short path in $\mathcal W$ can be unfair to $\mathcal Z$: if $\mathcal W$ is a flattened version of $\mathcal Z$, a straight line between two reachable points of $\mathcal W$ can pass through regions that $f$ never produces and that $g$ renders badly. The paper therefore also reports the **endpoint** version, $t \in \{0, 1\}$, which only compares images near codes that $f$ actually produces.
-
-### Linear separability
-
-If a latent space is disentangled, a binary attribute such as gender should be separable by a hyperplane (Section 4.2). The test: train 40 classifiers for the 40 CelebA attributes on CelebA-HQ; generate 200,000 images; classify each and keep the more confident half, 100,000 labelled codes per attribute; fit a linear SVM that predicts the label from the code ($z$ or $w$); and compute the conditional entropy $H(Y \mid X)$ of the classifier's label $Y$ given the side of the hyperplane $X$. The score is $\exp\big(\sum_{i=1}^{40} H(Y_i \mid X_i)\big)$. It equals 1 when every attribute is perfectly predicted by a hyperplane and grows with the information the hyperplanes miss; lower is better.
-
-Both metrics on FFHQ, lower is better (Tables 3 and 4):
-
-| Generator | Space | PPL, full | PPL, end | Separability |
-| --- | --- | --- | --- | --- |
-| traditional (B) | $\mathcal Z$ | 412.0 | 415.3 | 10.78 |
-| style-based, no noise (D) | $\mathcal W$ | 446.2 | 376.6 | 3.61 |
-| + noise inputs (E) | $\mathcal W$ | 200.5 | 160.6 | 3.54 |
-| + mixing 90% (F) | $\mathcal W$ | 234.0 | 195.9 | 3.79 |
-| traditional + 8-layer mapping | $\mathcal Z$ | 896.2 | 902.0 | 170.29 |
-| traditional + 8-layer mapping | $\mathcal W$ | 324.5 | 212.2 | 6.52 |
-
-$\mathcal W$ is consistently better separable than $\mathcal Z$, and its paths are shorter. The traditional generator with a mapping network is the clearest case: its intermediate space is easy to separate (6.52), while its input space becomes much worse (170.29), which supports the claim that the input space of a GAN can be arbitrarily entangled. Mixing regularization costs some path length and separability; the authors suggest that it makes it harder for $\mathcal W$ to encode factors that span several scales. They also note that PPL slowly rises late in training while FID keeps falling (Appendix D): quality was bought partly with entanglement.
+Both metrics favour $\mathcal W$: a traditional generator with a mapping network in front has separability 6.52 in $\mathcal W$ and 170.29 in its input space. PPL also crept up late in training while FID kept falling: some quality was paid for with entanglement.
 
 ## StyleGAN2: removing the artifacts
 
-StyleGAN images often contain a characteristic blob that resembles a water droplet, and moving features such as teeth sometimes stay fixed in place. StyleGAN2 traces the first to AdaIN and the second to progressive growing, and adds a regularizer that makes the generator smoother ([Karras et al., 2020](#references)). It focuses all analysis on $\mathcal W$, the space that matters to the synthesis network.
+StyleGAN images often contain a blob like a water droplet, and details such as teeth can stay fixed while the face turns. StyleGAN2 ([Karras et al., 2020](#references)) traces the first to AdaIN and the second to progressive growing, and adds a smoothness regularizer.
 
 ### Droplets and the normalization in AdaIN
 
-The droplet appears around $64 \times 64$, is present in all feature maps even when hard to see in the final image, and grows stronger at higher resolutions (Section 2, Figure 1). StyleGAN2's hypothesis: AdaIN normalizes the mean and variance of each feature map separately, which destroys any information carried by the magnitudes of the features relative to each other. The generator sneaks this signal-strength information past the normalization by creating a strong, localized spike that dominates the statistics; with the spike in place it can scale the signal elsewhere as it likes. The hypothesis is supported by an experiment: when the normalization step is removed, the droplets disappear completely. In the rare cases (perhaps 0.1% of images) where the droplet is missing, the image is severely corrupted (Figure 15).
+The droplet appears around $64 \times 64$ in the feature maps. Instance normalization sets the mean and variance of each feature map separately, destroying the information in the relative sizes of the features; the hypothesis is that the generator smuggles it past the normalization with a strong local spike that dominates the statistics. Without the normalization step, the droplets disappear.
 
-**Worked example (toy numbers).** A feature map of 16 positions carries a pattern of $\pm a$ on 15 of them (8 positive, 7 negative) and a spike $S$ at the 16th. After instance normalization the amplitude of the pattern is 1.035 for $S = 0$, whatever $a$ is: the normalization discards the scale that the previous layers chose. With a spike it depends on the ratio $S/a$; for $a = 1$: 0.737 for $S = 4$, 0.386 for $S = 10$ and 0.103 for $S = 40$, while the spike itself becomes a large value (3.85 at $S = 40$) at its own position. The spike works as a volume knob that the normalization cannot remove.
+A toy map shows it: 16 positions, a pattern $\pm a$ on 15 of them (8 positive, 7 negative) and a spike $S$ on the 16th. Without a spike the normalized pattern has half-gap 1.035 for every $a$: the scale $a$ is lost. With $a = 1$ and $S = 4$, 10, 40 the half-gap is 0.737, 0.386, 0.103, so it depends on $S/a$, and the spike itself becomes 3.85 at $S = 40$: a volume knob the normalization cannot remove.
 
-StyleGAN2 first simplifies the block (Section 2.1, Figure 2). AdaIN is split into its two parts, normalization and modulation. The bias and the noise are moved out of the part of the network where a style is active, so that their effect no longer scales with the style; normalization and modulation then act on the standard deviation alone, without the mean; and the bias, noise and normalization of the constant input are removed. The block that remains is modulation, convolution, normalization, and the normalization can now be replaced.
+StyleGAN2 first splits AdaIN into modulation and normalization, moves the bias and the noise outside the styled part and normalizes the standard deviation only, so that the normalization can be replaced.
 
 ### Weight modulation and demodulation
 
-Write $w_{ijk}$ for the weight of a convolution from input channel $i$ to output channel $j$ at kernel position $k$, and $s_i$ for the style's scale of input channel $i$ (in this section $w$ with three indices is a weight, not the latent). The derivation takes three steps (Section 2.2, Eqs. 1–3).
+Write $w_{ijk}$ for the weight from input channel $i$ to output channel $j$ at kernel position $k$ (not the latent), and $s_i$ for the style's scale of input channel $i$.
 
-**Step 1: modulation as a weight change.** Scaling input channel $i$ by $s_i$ and then convolving is the same as convolving with scaled weights, because a convolution is linear in each input channel:
+Modulation is a weight change: convolution is linear in each input channel, so scaling channel $i$ by $s_i$ and convolving equals convolving with $w'_{ijk} = s_i\, w_{ijk}$.
 
-$$
-w'_{ijk} = s_i\, w_{ijk} .
-$$
-
-**Step 2: the output scale.** Assume the input activations are independent random variables with unit standard deviation. Output $j$ at one position is $\sum_{i,k} w'_{ijk}\, x_{i,k}$, a sum of independent terms, and the variance of such a sum is the sum of the variances, $\sum_{i,k} w'^2_{ijk} \cdot 1$. Its standard deviation is the $L_2$ norm of the weights of output channel $j$:
+Assume independent unit-variance inputs. Output $j$ at one position is $\sum_{i,k} w'_{ijk}\, x_{i,k}$, and the variances of independent terms add, so
 
 $$
 \sigma_j = \sqrt{\textstyle\sum_{i,k} w'^2_{ijk}} .
 $$
 
-**Step 3: demodulation.** Instance normalization aims to remove the effect of $s$ from the output statistics. Dividing output $j$ by $\sigma_j$ does this directly, and the division can again be folded into the weights, with a small $\epsilon$ for numerical safety:
+Dividing output $j$ by $\sigma_j$ removes the effect of $s$ on the output scale, and the division folds into the weights:
 
 $$
 w''_{ijk} = \frac{w'_{ijk}}{\sqrt{\sum_{i,k} w'^2_{ijk} + \epsilon}} .
 $$
 
-The whole style block is now one convolution whose weights depend on the style. The normalization is computed from the weights, not from the feature maps, so a spike in the data no longer changes how the data are scaled, and the droplet loses its purpose. The price is that demodulation rests on a statistical assumption about the inputs rather than on their actual content; the authors call it weaker than instance normalization. Similar variance arguments are used in weight initialization, and the computation is the one of weight normalization. The weights differ for every sample in a minibatch, which standard convolution routines do not support; the implementation reshapes the minibatch into one sample with $N$ groups and uses grouped convolutions (Appendix B). The activation functions are scaled so that they keep the expected signal variance.
+The style block is now one convolution with style-dependent weights, scaled from the weights and the style, never from the feature maps, so a spike no longer changes the scaling and the droplet loses its purpose. The per-sample weights run as one grouped convolution.
 
-**Worked example (toy numbers).** One output channel of a $1 \times 1$ convolution with two inputs has weights $w = (0.6, 0.8)$, so unit-variance independent inputs give an output of variance $0.36 + 0.64 = 1$. A style $s = (3, 0.5)$ gives $w' = (1.8, 0.4)$ and an output variance of $3.24 + 0.16 = 3.4$. Demodulation divides by $\sigma = \sqrt{3.4} = 1.844$: $w'' = (0.976, 0.217)$, and the variance is $0.953 + 0.047 = 1$ again. The style still decides the mix, the first input now carries 95% of the variance instead of 36%, but not the overall scale. If the two inputs were correlated with coefficient 0.5, the same weights would give $1 + 2 \cdot 0.5 \cdot 0.976 \cdot 0.217 = 1.21$: the assumption matters. The figure repeats the experiment on a toy $3 \times 3$ convolution with six random styles.
+Toy numbers: one output channel of a $1 \times 1$ convolution has weights $w = (0.6, 0.8)$, so unit-variance inputs give output variance 1.
+
+| Quantity | Value |
+| --- | --- |
+| style $s$ | $(3, 0.5)$ |
+| modulated $w'$ | $(1.8, 0.4)$ |
+| output variance $\sum w'^2$ | $3.24 + 0.16 = 3.4$ |
+| $\sigma = \sqrt{3.4}$ | 1.844 |
+| demodulated $w''$ | $(0.976, 0.217)$ |
+| output variance | $0.953 + 0.047 = 1$ |
+
+The style still decides the mix (the first input carries 95% of the variance instead of 36%) but no longer the overall scale.
+
+The price is an assumption: demodulation equalizes the variance only for independent inputs. With correlation 0.5 between the two inputs, $\operatorname{Var}(aX + bY) = a^2 + b^2 + 2ab\rho$ gives $1 + 2 \cdot 0.5 \cdot 0.976 \cdot 0.217 = 1.21$ for the same $w''$. Real feature maps are correlated, so demodulation normalizes more weakly, a price accepted to remove the droplets. The figure repeats the test on a $3 \times 3$ convolution.
 
 <Demodulation />
 
-The new design removes the droplets while keeping full control through styles. FID is almost unchanged, 4.40 to 4.39 on FFHQ, but precision falls from 0.721 to 0.702 and recall rises from 0.399 to 0.425 (Table 1, rows A and B; see [precision and recall](/notes/generative-models/precision-recall)). The authors consider this shift desirable, since recall can be traded back for precision with truncation but not the other way round.
-
 ### Path-length regularization
 
-FID and precision and recall have a blind spot. StyleGAN2 shows pairs of LSUN models with the same FID and similar precision and recall whose images differ clearly in quality, and the difference is captured by PPL: on LSUN Cat, StyleGAN at FID 8.53 has PPL 924, and an early snapshot of StyleGAN2 at the same FID has PPL 387 and produces cat-shaped objects more often (Section 3, Figures 4–5 and 13). Images with low per-image PPL tend to look good, those with high PPL worse. The authors' hypothesis: as the discriminator penalizes broken images, the easiest way for the generator to improve is to stretch the regions of the latent space that give good images, which squeezes the bad ones into small regions of rapid change. Minimizing PPL itself would push toward a degenerate generator with zero recall, so they regularize something weaker: that a fixed-size step in $\mathcal W$ gives a fixed-size change in the image, whatever the step's direction (Section 3.2).
-
-The local behaviour of $g$ at $w$ is captured by its Jacobian $J_w = \partial g(w) / \partial w$. The regularizer is (Eq. 4)
+Models with equal FID can differ visibly in quality, and PPL tracks the difference: the generator, the authors suggest, stretches the regions of $\mathcal W$ that give good images and squeezes bad ones into small regions of rapid change. They ask that a fixed step in $\mathcal W$ give a fixed-size change in the image, in every direction:
 
 $$
-\mathcal L_{\mathrm{pl}} = \mathbb E_{w,\, y \sim \mathcal N(0, I)} \big(\lVert J_w^\top y \rVert_2 - a\big)^2 ,
+\mathcal L_{\mathrm{pl}} = \mathbb E_{w,\, y} \big(\lVert J_w^\top y \rVert_2 - a\big)^2 ,
 $$
 
-where $y$ is a random image with normally distributed pixels, $w = f(z)$ with $z \sim \mathcal N(0, I)$, and $a$ is a running average of $\lVert J_w^\top y \rVert_2$ (decay 0.99), so the network chooses the global scale itself. The Jacobian is never formed. By the chain rule, the gradient of the scalar $g(w) \cdot y$ with respect to $w$ is $J_w^\top y$, so a single backward pass gives $J_w^\top y = \nabla_w \big(g(w) \cdot y\big)$.
+where $J_w = \partial g(w) / \partial w$ is the Jacobian of the synthesis network, $y \sim \mathcal N(0, I)$ is a random image, and $a$ is a running average of the length, so the network picks the global scale. With $a$ at the mean, the penalty is the variance of the length $\ell = \lVert J_w^\top y \rVert$, $\operatorname{Var} \ell \approx \sum_i \sigma_i^4 / (2 \sum_i \sigma_i^2)$ in the singular values $\sigma_i$ of $J_w$, smallest when $J_w$ is orthogonal up to scale (derivation below).
 
-Why does this favour an even mapping? Write the [singular value decomposition](/notes/math/singular-value-decomposition) $J_w^\top = U \Sigma V^\top$ with singular values $\sigma_1, \dots, \sigma_L$ ($L = 512$, the dimension of $\mathcal W$). A standard normal $y$ is unchanged in distribution by the rotation $V^\top$, the components beyond the first $L$ are multiplied by zero, and $U$ does not change lengths, so $\lVert J_w^\top y\rVert$ is distributed as $\big(\sum_{i=1}^{L} \sigma_i^2 \tilde y_i^2\big)^{1/2}$ with independent standard normal $\tilde y_i$. With $a$ at the mean length, the penalty is the variance of this length. The sum $Q = \sum_i \sigma_i^2 \tilde y_i^2$ has mean $\sum_i \sigma_i^2$ and variance $2\sum_i \sigma_i^4$, and for large $L$ the variance of $\sqrt Q$ is approximately $\operatorname{Var} Q / (4\,\mathbb E Q) = \sum_i \sigma_i^4 / \big(2\sum_i \sigma_i^2\big)$. For a fixed $\sum_i \sigma_i^2$, the Cauchy–Schwarz inequality $\big(\sum_i \sigma_i^2\big)^2 \le L \sum_i \sigma_i^4$ makes this smallest when all $\sigma_i$ are equal: a Jacobian that is orthogonal up to a global scale, which preserves lengths and squeezes no direction. The paper reaches the same conclusion with a concentration argument (Appendix C). **Toy numbers:** with $L = 512$ and $\sum_i \sigma_i^2 = 512$, equal singular values give a variance of 0.50; half of them three times larger than the other half give 0.82 (0.81 in a Monte Carlo run with 20,000 draws). Spectral normalization, by contrast, constrains only the largest singular value (see [the WGAN note](/notes/generative-models/wgan#sn-gan-spectral-normalization)); adding it to the generator, with or instead of these changes, always worsened FID (Section 3.2 and Appendix E). The term is weighted by $\gamma_{\mathrm{pl}} = \ln 2 / \big(r^2 (\ln r - \ln 2)\big)$ for output resolution $r$, a choice that worked across all datasets (Appendix B).
+<details>
+<summary>Derivation</summary>
 
-With the regularizer, models behave more reliably, the generator becomes easier to invert, and the distribution of per-image PPL tightens without its mode going to zero. On FFHQ, PPL falls from 158.0 to 122.5 while FID barely moves, 4.38 to 4.34; on LSUN Car, FID rises from 2.83 to 3.43, which points to a trade-off between FID and PPL on less structured datasets (Table 1, rows C and D).
+The Jacobian is never formed: $y$ is a constant, so by linearity of differentiation component $k$ of the gradient of the scalar $g(w) \cdot y = \sum_i y_i\, g_i(w)$ is $\sum_i y_i\, \partial g_i / \partial w_k = (J_w^\top y)_k$, and one backward pass gives $J_w^\top y$. Take the [singular value decomposition](/notes/math/singular-value-decomposition#rotate-stretch-rotate) $J_w^\top = U \Sigma V^\top$ with singular values $\sigma_1, \dots, \sigma_L$, $L = 512$. $U$ preserves lengths, and $\tilde y = V^\top y$ is again $\mathcal N(0, I)$, because an [affine map](/notes/probability/multivariate-gaussian#affine-maps) sends $\mathcal N(0, I)$ to $\mathcal N(0, V^\top V) = \mathcal N(0, I)$. So $\ell^2 = Q = \sum_i \sigma_i^2 \tilde y_i^2$. Then:
 
-### Lazy regularization
+$$
+\begin{aligned}
+\mathbb E\, Q &= \textstyle\sum_i \sigma_i^2 , \\
+\operatorname{Var} Q &= 2 \textstyle\sum_i \sigma_i^4 , \\
+\operatorname{Var} \ell &\approx \frac{\operatorname{Var} Q}{4\, \mathbb E\, Q} = \frac{\sum_i \sigma_i^4}{2 \sum_i \sigma_i^2} .
+\end{aligned}
+$$
 
-The R1 penalty and the path-length term need extra backward passes. StyleGAN2 computes them less often than the main loss: once every $k = 16$ minibatches for the discriminator and $k = 8$ for the generator, in a separate pass (Section 3.1 and Appendix B). The term is multiplied by $k$ to keep the size of its gradients, and because $k$ main steps are now followed by one regularization step, Adam's learning rate and decay rates are adjusted with $c = k/(k+1)$: $\lambda' = c\lambda$, $\beta_1' = \beta_1^{\,c}$, $\beta_2' = \beta_2^{\,c}$. Running R1 once every 16 minibatches did no harm, FID 4.39 to 4.38 on FFHQ (Table 1, row C). With weight demodulation, lazy regularization and code optimizations, training at $1024^2$ rose from 37 to 61 images per second on eight V100 GPUs (Section 6).
+1. The mean uses $\mathbb E\, \tilde y_i^2 = 1$ and linearity of expectation.
+2. The variance adds over the independent terms, and $\operatorname{Var} \tilde y_i^2 = \mathbb E\, \tilde y_i^4 - 1 = 2$: integration by parts with $\varphi'(y) = -y\varphi(y)$ for the standard normal density gives $\int y^3 \cdot y\varphi(y)\,dy = \int 3y^2\varphi(y)\,dy = 3$, the boundary terms vanishing.
+3. The last line expands $\ell = \sqrt Q$ to first order around $\mathbb E\, Q$, $\sqrt Q \approx \sqrt{\mathbb E Q} + (Q - \mathbb E Q)/(2\sqrt{\mathbb E Q})$, accurate when $Q$ concentrates. From the first two lines, $\operatorname{Var} Q/(\mathbb E Q)^2 = 2\sum_i \sigma_i^4/(\sum_i \sigma_i^2)^2 \le 2\max_i \sigma_i^2/\sum_i \sigma_i^2$: for equal singular values $2/L$, a relative spread $\sqrt{2/512} \approx 6\%$, small unless a few $\sigma_i$ dominate.
+
+For a fixed $\sum_i \sigma_i^2$, the Cauchy–Schwarz inequality $\big(\sum_i \sigma_i^2 \cdot 1\big)^2 \le L \sum_i \sigma_i^4$ bounds $\sum_i \sigma_i^4$ from below, with equality only when all $\sigma_i$ are equal: the penalty is smallest for a Jacobian that stretches no direction more than another.
+
+</details>
+
+The Code section checks the formula: 0.50 for equal singular values, 0.82 when half of them are three times the others. The discriminators of StyleGAN and StyleGAN2 carry the **R1 penalty** $\tfrac\gamma2\,\mathbb E_{x\sim P}\lVert\nabla_x D(x)\rVert^2$ on real images, with $\gamma = 10$ in StyleGAN ([Mescheder, Geiger and Nowozin, 2018](#references), Eq. 9); the [StarGAN note](/notes/generative-models/stargan#r1-a-penalty-on-real-images-only) shows why it helps training converge. Both penalties run only every 16 (R1) and 8 (path length) minibatches, **lazy regularization**, with FID 4.38 against 4.40 ([Karras et al., 2020](#references), Table 1).
 
 ### Without progressive growing
 
-[Progressive growing](/notes/generative-models/gan-scaling#progan-growing-the-networks), the training scheme StyleGAN inherited from Progressive GAN, gives StyleGAN a strong location preference for details: when a face turns, the teeth or the eyes can stay aligned with the camera and then jump to the next preferred position (Section 4, Figure 6). The authors' explanation: during growing, each resolution serves for a while as the output resolution, so it is pushed to produce maximal-frequency detail; the trained network keeps excessively high frequencies in its intermediate layers, which compromises shift invariance (Figure 16).
-
-StyleGAN2 keeps the goal of growing, low resolutions first and fine detail later, without changing the network during training. It compares three generators and three discriminators trained without growing (Section 4.1, Figure 7): the original feedforward networks; **skip** connections, where the generator upsamples and sums RGB outputs from every resolution and the discriminator receives a downsampled image at every resolution; and **residual** networks, whose two branches are added and multiplied by $1/\sqrt2$ to keep the variance. FID and PPL on FFHQ (Table 2):
-
-| Generator / discriminator | original | input skips | residual |
-| --- | --- | --- | --- |
-| original | 4.32 / 265 | 4.18 / 235 | 3.58 / 269 |
-| output skips | 4.33 / 169 | 3.77 / 127 | 3.31 / 125 |
-| residual | 4.35 / 203 | 3.96 / 229 | 3.79 / 243 |
-
-Skip connections in the generator improve PPL strongly, and a residual discriminator improves FID. StyleGAN2 uses a skip generator and a residual discriminator. Measuring how much each resolution contributes to the summed output then shows the generator behaving like progressive growing on its own: low resolutions dominate early, higher ones later. But the $1024^2$ layers never took over, and the images looked like sharpened $512^2$ images. Doubling the feature maps of the $64^2$ to $1024^2$ layers of both networks fixed this, at 22% and 21% more parameters for the generator and the discriminator (Section 4.2, Figure 8).
-
-### Results
-
-FFHQ at $1024 \times 1024$; FID and PPL lower is better, precision and recall higher is better (Table 1):
-
-| Configuration | FID | PPL | Precision | Recall |
-| --- | --- | --- | --- | --- |
-| A. StyleGAN | 4.40 | 212.1 | 0.721 | 0.399 |
-| B. + weight demodulation | 4.39 | 175.4 | 0.702 | 0.425 |
-| C. + lazy regularization | 4.38 | 158.0 | 0.719 | 0.427 |
-| D. + path-length regularization | 4.34 | 122.5 | 0.715 | 0.418 |
-| E. + no growing, new G and D | 3.31 | 124.5 | 0.705 | 0.449 |
-| F. + large networks (StyleGAN2) | 2.84 | 145.0 | 0.689 | 0.492 |
-| A with large networks | 3.98 | 199.2 | 0.716 | 0.422 |
-
-FID falls by 35.5%, from 4.40 to 2.84, and recall rises from 0.399 to 0.492. The last row shows that capacity alone does not explain the gain. PPL here is the endpoint version in $\mathcal W$ computed on whole images, without the face crop of the StyleGAN paper, so it is not directly comparable with the earlier table. On LSUN, FID improves from 3.27 to 2.32 for cars, 8.53 to 6.93 for cats, 4.21 to 3.86 for churches and 3.83 to 3.43 for horses, and PPL falls by about half or more in all four (Tables 1 and 3).
+[Progressive growing](/notes/generative-models/gan-scaling#progan-growing-the-networks) gives StyleGAN a strong location preference for details: when a face turns, the teeth stay aligned with the camera, then jump, since each resolution, once an output, keeps producing too high frequencies. StyleGAN2 trains coarse-first with a fixed network: the generator sums upsampled RGB outputs of every resolution (**skip** connections), the discriminator is residual, and low resolutions dominate early, high ones later. With demodulation, path-length regularization and larger networks, FID on FFHQ falls from 4.40 to 2.84.
 
 ## StyleGAN3: details glued to the pixel grid
 
-StyleGAN2 still has a defect that shows in motion. In a latent interpolation, coarse features move, but fine detail such as hair or fur stays fixed in pixel coordinates, as if glued to the screen rather than to the surface of the face: **texture sticking** ([Karras et al., 2021](#references), Section 1, Figure 1). The network has access to unintended positional references: image borders, per-pixel noise inputs, positional encodings, and **aliasing**, the faint after-images of the pixel grid left by non-ideal upsampling filters (nearest, bilinear, strided convolutions) and by pointwise nonlinearities such as ReLU. The network amplifies even slight aliasing and combines it across scales into texture motifs fixed in screen coordinates.
+In a latent interpolation of StyleGAN2, fine detail such as hair stays fixed in pixel coordinates instead of moving with the face: **texture sticking** ([Karras et al., 2021](#references)). The network uses unintended positional references: image borders, the per-pixel noise, and **aliasing**, faint after-images of the pixel grid left by imperfect upsampling filters and by pointwise nonlinearities such as ReLU.
 
-StyleGAN3 treats every feature map as a continuous, bandlimited signal that the pixel grid merely represents, as in the Nyquist–Shannon sampling theorem (Section 2). A layer is then equivariant to a translation or rotation if it commutes with it in the continuous domain, and it must not create frequencies that the output grid cannot represent. Convolution is fine. Upsampling must use a close approximation of the ideal low-pass filter: a windowed sinc with a Kaiser window, since common filters attenuate aliases far too little, and filters with over 100 dB attenuation turn out to be needed. A pointwise nonlinearity can create arbitrarily high frequencies, so it is applied at twice the resolution and low-pass filtered back down, in a custom CUDA kernel (Sections 2.1 and 3.2). The generator also replaces the learned constant with Fourier features that can be translated and rotated exactly, removes the noise inputs, keeps a 10-pixel margin around the canvas instead of relying on padding, and sets the cutoff of each of its 14 layers separately. The rotation-equivariant version **StyleGAN3-R** uses $1 \times 1$ convolutions and radially symmetric filters; the translation-equivariant one is **StyleGAN3-T**. Equivariance is measured as a PSNR in decibels between the output for a transformed input and the transformed output (EQ-T for translation, EQ-R for rotation, Eq. 3).
+The fix treats every feature map as samples of a continuous, bandlimited signal. Sampling cannot tell some frequencies apart: on a grid of 8 samples per unit, $t = n/8$, and
 
-On unaligned FFHQ at $1024^2$ (Figure 5), StyleGAN2 reaches FID 3.79 with EQ-T 15.89 dB, StyleGAN3-T 3.67 with 61.69 dB, and StyleGAN3-R 3.66 with 64.78 dB and an EQ-R of 47.64 dB, against 10.79 for StyleGAN2. On aligned FFHQ the FIDs are 2.70, 2.79 and 3.07. The baseline in this comparison is a StyleGAN2 with Fourier features, not the exact configuration F above. The FID stays level with StyleGAN2 while the internal representation changes completely; the gain is the motion, which matters for video and animation. The price is compute: on FFHQ, 1106 GPU hours for StyleGAN2, 1576 (+42%) for StyleGAN3-T and 2248 (+103%) for StyleGAN3-R.
+$$
+\begin{aligned}
+\cos\big(2\pi \cdot 5 \tfrac n8\big) &= \cos\big(2\pi n - 2\pi \cdot 3 \tfrac n8\big) \\
+&= \cos\big(2\pi \cdot 3 \tfrac n8\big),
+\end{aligned}
+$$
 
-## Editing real images
+because cosine has period $2\pi$ and is even; likewise, on $s$ samples per unit, frequencies $f$ and $s - f$ give identical samples. The **Nyquist–Shannon sampling theorem** makes this a guarantee: a signal with no frequencies at or above $s/2$ is determined by its samples at rate $s$ and rebuilt from them by sinc interpolation ([Oppenheim, Willsky and Nawab, 1997](#references), Sections 7.1–7.2); by the folding above, no two frequencies below $s/2$ share their samples. A layer is **equivariant** to a shift if shifting the continuous input shifts the continuous output, so it must not create frequencies its grid cannot hold.
 
-Everything above controls images that the generator itself produced from a known $w$. To edit a photograph, we first need a $w$ whose image reproduces it: **GAN inversion**, an optimization over the latent, possibly per layer in $\mathcal W^+$, explained with its distortion–editability trade-off in the [drag-editing note](/notes/generative-models/drag-editing#editing-a-real-photo-gan-inversion). StyleGAN2's own projector optimizes $w$ and the noise maps under LPIPS, with ramped-down noise added to $w$ and a regularizer that keeps the noise maps from carrying coherent signal; it stays in $\mathcal W$ rather than $\mathcal W^+$, because the extended space can reproduce arbitrary images that the generator could never have produced (Section 5). The path-length regularized generator is much easier to invert: images generated by StyleGAN2 project back almost perfectly, which makes it possible to attribute a generated image to the network that made it, while projections of real training images show clear differences (Section 5.1, Figures 9–10).
+A ReLU breaks this rule. Take a wave of frequency 3 on 8 samples per unit, below the limit of 4. With $\theta = 2\pi \cdot 3t$, the coefficient of $\cos 2\theta$, frequency 6, in the Fourier series of $\max(0, \cos\theta)$ is
+
+$$
+\begin{aligned}
+a_2 &= \frac1\pi \int_{-\pi/2}^{\pi/2} \cos\theta \cos 2\theta \, d\theta \\
+&= \frac{1}{2\pi} \int_{-\pi/2}^{\pi/2} (\cos 3\theta + \cos\theta)\, d\theta \\
+&= \frac{1}{2\pi}\Big(-\frac23 + 2\Big) = \frac{2}{3\pi} \approx 0.21 ,
+\end{aligned}
+$$
+
+where the integral shrinks to $[-\pi/2, \pi/2]$ because the ReLU output is zero elsewhere, and the second line is the product-to-sum identity. Frequency 6 folds to $8 - 6 = 2$. The table gives the **amplitude** $\lvert \hat x_k\rvert/N$ of the discrete Fourier transform of $N$ samples: the mean at frequency 0, half the cosine coefficient elsewhere. The continuous output has amplitudes $1/\pi \approx 0.318$, $0.25$ at frequency 3 and $\tfrac12 \cdot \tfrac{2}{3\pi} \approx 0.106$ at 6; on the grid, harmonics 12, 18, 24 and higher fold too, giving the alias 0.125 and the mean 0.302. A half-pixel shift, $\tfrac1{16}$ of a unit, only changes phases in the continuous domain, where the pointwise ReLU commutes with it; on the grid the amplitudes change:
+
+| Amplitude after ReLU | 8 per unit | 8, shifted $\tfrac1{16}$ | 16 per unit | 16, shifted $\tfrac1{32}$ |
+| --- | --- | --- | --- | --- |
+| frequency 0 (the mean) | 0.302 | 0.327 | 0.314 | 0.320 |
+| frequency 2 (the alias) | 0.125 | 0.096 | 0.015 | 0.006 |
+| frequency 3 | 0.250 | 0.250 | 0.250 | 0.250 |
+
+The output depends on where the wave sits relative to the pixels, a positional signal the network exploits. The last two columns compute the ReLU on a grid twice as fine and keep only frequencies below 4, an ideal low-pass filter, shifting by half the finer pixel (a shift of $\tfrac1{16}$ would move a whole sample and prove nothing). The dependence shrinks about fourfold, 0.015 against 0.006, but harmonics 18 and above still fold. StyleGAN3 found twice the resolution sufficient; four times raised translation equivariance from 66.7 to 74.2 dB for 2.3 times the training time ([Karras et al., 2021](#references), Figure 3).
+
+StyleGAN3 builds the generator from such operations: windowed-sinc upsampling, close to the ideal low-pass filter; each nonlinearity at twice the resolution between an upsampling and a filtered downsampling; exactly shiftable Fourier features instead of the learned constant; no noise inputs; a margin instead of padding. FID stays level with StyleGAN2, and detail moves with the surface. The rotation-equivariant variant costs about twice the compute, 2,248 against 1,106 GPU-hours on FFHQ at $1024^2$ (Section 4).
+
+## Where control breaks
+
+StyleGAN controls images it produced from a known $w$. Editing a photograph first needs a $w$ that reproduces it, **GAN inversion**, explained with its fidelity–editability trade-off in the [drag-editing note](/notes/generative-models/drag-editing#editing-a-real-photo-gan-inversion). What lies outside the generator's range cannot be reached; the path-length regularized StyleGAN2 is markedly easier to invert.
+
+Nothing guarantees disentanglement: the separability of $\mathcal W$ stays well above its floor of 1, PPL rises again late in training, and factors such as hair style spread over several layer groups. All three papers train one model per kind of object, mostly on aligned crops.
 
 ## What changed
 
 | | Traditional generator | InfoGAN | StyleGAN | StyleGAN2 | StyleGAN3 |
 | --- | --- | --- | --- | --- | --- |
-| Where the code enters | first layer | first layer, as $(z, c)$ | every layer, as styles from $w = f(z)$ | every layer, as weight modulation | every layer, as weight modulation |
-| Source of control | none | MI term with an auxiliary network | architecture: mapping network, styles, noise | the same | the same |
-| Normalization in the generator | batch or pixel norm | batch norm | AdaIN | demodulation of the weights | demodulation, filtered resampling |
-| Random detail | from $z$ | from $z$ | per-pixel noise | per-pixel noise | noise removed |
-| Training schedule | progressive growing (Progressive GAN) | fixed network | progressive growing | skip G, residual D, no growing | no growing |
-| Known artifact addressed | – | trivial use of the code | entanglement of $\mathcal Z$ | droplets, phase artifacts | texture sticking |
+| Where the code enters | first layer | first layer, as $(z, c)$ | every layer, as AdaIN styles of $w = f(z)$ | every layer, as weight modulation | the same |
+| Source of control | none | an information term | the architecture | the same | the same |
+| Random detail | from $z$ | from $z$ | per-pixel noise | per-pixel noise | no noise |
+| Artifact addressed | – | the code is ignored | entangled $z$ | droplets, details tied to positions | texture sticking |
 
-## Limitations
+## What you should remember
 
-- **No encoder.** A StyleGAN maps codes to images only. Editing a real photo needs an inversion by optimization or a separately trained encoder, and what lies outside the generator's range cannot be reached.
-- **Disentanglement is encouraged, not guaranteed.** The mapping network gives the generator room to straighten $\mathcal W$, but nothing forces it. The metrics improve without reaching their ideal values, the separability score of $\mathcal W$ is 3.79 against a floor of 1, and PPL rises again late in training.
-- **The coarse, middle and fine split is found, not specified.** Which attributes end up in which layers depends on the data and the training run, and some factors, like hair style, are spread over several groups.
-- **Demodulation is approximate.** It equalizes output variance only under its statistical assumption, and needs grouped convolutions with per-sample weights.
-- **Trade-offs remain.** Path-length regularization can cost FID on less structured datasets, truncation trades variety for quality, and the rotation-equivariant StyleGAN3-R needs about twice the GPU hours of StyleGAN2.
-- **One kind of object per model.** The results of all three StyleGAN papers are on collections of a single kind of object, such as faces, cars, cats, bedrooms or beaches, often aligned. FFHQ is aligned and cropped; StyleGAN3 created unaligned versions of FFHQ and MetFaces to test equivariance.
-
-## Summary
-
-- A GAN's input $z$ follows a fixed distribution that must cover the data, so missing combinations of factors force a curved, entangled map from $\mathcal Z$ to images.
-- InfoGAN adds a code $c$ and maximizes a variational lower bound $\mathbb E \log q_\phi(c \mid G(z, c)) + H(c)$ on the mutual information between $c$ and the image; on MNIST it finds digit class, rotation and width without labels, but the codes are designed by hand and the rest of $z$ stays entangled.
-- StyleGAN maps $z$ through an 8-layer MLP to $w$, starts synthesis from a learned constant, injects $w$ through a per-layer affine map and AdaIN, adds per-pixel noise for stochastic detail, and regularizes with style mixing. Coarse styles carry pose and shape, middle ones facial features, fine ones colour and microstructure; truncation shrinks $w$ toward $\bar w$.
-- Perceptual path length and linear separability measure disentanglement without an encoder; both favour $\mathcal W$ over $\mathcal Z$.
-- StyleGAN2 replaces AdaIN's data-dependent normalization by weight modulation $w' = s_i w$ and demodulation $w'' = w' / \lVert w'_{j} \rVert_2$, which removes the droplets; adds path-length regularization that favours an orthogonal Jacobian; computes regularizers lazily; and replaces progressive growing with a skip generator and a residual discriminator. FFHQ FID falls from 4.40 to 2.84.
-- StyleGAN3 removes aliasing by treating feature maps as continuous signals, which ends texture sticking at the same FID.
+- A fixed prior that must cover correlated data forces an entangled map from $z$ to images.
+- InfoGAN: maximize $\mathbb E \log q_\phi(c \mid G(z, c)) + H(c) \le I(c; x)$; the codes are chosen by hand.
+- StyleGAN: $w = f(z)$, a learned constant, per-layer AdaIN styles, per-pixel noise; coarse layers set layout, fine ones texture.
+- StyleGAN2: $w''_{ijk} = s_i w_{ijk} / \sigma_j$, exact only for independent inputs.
+- StyleGAN3: run nonlinearities at twice the resolution and filter, against aliases.
 
 ## Code
 
-A modulated convolution with per-sample weights, run as one grouped convolution, and a numerical check of the identity behind the path-length regularizer. It runs in about a second on a CPU.
+A modulated convolution with one style vector per sample, the variance of $\lVert J^\top y \rVert$ behind the path-length penalty, and the aliasing of a ReLU on a pixel grid; NumPy only, about two seconds.
 
 ```python
-import torch
-import torch.nn.functional as F
+import numpy as np
+from numpy.lib.stride_tricks import sliding_window_view
 
-torch.manual_seed(0)
+rng = np.random.default_rng(0)
 
-# 1. A modulated 3x3 convolution with per-sample weights, run as one grouped convolution.
-N, C, k, H = 4, 64, 3, 32                       # 4 samples, 64 channels in and out
-x = torch.randn(N, C, H, H)                     # i.i.d. unit-variance inputs
-w = torch.randn(C, C, k, k) / (C * k * k) ** 0.5
-s = torch.exp(1.5 * torch.randn(N, C))          # one style vector per sample
-wm = w[None] * s[:, None, :, None, None]        # modulate: (N, C_out, C_in, k, k)
-wd = wm * (wm.pow(2).sum([2, 3, 4], keepdim=True) + 1e-8).rsqrt()   # demodulate
+# 1. A modulated 3x3 convolution with one style vector per sample.
+N, C, k, H = 4, 64, 3, 32                        # 4 samples, 64 channels in and out
+x = rng.standard_normal((N, C, H, H))            # i.i.d. unit-variance inputs
+w = rng.standard_normal((C, C, k, k)) / np.sqrt(C * k * k)   # (out, in, k, k)
+s = np.exp(1.5 * rng.standard_normal((N, C)))    # styles s_i, one vector per sample
+wm = w[None] * s[:, None, :, None, None]         # modulate: (N, out, in, k, k)
+wd = wm / np.sqrt((wm ** 2).sum(axis=(2, 3, 4), keepdims=True) + 1e-8)   # demodulate
 
-def conv(weights):
-    y = F.conv2d(x.reshape(1, N * C, H, H), weights.reshape(N * C, C, k, k), groups=N)
-    return y.reshape(N, C, H - 2, H - 2)
-
+patches = sliding_window_view(x, (k, k), axis=(2, 3))     # (N, in, 30, 30, k, k)
 for name, wt in [("modulated", wm), ("demodulated", wd)]:
-    sd = conv(wt).std(dim=(2, 3))               # std of every output channel of every sample
-    print(f"{name:12s} std of channels: min {sd.min():.2f}, max {sd.max():.2f}")
-# modulated    std of channels: min 3.31, max 6.62
-# demodulated  std of channels: min 0.92, max 1.06
+    y = np.einsum("nichab,noiab->noch", patches, wt)      # per-sample weights
+    sd = y.std(axis=(2, 3))
+    print(f"{name:12s} channel std: min {sd.min():.2f}, max {sd.max():.2f}")
+# modulated    channel std: min 1.97, max 7.12
+# demodulated  channel std: min 0.92, max 1.07
 
-# 2. The path-length trick: J^T y equals the gradient of g(w) . y with respect to w.
-g = torch.nn.Sequential(torch.nn.Linear(8, 32), torch.nn.LeakyReLU(0.2), torch.nn.Linear(32, 100))
-wv = torch.randn(8, requires_grad=True)
-y = torch.randn(100)                            # a random "image" direction
-J = torch.autograd.functional.jacobian(g, wv)   # 100 x 8
-(grad,) = torch.autograd.grad(g(wv) @ y, wv)
-print("max |J^T y - grad| =", f"{(J.T @ y - grad).abs().max():.1e}")
-# max |J^T y - grad| = 3.6e-07   (float32 rounding)
+# 2. The path-length penalty is the variance of |J^T y|; it is smallest for equal singular values.
+L = 512
+y = rng.standard_normal((20000, L))
+for name, sig in [("equal", np.ones(L)), ("half 3x larger", np.r_[np.ones(256), 3 * np.ones(256)])]:
+    sig = sig * np.sqrt(L / (sig ** 2).sum())            # same sum of sigma_i^2 = 512
+    length = np.sqrt((sig ** 2 * y ** 2).sum(axis=1))
+    print(f"{name:15s} Var|J^T y| = {length.var():.2f}, formula {(sig**4).sum() / (2 * (sig**2).sum()):.2f}")
+# equal           Var|J^T y| = 0.51, formula 0.50
+# half 3x larger  Var|J^T y| = 0.84, formula 0.82
+
+# 3. Aliasing: ReLU of a frequency-3 wave on a grid, shifted by half a pixel.
+def relu_spectrum(pixels_per_unit, shift):
+    t = np.arange(pixels_per_unit) / pixels_per_unit
+    out = np.maximum(0, np.cos(2 * np.pi * 3 * (t - shift)))
+    return np.abs(np.fft.rfft(out))[:4] / pixels_per_unit   # amplitudes at frequencies 0..3
+
+for m in [8, 16]:                                 # 8: the layer's grid; 16: twice the resolution, then low-pass
+    print(m, relu_spectrum(m, 0).round(3), relu_spectrum(m, 1 / (2 * m)).round(3))   # shift by half of its pixel
+# 8 [0.302 0.    0.125 0.25 ] [0.327 0.    0.096 0.25 ]
+# 16 [0.314 0.    0.015 0.25 ] [0.32  0.    0.006 0.25 ]
 ```
 
 ## Next
 
-StyleGAN controls what it generates: coarse and fine styles, a truncation knob, directions in $\mathcal W$. It still has no way back from an image to its code. Inversion is an optimization run separately for every photograph, and nothing in training ensures that a real image has a good code at all. The [next note](/notes/generative-models/alpha-gan) gives a GAN an encoder, trained together with the generator: adversarial autoencoders and α-GAN.
+StyleGAN has no way back from an image to its code: inversion is an optimization run separately for every photograph, and nothing in training ensures that a real image has a good code. The [next note](/notes/generative-models/alpha-gan) trains an encoder together with the generator: adversarial autoencoders and α-GAN.
 
 ## Where to see the images
 
-These models are best judged by their samples. Each line says where to find them; figure numbers refer to the linked arXiv version.
+Figure numbers refer to the linked arXiv versions.
 
-- **InfoGAN** ([Chen et al., 2016](#references); [arXiv v1](https://arxiv.org/abs/1606.03657v1)): one latent code varied at a time on MNIST in Figure 2 (digit class, rotation, width), on 3D faces in Figure 3, 3D chairs in Figure 4, SVHN in Figure 5 and CelebA in Figure 6.
-- **StyleGAN** ([Karras, Laine and Aila, 2019](#references); [arXiv v3](https://arxiv.org/abs/1812.04948v3)): uncurated FFHQ faces in Figure 2; style mixing in Figure 3; stochastic variation from the noise inputs in Figures 4 and 5; the truncation trick in Figure 8; uncurated LSUN bedrooms, cars and cats in Figures 10–12; [repository with the result video](https://github.com/NVlabs/stylegan).
-- **StyleGAN2** ([Karras et al., 2020](#references); [arXiv v2](https://arxiv.org/abs/1912.04958v2)): droplet artifacts in Figure 1 and their removal by demodulation in Figure 3; phase artifacts of progressive growing in Figure 6; hand-picked samples in Figure 11 and uncurated samples for every dataset in Figure 12; [repository with the result video and example images](https://github.com/NVlabs/stylegan2).
-- **StyleGAN3** ([Karras et al., 2021](#references); [arXiv v4](https://arxiv.org/abs/2106.12423v4)): texture sticking in Figure 1; internal feature maps of StyleGAN2 and StyleGAN3 in Figure 6; uncurated samples for FFHQ-U, MetFaces-U, AFHQv2 and Beaches in Figures 7–10; [project page with videos](https://nvlabs.github.io/stylegan3/). Texture sticking shows only in motion, so the videos say more than the figures.
+- InfoGAN ([arXiv v1](https://arxiv.org/abs/1606.03657v1)): MNIST codes varied one at a time, Figure 2.
+- StyleGAN ([arXiv v3](https://arxiv.org/abs/1812.04948v3)): uncurated faces, Figure 2; style mixing, Figure 3; noise, Figure 4; truncation, Figure 8.
+- StyleGAN2 ([arXiv v2](https://arxiv.org/abs/1912.04958v2)): droplets, Figure 1; details stuck under progressive growing, Figure 6.
+- StyleGAN3 ([project page with videos](https://nvlabs.github.io/stylegan3/)): texture sticking shows only in motion.
 
 ## References
 
-- X. Chen, Y. Duan, R. Houthooft, J. Schulman, I. Sutskever, P. Abbeel. [InfoGAN: Interpretable representation learning by information maximizing generative adversarial nets](https://arxiv.org/abs/1606.03657). NeurIPS, 2016. Section 4: the mutual-information objective; Section 5: the variational lower bound and Lemma 5.1; Section 7 and Appendix C: experiments and architectures.
-- T. Karras, S. Laine, T. Aila. [A style-based generator architecture for generative adversarial networks](https://arxiv.org/abs/1812.04948). CVPR, 2019. Section 2: the generator, Eq. 1 (AdaIN), Table 1; Section 3: style mixing, noise, Table 2; Section 4: perceptual path length and linear separability, Tables 3–4; Appendix A: FFHQ; Appendix B: truncation in $\mathcal W$.
-- T. Karras, S. Laine, M. Aittala, J. Hellsten, J. Lehtinen, T. Aila. [Analyzing and improving the image quality of StyleGAN](https://arxiv.org/abs/1912.04958). CVPR, 2020. Section 2: droplets, weight demodulation (Eqs. 1–3); Section 3: path-length and lazy regularization (Eq. 4); Section 4: architectures without progressive growing, Tables 1–2; Section 5: projection; Appendices B–C.
-- T. Karras, M. Aittala, S. Laine, E. Härkönen, J. Hellsten, J. Lehtinen, T. Aila. [Alias-free generative adversarial networks](https://arxiv.org/abs/2106.12423). NeurIPS, 2021. Sections 2–3: continuous signal interpretation and the redesigned generator; Figure 5: results.
+- X. Chen, Y. Duan, R. Houthooft, J. Schulman, I. Sutskever, P. Abbeel. [InfoGAN: Interpretable representation learning by information maximizing generative adversarial nets](https://arxiv.org/abs/1606.03657). NeurIPS, 2016. Section 5: the variational lower bound (Lemma 5.1); Section 7: experiments, including the 5% MNIST error.
+- T. Karras, S. Laine, T. Aila. [A style-based generator architecture for generative adversarial networks](https://arxiv.org/abs/1812.04948). CVPR, 2019. Section 2 and Table 1: the generator, AdaIN and the constant input; Section 3: style mixing (Figure 3, Table 2) and noise; Section 4: the entanglement argument (Figure 6), perceptual path length and linear separability (Table 4); Appendix B: truncation in $\mathcal W$; Appendix C: R1 with $\gamma = 10$.
+- T. Karras, S. Laine, M. Aittala, J. Hellsten, J. Lehtinen, T. Aila. [Analyzing and improving the image quality of StyleGAN](https://arxiv.org/abs/1912.04958). CVPR, 2020. Section 2: droplets and weight demodulation (Eqs. 1–3); Section 3: lazy and path-length regularization (Eq. 4, Appendix C; intervals 16 and 8 in Appendix B); Section 4: networks without progressive growing; Table 1: FID 4.40 to 2.84.
+- T. Karras, M. Aittala, S. Laine, E. Härkönen, J. Hellsten, J. Lehtinen, T. Aila. [Alias-free generative adversarial networks](https://arxiv.org/abs/2106.12423). NeurIPS, 2021. Sections 2–3: the continuous interpretation, filtered nonlinearities and the redesigned generator; Figure 3: oversampling $m = 2$ against 4; Section 4: training times.
+- L. Mescheder, A. Geiger, S. Nowozin. [Which training methods for GANs do actually converge?](https://arxiv.org/abs/1801.04406). ICML, 2018. Section 4.1, Eq. 9: the R1 penalty.
 - X. Huang, S. Belongie. [Arbitrary style transfer in real-time with adaptive instance normalization](https://arxiv.org/abs/1703.06868). ICCV, 2017. AdaIN.
+- A. V. Oppenheim, A. S. Willsky, S. H. Nawab. *Signals and Systems*, 2nd ed. Prentice Hall, 1997. Sections 7.1–7.2: the sampling theorem and reconstruction by interpolation; Section 7.3: aliasing.
 - R. Zhang, P. Isola, A. A. Efros, E. Shechtman, O. Wang. [The unreasonable effectiveness of deep features as a perceptual metric](https://arxiv.org/abs/1801.03924). CVPR, 2018. LPIPS, the distance inside perceptual path length.
+- A. Ryzhikov, A. Khizhik et al. [Lecture 4: StyleGAN](https://github.com/HSE-LAMBDA/DeepGenerativeModels/blob/spring-2025-long/lectures/04_Lecture_StyleGAN.pdf). HSE *Deep Generative Models*, spring 2025. StyleGAN3's continuous and discrete signal operations, step by step.

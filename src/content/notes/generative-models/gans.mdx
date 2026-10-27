@@ -1,9 +1,9 @@
 ---
 title: Generative adversarial networks
-description: The GAN as a two-player minimax game, its value function read as a binary cross-entropy, the alternating training loop, the optimal discriminator, the Jensen–Shannon identity behind the global optimum, why practice uses the non-saturating generator loss computed from logits, the practical rules that make training work (DCGAN architecture, balancing the players, label smoothing, remedies for mode collapse), and the conditional, f-GAN and least-squares extensions.
+description: "How to train a sampler that has no density: a classifier learns to tell its samples from real data, the generator learns to fool it, and the game minimizes the Jensen–Shannon divergence."
 course: generative-models
 section: GANs
-order: 8
+order: 13
 status: published
 tags: [gan, minimax, binary-cross-entropy, js-divergence, optimal-discriminator, non-saturating-loss, dcgan, mode-collapse, f-gan, lsgan]
 prerequisites: ["Entropy, cross-entropy and KL divergence", Binary cross-entropy, Expectation]
@@ -17,347 +17,349 @@ import SaturatingLoss from '../../../components/figures/gans/SaturatingLoss.astr
 import FenchelConjugate from '../../../components/figures/gans/FenchelConjugate.astro';
 import LeastSquaresPull from '../../../components/figures/gans/LeastSquaresPull.astro';
 
-The [VAE](/notes/generative-models/vae) trains its generator through a bound on the likelihood and pays for it with blurry samples. A generative adversarial network (GAN) avoids likelihoods altogether ([Goodfellow et al., 2014](#references)). The generator is a network that turns noise into samples, and it is trained only through a second network, the discriminator, which tries to tell generated samples from real ones. The model is *implicit*: we can sample from it, but we cannot evaluate its density.
+Take a network that turns Gaussian noise into $64 \times 64$ images. You can draw samples and [score](/notes/generative-models/fid) them, but not compute the probability of a training image: that is an integral over all noise vectors that map near it, with no closed form. How do you train it without maximum likelihood?
 
-Two facts organize this note; the rest shows where they come from.
+A **two-sample test** decides from two sets of samples whether they come from the same distribution. In high dimension no fixed statistic is sharp enough, so learn one: a classifier that tells real images from generated ones. Where it beats chance shows where the generator is wrong; if the generator matches the data, no classifier beats a coin. A **generative adversarial network** (GAN) trains the sampler against such a classifier ([Goodfellow et al., 2014](#references)).
 
-- **If the discriminator is optimal**, the generator's objective becomes the [Jensen–Shannon divergence](/notes/generative-models/entropy-and-divergences#jensenshannon-divergence) in disguise: $2\,D_{\mathrm{JS}}(p_{\text{data}}\,\|\,p_g) - 2\ln 2$. Training the generator then means minimizing $D_{\mathrm{JS}}(p_{\text{data}}\,\|\,p_g)$.
-- **If the supports of the two distributions do not overlap** and the discriminator is (near-)optimal, the minimax generator loss gives no useful gradient: JS is stuck at its maximum $\ln 2$ wherever $p_g$ sits, and the optimal discriminator is constant around the generated samples.
-
-**Notation.** $p_{\text{data}}(x)$ is the data density, $p_z(z)$ the noise prior, $G$ the generator with parameters $\theta_g$, $p_g(x)$ the density of the generated samples $G(z)$, and $D$ the discriminator with parameters $\theta_d$; $D(x) \in [0, 1]$ is the probability that $x$ is real, with $\ln 0 = -\infty$. A network with a sigmoid output takes values in $(0, 1)$ and can only approach the endpoints. Logarithms are natural.
-
-**Reading route.** A first pass follows the game, the alternating updates, the optimal discriminator and its JS identity, the non-saturating loss computed from logits, mode collapse, and then the [Wasserstein GAN](/notes/generative-models/wgan). The f-GAN and least-squares extensions are optional depth.
+Likelihood and sample quality can disagree anyway. A model that puts weight $0.01$ on the true density and $0.99$ on noise loses at most $\ln 100 \approx 4.6$ nats per image: the logarithm is increasing, so $\ln(0.01\,p + 0.99\,q) \ge \ln(0.01\,p) = \ln p - \ln 100$. The log-likelihood of an image grows with its number of pixels, so in high dimension this loss is negligible, yet 99 samples in 100 are noise ([CS236, lecture 9](#references)).
 
 ## The setup
 
-Sample noise $z \sim p_z(z)$, for example a standard Gaussian, and pass it through the generator. The output $G(z)$ is a generated sample, and its distribution is $p_g(x)$. The discriminator receives either a generated sample, labelled $y = 0$ (fake), or a data point $x \sim p_{\text{data}}(x)$, labelled $y = 1$ (real), and outputs the probability that its input is real.
+Sample noise $z$ from a simple prior $p_z$, such as a standard Gaussian, and pass it through the **generator** $G$, a network with parameters $\theta_g$. The outputs $G(z)$ have some distribution $p_g$ on image space. The **discriminator** $D$, with parameters $\theta_d$, receives either a generated sample, labelled $y = 0$, or a data point $x \sim p_{\text{data}}$, labelled $y = 1$, and outputs $D(x) \in (0, 1)$, the probability that its input is real.
 
 <GanSchematic />
 
-The generator never sees real data directly. It learns only through the discriminator's output, and the discriminator learns to separate the two streams.
+The generator never sees a training image; its only signal is the gradient of the discriminator's output. The model is **implicit**: it defines $p_g$ by a sampling procedure and never writes down a density.
 
 ## A minimax game
 
-The two networks play a **minimax** game: the discriminator **maximizes** its success, and the generator **minimizes** the discriminator's success. Success is measured by the **value function**
+The discriminator wants $D(x)$ near 1 on real data and $D(G(z))$ near 0 on fakes. The generator wants the opposite on its fakes. Both goals are measured by one **value function**
 
 $$
 \begin{aligned}
-V(G, D) ={}& \mathbb{E}_{x\sim p_{\text{data}}}\big[\ln D(x)\big] \\
-&+ \mathbb{E}_{z\sim p_z}\big[\ln\big(1 - D(G(z))\big)\big],
+V(G, D) ={}& \mathbb E_{x\sim p_{\text{data}}}\big[\ln D(x)\big] \\
+&+ \mathbb E_{z\sim p_z}\big[\ln\big(1 - D(G(z))\big)\big],
 \end{aligned}
 $$
 
-and the game is $\min_G \max_D V(G, D)$.
-
-The discriminator wants $D(x)$ close to $1$ on real data and $D(G(z))$ close to $0$ on fakes; both make $V$ larger. The generator wants $D(G(z))$ close to $1$, which makes the second term very negative.
+which the discriminator maximizes and the generator minimizes: the game is $\min_G \max_D V(G, D)$.
 
 ### Where the value function comes from: binary cross-entropy
 
-The discriminator is a binary classifier, so start from the **binary cross-entropy** between a label $y$ and a prediction $\hat y$:
+The discriminator is a binary classifier, so its natural loss is the **binary cross-entropy** between a label $y$ and a prediction $\hat y$:
 
 $$
-H(y, \hat y) = -\big[\,y\ln\hat y + (1 - y)\ln(1 - \hat y)\,\big].
+H(y, \hat y) = -\big[y\ln\hat y + (1 - y)\ln(1 - \hat y)\big] .
 $$
 
-- For a real sample, $y = 1$, $\hat y = D(x)$ and $H = -\ln D(x)$.
-- For a fake sample, $y = 0$, $\hat y = D(G(z))$ and $H = -\ln\big(1 - D(G(z))\big)$.
-
-For one real and one fake sample the total is $H = -\big[\ln D(x) + \ln\big(1 - D(G(z))\big)\big]$. Averaging over many such pairs turns the sums into expectations:
+A real sample has $y = 1$ and costs $-\ln D(x)$. A fake has $y = 0$ and costs $-\ln\big(1 - D(G(z))\big)$. In a stream with as many real samples as fakes, each kind has weight $\tfrac12$, so by linearity of expectation the mean loss is
 
 $$
 \begin{aligned}
-\mathbb{E}[-H] ={}& \mathbb{E}_{x\sim p_{\text{data}}}\big[\ln D(x)\big] \\
-&+ \mathbb{E}_{z\sim p_z}\big[\ln\big(1 - D(G(z))\big)\big],
+\bar H &= \tfrac12\,\mathbb E_x\big[-\ln D(x)\big] \\
+&\quad + \tfrac12\,\mathbb E_z\big[-\ln\big(1 - D(G(z))\big)\big] \\
+&= -\tfrac12\,V(G, D) .
 \end{aligned}
 $$
 
-which for continuous distributions reads
-
-$$
-\begin{aligned}
-&\int p_{\text{data}}(x)\ln D(x)\,dx \\
-&\quad + \int p_z(z)\ln\big(1 - D(G(z))\big)\,dz .
-\end{aligned}
-$$
-
-This is exactly $V(G, D)$. So **$V$ is the negative binary cross-entropy** of the discriminator: maximizing $V$ over $D$ is the same as training $D$ as an ordinary classifier with a BCE loss. The two terms have equal weight because the classifier sees real and fake samples in equal proportion, a class prior of $\tfrac12$. With other proportions both $V$ and the optimal discriminator below change.
+The factor $\tfrac12$ does not move the maximizer, so maximizing $V$ over $D$ is ordinary classifier training with class prior $\tfrac12$.
 
 ## How to optimize: alternate the players
 
-The two players take turns, each with a minibatch of size $m$ ([Goodfellow et al., 2014](#references), Algorithm 1).
+The two networks take turns, each step on a minibatch of size $m$ ([Goodfellow et al., 2014](#references), Algorithm 1).
 
-1. **Fix $G$.** Take $m$ real samples $x^{(1)},\dots,x^{(m)}$ and $m$ noise samples $z^{(1)},\dots,z^{(m)}$, and update $\theta_d$ by gradient **ascent** along
+1. Fix $G$. Draw real samples $x^{(1)}, \dots, x^{(m)}$ and noise $z^{(1)}, \dots, z^{(m)}$, and take a gradient **ascent** step on $\theta_d$ along
 $$
-\begin{aligned}
-\nabla_{\theta_d}\,\frac1m\sum_{i=1}^{m}\Big[&\ln D\big(x^{(i)}\big) \\
-&+ \ln\Big(1 - D\big(G(z^{(i)})\big)\Big)\Big].
-\end{aligned}
+\nabla_{\theta_d}\,\frac1m\sum_{i=1}^{m}\Big[\ln D\big(x^{(i)}\big) + \ln\Big(1 - D\big(G(z^{(i)})\big)\Big)\Big].
 $$
-2. **Fix $D$.** Take $m$ fresh noise samples and update $\theta_g$ by gradient **descent** along
+2. Fix $D$. Draw fresh noise and take a gradient **descent** step on $\theta_g$ along
 $$
 \nabla_{\theta_g}\,\frac1m\sum_{i=1}^{m}\ln\Big(1 - D\big(G(z^{(i)})\big)\Big).
 $$
 
-The generator step uses only the second term because **the first term does not depend on $G$**: $\ln D(x)$ involves real data and $\theta_d$ only, so its gradient with respect to $\theta_g$ is zero. Step 1 may be repeated $k$ times per generator step; the original paper used $k = 1$. How to choose $k$ is discussed under [balancing the two players](#balancing-the-two-players).
+The generator's step drops the first term because $\ln D(x)$ on real data does not depend on $\theta_g$. Step 1 can be repeated $k$ times per generator step; the original paper used $k = 1$ (see the [balance section](#balancing-the-two-players)).
 
 ## Global optimality: the generator matches the data
 
-The game is won when the generator's distribution **equals the data distribution**. The proof has two steps ([Goodfellow et al., 2014](#references), Proposition 1 and Theorem 1).
+Why should this game end with $p_g = p_{\text{data}}$? The argument has two steps. It assumes that both distributions have densities on the same space and that $D$ can be any function ([Goodfellow et al., 2014](#references), Section 4).
 
 ### Step 1: the optimal discriminator for a fixed generator
 
-As in [Goodfellow et al. (2014)](#references), Section 4, we assume that both distributions have densities on the same space and that $D$ can be any function (infinite capacity). When $\dim z < \dim x$ the first assumption fails, and the paragraph on non-overlapping supports below covers that case.
-
-Rewrite the second expectation over generated samples: $x = G(z)$ has density $p_g$, so $\mathbb{E}_{z\sim p_z}\big[\ln(1 - D(G(z)))\big] = \mathbb{E}_{x\sim p_g}\big[\ln(1 - D(x))\big]$. Then, for fixed $G$,
+The generated samples $x = G(z)$ have density $p_g$, so the second expectation can be taken over $x \sim p_g$:
 
 $$
 \begin{aligned}
-V(G, D) = \int_x \Big[\,&p_{\text{data}}(x)\ln D(x) \\
+V(G, D) = \int \Big[&p_{\text{data}}(x)\ln D(x) \\
 &+ p_g(x)\ln\big(1 - D(x)\big)\Big]\,dx .
 \end{aligned}
 $$
 
-$D$ can be chosen freely at every $x$, so the integrand can be maximized pointwise. Write $a = p_{\text{data}}(x)$, $b = p_g(x)$ and $s = D(x)$. If $a, b > 0$, the function $f(s) = a\ln s + b\ln(1 - s)$ on $(0, 1)$ has
+$D$ can take any value at every $x$, so we maximize the integrand pointwise. Write $a = p_{\text{data}}(x)$, $b = p_g(x)$ and $s = D(x)$. For $a, b > 0$,
 
 $$
 \begin{aligned}
-f'(s) &= \frac{a}{s} - \frac{b}{1 - s} = 0 \;\Longrightarrow\; s^* = \frac{a}{a + b}, \\
-f''(s) &= -\frac{a}{s^2} - \frac{b}{(1 - s)^2} < 0,
+f(s) &= a\ln s + b\ln(1 - s), \\
+f'(s) &= \frac{a}{s} - \frac{b}{1 - s} = 0 , \\
+s^* &= \frac{a}{a + b} .
 \end{aligned}
 $$
 
-so $s^*$ is the unique maximum, and it lies inside $(0, 1)$. If exactly one density vanishes, $f$ is monotone on $[0, 1]$ and its maximum sits at an endpoint: $s^* = 1$ where $b = 0$ (only data) and $s^* = 0$ where $a = 0$ (only fakes). The formula $a/(a + b)$ gives these values too; a sigmoid output can only approach them. Where both densities vanish, $D$ does not matter ([Goodfellow et al., 2014](#references), Proposition 1).
+The second derivative, $-a/s^2 - b/(1 - s)^2$, is negative, so $s^*$ is the unique maximum. Where only one density is positive, $f$ is monotone and the same formula gives the endpoint, $s^* = 1$ or $0$; where both vanish, $D$ does not matter.
 
 <PointwiseMaximum />
 
-Hence, for a fixed generator, the best discriminator is
+For a fixed generator the best discriminator is therefore
 
 $$
 D^*_G(x) = \frac{p_{\text{data}}(x)}{p_{\text{data}}(x) + p_g(x)} .
 $$
 
+It is the posterior probability of "real" when real and fake samples are equally likely a priori.
+
 <OptimalDiscriminator />
 
 ### Step 2: substitute the optimal discriminator and recognize JS
 
-Plug $D^*_G$ back into $V$. Since $1 - D^*_G = \dfrac{p_g}{p_{\text{data}} + p_g}$,
+Put $D^*_G$ back into $V$, using $1 - D^*_G = p_g / (p_{\text{data}} + p_g)$:
 
 $$
 \begin{aligned}
-C(G) :={}& \max_D V(G, D) = V(G, D^*_G) \\
-={}& \mathbb{E}_{x\sim p_{\text{data}}}\ln\frac{p_{\text{data}}(x)}{p_{\text{data}}(x) + p_g(x)} \\
-&+ \mathbb{E}_{x\sim p_g}\ln\frac{p_g(x)}{p_{\text{data}}(x) + p_g(x)} .
+C(G) &= \max_D V(G, D) \\
+&= \mathbb E_{p_{\text{data}}}\ln\frac{p_{\text{data}}}{p_{\text{data}} + p_g} \\
+&\quad + \mathbb E_{p_g}\ln\frac{p_g}{p_{\text{data}} + p_g} .
 \end{aligned}
 $$
 
-The Jensen–Shannon divergence ([defined here](/notes/generative-models/entropy-and-divergences#jensenshannon-divergence)) compares each distribution with the mixture $m = \tfrac12(p_1 + p_2)$. Written with expectations,
+The [Jensen–Shannon divergence](/notes/generative-models/entropy-and-divergences#jensenshannon-divergence) compares each distribution with the mixture $m = \tfrac12(p_{\text{data}} + p_g)$. To bring it in, write each denominator as $2m$ and pull out the 2, which costs $\ln 2$ per expectation:
 
 $$
 \begin{aligned}
-D_{\mathrm{JS}}(p_1\,\|\,p_2) &= \tfrac12 D_{\mathrm{KL}}(p_1\,\|\,m) \\
-&\quad + \tfrac12 D_{\mathrm{KL}}(p_2\,\|\,m) \\
-&= \tfrac12\,\mathbb{E}_{x\sim p_1}\ln\frac{p_1(x)}{m(x)} \\
-&\quad + \tfrac12\,\mathbb{E}_{x\sim p_2}\ln\frac{p_2(x)}{m(x)} .
+C(G) &= \mathbb E_{p_{\text{data}}}\ln\frac{p_{\text{data}}}{m} + \mathbb E_{p_g}\ln\frac{p_g}{m} - 2\ln 2 \\
+&= D_{\mathrm{KL}}(p_{\text{data}} \,\|\, m) + D_{\mathrm{KL}}(p_g \,\|\, m) - 2\ln 2 \\
+&= 2\,D_{\mathrm{JS}}(p_{\text{data}} \,\|\, p_g) - 2\ln 2 .
 \end{aligned}
 $$
 
-To make the denominators match, divide each by $2$ inside the logarithm and pay $\ln 2$ for each expectation, because $\ln\frac{p}{p+q} = \ln\frac{p}{(p+q)/2} - \ln 2$. With $m = \tfrac12(p_{\text{data}} + p_g)$,
+The second line is the definition of KL, and the third the definition of JS, $D_{\mathrm{JS}}(p \,\|\, q) = \tfrac12 D_{\mathrm{KL}}(p \,\|\, m) + \tfrac12 D_{\mathrm{KL}}(q \,\|\, m)$, multiplied by 2.
+
+Against an optimal discriminator, the generator minimizes the Jensen–Shannon divergence. $D_{\mathrm{JS}} \ge 0$, with equality only when the two densities coincide, so the unique minimum is
 
 $$
-\begin{aligned}
-C(G) ={}& \mathbb{E}_{x\sim p_{\text{data}}}\ln\frac{p_{\text{data}}(x)}{m(x)} \\
-&+ \mathbb{E}_{x\sim p_g}\ln\frac{p_g(x)}{m(x)} - 2\ln 2 ,
-\end{aligned}
+\min_G C(G) = -2\ln 2 \approx -1.386 \quad \text{at } p_g = p_{\text{data}},
 $$
 
-that is,
+where $D^* = \tfrac12$ everywhere. For the two densities of the figure, $D_{\mathrm{JS}} \approx 0.430$ nats and $C(G) \approx -0.526$.
 
-$$
-C(G) = 2\,D_{\mathrm{JS}}(p_{\text{data}}\,\|\,p_g) - 2\ln 2 .
-$$
+### Where it breaks: supports that do not overlap
 
-Since $D_{\mathrm{JS}} \ge 0$, with equality only when $p_{\text{data}} = p_g$, the minimum over $G$ is reached only at $p_g = p_{\text{data}}$:
+Let $p_{\text{data}}$ and $p_g$ live on disjoint sets. Then $D^* = 1$ on the data and $0$ on the fakes, $D_{\mathrm{JS}} = \ln 2$ and $C(G) = 0$, wherever $p_g$ sits. Moving the generator closer to the data, without overlap, does not change $C$ at all.
 
-$$
-\min_G C(G) = -2\ln 2 \approx -1.386 ,
-$$
+The generator's gradient is $\nabla_x D$ at its samples, sent back through $G$. Disjoint compact supports lie a distance $\delta > 0$ apart. A smooth function equal to 1 within $\delta/3$ of the data and 0 within $\delta/3$ of the fakes makes both logarithms in $V$ zero, their maximum, so it is an optimal discriminator; it is constant around every fake, so its gradient there is zero, and so is the generator's ([Arjovsky and Bottou, 2017](#references), Theorem 2.1; Theorem 2.2 extends it to manifolds that do not align).
 
-where $D^* = \tfrac12$ everywhere. For the two densities in the optimal-discriminator figure, $D_{\mathrm{JS}} \approx 0.430$ nats and $C(G) \approx -0.526$, computed by numerical integration both from the definition of $V$ and from the JS formula.
-
-This also explains the warning about **non-overlapping supports**. If $p_{\text{data}}$ and $p_g$ live on disjoint sets, then $D^* = 1$ on the data and $D^* = 0$ on the fakes, $D_{\mathrm{JS}} = \ln 2$ and $C(G) = 0$, no matter where exactly $p_g$ sits. So $C$ is flat in the generator's parameters. Backpropagation, however, does not differentiate $C$: it sends the gradient of $\ln\big(1 - D(G(z))\big)$ through a fixed $D$, and that gradient contains $\nabla_x D$ at the generated samples. When the supports are disjoint compact sets, or manifolds that do not perfectly align, there is an optimal discriminator that equals $0$ on a whole neighbourhood of the generated samples, so $\nabla_x D^* = 0$ there and the generator's gradient vanishes ([Arjovsky and Bottou, 2017](#references), Theorems 2.1–2.2). For a discriminator within $\varepsilon$ of $D^*$, in value and gradient, the gradient norm is at most $M\varepsilon/(1 - \varepsilon)$, where $M$ bounds the generator's Jacobian (Theorem 2.4).
-
-This is not an exotic case. A generator built from affine maps and pointwise nonlinearities maps $z$ into a countable union of manifolds of dimension at most $\dim z$ (Lemma 1), and natural images are believed to concentrate near a low-dimensional manifold. Two such manifolds almost never overlap on a set of positive measure: they may cross, but only on a lower-dimensional set (Lemmas 2–3). So a perfect discriminator exists and $D_{\mathrm{JS}} = \ln 2$ however close the two manifolds are (Theorems 2.2–2.3). It is the same saturation of JS that the [fitting note](/notes/generative-models/fitting-distributions-with-kl#js-does-not-cover-the-modes-either) observed in one dimension. The [WGAN note](/notes/generative-models/wgan) replaces JS with the Wasserstein-1 distance to fix it.
+This is the usual case. A generator built from affine maps and ReLU-type or smooth increasing activations maps its noise into a countable union of manifolds of dimension at most $\dim z$, which has zero volume when $\dim z$ is below the number of pixels ([Arjovsky and Bottou, 2017](#references), Lemma 1). Natural images are believed to concentrate near a low-dimensional set too. After an arbitrarily small random shift, two such sets meet, if at all, in a lower-dimensional set that carries no mass (Lemmas 2 and 3), as two curves in three-dimensional space miss each other. The [fitting note](/notes/generative-models/fitting-distributions-with-kl#js-does-not-cover-the-modes-either) saw the same saturation of JS in one dimension; the [Wasserstein GAN](/notes/generative-models/wgan) replaces JS with a distance that keeps a slope.
 
 ## Training as a picture
 
 <TrainingEvolution />
 
-1. **At the beginning**, $p_g$ is far from $p_{\text{data}}$ and the discriminator is arbitrary.
-2. **After updating $\theta_d$**, $D$ approaches $D^*$: high over the data, low over the generated samples.
-3. **After updating $\theta_g$**, the gradient of $D$ guides $G(z)$ towards regions that $D$ classifies as data, so $p_g$ moves towards $p_{\text{data}}$.
-4. **Finally**, $p_g = p_{\text{data}}$ and the discriminator cannot tell them apart: $D(x) = \tfrac12$.
+Watch the discriminator curve. Each $D$ step makes it high over the data and low over the fakes; each $G$ step pushes the fakes up its slope. When the two densities coincide, the curve is flat at $\tfrac12$.
 
-The picture is idealized. The theory assumes that $D$ reaches its optimum after every generator step and that both players can represent any function. In practice both are networks trained a few steps at a time, and the alternating updates can oscillate or collapse onto a few modes of the data (**mode collapse**) instead of converging ([Goodfellow, 2016](#references), Section 5.1.1). The remedies are collected under [mode collapse and how to fight it](#mode-collapse-and-how-to-fight-it).
+The picture assumes an optimal $D$ before every generator step and unlimited capacity. Real networks, updated a few steps at a time, can oscillate or settle on a few modes ([Goodfellow, 2016](#references)).
 
 ## Which generator loss is used in practice?
 
-The minimax loss for the generator, $\mathbb{E}_z\ln\big(1 - D(G(z))\big)$, is rarely minimized directly. Already the original paper recommends ([Goodfellow et al., 2014](#references), Section 3) training the generator to **maximize** $\ln D(G(z))$ instead, that is, to minimize
+The minimax generator loss $\mathbb E_z\ln\big(1 - D(G(z))\big)$ is rarely used. Already the original paper trains the generator to maximize $\ln D(G(z))$ instead, that is, to minimize the **non-saturating** loss
 
 $$
-\mathcal L_G = -\mathbb{E}_z\ln D\big(G(z)\big),
+\mathcal L_G = -\mathbb E_z\ln D\big(G(z)\big) .
 $$
 
-the **non-saturating** loss. In code this is the BCE of the discriminator's output on generated samples with the "real" label.
-
-**The problem with the minimax loss.** When $D$ is good, it rejects fakes confidently: $d = D(G(z)) \approx 0$. Then $\ln(1 - d) \approx \ln 1 = 0$. A small value does not by itself mean a small gradient; what matters is the slope of the loss with respect to $d$, and further back through the network:
+Why change it? Early in training $D$ rejects fakes confidently, $d = D(G(z)) \approx 0$. Compare the slopes of the two losses in $d$:
 
 $$
 \begin{aligned}
 \frac{\partial}{\partial d}\ln(1 - d) &= -\frac{1}{1 - d} \approx -1, \\
-\frac{\partial}{\partial d}\big(-\ln d\big) &= -\frac1d \to -\infty \quad (d \to 0).
+\frac{\partial}{\partial d}\big(-\ln d\big) &= -\frac1d \to -\infty .
 \end{aligned}
 $$
 
-At $d = 0.05$ the slopes are $-1.05$ and $-20$. The discriminator ends in a sigmoid, $d = \sigma(\ell)$, and $\partial d/\partial\ell = d(1 - d)$. Per logit the gradients are therefore $-d \to 0$ for the minimax loss and $-(1 - d) \to -1$ for the non-saturating one. The minimax loss **saturates** at the logit, which is where the gradient enters the network: its gradient vanishes exactly when the generator is worst, while the non-saturating gradient is largest there.
+At $d = 0.05$ the slopes are $-1.05$ and $-20$. Through the logit $\ell$, with $d = \sigma(\ell)$ and $\partial d/\partial\ell = d(1 - d)$, the minimax loss has slope $-d$, which vanishes as $D$ grows confident, and the non-saturating loss $-(1 - d)$, largest there: the minimax loss gives the weakest signal to the worst generator.
 
 <SaturatingLoss />
 
-Both losses decrease as $D(G(z))$ grows, so they push the generator in the same direction, and for the optimal discriminator they share the fixed point $p_g = p_{\text{data}}$ ([Goodfellow et al., 2014](#references), Section 3). The non-saturating version is no longer the minimax game exactly. With $D = D^*$, its expected gradient equals the gradient of $D_{\mathrm{KL}}(p_g\,\|\,p_{\text{data}}) - 2\,D_{\mathrm{JS}}(p_{\text{data}}\,\|\,p_g)$ ([Arjovsky and Bottou, 2017](#references), Theorem 2.5). The first term is a reverse KL: it punishes fake-looking samples heavily and missing modes only lightly, one explanation for mode dropping. The non-saturating loss fixes the weak gradients early in training, but not the disjoint-support problem of the previous section: if the discriminator's error around $D^*$ is modelled as independent noise, its updates become unstable rather than vanishing, with infinite variance (Theorem 2.6).
+Both losses share the fixed point $p_g = p_{\text{data}}$, but the non-saturating loss is no longer the minimax game. With $D = D^*$ computed for the current generator and held fixed, its expected gradient is the gradient of $D_{\mathrm{KL}}(p_g \,\|\, p_{\text{data}}) - 2\,D_{\mathrm{JS}}(p_{\text{data}} \,\|\, p_g)$ ([Arjovsky and Bottou, 2017](#references), Theorem 2.5), derived below. The first term, a reverse KL, punishes fakes where the data have little mass and barely punishes missed data modes, one reason for dropped modes.
 
-### Computing the losses from logits
+<details>
+<summary>Derivation</summary>
 
-The discriminator network ends in a logit $\ell$, and $D = \sigma(\ell)$. Both logarithms in the losses are functions of $\ell$ that never need $\sigma(\ell)$ itself:
+Let $p_\theta$ be the generator's density, $\theta_0$ the current parameters and $D^* = p_{\text{data}}/(p_{\text{data}} + p_{\theta_0})$, frozen. Assume $p_\theta$ is differentiable in $\theta$, that $\nabla_\theta$ and $\int$ can be swapped, and that $p_{\text{data}} > 0$ wherever $p_\theta > 0$. Two facts do the work. For a fixed function $h$, $\mathbb E_z h(G_\theta(z)) = \int p_\theta h$, so its gradient is $\int \nabla p_\theta\, h$. And $\int \nabla p_\theta = \nabla 1 = 0$, so constants added to $h$ drop out.
+
+Each divergence is $\int \phi(p_\theta(x))\,dx$ for a function $\phi$ of the value $p = p_\theta(x)$, so its gradient is $\int \phi'(p_\theta)\,\nabla p_\theta\,dx$ by the chain rule. With $a = p_{\text{data}}(x)$:
 
 $$
 \begin{aligned}
-\ln D &= \ln\sigma(\ell) = -\operatorname{softplus}(-\ell),\\
+\phi_{\mathrm{KL}}(p) &= p\ln\frac{p}{a}, \\
+\phi_{\mathrm{KL}}'(p) &= \ln\frac{p}{a} + 1, \\
+\phi_{\mathrm{JS}}(p) &= a\ln\frac{2a}{a + p} + p\ln\frac{2p}{a + p}, \\
+\phi_{\mathrm{JS}}'(p) &= -\frac{a}{a + p} + \ln\frac{2p}{a + p} + 1 - \frac{p}{a + p} \\
+&= \ln 2 + \ln\frac{p}{a + p} .
+\end{aligned}
+$$
+
+Here $\phi_{\mathrm{JS}}$ is the integrand of $2D_{\mathrm{JS}}$. At $\theta_0$, $p/a = (1 - D^*)/D^*$ and $p/(a + p) = 1 - D^*$. Dropping the constants 1 and $\ln 2$:
+
+$$
+\begin{aligned}
+\nabla D_{\mathrm{KL}} &= \int \nabla p_\theta\,\big[\ln(1 - D^*) - \ln D^*\big] , \\
+\nabla\, 2D_{\mathrm{JS}} &= \int \nabla p_\theta\,\ln(1 - D^*) , \\
+\nabla\big(D_{\mathrm{KL}} - 2D_{\mathrm{JS}}\big) &= \int \nabla p_\theta\,\big(-\ln D^*\big) \\
+&= \nabla_\theta\,\mathbb E_z\big[-\ln D^*(G_\theta(z))\big] .
+\end{aligned}
+$$
+
+The last line is the first fact read backwards. The second line also shows that the minimax loss $\mathbb E_z\ln(1 - D^*(G_\theta(z)))$ has the gradient of $2D_{\mathrm{JS}}$, as Step 2 says.
+
+</details>
+
+The non-saturating loss also leaves the disjoint-support problem in place. Near a perfect discriminator $D(G(z)) \approx 0$, and the gradient $-\nabla_x D / D$ divides one small error by another. If the errors of $D$ and of $\nabla_x D$ are independent zero-mean Gaussian noise, the ratio has a Cauchy distribution, which has no mean and no variance ([Arjovsky and Bottou, 2017](#references), Theorem 2.6). The updates become noisy instead of vanishing.
+
+### Computing the losses from logits
+
+Both logarithms are functions of the logit that never need $\sigma(\ell)$:
+
+$$
+\begin{aligned}
+\ln D &= \ln\sigma(\ell) = -\operatorname{softplus}(-\ell), \\
 \ln(1 - D) &= \ln\sigma(-\ell) = -\operatorname{softplus}(\ell),
 \end{aligned}
 $$
 
-with $\operatorname{softplus}(t) = \ln(1 + e^{t})$. The first line is $\sigma(\ell) = 1/(1 + e^{-\ell})$, and the second uses $1 - \sigma(\ell) = \sigma(-\ell)$. Softplus is evaluated as $\max(t, 0) + \ln(1 + e^{-\lvert t\rvert})$, the two-term [log-sum-exp](/notes/math/conditioning-and-stability#log-sum-exp-and-the-stable-softmax), so the exponential never overflows. The discriminator's loss $-V$ becomes $\mathbb E_x\operatorname{softplus}(-\ell(x)) + \mathbb E_z\operatorname{softplus}(\ell(G(z)))$ and the non-saturating generator loss $\mathbb E_z\operatorname{softplus}(-\ell(G(z)))$.
+where $\operatorname{softplus}(t) = \ln(1 + e^{t})$ is evaluated stably as $\max(t, 0) + \ln(1 + e^{-\lvert t\rvert})$, the two-term [log-sum-exp](/notes/math/conditioning-and-stability#log-sum-exp-and-the-stable-softmax). The discriminator then minimizes $\mathbb E_x\operatorname{softplus}(-\ell(x)) + \mathbb E_z\operatorname{softplus}(\ell(G(z)))$ and the generator $\mathbb E_z\operatorname{softplus}(-\ell(G(z)))$.
 
-Computing $\sigma$ first and the logarithm afterwards fails exactly where the discriminator is confident. In [32-bit floating point](/notes/acos/floating-point#rounding-ulp-and-machine-epsilon), $\sigma(\ell)$ rounds to exactly $1$ once $\ell$ exceeds about 17, so $\ln(1 - \sigma(\ell))$ returns $-\infty$ where the softplus form returns about $-17$, and no gradient passes through the rounded sigmoid. Deep-learning libraries provide the stable form as binary cross-entropy with logits (`binary_cross_entropy_with_logits` in PyTorch).
+Computing $\sigma$ first fails where the discriminator is confident: in [32-bit floating point](/notes/acos/floating-point#rounding-ulp-and-machine-epsilon) $\sigma(\ell)$ rounds to 1 once $\ell$ exceeds about 17, so $\ln(1 - \sigma(\ell)) = -\infty$ where softplus gives about $-17$. PyTorch provides the stable form as `binary_cross_entropy_with_logits`.
 
 ## Training GANs in practice
 
-The theory above assumes an optimal discriminator and networks of unlimited capacity. Real GANs are two finite networks trained a few steps at a time, and a set of empirical rules decides whether training works at all. None of them is a theorem; each is given here with the reason it helps.
+Real training depends on empirical rules; none is a theorem, so each comes with the reason it helps.
 
 ### Architecture: the DCGAN guidelines
 
-The first convolutional GANs that trained reliably on images followed five rules ([Radford, Metz and Chintala, 2016](#references), Section 3):
+The first convolutional GANs that trained reliably on images followed five rules ([Radford, Metz and Chintala, 2016](#references)):
 
-1. **No pooling.** The discriminator downsamples with strided convolutions and the generator upsamples with fractionally strided (transposed) convolutions, so both networks learn their own resampling.
-2. **Batch normalization in both networks**, except at the generator's output layer and the discriminator's input layer, where it made the samples oscillate.
-3. **No fully connected hidden layers.** The generator's first layer is a matrix multiplication whose output is reshaped into a small spatial map, $4 \times 4$ with 1024 channels in the paper's $64 \times 64$ generator. The discriminator's last convolutional features are flattened into a single sigmoid output.
-4. **ReLU in the generator** and a Tanh at its output, so that images lie in $[-1, 1]$, like the training images scaled to that range.
-5. **LeakyReLU in the discriminator**, with slope $0.2$.
+1. strided convolutions instead of pooling, transposed convolutions to upsample;
+2. batch normalization in both networks, except at the generator's output and the discriminator's input;
+3. no fully connected hidden layers: the noise is reshaped into a $4 \times 4$ map with 1024 channels;
+4. ReLU in the generator, Tanh at its output, images scaled to $[-1, 1]$;
+5. LeakyReLU with slope $0.2$ in the discriminator.
 
-The training details became defaults as well (Section 4): Adam with learning rate $2\cdot10^{-4}$ and $\beta_1 = 0.5$, because the usual $\beta_1 = 0.9$ made training oscillate; minibatches of 128; weights initialized from $\mathcal N(0, 0.02^2)$; and a 100-dimensional uniform noise vector.
+Training used Adam with learning rate $2\cdot10^{-4}$ and $\beta_1 = 0.5$ (the usual $0.9$ oscillated), minibatches of 128 and weights from $\mathcal N(0, 0.02^2)$.
 
-The rules have reasons that earlier notes explain. Strided convolutions and LeakyReLU keep gradients dense: max-pooling sends a gradient to only one input of each window, and a ReLU sends none for negative inputs, while LeakyReLU keeps the slope $0.2$ there (see [common remedies](/notes/generative-models/training-background#common-remedies) for vanishing gradients). [Batch normalization](/notes/generative-models/training-background#batch-normalization) was what made deep generators start learning, and it kept them from collapsing all samples to one point (Section 3). Inside the discriminator it also makes each output depend on the statistics of the whole minibatch, a weak form of the minibatch discrimination below ([Salimans et al., 2016](#references), Sections 3.2 and 3.5).
+The rules keep the gradient signal dense: max-pooling passes gradient to one input per window and ReLU none for negative inputs, while strided convolutions and LeakyReLU pass some everywhere. [Batch normalization](/notes/deep-learning/normalization-and-initialization#batch-normalization-in-training-and-in-evaluation) let deep generators start learning without collapsing all samples to one point. Later models upsample by resizing and a convolution, which avoids [checkerboard artifacts](/notes/generative-models/autoencoders#transposed-convolution-or-upsample--conv).
 
-Later architectures change some rules but keep their purpose.
-
-- **Upsampling.** A transposed convolution whose kernel size is not divisible by its stride overlaps unevenly and can leave checkerboard artifacts. Resizing followed by an ordinary convolution avoids the uneven overlap ([transposed convolution or upsample + conv?](/notes/generative-models/autoencoders#transposed-convolution-or-upsample--conv)).
-- **A fully convolutional discriminator.** The last layer can be a convolution whose kernel covers the whole remaining feature map, for example $4 \times 4$ on a $4 \times 4$ map, which returns one logit per image without a fully connected layer. Radford et al. found that global average pooling instead increased stability but slowed convergence (Section 3).
-- **Dropout in the discriminator.** Dropping whole feature maps at random, as in the [denoising autoencoder](/notes/generative-models/autoencoders#denoising-autoencoder), regularizes the discriminator so that it fits the training images less closely.
-- **The latent code.** No theory fixes its size. A code that is too small cannot represent the variety of the data; DCGAN uses 100 dimensions, and 100 to 256 are common. A convolutional generator can also start from a small spatial grid of noise, such as $4 \times 4$ with a few channels, and double the resolution in every block, $4 \to 8 \to 16 \to 32 \to 64$.
-- **Sampling from a narrowed prior.** Scaling the noise down at sampling time, for example drawing $z \sim \mathcal N(0, 0.7^2 I)$ instead of $\mathcal N(0, I)$, gives more typical but less varied images. The samples then come from a different distribution than the one the generator was trained on. This prior narrowing is a truncation-like heuristic, often loosely called the [truncation trick](/notes/generative-models/precision-recall#where-the-trade-off-appears), which trades recall for precision; strictly, scaling a Gaussian is not sampling a truncated one, which [BigGAN does](/notes/generative-models/gan-scaling#the-truncation-trick) by resampling values beyond a threshold. Any metric computed on such samples measures the modified distribution, so the sampling scale has to be reported with it.
+Sampling $z \sim \mathcal N(0, 0.7^2 I)$ instead of $\mathcal N(0, I)$ trades [recall for precision](/notes/generative-models/precision-recall#where-the-trade-off-appears); an FID of such samples must report the scale. [BigGAN's truncation trick](/notes/generative-models/gan-scaling#the-truncation-trick) is the principled version.
 
 ### Balancing the two players
 
-The discriminator is the generator's only source of gradient, so the two must improve at comparable speeds. The original paper already warns that a generator trained too long against a fixed discriminator maps too many values of $z$ to the same $x$ ([Goodfellow et al., 2014](#references), Section 6). The knobs are the number $k$ of discriminator steps per generator step, the two learning rates and the capacity of each network.
+The discriminator is the generator's only source of gradient, so the two must improve at comparable speeds, tuned by $k$, the learning rates and the capacities. A discriminator that rejects every fake leaves the generator vanishing or noisy gradients: weaken it. One that lags points the generator in poor directions: update it more often. The [WGAN](/notes/generative-models/wgan) makes a strong critic help instead.
 
-- **The discriminator saturates**: it rejects the fakes with near certainty, and the generator's gradients shrink. The minimax loss [saturates](#which-generator-loss-is-used-in-practice), and with disjoint supports even the optimal discriminator gives no direction. Update the discriminator less often, lower its learning rate, or reduce its capacity.
-- **The generator struggles**, or collapses to a few modes, while the discriminator's feedback is unstable: the discriminator lags behind and points in poor directions. Update it more often, $k > 1$.
-
-Neither extreme works. Too many discriminator steps make the generator's gradients vanish; too few leave a discriminator that cannot give meaningful feedback. The [next note](/notes/generative-models/wgan) changes the objective so that a strong critic helps rather than hurts.
-
-Three habits complete the picture. Gradient-norm clipping ([common remedies](/notes/generative-models/training-background#common-remedies)) guards against occasional explosive updates; Nowozin, Cseke and Tomioka found Adam and clipping useful in their largest experiment ([2016](#references), Section 3.2). A small architecture or dataset first checks that the pipeline works. And samples should be looked at often: the two losses move against each other and do not measure sample quality, so samples, and later metrics such as the [Inception Score](/notes/generative-models/inception-score), are what reveals a collapse early.
+The losses say little about sample quality: track samples from fixed noise vectors and an [FID](/notes/generative-models/fid), where a collapse shows first. [Gradient-norm clipping](/notes/deep-learning/optimizing-deep-networks#gradient-clipping) guards against explosive updates.
 
 ### Label smoothing and label flipping
 
-**One-sided label smoothing** trains the discriminator against the target $\alpha = 0.9$ instead of $1$ on real samples, so that it never becomes fully confident ([Salimans et al., 2016](#references), Section 3.4). Why only on real samples? Let the targets be $\alpha$ for real and $\beta$ for fake samples. The integrand of [Step 1](#step-1-the-optimal-discriminator-for-a-fixed-generator) becomes $A\ln s + B\ln(1 - s)$ with $A = \alpha\,p_{\text{data}} + \beta\,p_g$ and $B = (1 - \alpha)\,p_{\text{data}} + (1 - \beta)\,p_g$, so its maximum is at $A/(A + B)$:
+**One-sided label smoothing** trains the discriminator toward $0.9$ instead of 1 on real samples ([Salimans et al., 2016](#references)). Why only the real side? With targets $\alpha$ for real and $\beta$ for fake samples, the pointwise integrand of [Step 1](#step-1-the-optimal-discriminator-for-a-fixed-generator) becomes $A\ln s + B\ln(1 - s)$ with $A = \alpha p_{\text{data}} + \beta p_g$ and $B = (1 - \alpha)p_{\text{data}} + (1 - \beta)p_g$, maximized at $A/(A + B)$:
 
 $$
 D^*(x) = \frac{\alpha\,p_{\text{data}}(x) + \beta\,p_g(x)}{p_{\text{data}}(x) + p_g(x)} .
 $$
 
-Look at a region where the generator puts much more mass than the data, so that the ratio $r = p_{\text{data}}/p_g$ is small. There $D^* \approx \beta + (\alpha - \beta)\,r$ to first order in $r$.
+Look at a region where the generator puts much more mass than the data, with $r = p_{\text{data}}/p_g$ small. To first order in $r$, $D^* \approx \beta + (\alpha - \beta)r$, and the non-saturating loss is
 
-- With $\beta = 0$, the non-saturating loss $-\ln D^* \approx -\ln\alpha - \ln r$ follows the log density ratio, and its gradient does not shrink as $r$ does.
-- With $\beta > 0$, it is $-\ln D^* \approx -\ln\beta - \frac{\alpha - \beta}{\beta}\,r$, whose gradient $-\frac{\alpha - \beta}{\beta}\,r\,\nabla\ln r$ carries the small factor $r$: fakes far from the data barely move.
+$$
+\begin{aligned}
+-\ln D^* &\approx -\ln\alpha - \ln r && \beta = 0, \\
+-\ln D^* &\approx -\ln\beta - \frac{\alpha - \beta}{\beta}\,r && \beta > 0 .
+\end{aligned}
+$$
 
-So only the real label is smoothed. With $\beta = 0$ the optimal output is at most $\alpha$: where the two densities are equal it is $0.45$ instead of $0.5$.
+With $\beta = 0$ the loss follows the log density ratio, and its gradient does not fade as $r$ shrinks. With $\beta > 0$ the gradient carries the factor $r$, so fakes far from the data barely move. Hence only the real label is smoothed.
 
-**Random label flipping** swaps the labels of a small random fraction $\varepsilon$ of the discriminator's training examples. The binary cross-entropy $H(y, \hat y) = -[y\ln\hat y + (1 - y)\ln(1 - \hat y)]$ is linear in the target $y$, so in expectation flipping replaces the targets $1$ and $0$ by $1 - \varepsilon$ and $\varepsilon$. It is two-sided label smoothing with $\alpha = 1 - \varepsilon$ and $\beta = \varepsilon$, plus noise. It keeps the discriminator from becoming overconfident, but by the argument above its fake half weakens the pull on fakes far from the data, so it is used sparingly, if at all.
+**Random label flipping** of a fraction $\varepsilon$ of the labels is, in expectation, two-sided smoothing with $\alpha = 1 - \varepsilon$, $\beta = \varepsilon$ (cross-entropy is linear in the target), so it is used sparingly.
 
 ### Mode collapse and how to fight it
 
-In **mode collapse** the generator maps most of its noise to a few outputs that the current discriminator accepts. Salimans et al. ([2016](#references), Section 3.2) describe the mechanism. The discriminator judges each sample on its own, so its gradient points the same way for all similar samples, and nothing tells the generator's outputs to differ from each other. When the discriminator learns to reject the collapsed mode, the generator moves to another one, and the two can chase each other indefinitely. The reverse-KL term of the non-saturating loss ([above](#which-generator-loss-is-used-in-practice)) is a second reason: dropping a mode costs it little. The remedies attack different parts of this mechanism.
+In **mode collapse** the generator maps most of its noise to a few outputs the current discriminator accepts. The discriminator judges each sample on its own, so nothing tells the outputs to differ ([Salimans et al., 2016](#references)); when it rejects the collapsed mode, the generator moves to another. The reverse-KL term makes dropping a mode cheap.
 
-- **Minibatch discrimination** lets the discriminator compare samples ([Salimans et al., 2016](#references), Section 3.2). An intermediate feature vector $f(x_i) \in \mathbb R^A$ is multiplied by a learned tensor $T \in \mathbb R^{A\times B\times C}$, which gives a matrix $M_i \in \mathbb R^{B\times C}$. For each of its rows $b$, the closeness of two samples is $c_b(x_i, x_j) = \exp\big(-\lVert M_{i,b} - M_{j,b}\rVert_1\big)$, and the layer outputs $o(x_i)_b = \sum_{j} c_b(x_i, x_j)$, summed over the minibatch. The vector $o(x_i) \in \mathbb R^B$ is concatenated with $f(x_i)$ and fed to the next layer, separately for real and generated minibatches. A collapsed batch contains many near-identical samples and therefore large values of $o$, which the discriminator can learn to reject.
-- **Unrolled GANs** let the generator anticipate the discriminator's answer ([Metz et al., 2017](#references), Sections 2.2–2.4). Write the value function as $V(\theta_G, \theta_D)$. Starting from $\theta_D^0 = \theta_D$, take $K$ gradient-ascent steps of the discriminator, $\theta_D^{k+1} = \theta_D^k + \eta\,\partial V(\theta_G, \theta_D^k)/\partial\theta_D^k$, and define the surrogate $V_K(\theta_G, \theta_D) = V\big(\theta_G, \theta_D^K(\theta_G, \theta_D)\big)$. The generator descends $V_K$, backpropagating through the $K$ steps, while the discriminator is still updated with $V$. By the chain rule the gradient of $V_K$ has two terms (Section 2.4): the usual $\partial V/\partial\theta_G$ at the unrolled discriminator, and a term through $d\theta_D^K/d\theta_G$ that describes how the discriminator would react to the generator's move. The first term alone pushes toward a collapse: against a fixed discriminator, the best generator puts all its mass on the single point that the discriminator likes most. The second term sees that a collapsed generator would quickly be rejected, which discourages the collapse. $K = 0$ is the standard GAN. If the $K$ inner steps converge to an optimal discriminator, $K \to \infty$ approaches the true generator objective $V(\theta_G, \theta_D^*(\theta_G))$; for a neural discriminator the inner ascent need not converge, or may reach only a local optimum, so a large $K$ is an approximation, not a guarantee.
-- **History.** Historical averaging adds $\big\lVert\theta - \tfrac1t\sum_{i=1}^{t}\theta[i]\big\rVert^2$ to each player's cost, where $\theta[i]$ are the parameters at past step $i$: a pull toward the average of all past parameters that damps oscillations ([Salimans et al., 2016](#references), Section 3.3). Training the discriminator partly on a buffer of samples from earlier generators, half of each discriminator minibatch in [Shrivastava et al. (2017)](#references), Section 2.3, keeps it from forgetting the modes the generator visited before, so the generator cannot return to them unpunished.
-- **Several discriminators.** GMAN trains the generator against $N$ discriminators and combines their values with a softened maximum, from the mean to the maximum as a parameter $\lambda$ goes from $0$ to $\infty$ ([Durugkar, Gemp and Mahadevan, 2017](#references), Section 4.1). The mean is a lenient teacher and the maximum a harsh adversary.
-- **A different distance.** The [Wasserstein GAN](/notes/generative-models/wgan), with a gradient penalty or spectral normalization on its critic, gives useful gradients even when the supports do not overlap. The original WGAN, trained with weight clipping, showed no evidence of mode collapse in any of its authors' experiments ([Arjovsky, Chintala and Bottou, 2017](#references), Section 4.3).
+Take data from eight Gaussians of standard deviation $0.02$ on a circle. A standard GAN puts almost all its mass on one mode at a time and rotates from mode to mode, never covering all eight ([Metz et al., 2017](#references)). Nearly every sample lies on a real mode while one mode in eight is covered: [precision](/notes/generative-models/precision-recall) near 1, recall near $1/8$ (toy values). FID penalizes the missing modes; each sample alone looks perfect.
 
-## Extensions
-
-### Conditional GAN
-
-A conditional GAN ([Mirza and Osindero, 2014](#references)) gives both networks a label $c$, such as a class: the generator produces $G(z, c)$ and the discriminator judges pairs $D(x, c)$. Let $p_{\text{data}}(x, c)$ be the joint distribution of data and labels and $p_c$ its label marginal. The value function becomes
+**Minibatch discrimination** lets the discriminator compare samples within a batch ([Salimans et al., 2016](#references)). A learned tensor maps a feature vector $f(x_i)$ to a matrix $M_i$ with rows $M_{i,b}$, giving the features
 
 $$
 \begin{aligned}
-V_{\text{cond}} ={}& \mathbb{E}_{(x,c)\sim p_{\text{data}}}\big[\ln D(x,c)\big] \\
-&+ \mathbb{E}_{c,\,z}\big[\ln\big(1-D(G(z,c),c)\big)\big],
+c_b(x_i, x_j) &= \exp\big(-\lVert M_{i,b} - M_{j,b}\rVert_1\big), \\
+o(x_i)_b &= \sum_{j} c_b(x_i, x_j), \quad b = 1, \dots, B .
 \end{aligned}
 $$
 
-where the second expectation is over $c \sim p_c$ and $z \sim p_z$. This is the original game played on pairs $(x, c)$: the generated pairs have the joint $p_g(x, c) = p_c(c)\,p_g(x \mid c)$, and the argument of the previous sections, applied to pairs, shows that the optimum matches the joints, $p_g(x, c) = p_{\text{data}}(x, c)$. A realistic image paired with the wrong label lies outside the data joint, so the discriminator can reject it, and the generator learns to follow the condition. It is the GAN counterpart of the [conditional VAE](/notes/generative-models/vae#conditioning-on-a-label-the-conditional-vae).
+The vector $o(x_i)$ is appended to $f(x_i)$; a collapsed batch has large $o$, which the discriminator learns to reject.
 
-### f-GAN
-
-*Optional depth: the game for any f-divergence through convex conjugates. The rest of the note does not depend on it.*
-
-The original GAN minimizes JS. An f-GAN ([Nowozin, Cseke and Tomioka, 2016](#references)) generalizes the game to any **f-divergence**
+**Unrolled GANs** let the generator anticipate the discriminator's reply ([Metz et al., 2017](#references)). Starting from the current $\theta_D$, take $K$ ascent steps of the discriminator and score the generator against the result:
 
 $$
-D_f(P\,\|\,Q) = \int q(x)\, f\!\left(\frac{p(x)}{q(x)}\right) dx ,
+\begin{aligned}
+\theta_D^{0} &= \theta_D, \\
+\theta_D^{k+1} &= \theta_D^{k} + \eta\,\nabla_{\theta_D} V\big(\theta_G, \theta_D^{k}\big), \\
+V_K(\theta_G, \theta_D) &= V\big(\theta_G, \theta_D^{K}(\theta_G, \theta_D)\big) .
+\end{aligned}
 $$
 
-for a convex, lower semicontinuous $f$ with $f(1) = 0$; $f(u) = u\ln u$ gives $D_{\mathrm{KL}}(P\,\|\,Q)$. The key tool is the **convex conjugate** $f^*(t) = \sup_u \{ut - f(u)\}$. Rearranged, its definition says $f(u) \ge tu - f^*(t)$ for every $t$: each line with slope $t$ and intercept $-f^*(t)$ lies below the graph of $f$, and for differentiable $f$ the line with $t = f'(u)$ touches it at $u$, the [tangent that lies below a convex function](/notes/math/convex-sets-and-functions#the-first-order-condition-the-tangent-lies-below). For convex, lower semicontinuous $f$ these lines recover $f$ exactly, $f(u) = \sup_t \{tu - f^*(t)\}$ (the Fenchel–Moreau theorem). For example, $f(u) = \tfrac12(u - 1)^2$, half the Pearson $\chi^2$ generator, gives $f^*(t) = t + \tfrac12 t^2$: the supremum of $tu - \tfrac12(u-1)^2$ is at $u = 1 + t$.
+The generator descends $V_K$ through the $K$ steps; the discriminator is updated with $V$. By the chain rule,
+
+$$
+\frac{dV_K}{d\theta_G} = \frac{\partial V}{\partial \theta_G} + \frac{\partial V}{\partial \theta_D^{K}}\,\frac{d\theta_D^{K}}{d\theta_G} .
+$$
+
+The first term alone favours putting all mass on the point $D$ likes most; the second sees that the discriminator would reject such a collapse. $K = 0$ is the standard GAN; with $K = 10$ the eight-Gaussian generator covers all modes. A buffer of earlier fakes, cheaper, keeps an abandoned mode punished.
+
+## Conditional GAN
+
+A **conditional GAN** ([Mirza and Osindero, 2014](#references)) gives both networks a label $c$, such as a class. The generator produces $G(z, c)$ and the discriminator judges pairs $D(x, c)$:
+
+$$
+\begin{aligned}
+V_{\text{cond}} ={}& \mathbb E_{(x, c)\sim p_{\text{data}}}\big[\ln D(x, c)\big] \\
+&+ \mathbb E_{c \sim p_c,\, z \sim p_z}\big[\ln\big(1 - D(G(z, c), c)\big)\big],
+\end{aligned}
+$$
+
+where $p_c$ is the label distribution of the data. Generated pairs have the joint $p_c(c)\,p_g(x \mid c)$, and the optimality argument applied to pairs gives $p_g(x, c) = p_{\text{data}}(x, c)$: a realistic image with the wrong label can be rejected, so the generator follows the label, as in the [conditional VAE](/notes/generative-models/vae#conditioning-on-a-label-the-conditional-vae).
+
+## f-GAN
+
+*Optional depth: the game for any f-divergence. The rest of the note does not depend on it.*
+
+The GAN minimizes JS. An **f-GAN** ([Nowozin, Cseke and Tomioka, 2016](#references)) plays the same game for any **f-divergence**
+
+$$
+D_f(P \,\|\, Q) = \int q(x)\, f\!\left(\frac{p(x)}{q(x)}\right) dx ,
+$$
+
+with $f$ convex, lower semicontinuous and $f(1) = 0$; $f(u) = u\ln u$ gives $D_{\mathrm{KL}}(P \,\|\, Q)$. The tool is the **convex conjugate** $f^*(t) = \sup_u \{ut - f(u)\}$. By definition $f(u) \ge tu - f^*(t)$ for every $t$: each line of slope $t$ and intercept $-f^*(t)$ lies below $f$. For a convex, lower semicontinuous $f$ these lines recover it, $f(u) = \sup_t\{tu - f^*(t)\}$, the **Fenchel–Moreau theorem** ([Boyd and Vandenberghe, 2004](#references), Section 3.3.2 and Exercise 3.39). For the differentiable $f$ of the table below, two lines prove it. The inequality gives $\sup_t\{tu - f^*(t)\} \le f(u)$. The [tangent](/notes/math/convex-sets-and-functions#the-first-order-condition-the-tangent-lies-below) at $u$, of slope $t_u = f'(u)$, lies below $f$ and touches it at $u$, so the supremum defining $f^*(t_u)$ is attained at $u$: $f^*(t_u) = t_u u - f(u)$, and the slope $t_u$ reaches $f(u)$. For example, $f(u) = \tfrac12(u - 1)^2$ has its supremum at $u = 1 + t$, so $f^*(t) = t + \tfrac12 t^2$.
 
 <FenchelConjugate />
 
-Substitute this representation at every point, with $u(x) = p(x)/q(x)$, and let the slope $t = T(x)$ depend on $x$ ([Nguyen, Wainwright and Jordan, 2010](#references); [Nowozin, Cseke and Tomioka, 2016](#references), Section 2.2, Eqs. 4–5):
+Substitute this at every point, with $u = p(x)/q(x)$ and a slope $T(x)$ that may depend on $x$:
 
 $$
 \begin{aligned}
-D_f(P\,\|\,Q) &= \int q(x) \sup_t \big\{ t u(x) - f^*(t) \big\}\,dx \\
-&= \sup_T \int \Big[ p(x)\,T(x) \\
-&\qquad - q(x)\,f^*\big(T(x)\big) \Big]\, dx \\
-&\ge \sup_{T \in \mathcal T} \Big\{\mathbb{E}_{x\sim P}\big[T(x)\big] \\
-&\qquad - \mathbb{E}_{x\sim Q}\big[f^*(T(x))\big]\Big\}.
+D_f(P \,\|\, Q) &= \int q(x) \sup_t \big\{t\,u(x) - f^*(t)\big\}\,dx \\
+&= \sup_T \int \big[p(x)\,T(x) - q(x)\,f^*(T(x))\big]\,dx \\
+&\ge \sup_{T \in \mathcal T} \Big\{\mathbb E_{P}\big[T(x)\big] - \mathbb E_{Q}\big[f^*(T(x))\big]\Big\} .
 \end{aligned}
 $$
 
-The second line picks the best slope separately at every point. Over all functions $T$ with values in the domain of $f^*$ this loses nothing: for differentiable $f$ the supremum is attained at $T^*(x) = f'\big(p(x)/q(x)\big)$. The inequality appears in the third line, where $T$ is restricted to a class $\mathcal T$, such as a neural network family.
+The second line chooses the slope at each point; nothing is lost, because $T(x) = f'(u(x))$ attains every pointwise supremum at once ([Nguyen, Wainwright and Jordan, 2010](#references)). The inequality comes from restricting $T$ to a network family $\mathcal T$. With $P = p_{\text{data}}$ and $Q = p_g$, the last line is a two-player game that needs only samples.
 
-With $P = p_{\text{data}}$, $Q = p_g$ and $T$ a neural network, the right-hand side is a two-player game: $T$ plays the discriminator's role and maximizes, and the generator minimizes. Both expectations need only samples, never densities, which is what makes the bound usable for an implicit model. The original GAN is one case, with a generator that is not normalized. With $f(u) = u\ln u - (u + 1)\ln(u + 1)$ we have $f(1) = -2\ln 2 = -\ln 4$ rather than $0$: this $f$ is a normalized generator plus the constant $-\ln 4$, and since $\int q\,(-\ln 4)\,dx = -\ln 4$ the divergence is shifted by the same constant, $D_f(P\,\|\,Q) = 2\,D_{\mathrm{JS}}(P\,\|\,Q) - \ln 4$, and the conjugate is $f^*(t) = -\ln(1 - e^t)$ for $t < 0$. Writing $T(x) = \ln D(x)$ with $D(x) \in (0, 1)$ gives $f^*(T(x)) = -\ln(1 - D(x))$, and the bound becomes exactly $V(G, D)$ ([Nowozin, Cseke and Tomioka, 2016](#references), Section 2.4, Tables 1 and 6).
-
-**Output activations.** The bound needs $T(x)$ inside the domain of $f^*$, which for most divergences is not the whole real line. f-GAN therefore lets the network output an unconstrained number $v(x)$ and maps it through a fixed increasing **output activation** $g_f$, so that $T(x) = g_f(v(x))$ (Section 2.4, Eq. 7). The game becomes
-
-$$
-\begin{aligned}
-F ={}& \mathbb{E}_{x\sim P}\big[g_f(v(x))\big] \\
-&- \mathbb{E}_{x\sim Q}\big[f^*\big(g_f(v(x))\big)\big] .
-\end{aligned}
-$$
-
-The table lists the usual choices (Tables 1 and 2). The convention is the one above: $D_f(P\,\|\,Q) = \int q\, f(p/q)\,dx$ with $P = p_{\text{data}}$ and $Q = p_g$, and the generators $f$ are those of Nowozin et al. A condition after $f^*(t)$ is its domain.
+A fixed increasing **output activation** $g_f$ maps the network's unconstrained output $v(x)$ into the domain of $f^*$, $T(x) = g_f(v(x))$. The usual choices, with $P$ the data:
 
 | Divergence | $f(u)$ | $g_f(v)$ | $f^*(t)$ |
 | --- | --- | --- | --- |
@@ -366,114 +368,126 @@ The table lists the usual choices (Tables 1 and 2). The convention is the one ab
 | Pearson $\chi^2$ | $(u-1)^2$ | $v$ | $t + t^2/4$ |
 | squared Hellinger | $(\sqrt u - 1)^2$ | $1 - e^{-v}$ | $t/(1-t)$, $t<1$ |
 | $2D_{\mathrm{JS}}$ | $u\ln u - (u+1)\ln\frac{u+1}{2}$ | $\ln 2 - \ln(1 + e^{-v})$ | $-\ln(2 - e^{t})$, $t<\ln 2$ |
-| GAN: $2D_{\mathrm{JS}} - \ln 4$, unnormalized | $u\ln u - (u+1)\ln(u+1)$ | $-\ln(1 + e^{-v})$ | $-\ln(1 - e^{t})$, $t<0$ |
+| GAN | $u\ln u - (u+1)\ln(u+1)$ | $-\ln(1 + e^{-v})$ | $-\ln(1 - e^{t})$, $t<0$ |
 
-Three remarks on the table.
+The GAN row has $f(1) = -\ln 4$, so its divergence is $2D_{\mathrm{JS}} - \ln 4$; with $T = \ln D$ the bound is the value function $V(G, D)$. The fifth row differs from it by a constant and trains the same way.
 
-- Every $g_f$ is increasing, so a large $v(x)$ always means "looks real".
-- Nowozin et al. label the fifth row Jensen–Shannon, but with this $f$ the divergence is twice $D_{\mathrm{JS}}$ as defined in the [entropy note](/notes/generative-models/entropy-and-divergences#jensenshannon-divergence). Its $f$ exceeds the GAN row's by $(u+1)\ln 2$, so the two divergences differ by the constant $\ln 4$, and the two rows train identically.
-- The Pearson row uses $f(u) = (u - 1)^2$. The generator $\tfrac12(u - 1)^2$ of the example above gives half that divergence and the conjugate $t + t^2/2$.
+Evaluate the composition $f^*(g_f(v))$ in one piece, as with softplus above. Row by row it is $e^{v-1}$, $v - 1$, $v + v^2/4$, $e^{v} - 1$, $\operatorname{softplus}(v) - \ln 2$ and $\operatorname{softplus}(v)$.
 
-**Compose before computing.** Evaluating $g_f$ and then $f^*$ loses precision for the same reason as $\sigma$ followed by $\ln$ ([above](#computing-the-losses-from-logits)), and Nowozin et al. recommend implementing the composition $f^*(g_f(v))$ directly (Section 2.4, footnote 1). It is simple for every row: from top to bottom, $e^{v-1}$, $v - 1$, $v + v^2/4$, $e^{v} - 1$, $\operatorname{softplus}(v) - \ln 2$ and $\operatorname{softplus}(v)$. For the GAN row $g_f(v) = -\operatorname{softplus}(-v) = \ln\sigma(v)$, so $F$ is exactly minus the discriminator's binary cross-entropy computed from its logit $v$.
+## Least-squares GAN
 
-**The generator's step.** As for the GAN, the generator can maximize $\mathbb E_{x\sim Q}\big[g_f(v(x))\big]$ instead of minimizing the fake term of $F$. This keeps the stationary point, and Nowozin et al. found it useful for divergences other than the GAN's as well (Section 3.2).
+*Optional depth: a squared-error discriminator and the divergence it minimizes. The rest of the note does not depend on it.*
 
-### Least-squares GAN
-
-*Optional depth: a squared-error discriminator loss and what its optimum minimizes. The rest of the note does not depend on it.*
-
-The non-saturating loss repairs the gradient for fakes that the discriminator confidently rejects. The **least-squares GAN** (LSGAN) also repairs the opposite case, fakes that the discriminator already accepts but that are still far from the data ([Mao et al., 2017](#references)). Its discriminator has no sigmoid. It is a regression network with a real-valued output, trained toward the value $b$ on real samples and $a$ on fakes, and the generator wants its samples to be scored $c$ (Section 3.2, Eq. 2):
+The **least-squares GAN** (LSGAN) also repairs the gradient for fakes the discriminator already accepts that are still far from the data ([Mao et al., 2017](#references)). Its discriminator regresses toward $b$ on real samples and $a$ on fakes, and the generator asks for the score $c$:
 
 $$
 \begin{aligned}
-\min_D\;& \tfrac12\,\mathbb E_{x\sim p_{\text{data}}}\big[(D(x) - b)^2\big] \\
-&+ \tfrac12\,\mathbb E_{z\sim p_z}\big[(D(G(z)) - a)^2\big],\\
-\min_G\;& \tfrac12\,\mathbb E_{z\sim p_z}\big[(D(G(z)) - c)^2\big].
+\min_D\;& \tfrac12\,\mathbb E_{p_{\text{data}}}\big[(D(x) - b)^2\big] + \tfrac12\,\mathbb E_{z}\big[(D(G(z)) - a)^2\big], \\
+\min_G\;& \tfrac12\,\mathbb E_{z}\big[(D(G(z)) - c)^2\big] .
 \end{aligned}
 $$
 
-The common choice is the 0–1 coding $a = 0$, $b = c = 1$ (Eq. 9): the discriminator regresses real samples to 1 and fakes to 0, and the generator asks for 1. Mao et al. found that it performs like the $\chi^2$ coding below and used it in their experiments (Section 3.2.3).
+The common coding is $a = 0$, $b = c = 1$.
 
-**Why least squares helps.** The decision boundary is where $D$ lies halfway between $a$ and $b$. A fake can lie on the real side of that boundary, so the discriminator already scores it as real, and still be far from the data. With the sigmoid cross-entropy such a sample has almost no loss and almost no gradient: the non-saturating loss $-\ln\sigma(\ell)$ flattens as the logit $\ell$ grows, with slope $-(1 - \sigma(\ell)) \to 0$. The squared loss is flat only at $D = c$, so a fake scored beyond $c$ is pulled back, but only as far as the level set $D = c$. The discriminator is fixed during the generator's step, so this moves such fakes toward the decision boundary, and for training to succeed the boundary should run through the data (Section 3.2.1).
+With a sigmoid cross-entropy, a fake far on the real side of the boundary has almost no gradient: the slope of $-\ln\sigma(\ell)$ is $-(1 - \sigma(\ell)) \to 0$. The squared loss is flat only at $D = c$, so a fake scored beyond $c$ is pulled back toward the level set $D = c$, which helps if that set runs through the data.
 
 <LeastSquaresPull />
 
-The extra gradient comes from the shape of a learned real-valued discriminator, which keeps growing away from the boundary, as the linear one in the figure does. The unconstrained optimal discriminator below lies between $a$ and $b$ everywhere, and far from both distributions its squared loss can flatten too.
-
-**The optimal discriminator and Pearson $\chi^2$.** For a fixed generator, the discriminator's loss can be minimized pointwise, as in [Step 1](#step-1-the-optimal-discriminator-for-a-fixed-generator). The integrand $\tfrac12 p_{\text{data}}(D - b)^2 + \tfrac12 p_g(D - a)^2$ is a parabola in $D$ with its minimum at (Eq. 5)
+**The optimal discriminator.** For a fixed generator the integrand $\tfrac12 p_{\text{data}}(D - b)^2 + \tfrac12 p_g(D - a)^2$ is a parabola in $D$, minimized at
 
 $$
 D^*(x) = \frac{b\,p_{\text{data}}(x) + a\,p_g(x)}{p_{\text{data}}(x) + p_g(x)} .
 $$
 
-Add to the generator's loss the term $\tfrac12\,\mathbb E_{x\sim p_{\text{data}}}\big[(D(x) - c)^2\big]$; it does not depend on $G$, so it changes no gradient. At $D = D^*$, using $D^* - c = \big((b - c)\,p_{\text{data}} + (a - c)\,p_g\big)/(p_{\text{data}} + p_g)$, the extended loss is (Eqs. 4 and 6)
+Add $\tfrac12\mathbb E_{p_{\text{data}}}[(D(x) - c)^2]$ to the generator's loss; it does not depend on $G$. At $D = D^*$ the extended loss is
 
 $$
 \begin{aligned}
-2C(G) &= \int \big(p_{\text{data}} + p_g\big)\big(D^* - c\big)^2\,dx \\
-&= \int \frac{\big((b - c)\,p_{\text{data}} + (a - c)\,p_g\big)^2}{p_{\text{data}} + p_g}\,dx .
+2C(G) &= \int (p_{\text{data}} + p_g)(D^* - c)^2\,dx \\
+&= \int \frac{\big((b - c)p_{\text{data}} + (a - c)p_g\big)^2}{p_{\text{data}} + p_g}\,dx .
 \end{aligned}
 $$
 
-Choose $b - c = 1$ and $b - a = 2$, for example $a = -1$, $b = 1$, $c = 0$ (Eq. 8). Then $a - c = -1$ and the numerator is $(p_{\text{data}} - p_g)^2$. With the mixture $m = \tfrac12(p_{\text{data}} + p_g)$ we have $p_{\text{data}} - p_g = 2(m - p_g)$ and $p_{\text{data}} + p_g = 2m$, so
+Choose $b - c = 1$ and $b - a = 2$, for example $a = -1$, $b = 1$, $c = 0$. The numerator becomes $(p_{\text{data}} - p_g)^2 = 4(m - p_g)^2$ and the denominator $2m$, with $m = \tfrac12(p_{\text{data}} + p_g)$:
 
 $$
-C(G) = \int \frac{\big(p_g(x) - m(x)\big)^2}{m(x)}\,dx = \chi^2_{\text{Pearson}}(p_g\,\|\,m),
+C(G) = \int \frac{\big(p_g(x) - m(x)\big)^2}{m(x)}\,dx = \chi^2_{\text{Pearson}}(p_g \,\|\, m) .
 $$
 
-the Pearson row of the f-GAN table with $p_g$ in place of $P$ and $m$ in place of $Q$. This mirrors the [JS identity](#step-2-substitute-the-optimal-discriminator-and-recognize-js) of the original GAN, which compares both distributions with the same mixture through KL divergences. $C(G)$ is zero only when $p_g = m$, that is, $p_g = p_{\text{data}}$. Mao et al. write the same quantity as $\chi^2_{\text{Pearson}}(p_{\text{data}} + p_g\,\|\,2p_g)$ (Eq. 7), with the reference measure as the first argument. For the two Gaussians of the figure, $C(G) \approx 0.550$ (a toy value, by numerical integration).
+Like the [JS identity](#step-2-substitute-the-optimal-discriminator-and-recognize-js), it compares the generator with the mixture, here through $\chi^2$. The 0–1 coding misses these conditions, yet its $2C(G) = \int \varphi(p_g(x))\,dx$, with $\varphi(q) = q^2/(p_{\text{data}}(x) + q)$, is still minimized at $p_g = p_{\text{data}}$ among densities. The constraint $\int p_g = 1$ is needed: without it $p_g = 0$ would give 0. At each $x$, $\varphi''(q) = 2p_{\text{data}}^2/(p_{\text{data}} + q)^3 > 0$, so $\varphi$ is convex, and $\varphi'(p_{\text{data}}) = \tfrac34$ at every $x$. The tangent bound then gives
 
-The 0–1 coding does not meet these conditions: there $b - c = 0$, and $2C(G) = \int p_g^2/(p_{\text{data}} + p_g)\,dx$, which equals $\tfrac12$, not $0$, at $p_g = p_{\text{data}}$. It is still minimized there. The integrand is convex in $p_g(x)$, and at $p_g = p_{\text{data}}$ its derivative with respect to $p_g(x)$, $(p_g^2 + 2p_g\,p_{\text{data}})/(p_{\text{data}} + p_g)^2$, equals $\tfrac34$ at every $x$: the optimality condition for a convex objective under the constraint $\int p_g = 1$.
+$$
+\begin{aligned}
+\int \varphi(p_g)\,dx &\ge \int \Big[\varphi(p_{\text{data}}) + \tfrac34\,(p_g - p_{\text{data}})\Big]dx \\
+&= \int \varphi(p_{\text{data}})\,dx ,
+\end{aligned}
+$$
 
-## Strengths and weaknesses
+because both densities integrate to 1.
 
-**Strengths.**
+## What the game gives up
 
-- Sampling is one forward pass of the generator, and training needs only backpropagation: no Markov chains, no inference over latent variables during learning and no intractable integral ([Goodfellow et al., 2014](#references), Section 6).
-- The model can represent very sharp, even degenerate distributions (Section 6). Nothing averages plausible images into a blur, as the squared error of a Gaussian decoder does.
-- The same game accepts labels, other divergences and other losses, as the extensions above show.
+A GAN samples with one forward pass, and nothing in its loss averages plausible images into a blur. The price is what the game never computes: without a density, models are compared on samples, with [FID](/notes/generative-models/fid) and [precision and recall](/notes/generative-models/precision-recall); without an encoder, the code of an image needs an optimization over $z$ or a second network, as in the [autoencoding GANs](/notes/generative-models/alpha-gan).
 
-**Weaknesses.**
+For images, realism often counts for more than variety. For molecules in drug discovery, variety is the point, and a likelihood-trained model such as the [VAE](/notes/generative-models/vae), whose loss charges every underweighted mode, is the safer choice ([BMML lecture notes, 2026](#references)), though not a guarantee, as the next section shows.
 
-- **No density.** $p_g(x)$ has no explicit form (Section 6), so the likelihood of test data cannot be computed, and models cannot be compared by it. The two losses do not measure sample quality, and there is no clear stopping criterion. Evaluation needs sample-based metrics, the subject of the [Inception Score](/notes/generative-models/inception-score) and the notes after it.
-- **No way back.** The generator maps $z$ to $x$, but nothing maps an image back to its code. Finding the code of a given image needs an optimization over $z$ or an extra network trained for the purpose.
-- **Unstable training.** The alternating updates can oscillate, and the two players must be kept in [balance](#balancing-the-two-players).
-- **Mode collapse.** The generator can cover a few modes well and drop the rest.
-- **Memorization.** A generator can reproduce training images, so samples should be compared with their nearest training images. Radford et al. de-duplicated their largest training set to make memorization less likely ([2016](#references), Section 4.1.1).
+### Strengths and weaknesses
+
+| | VAE | GAN |
+| --- | --- | --- |
+| Objective | maximize the [ELBO](/notes/generative-models/vae#where-the-elbo-comes-from), a lower bound on $\ln p_\theta(x)$ | a minimax game; against $D^*$, $2D_{\mathrm{JS}} - 2\ln 2$ |
+| Encoder | $q_\phi(z \mid x)$, trained with the decoder | none; inversion needs an optimization or a second network |
+| Density | a lower bound on $\ln p_\theta(x)$ for any image | none, only samples |
+| Typical failures | blurry samples, [posterior collapse](/notes/generative-models/vae#where-it-breaks-posterior-collapse) | mode collapse, unstable training |
+| Sampling cost | one decoder pass: $z \sim p(z)$, then $x \sim p_\theta(x \mid z)$ | one generator pass: $z \sim p_z$, $x = G(z)$ |
+
+The failures row is typical behaviour, not theorems. Blur comes from a fixed-variance Gaussian decoder: its squared error is minimized by the average of the images compatible with $z$. Mode collapse is a failure of the optimization: at the global optimum of the game, $p_g = p_{\text{data}}$ covers every mode.
+
+Nor does a VAE guarantee coverage: its forward KL charges an underweighted mode only in proportion to the mode's mass. Let the data put mass $0.05$ on one mode and $0.95$ on the rest, on disjoint regions, and the model fit each region exactly but give the rare mode $0.005$. The density ratio is constant on each region, and
+
+$$
+\begin{aligned}
+D_{\mathrm{KL}} &= 0.05\ln\frac{0.05}{0.005} + 0.95\ln\frac{0.95}{0.995} \\
+&\approx 0.115 - 0.044 = 0.071 \text{ nats}
+\end{aligned}
+$$
+
+per sample, invisible next to a log-likelihood of thousands of nats. The ELBO is also only a bound, so training maximizes the bound, not the likelihood.
+
+## What you should remember
+
+- Against $D^* = p_{\text{data}}/(p_{\text{data}} + p_g)$ the game value is $2D_{\mathrm{JS}} - 2\ln 2$, minimized only at $p_g = p_{\text{data}}$.
+- Disjoint supports: $D_{\mathrm{JS}} = \ln 2$ and no gradient.
+- Train $G$ with $-\ln D(G(z))$, from logits via softplus.
+- Smooth only the real label; mode collapse is high precision, low recall.
+- f-GAN: any f-divergence via $f^*$; LSGAN: Pearson $\chi^2$ to the mixture.
 
 ## Notebook
 
-The [GANs notebook](https://github.com/HSE-LAMBDA/DeepGenerativeModels/blob/spring-2025-long/seminars/02_GAN/GANs.ipynb) of the HSE-LAMBDA *Deep Generative Models* repository (pinned commit; cell numbers count every cell from 1) implements all three models. The notebook has no saved outputs; it documents procedures, not results.
+The [GANs notebook](https://github.com/HSE-LAMBDA/DeepGenerativeModels/blob/spring-2025-long/seminars/02_GAN/GANs.ipynb) of the HSE-LAMBDA *Deep Generative Models* course trains three models; cells are counted from 1, markdown included. It has no saved outputs, so it documents procedures only.
 
-- **Cells 1–2**: the minimax objective and the list of tricks the notebook uses: one-sided label smoothing, gradient clipping, dropout in the discriminator, a reduced latent variance at sampling time, a balanced update ratio and batch normalization in the generator.
-- **Cells 5–16: unconditional GAN on MNIST zeros**, resized to $32\times32$ and scaled to $[-1, 1]$, batch size 128 with `drop_last=True`.
-  - **Cell 9: the networks.** The latent is a spatial grid, 4 channels on a $4 \times 4$ grid, not a vector, and it is drawn inside the generator's `forward`. Each `UpsampleBlock` doubles the resolution bilinearly and then applies twice a $3 \times 3$ convolution, batch norm and LeakyReLU(0.2). Three blocks take $4 \times 4$ to $32 \times 32$ with 32, 64 and 128 channels, and a $1 \times 1$ convolution with Tanh gives the image. Each `DownsampleBlock` applies a stride-2 $3 \times 3$ convolution and a $3 \times 3$ convolution, each followed by batch norm, LeakyReLU(0.2) and `Dropout2d(0.3)`, and three blocks take $32 \times 32$ to $4 \times 4$. The discriminator is fully convolutional: a final $4 \times 4$ convolution turns the $4 \times 4 \times 128$ map into one logit. The docstrings speak of four blocks and of a global average, but the code has three blocks and no pooling. Against the [DCGAN guidelines](#architecture-the-dcgan-guidelines), the generator uses LeakyReLU instead of ReLU and resize-convolutions instead of transposed convolutions, the generator's channel count grows rather than shrinks with the resolution, and the discriminator applies batch norm right after its first convolution.
-  - **Cell 10** sets the hyperparameters: learning rate $10^{-4}$ for both networks, 30 epochs, one discriminator step per generator step (`update_ratio = 1`), gradient-norm clipping at $1$ and one-sided label smoothing $0.9$.
-  - **Cell 11** gives the guidance on the update ratio summarized under [balancing the two players](#balancing-the-two-players).
-  - **Cell 12** builds the networks and the optimizers: Adam with the default betas for $G$ and betas $(0.5, 0.999)$ for $D$, each with a step schedule that halves the learning rate every 20 epochs.
-  - **Cell 13** is the training loop with `binary_cross_entropy_with_logits`. The discriminator loss is the mean of BCE on real images (target 0.9) and on detached fakes (target 0), which is $-V$ up to the factor $\tfrac12$ and the smoothing. The generator loss is the non-saturating BCE towards the real label. Here the smoothed target $0.9$ is also used for the generator, so the exact loss is $-\mathbb{E}_z\big[0.9\ln D(G(z)) + 0.1\ln(1 - D(G(z)))\big]$, minimized at $D(G(z)) = 0.9$ rather than $1$. The schedulers are stepped once per epoch. Every 5 epochs the loop saves a checkpoint into `weights/`, as does the conditional loop of cell 23; the notebook never creates that directory, so `torch.save` fails unless it already exists.
-  - **Cells 14–16** plot the losses, sample a grid and list common tricks: one-sided label smoothing, random label flipping, batch normalization in both networks, "avoiding sparse gradients" with the log-sigmoid (the [logit form](#computing-the-losses-from-logits) of the losses), and mode collapse with minibatch discrimination, a history of old generators and WGAN as remedies. Cell 15 multiplies the latent by $0.7$ when sampling, so the grid shows the generator applied to a reduced-variance prior rather than samples from $p_g$ itself, the truncation-like [prior narrowing](#architecture-the-dcgan-guidelines); cells 25 and 33 do the same for the other two models.
-- **Cells 17–26: conditional GAN on CIFAR-100.** Cell 19 sets batch size 32, learning rate $2\cdot10^{-4}$ and Adam betas $(0.5, 0.999)$ for both networks, no learning-rate schedule, 30 epochs, smoothing $0.9$ (again also in the generator's target) and gradient clipping at $1$. In cell 22 the generator embeds the label with `Embedding(100, 16)`, reshaped into one $4 \times 4$ channel next to the 4 noise channels, and the discriminator embeds it with `Embedding(100, 1024)`, reshaped into one $32 \times 32$ channel next to the RGB image. The blocks are those of cell 9, with dropout 0.3 in the discriminator. Cell 23 alternates one discriminator and one generator step. Cell 26 lists what the condition buys: control over the class, samples focused on class-specific features, and variety across classes.
-- **Cells 27–33: f-GAN.** `Activation_g` and `Conjugate_f` (cell 29) implement $g_f$ and $f^*$ from the [table](#f-gan) for `"KLD"`, `"RKL"`, `"CHI"`, `"SQH"`, `"JSD"` and `"GAN"`, in the same convention: the Pearson conjugate is $t^2/4 + t$. `VLoss` is the mean of $g_f(v)$ and `QLoss` the mean of $-f^*(g_f(v))$. Cell 31 selects JS and reuses the unconditional networks: learning rate $10^{-4}$, Adam with default betas for $G$ and $(0.5, 0.999)$ for $D$, 100 epochs, no clipping, smoothing or schedule. In cell 32 the generator maximizes $T$ on generated samples rather than minimizing the fake term of the bound, the non-saturating surrogate of the [generator's step](#f-gan); the direct form is left as a commented alternative. Two implementation notes. The activation and the conjugate are evaluated one after the other with plain `exp` and `log`. In 32-bit floating point the JS and GAN conjugates return $+\infty$ once a fake's output $v$ exceeds about 17, because $2 - e^{t}$ or $1 - e^{t}$ rounds to $0$, and the GAN activation returns $-\infty$ for $v$ below about $-89$, where `exp(-v)` overflows. The composed forms $\operatorname{softplus}(v) - \ln 2$ and $\operatorname{softplus}(v)$ avoid both ([compose before computing](#f-gan)). And `loss_real.backward(retain_graph=True)` keeps a graph that is never used again.
-- **Cells 34–36**: the choice of latent size (a 100-dimensional vector or a small $4 \times 4$ grid, doubled by each upsampling layer), transposed convolutions against upsampling followed by a convolution, a comparison of variants (the original GAN, WGAN, LSGAN, f-GAN and the conditional GAN), the key challenges with their remedies (gradient penalties, unrolled GANs and several discriminators against mode collapse; label smoothing, balanced learning rates and spectral normalization for stability; the Inception Score, FID and KID for evaluation), practical tips and a list of pros and cons. The body covers them under [training GANs in practice](#training-gans-in-practice), [least-squares GAN](#least-squares-gan) and [strengths and weaknesses](#strengths-and-weaknesses); KID is covered with [FID](/notes/generative-models/fid).
+- **Unconditional GAN on MNIST zeros** (cells 4–16: data in 4–6, the model and its training from 7). Images at $32 \times 32$, resize-convolution upsampling, BCE with logits, one-sided smoothing $0.9$ (also the generator's target, so its loss is minimized at $D(G(z)) = 0.9$), clipping at 1, one $D$ step per $G$ step; noise scaled by $0.7$ at sampling.
+- **Conditional GAN on CIFAR-100** (cells 17–26). The label enters each network as a learned extra channel; Adam with $\beta_1 = 0.5$ for both.
+- **f-GAN** (cells 27–33). The table's activations and conjugates, trained with JS and applied one after the other with plain `exp` and `log`: in 32-bit floats a logit above about 17 rounds $2 - e^{t}$ to 0 and the loss on that fake to $+\infty$ (at $v = 16$ it already gives 15.25 instead of 15.31). The composed softplus forms avoid this.
 
 ## Next
 
-The disjoint-support argument showed that JS gives no gradient whenever the supports are disjoint, even when the generator's samples are close to the data. The [next note](/notes/generative-models/wgan) replaces it with a distance that shrinks continuously as the two distributions approach each other: the Wasserstein distance.
+JS gives no slope whenever the two distributions do not overlap, however close. The [next note](/notes/generative-models/wgan) replaces it with the Wasserstein distance, which shrinks steadily as the samples approach the data, and asks what constraint the discriminator then needs.
 
 ## References
 
-- I. Goodfellow, J. Pouget-Abadie, M. Mirza, B. Xu, D. Warde-Farley, S. Ozair, A. Courville, Y. Bengio. [Generative adversarial nets](https://papers.nips.cc/paper_files/paper/2014/hash/f033ed80deb0234979a61f95710dbe25-Abstract.html). NeurIPS, 2014. Preprint arXiv:1406.2661.
-- M. Arjovsky, L. Bottou. [Towards principled methods for training generative adversarial networks](https://arxiv.org/abs/1701.04862). ICLR, 2017.
-- T. Salimans, I. Goodfellow, W. Zaremba, V. Cheung, A. Radford, X. Chen. [Improved techniques for training GANs](https://arxiv.org/abs/1606.03498). NeurIPS, 2016.
-- M. Mirza, S. Osindero. [Conditional generative adversarial nets](https://arxiv.org/abs/1411.1784). arXiv:1411.1784, 2014.
-- S. Nowozin, B. Cseke, R. Tomioka. [f-GAN: Training generative neural samplers using variational divergence minimization](https://arxiv.org/abs/1606.00709). NeurIPS, 2016.
-- X. Nguyen, M. J. Wainwright, M. I. Jordan. [Estimating divergence functionals and the likelihood ratio by convex risk minimization](https://arxiv.org/abs/0809.0853). *IEEE Transactions on Information Theory*, 56(11), 2010.
+- I. Goodfellow, J. Pouget-Abadie, M. Mirza, B. Xu, D. Warde-Farley, S. Ozair, A. Courville, Y. Bengio. [Generative adversarial nets](https://papers.nips.cc/paper_files/paper/2014/hash/f033ed80deb0234979a61f95710dbe25-Abstract.html). NeurIPS, 2014. Algorithm 1; Section 3 (the non-saturating loss); Section 4 (optimal discriminator and global optimum).
+- M. Arjovsky, L. Bottou. [Towards principled methods for training generative adversarial networks](https://arxiv.org/abs/1701.04862). ICLR, 2017. Lemmas 1–3 (the generator's image has zero volume; perturbed manifolds meet in lower dimension), Theorems 2.1–2.2 (a perfect, locally constant discriminator), Theorem 2.5 (the gradient of the non-saturating loss), Theorem 2.6 (Cauchy-distributed updates).
 - I. Goodfellow. [NIPS 2016 tutorial: Generative adversarial networks](https://arxiv.org/abs/1701.00160). arXiv:1701.00160, 2016.
-- A. Radford, L. Metz, S. Chintala. [Unsupervised representation learning with deep convolutional generative adversarial networks](https://arxiv.org/abs/1511.06434). ICLR, 2016. DCGAN; Section 3: architecture guidelines; Section 4: training details.
-- X. Mao, Q. Li, H. Xie, R. Y. K. Lau, Z. Wang, S. P. Smolley. [Least squares generative adversarial networks](https://arxiv.org/abs/1611.04076). ICCV, 2017. Section 3.2: losses, benefits and the Pearson χ² connection.
-- L. Metz, B. Poole, D. Pfau, J. Sohl-Dickstein. [Unrolled generative adversarial networks](https://arxiv.org/abs/1611.02163). ICLR, 2017.
-- I. Durugkar, I. Gemp, S. Mahadevan. [Generative multi-adversarial networks](https://arxiv.org/abs/1611.01673). ICLR, 2017.
-- A. Shrivastava, T. Pfister, O. Tuzel, J. Susskind, W. Wang, R. Webb. [Learning from simulated and unsupervised images through adversarial training](https://arxiv.org/abs/1612.07828). CVPR, 2017. Section 2.3: a history of generated images for the discriminator.
-- M. Arjovsky, S. Chintala, L. Bottou. [Wasserstein GAN](https://arxiv.org/abs/1701.07875). arXiv:1701.07875, 2017; ICML 2017.
-- HSE-LAMBDA, *Deep Generative Models* course repository: [`GANs.ipynb`](https://github.com/HSE-LAMBDA/DeepGenerativeModels/blob/spring-2025-long/seminars/02_GAN/GANs.ipynb).
+- A. Radford, L. Metz, S. Chintala. [Unsupervised representation learning with deep convolutional generative adversarial networks](https://arxiv.org/abs/1511.06434). ICLR, 2016. Sections 3–4: architecture guidelines and training details.
+- T. Salimans, I. Goodfellow, W. Zaremba, V. Cheung, A. Radford, X. Chen. [Improved techniques for training GANs](https://arxiv.org/abs/1606.03498). NeurIPS, 2016. Sections 3.2–3.4: minibatch discrimination, historical averaging, one-sided label smoothing.
+- L. Metz, B. Poole, D. Pfau, J. Sohl-Dickstein. [Unrolled generative adversarial networks](https://arxiv.org/abs/1611.02163). ICLR, 2017. Section 2 (the unrolled objective), Section 3.1 and Figure 2 (eight Gaussians on a circle).
+- M. Mirza, S. Osindero. [Conditional generative adversarial nets](https://arxiv.org/abs/1411.1784). arXiv:1411.1784, 2014.
+- S. Nowozin, B. Cseke, R. Tomioka. [f-GAN: Training generative neural samplers using variational divergence minimization](https://arxiv.org/abs/1606.00709). NeurIPS, 2016. Section 2 and Tables 1–2: the bound, output activations and conjugates.
+- X. Nguyen, M. J. Wainwright, M. I. Jordan. [Estimating divergence functionals and the likelihood ratio by convex risk minimization](https://arxiv.org/abs/0809.0853). *IEEE Transactions on Information Theory*, 56(11), 2010.
+- S. Boyd, L. Vandenberghe. [*Convex Optimization*](https://web.stanford.edu/~boyd/cvxbook/). Cambridge University Press, 2004. Section 3.3.2 (the conjugate of the conjugate) and Exercise 3.39(d) (its proof outline).
+- X. Mao, Q. Li, H. Xie, R. Y. K. Lau, Z. Wang, S. P. Smolley. [Least squares generative adversarial networks](https://arxiv.org/abs/1611.04076). ICCV, 2017. Section 3.2: losses, codings and the Pearson $\chi^2$ connection.
+- S. Ermon et al. *Stanford CS236: Deep Generative Models*. [Course notes on GANs](https://deepgenerativemodels.github.io/notes/gan/) and [lecture 9](https://deepgenerativemodels.github.io/assets/slides/cs236_lecture9.pdf): likelihood-free learning, two-sample tests, mode collapse.
+- R. Isachenko. *Deep Generative Models*, MIPT and YSDA, 2025. [Lecture 5](https://github.com/r-isachenko/2025-DGM-MIPT-YSDA-course/tree/main/lectures/lecture5): likelihood-free learning, GAN optimality, mode collapse, the Wasserstein GAN.
+- BMML team. *Байесовские методы в анализе данных* (Bayesian methods in data analysis), lecture notes, lectures 1–6, 2026. [GitHub repository](https://github.com/bmml-team/bmml_ftda). Section 6.31: VAE against GAN, realism against diversity for images and molecules.
+- HSE-LAMBDA, *Deep Generative Models* course, spring 2025: [lecture 2, GAN](https://github.com/HSE-LAMBDA/DeepGenerativeModels/blob/spring-2025-long/lectures/02_Lecture_GAN.pdf) and [`GANs.ipynb`](https://github.com/HSE-LAMBDA/DeepGenerativeModels/blob/spring-2025-long/seminars/02_GAN/GANs.ipynb).

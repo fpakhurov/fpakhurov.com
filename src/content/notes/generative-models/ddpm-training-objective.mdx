@@ -1,6 +1,6 @@
 ---
 title: "DDPM: reverse process and training objective"
-description: How DDPM learns to run the noising chain backwards. The exact likelihood is an intractable integral over all noise-to-image paths, Jensen's inequality turns it into a bound made of KL terms, and matching Gaussian posteriors reduces training to predicting the added noise at a random timestep, with one U-Net for all steps that receives the timestep as a sinusoidal embedding.
+description: "How DDPM learns to run the noising chain backwards: a likelihood bound split into one KL term per step, a Gaussian posterior known in closed form, and the noise-prediction loss with its training and sampling algorithms."
 course: generative-models
 section: Diffusion Models
 order: 26
@@ -17,373 +17,454 @@ import TrainingStep from '../../../components/figures/ddpm-training-objective/Tr
 import LossWeight from '../../../components/figures/ddpm-training-objective/LossWeight.astro';
 import DenoiserFlow from '../../../components/figures/ddpm-training-objective/DenoiserFlow.astro';
 
-The [forward process](/notes/generative-models/ddpm-forward-process) gave us a diffusion process: a fixed chain that turns an image into Gaussian noise. To generate images we have to **invert** it, and that is the job of a deep neural network. This note derives what the network is trained to do. The route is the same as for the [VAE](/notes/generative-models/vae): the likelihood is intractable, so we minimise an upper bound on the negative log-likelihood instead. The bound then simplifies, step by step, into a plain mean squared error on noise. A first reading can skip the callouts (the algebra of the KL split, the 2015 form of the bound, the discretized decoder); the [recap](#recap-from-the-likelihood-to-one-training-step) at the end collects the chain in six lines.
+A DDPM is trained with one line of code: take an image, add Gaussian noise of a random strength, and ask the network to say what noise was added. The loss is the squared error of that guess. Nothing in it mentions likelihoods, chains or posteriors, yet the network it trains generates images by running the [forward process](/notes/generative-models/ddpm-forward-process) backwards. Why is this the right regression, and what does it give up?
 
-**Notation.** The forward step adds noise with variance $\beta_t \in (0, 1)$ at step $t = 1, \dots, T$. We write
+The answer comes from treating the noisy images $x_1, \dots, x_T$ as latent variables, as in the [VAE](/notes/generative-models/vae). The encoder is the fixed forward chain, the decoder is the learned reverse chain, and the loss starts as the VAE's bound on the likelihood. Every simplification from that bound to the one-line loss can be derived, and one of them is a deliberate change of objective.
+
+We keep the notation of the forward process: $\beta_t \in (0, 1)$ is the noise variance of step $t$, and
 
 $$
 \begin{aligned}
-\alpha_t &= 1 - \beta_t, \\
-\bar\alpha_t &= \prod_{s=1}^{t} \alpha_s, \qquad \bar\alpha_0 = 1,
+\alpha_t &= 1 - \beta_t , \\
+\bar\alpha_t &= \textstyle\prod_{s=1}^{t} \alpha_s , \\
+\bar\alpha_0 &= 1 , \\
+q(x_t \mid x_{t-1}) &= \mathcal N\big(\sqrt{\alpha_t}\, x_{t-1},\; \beta_t I\big) , \\
+q(x_t \mid x_0) &= \mathcal N\big(\sqrt{\bar\alpha_t}\, x_0,\; (1 - \bar\alpha_t) I\big) .
 \end{aligned}
 $$
 
-so the forward step and its closed-form shortcut from the previous note are
-
-$$
-\begin{gathered}
-q(x_t \mid x_{t-1}) = \mathcal N\!\big(\sqrt{\alpha_t}\,x_{t-1},\; \beta_t I\big), \\
-q(x_t \mid x_0) = \mathcal N\!\big(\sqrt{\bar\alpha_t}\,x_0,\; (1 - \bar\alpha_t) I\big).
-\end{gathered}
-$$
-
-The second argument of $\mathcal N(\mu, \sigma^2)$ is always the **variance**. $q$ denotes the fixed forward process and $q(x_0)$ the data distribution where it starts, $p_\theta$ the learned reverse process, $\theta$ the parameters of the neural network, and $p(x_T) = \mathcal N(0, I)$ the noise distribution where generation starts.
+The second argument of $\mathcal N$ is the variance, and $x_{s:t}$ is short for $(x_s, \dots, x_t)$.
 
 ## The reverse process
 
-The image $x_0$ sits at one end of the chain and pure noise $x_T$ at the other. Going forward, the step $q(x_t \mid x_{t-1})$ is known. Going backward we need $p_\theta(x_{t-1} \mid x_t)$: the probability density that we have to learn in order to invert the process.
+Generation starts from $p(x_T) = \mathcal N(0, I)$, a fixed distribution with no parameters, and applies a learned step $p_\theta(x_{t-1} \mid x_t)$ for $t = T, \dots, 1$. The complete forward and reverse processes are
+
+$$
+\begin{aligned}
+q(x_{1:T} \mid x_0) &= \prod_{t=1}^{T} q(x_t \mid x_{t-1}) , \\
+p_\theta(x_{0:T}) &= p(x_T) \prod_{t=1}^{T} p_\theta(x_{t-1} \mid x_t) .
+\end{aligned}
+$$
 
 <InverseProcessChain />
 
-What should $\theta$ optimise? The usual answer for a generative model: make real images likely. We minimise the **negative log-likelihood**, averaged over the data,
+What family should $p_\theta(x_{t-1} \mid x_t)$ belong to? The step it imitates is the true reverse step, by Bayes' theorem
 
 $$
-\mathbb{E}_{x_0 \sim q(x_0)}\big[-\log p_\theta(x_0)\big] \;\to\; \min_\theta ,
+q(x_{t-1} \mid x_t) \propto q(x_t \mid x_{t-1})\, q(x_{t-1}) ,
 $$
 
-which is the same as maximising the likelihood, the density the model assigns to real images. The derivation below works with one image $x_0$; the average over images is added back at the end.
-
-## Complete forward and reverse processes
-
-The **complete forward process** is the joint distribution of all noisy versions of an image. By the chain rule of probability,
+which involves the unknown marginal $q(x_{t-1})$. When $\beta_t$ is small this step is close to a Gaussian anyway:
 
 $$
 \begin{aligned}
-& q(x_1, \dots, x_T \mid x_0) \\
-&\quad = q(x_1 \mid x_0)\, q(x_2 \mid x_1, x_0) \\
-&\qquad \cdots q(x_T \mid x_{T-1}, \dots, x_0).
+q(x_{t-1} \mid x_t) &\approx \mathcal N\big(y + v\, \nabla \log q(y),\; v\big) , \\
+y &= x_t / \sqrt{\alpha_t} , \\
+v &= \beta_t / \alpha_t ,
 \end{aligned}
 $$
 
-The forward process is a **Markov chain**: each next state depends only on the previous one, so every factor keeps only its last condition:
+with an error that vanishes as $\beta_t \to 0$, provided $\log q$ has bounded curvature near $y$ (derivation below). The general statement, that for small steps the reverse of a Gaussian diffusion step is again Gaussian, goes back to Feller (1949); [Sohl-Dickstein et al. (2015](#references), §2.2) build on it, and [Isachenko (2025](#references), lecture 7) states it as a theorem.
+
+<details>
+<summary>Why a small reverse step is nearly Gaussian</summary>
+
+As a function of $x_{t-1}$, the first factor is a Gaussian centred at $y$ with the tiny variance $v$; its exponent is $-\alpha_t (x_{t-1} - y)^2 / (2\beta_t)$. Over a width of order $\sqrt v$ around $y$, the smooth function $\log q(x_{t-1})$ is close to its first-order Taylor expansion, $\log q(y) + (x_{t-1} - y)\, \nabla \log q(y)$. A Gaussian multiplied by the exponential of a linear function is a Gaussian with the same variance and its mean moved by the variance times the slope (complete the square). That gives the display above.
+
+The error comes from the neglected quadratic term of the Taylor expansion. If the second derivative of $\log q$ stays within $\pm K$ near $y$, that term is at most $\tfrac12 K (x_{t-1} - y)^2$, which is of order $K v$ over the width $\sqrt v$ and goes to $0$ with $v$.
+
+</details>
+
+This is why DDPM takes about a thousand small steps, and why it sets
 
 $$
-\begin{aligned}
-& q(x_1, \dots, x_T \mid x_0) \\
-&\quad = q(x_1 \mid x_0)\, q(x_2 \mid x_1) \cdots q(x_T \mid x_{T-1}).
-\end{aligned}
+p_\theta(x_{t-1} \mid x_t) = \mathcal N\big(\mu_\theta(x_t, t),\; \sigma_t^2 I\big) ,
 $$
 
-With the shorthand $x_{s:T} = (x_s, \dots, x_T)$, so that $x_{1:T}$ are the noisy states and $x_{0:T}$ the whole chain, the complete forward and reverse processes are
-
-$$
-\begin{gathered}
-\underbrace{q(x_{1:T} \mid x_0) = \prod_{t=1}^{T} q(x_t \mid x_{t-1})}_{\text{complete forward process}} , \\[4pt]
-\underbrace{p_\theta(x_{0:T}) = p(x_T) \prod_{t=1}^{T} p_\theta(x_{t-1} \mid x_t)}_{\text{complete reverse process}} .
-\end{gathered}
-$$
-
-The reverse process starts from $p(x_T) = \mathcal N(0, I)$. This factor has no parameters and needs no knowledge about the data: it is the fixed standard normal, the same for every dataset. All learning sits in the reverse steps $p_\theta(x_{t-1} \mid x_t)$.
-
-## The exact log-likelihood is intractable
-
-To get the exact log-likelihood of an image, take the joint reverse distribution and integrate out all intermediate states. This is **marginalisation**, extracting a marginal from the joint distribution:
-
-$$
--\log p_\theta(x_0) = -\log \int p_\theta(x_{0:T})\, dx_{1:T} .
-$$
-
-Can we use it? In DDPM each reverse step is a Gaussian whose mean is computed from $x_t$ by a neural network (made precise below). The network is nonlinear in $x_t$, so, unlike the forward chain of linear Gaussian steps, the composition of reverse steps is not Gaussian and the integral has no closed form. This is the same obstacle as for the [VAE decoder](/notes/generative-models/vae#the-latent-variable-model-and-its-posterior). What remains is numerical integration, so look at what the integral means. Every value of $x_{1:T}$ is one **path** from a noise sample $x_T$ to the image $x_0$, and the integral adds up the probabilities of all such paths. For images, each $x_t$ has as many dimensions as there are pixels, and there are $T$ of them (hundreds or thousands of steps), so the integral runs over $T \times (\text{number of pixels})$ dimensions. We cannot really compute all of those paths.
-
-<AllPathsIntegral />
+a Gaussian whose mean a network computes from $x_t$ and $t$, and whose variance $\sigma_t^2$ is a fixed number for each step. The gradient $\nabla \log q$ in the mean is the **score** of the noised data; the [score matching note](/notes/generative-models/score-matching#the-same-model-as-ddpm) returns to it.
 
 ## An upper bound via Jensen's inequality
 
-The trick is the one from the [VAE](/notes/generative-models/vae#where-the-elbo-comes-from). Multiply and divide by the complete forward process $q(x_{1:T} \mid x_0)$, which we know and can sample from (it is a product of Gaussians, positive everywhere, so the division is safe):
+We want real images to be likely under the model: minimize $\mathbb E_{q(x_0)}[-\log p_\theta(x_0)]$. The likelihood of one image integrates the reverse process over all intermediate states, every path from noise to the image:
+
+$$
+p_\theta(x_0) = \int p_\theta(x_{0:T})\, dx_{1:T} .
+$$
+
+The network is nonlinear in $x_t$, so the composed reverse steps are not Gaussian and the integral has no closed form. Numerically it runs over $T$ times the number of pixels dimensions.
+
+<AllPathsIntegral />
+
+The way out is the one of the [VAE](/notes/generative-models/vae#where-the-elbo-comes-from). Multiply and divide by the forward process, which is positive everywhere and easy to sample, then apply Jensen's inequality to the concave logarithm, $\log \mathbb E[Y] \ge \mathbb E[\log Y]$:
 
 $$
 \begin{aligned}
-& -\log p_\theta(x_0) \\
-&\quad = -\log \int q(x_{1:T} \mid x_0)\, \frac{p_\theta(x_{0:T})}{q(x_{1:T} \mid x_0)}\, dx_{1:T} \\
-&\quad = -\log \mathbb{E}_{q(x_{1:T} \mid x_0)}\!\left[ \frac{p_\theta(x_{0:T})}{q(x_{1:T} \mid x_0)} \right].
+-\log p_\theta(x_0)
+&= -\log \mathbb E_{q(x_{1:T} \mid x_0)}\Big[\frac{p_\theta(x_{0:T})}{q(x_{1:T} \mid x_0)}\Big] \\
+&\le \mathbb E_{q(x_{1:T} \mid x_0)}\Big[-\log \frac{p_\theta(x_{0:T})}{q(x_{1:T} \mid x_0)}\Big] \\
+&=: L(x_0) .
 \end{aligned}
 $$
 
-The logarithm is concave, so Jensen's inequality, $\log \mathbb{E}[Y] \ge \mathbb{E}[\log Y]$, moves it inside the expectation and turns the equality into a bound:
+$L$ is the negative ELBO, an upper bound on the negative log-likelihood. The gap is $D_{\mathrm{KL}}\big(q(x_{1:T} \mid x_0) \,\|\, p_\theta(x_{1:T} \mid x_0)\big)$, by the same decomposition as in [variational inference](/notes/bayesian-methods/variational-inference#the-evidence-lower-bound-and-the-reverse-kl). Training minimizes $\mathbb E_{q(x_0)}[L(x_0)]$. As written, $L$ is still an expectation over all $T$ noisy states at once. A one-sample estimate draws a whole path and adds $T$ random log-ratios, so the randomness of every step enters it. The next two sections rewrite $L$ as a sum of terms that each involve one step, and replace the average over each step by its closed form; [Ho, Jain and Abbeel (2020](#references), §2) introduce this rewriting as variance reduction.
+
+## The lemma: the reversed chain is Markov given the image
+
+The bound pairs the reverse steps $p_\theta(x_{t-1} \mid x_t)$ with forward steps $q(x_t \mid x_{t-1})$, which are densities of different variables. To compare like with like we need the forward process written backwards. The tool is a lemma ([lecture notes](#references), lecture 5, Lemma 1).
+
+**Lemma.** If $q(x_{1:T} \mid x_0) = \prod_{t=1}^T q(x_t \mid x_{t-1})$, then for every $t < T$
+
+$$
+q(x_t \mid x_{t+1}, \dots, x_T, x_0) = q(x_t \mid x_{t+1}, x_0) .
+$$
+
+Reversed in time and with $x_0$ held fixed, the chain is still Markov: once $x_{t+1}$ and the image are known, the later, noisier states say nothing more about $x_t$.
+
+<details>
+<summary>Proof of the lemma</summary>
+
+Fix $t$. Integrating $x_1, \dots, x_{t-1}$ out of the forward product turns its first $t$ factors into the marginal $q(x_t \mid x_0)$:
+
+$$
+q(x_t, \dots, x_T \mid x_0) = q(x_t \mid x_0) \prod_{s=t+1}^{T} q(x_s \mid x_{s-1}) . \tag{1}
+$$
+
+By the definition of a conditional density, the same joint is
+
+$$
+q(x_t, \dots, x_T \mid x_0) = q(x_t \mid x_{t+1:T}, x_0)\; q(x_{t+1:T} \mid x_0) . \tag{2}
+$$
+
+Now rewrite the first two factors of (1). The chain is Markov, so $q(x_{t+1} \mid x_t) = q(x_{t+1} \mid x_t, x_0)$, and Bayes' theorem for the pair $(x_t, x_{t+1})$ given $x_0$ gives
 
 $$
 \begin{aligned}
--\log p_\theta(x_0) &\le -\mathbb{E}_{q(x_{1:T} \mid x_0)}\!\left[ \log \frac{p_\theta(x_{0:T})}{q(x_{1:T} \mid x_0)} \right].
+q(x_t \mid x_0)\, q(x_{t+1} \mid x_t)
+&= q(x_t \mid x_0)\, q(x_{t+1} \mid x_t, x_0) \\
+&= q(x_t \mid x_{t+1}, x_0)\, q(x_{t+1} \mid x_0) .
 \end{aligned}
 $$
 
-The right-hand side is an **upper bound on the negative log-likelihood**. It is the negative **ELBO**: equivalently, the ELBO is a lower bound on the log-likelihood. The bound only involves quantities we can sample and evaluate. Minimising it caps the negative log-likelihood from above, but the two are not the same. The gap is $D_{\mathrm{KL}}\big(q(x_{1:T} \mid x_0)\,\|\,p_\theta(x_{1:T} \mid x_0)\big)$, exactly as in the VAE ([how loose is the bound](/notes/generative-models/vae#where-the-elbo-comes-from)), and it also depends on $\theta$. Write $B$ for the bound and $G$ for the gap. Then $-\log p_\theta(x_0) = B - G$, so a training step changes the negative log-likelihood by $\Delta B - \Delta G$. A falling bound alone therefore guarantees nothing: if $B$ drops from 10 to 9 while $G$ shrinks from 3 to 1, the negative log-likelihood rises from 7 to 8. Minimising the bound improves the likelihood only when the bound falls by more than the gap shrinks; if the gap stays the same or grows, the likelihood improves at least as much as the bound.
+Substituted into (1), the factors left after $q(x_t \mid x_{t+1}, x_0)$ are $q(x_{t+1} \mid x_0) \prod_{s=t+2}^{T} q(x_s \mid x_{s-1})$, which is (1) written for $t + 1$, that is $q(x_{t+1:T} \mid x_0)$:
+
+$$
+q(x_t, \dots, x_T \mid x_0) = q(x_t \mid x_{t+1}, x_0)\; q(x_{t+1:T} \mid x_0) .
+$$
+
+Comparing with (2) and dividing by $q(x_{t+1:T} \mid x_0) > 0$ proves the lemma.
+
+</details>
+
+The chain rule of probability, applied from the last state backwards, and then the lemma, give the factorization the bound needs:
+
+$$
+\begin{aligned}
+q(x_{1:T} \mid x_0)
+&= q(x_T \mid x_0) \prod_{t=1}^{T-1} q(x_t \mid x_{t+1:T}, x_0) \\
+&= q(x_T \mid x_0) \prod_{t=1}^{T-1} q(x_t \mid x_{t+1}, x_0) .
+\end{aligned}
+$$
 
 ## Splitting the bound into KL terms
 
-The algebra is in Appendix A of the DDPM paper ([Ho, Jain and Abbeel, 2020](#references), Eq. 5) and is sketched in the callout below. The bound becomes a sum of three kinds of terms:
+Put the two factorizations into the ratio inside $L$. In the numerator, peel off the last reverse step $p_\theta(x_0 \mid x_1)$; in the denominator, shift the index of the product by one, so that both products run over $t = 2, \dots, T$ and pair a reverse step with a backward forward step of the same variables:
 
 $$
 \begin{aligned}
-& \mathbb{E}_q\Bigg[\, \underbrace{D_{\mathrm{KL}}\big(q(x_T \mid x_0) \,\|\, p(x_T)\big)}_{\text{does not depend on }\theta} \\
-& + \sum_{t > 1} D_{\mathrm{KL}}\big(q(x_{t-1} \mid x_t, x_0) \,\|\, p_\theta(x_{t-1} \mid x_t)\big) \\
-& \underbrace{-\, \log p_\theta(x_0 \mid x_1)}_{\text{reconstruction}}
-\,\Bigg].
+\log \frac{p_\theta(x_{0:T})}{q(x_{1:T} \mid x_0)}
+&= \log \frac{p(x_T)}{q(x_T \mid x_0)} \\
+&\quad + \sum_{t=2}^{T} \log \frac{p_\theta(x_{t-1} \mid x_t)}{q(x_{t-1} \mid x_t, x_0)} \\
+&\quad + \log p_\theta(x_0 \mid x_1) .
 \end{aligned}
 $$
 
-Here $\mathbb{E}_q$ averages over the noisy states $x_{1:T} \sim q(x_{1:T} \mid x_0)$ of one image. Each term needs only some of them: the $t$-th KL depends only on $x_t$, so its average is over $x_t \sim q(x_t \mid x_0)$, and the reconstruction term depends only on $x_1$. In training we also average over images $x_0 \sim q(x_0)$.
-
-<aside class="callout">
-
-<strong>Where the KL terms come from.</strong> Write the ratio inside the logarithm with the two products. The bound becomes a sum of per-step log-ratios, each comparing a reverse step with the forward step it should undo ([Ho, Jain and Abbeel, 2020](#references), Eq. 3):
-
-$$
-\mathbb{E}_q\Bigg[ -\log p(x_T) - \sum_{t \ge 1} \log \frac{p_\theta(x_{t-1} \mid x_t)}{q(x_t \mid x_{t-1})} \Bigg].
-$$
-
-The two densities in each ratio are densities of different variables, $x_{t-1}$ and $x_t$, so a ratio is not yet a KL divergence. Peel off the $t = 1$ factor $p_\theta(x_0 \mid x_1)/q(x_1 \mid x_0)$. For $t \ge 2$, because the chain is Markov, $q(x_t \mid x_{t-1}) = q(x_t \mid x_{t-1}, x_0)$, and Bayes' theorem turns each forward step into a <em>backward</em> one: $q(x_t \mid x_{t-1}, x_0) = q(x_{t-1} \mid x_t, x_0)\, q(x_t \mid x_0) / q(x_{t-1} \mid x_0)$. The ratios $q(x_t \mid x_0)/q(x_{t-1} \mid x_0)$ telescope to $q(x_T \mid x_0)/q(x_1 \mid x_0)$. The $q(x_1 \mid x_0)$ left over cancels the one in the peeled-off factor, and the bound becomes
+Each term involves at most two states, so its expectation over all of $x_{1:T}$ reduces to those two. For the term with $(x_{t-1}, x_t)$, apply the definition of a conditional density twice:
 
 $$
 \begin{aligned}
-\mathbb{E}_q\Bigg[ & -\log \frac{p(x_T)}{q(x_T \mid x_0)} \\
-& - \sum_{t>1} \log \frac{p_\theta(x_{t-1} \mid x_t)}{q(x_{t-1} \mid x_t, x_0)} \\
-& - \log p_\theta(x_0 \mid x_1)\Bigg].
+q(x_{1:T} \mid x_0) &= q(x_t \mid x_0)\; q(x_{t-1} \mid x_t, x_0) \\
+&\quad \cdot q(\text{other states} \mid x_{t-1}, x_t, x_0) .
 \end{aligned}
 $$
 
-Averaging the $t$-th log-ratio over $q(x_{t-1} \mid x_t, x_0)$ gives the KL divergence, and the outer expectation is over $x_t \sim q(x_t \mid x_0)$; the first term is a KL in the same way, averaged over $q(x_T \mid x_0)$. [Luo (2022)](#references) writes out every step.
+The last factor integrates to $1$ over the other states. What remains is an average over $x_t \sim q(x_t \mid x_0)$ of an inner average over $x_{t-1} \sim q(x_{t-1} \mid x_t, x_0)$, and the inner average of $\log(q / p_\theta)$ is by definition a KL divergence ([lecture notes](#references), lecture 5). Changing the sign, the bound splits into
 
-</aside>
-
-<aside class="callout">
-
-<strong>The 2015 form of the bound.</strong> [Sohl-Dickstein et al. (2015)](#references), §2.4, Eq. 14, write the same bound with entropies in place of the two end terms. As a lower bound $K \le \mathbb E[\log p_\theta(x_0)]$,
+$$
+L(x_0) = L_T + \sum_{t=2}^{T} L_{t-1} + L_0 ,
+$$
 
 $$
 \begin{aligned}
-K = {} & -\sum_{t=2}^{T} \mathbb E_q\, D_{\mathrm{KL}}\big(q(x_{t-1} \mid x_t, x_0) \,\|\, p_\theta(x_{t-1} \mid x_t)\big) \\
-& + H_q(X_T \mid X_0) - H_q(X_1 \mid X_0) - H_p(X_T).
+L_T &= D_{\mathrm{KL}}\big(q(x_T \mid x_0) \,\|\, p(x_T)\big) , \\
+L_{t-1} &= \mathbb E_{q(x_t \mid x_0)}\, D_{\mathrm{KL}}\big(q_{t-1} \,\|\, p_{\theta, t-1}\big) , \\
+q_{t-1} &= q(x_{t-1} \mid x_t, x_0) , \\
+p_{\theta, t-1} &= p_\theta(x_{t-1} \mid x_t) , \\
+L_0 &= -\mathbb E_{q(x_1 \mid x_0)} \log p_\theta(x_0 \mid x_1) ,
 \end{aligned}
 $$
 
-Two choices turn the end terms into constants (their Appendix B). The last reverse step is not learned: it is fixed to the reversal of the first forward step under the prior $\pi = \mathcal N(0, I)$, $p(x_0 \mid x_1) = q(x_1 \mid x_0)\,\pi(x_0)/\pi(x_1)$. And for data scaled to mean $0$ and variance $1$, the cross-entropy $\mathbb E_q[-\log \pi(x_t)]$ is the same at every $t$, because $\mathbb E\lVert x_t\rVert^2 = \bar\alpha_t\,\mathbb E\lVert x_0\rVert^2 + (1 - \bar\alpha_t)\,d = d$; it equals the entropy $H_p(X_T)$ of the prior. Every entropy left is that of a Gaussian, $H = \tfrac d2\big(1 + \ln(2\pi\sigma^2)\big)$ for $\mathcal N(\mu, \sigma^2 I)$, with $\sigma^2 = 1 - \bar\alpha_t$ for $H_q(X_t \mid X_0)$ and $\sigma^2 = 1$ for $H_p(X_T)$. With DDPM's linear schedule, per dimension, $H_q(X_T \mid X_0)$ and $H_p(X_T)$ are both about $1.419$ nats and almost cancel, while $H_q(X_1 \mid X_0) = \tfrac12\ln(2\pi e \cdot 10^{-4}) \approx -3.19$ nats. Sohl-Dickstein et al. report $K - L_{\text{null}}$ in bits, the gain over the log-likelihood $L_{\text{null}}$ that the isotropic Gaussian $\pi$ itself assigns to the data.
+the form of [Ho, Jain and Abbeel (2020](#references), Eq. 5). The three kinds of terms behave differently.
 
-</aside>
+- $L_T$ compares the end of the forward chain with the fixed prior. Neither contains a trainable parameter, so $L_T$ is a constant during training; for DDPM's schedule it is about $10^{-5}$ bits per dimension ([forward process](/notes/generative-models/ddpm-forward-process#where-it-breaks-a-chain-too-short-to-forget)).
+- $L_0$ is the decoder's reconstruction term. It is not a constant: even with the family of $p_\theta(x_0 \mid x_1)$ fixed, its mean $\mu_\theta(x_1, 1)$ is the network's output, so $L_0$ changes with $\theta$.
+- $L_{t-1}$ for $t = 2, \dots, T$ does the main work. Each compares the model's step with $q(x_{t-1} \mid x_t, x_0)$, the forward step reversed with the image known. Both are Gaussians, as the next section shows, so every KL has a closed form instead of a noisy Monte Carlo estimate.
 
-Read the three terms one by one.
+<details>
+<summary>The decoder at t = 1 and bits per dimension</summary>
 
-- **First term.** $q(x_T \mid x_0)$ is the fixed forward process and $p(x_T)$ is the fixed standard normal. Nothing here depends on $\theta$, so for training it is a constant. (It is also tiny for a well-chosen schedule: DDPM's linear schedule reaches $\bar\alpha_{1000} \approx 4 \times 10^{-5}$, so $q(x_T \mid x_0) \approx \mathcal N(0, I)$. A toy schedule with $T = 100$ steps and $\beta_t$ rising from $10^{-5}$ to $10^{-2}$ ends near $\bar\alpha_{100} \approx 0.6$ and does not get there.)
-- **Last term.** $-\log p_\theta(x_0 \mid x_1)$ measures how likely the model is to recreate the image from the slightly noisier $x_1$. At $x_1$ barely any noise is left, so for the derivation we set this term aside. This is a simplification: DDPM keeps the term as a discretized decoder for 8-bit pixel values ([Ho, Jain and Abbeel, 2020](#references), §3.3, Eq. 13; callout below), and in its simplified loss the $t = 1$ noise-regression term approximates it (§3.4).
-- **Middle terms.** These do the work. Each compares the "**true posterior**" $q(x_{t-1} \mid x_t, x_0)$ with the model's **reverse diffusion step** $p_\theta(x_{t-1} \mid x_t)$.
-
-<aside class="callout">
-
-<strong>The discretized decoder and bits per dimension.</strong> Pixels are integers $0, \dots, 255$ scaled linearly to $[-1, 1]$, so neighbouring values are $2/255$ apart. DDPM's last step gives each value the probability mass of its bin under the Gaussian of the reverse step ([Ho, Jain and Abbeel, 2020](#references), Eq. 13):
-
-$$
-\begin{gathered}
-p_\theta(x_0 \mid x_1) = \prod_{i=1}^{D} \int_{\delta_-(x_0^i)}^{\delta_+(x_0^i)} \mathcal N\big(x;\ \mu_\theta^i(x_1, 1),\ \sigma_1^2\big)\,dx, \\
-\delta_\pm(x) = x \pm \tfrac{1}{255}, \qquad \delta_+(1) = +\infty, \qquad \delta_-(-1) = -\infty .
-\end{gathered}
-$$
-
-$D$ is the number of pixel values in the image, and the bins of the two extreme values extend to infinity, so the probabilities of the 256 values sum to $1$. Each factor is a difference of two values of the standard normal CDF $\Phi$. **Worked example** with $\sigma_1 = \sqrt{\beta_1} = 0.01$. Pixel value 128 becomes $x_0 = 128/127.5 - 1 \approx 0.0039$. With the mean exactly on it, the bin $\pm 1/255$ spans $\pm 0.392$ standard deviations, so its probability is $2\Phi(0.392) - 1 = 0.305$, or $-\log_2 0.305 = 1.71$ bits. A mean off by $0.004$ gives $0.283$ and $1.82$ bits. The extreme value 255 with the mean on it gets $\Phi(0.392) = 0.653$, $0.62$ bits, because its bin is open to the right. The same construction with a mixture of logistic distributions in place of the Gaussian is the output layer of [PixelCNN++](/notes/generative-models/autoregressive-models#pixelcnn-plus-plus).
-
-Likelihoods are reported in **bits per dimension**: the bound on $-\ln p_\theta(x_0)$ in nats, divided by $D \ln 2$ ([definition](/notes/generative-models/autoregressive-models#pixels-as-discrete-values)). Every term is converted the same way, the KL terms of the middle steps and the decoder term at $t = 1$ alike. For CIFAR-10, $D = 32 \cdot 32 \cdot 3 = 3072$, so the $3.75$ bits per dimension of DDPM below mean about $11{,}520$ bits per image.
-
-</aside>
-
-Simplified, the objective is
+Pixels are integers $0, \dots, 255$ scaled linearly to $[-1, 1]$, so neighbouring values are $2/255$ apart. DDPM's last step gives each value the probability mass of its bin under the Gaussian of the reverse step ([Ho, Jain and Abbeel, 2020](#references), Eq. 13), one factor per pixel value $i = 1, \dots, D$:
 
 $$
 \begin{aligned}
-\mathbb{E}_q\Bigg[ \sum_{t > 1} D_{\mathrm{KL}}\Big( & \underbrace{q(x_{t-1} \mid x_t, x_0)}_{\text{true posterior}} \\
-& \Big\|\, \underbrace{p_\theta(x_{t-1} \mid x_t)}_{\text{reverse step}} \Big) \Bigg].
+p_\theta(x_0 \mid x_1) &= \prod_{i=1}^{D} \int_{\delta_-(x_0^i)}^{\delta_+(x_0^i)} \mathcal N\big(x;\ \mu_\theta^i(x_1, 1),\ \sigma_1^2\big)\, dx , \\
+\delta_\pm(x) &= x \pm \tfrac{1}{255} ,
 \end{aligned}
 $$
+
+with the outer edges $\delta_+(1) = +\infty$ and $\delta_-(-1) = -\infty$, so that the 256 probabilities sum to $1$. Each factor is a difference of two values of the standard normal CDF $\Phi$. With $\sigma_1 = \sqrt{\beta_1} = 0.01$ and the mean exactly on the pixel value, the bin $\pm 1/255$ spans $\pm 0.392$ standard deviations, so its probability is $2\Phi(0.392) - 1 = 0.305$, or $-\log_2 0.305 = 1.71$ bits.
+
+Likelihoods are reported in **bits per dimension**: the bound in nats divided by $D \ln 2$ ([definition](/notes/generative-models/autoregressive-models#pixels-as-discrete-values)). For CIFAR-10, $D = 32 \cdot 32 \cdot 3 = 3072$, so $3.75$ bits per dimension mean $11{,}520$ bits per image.
+
+</details>
 
 ## The true posterior
 
-The three states and the three conditional distributions fit into one small graph. $x_{t-1}$ is noisy, $x_t$ is more noisy, and $x_0$ is the original image.
-
 <PosteriorGraph />
 
-The forward step $q(x_t \mid x_{t-1})$ goes right. The model's step $p_\theta(x_{t-1} \mid x_t)$ goes left, using only $x_t$. The true posterior $q(x_{t-1} \mid x_t, x_0)$ also goes left, but it looks at both $x_t$ and the original image $x_0$.
-
-The true posterior has a **closed-form expression** (derived below). So why do we need a neural network at all? Because the true posterior requires knowing $x_0$. At generation time we have no image; we have to produce one starting from pure noise alone. The network $p_\theta(x_{t-1} \mid x_t)$ must therefore imitate the true posterior without seeing $x_0$.
-
-So we **train the model's reverse step to match the true posterior**:
+The forward step reversed with the image known, $q(x_{t-1} \mid x_t, x_0)$, is the "true posterior" that each $L_{t-1}$ compares with. Bayes' theorem conditioned on $x_0$, followed by the Markov property $q(x_t \mid x_{t-1}, x_0) = q(x_t \mid x_{t-1})$, gives
 
 $$
-\begin{gathered}
-p_\theta(x_{t-1} \mid x_t) = \mathcal N\!\big(\mu_\theta(x_t, t),\; \sigma_\theta^2(x_t, t)\, I\big) \\
-\big\updownarrow \\
-q(x_{t-1} \mid x_t, x_0) = \mathcal N\!\big(\tilde\mu_t(x_t, x_0),\; \tilde\beta_t I\big).
-\end{gathered}
+q(x_{t-1} \mid x_t, x_0) = \frac{q(x_t \mid x_{t-1})\; q(x_{t-1} \mid x_0)}{q(x_t \mid x_0)} .
 $$
 
-Why Gaussians?
-
-1. **Small steps keep the reverse step Gaussian.** For a diffusion with small steps, the reverse of a Gaussian Markov chain is also (approximately) Gaussian: as $\beta_t \to 0$, the reverse step $q(x_{t-1} \mid x_t)$ has the same Gaussian functional form as the forward step ([Feller, 1949](#references); used by [Sohl-Dickstein et al., 2015](#references), §2.2). For finite steps $q(x_{t-1} \mid x_t)$ is *not* exactly Gaussian, because it mixes over all images $x_0$ in the data. The posterior conditioned on $x_0$, $q(x_{t-1} \mid x_t, x_0)$, is exactly Gaussian for any $\beta_t$ when $t \ge 2$. At $t = 1$ it collapses to the point mass at $x_0$ ($\tilde\beta_1 = 0$), which is why that step is handled by the reconstruction term.
-2. **Everything is just simpler.** KL divergences between Gaussians have closed forms, and sampling from a Gaussian is trivial.
-
-**The closed form.** Let $t \ge 2$. By Bayes' theorem, $q(x_{t-1} \mid x_t, x_0) \propto q(x_t \mid x_{t-1})\, q(x_{t-1} \mid x_0)$. Both factors are Gaussian in $x_{t-1}$. The first has the exponent $-(x_t - \sqrt{\alpha_t}\,x_{t-1})^2/(2\beta_t) = -\alpha_t\,(x_{t-1} - x_t/\sqrt{\alpha_t})^2/(2\beta_t)$ (per coordinate), so as a function of $x_{t-1}$ it has mean $x_t/\sqrt{\alpha_t}$ and precision $\alpha_t/\beta_t$. The second is $\mathcal N\big(\sqrt{\bar\alpha_{t-1}}\,x_0,\; 1 - \bar\alpha_{t-1}\big)$. Completing the square in the product, the precisions add and the mean is the precision-weighted average of the two means, the same computation as the [normal–normal conjugate update](/notes/bayesian-methods/conjugate-priors#normal-normal-an-unknown-mean):
+Both factors of the numerator are Gaussian in $x_{t-1}$, and the denominator does not depend on $x_{t-1}$. Take logarithms, per coordinate, and collect the terms in $x_{t-1}$; every term without $x_{t-1}$ goes into a constant $c$:
 
 $$
 \begin{aligned}
-\frac{1}{\tilde\beta_t} &= \frac{\alpha_t}{\beta_t} + \frac{1}{1 - \bar\alpha_{t-1}}
-= \frac{\alpha_t (1 - \bar\alpha_{t-1}) + \beta_t}{\beta_t (1 - \bar\alpha_{t-1})} \\
-&= \frac{1 - \bar\alpha_t}{\beta_t (1 - \bar\alpha_{t-1})}, \\
-\tilde\mu_t &= \tilde\beta_t \left( \frac{\sqrt{\alpha_t}}{\beta_t}\, x_t + \frac{\sqrt{\bar\alpha_{t-1}}}{1 - \bar\alpha_{t-1}}\, x_0 \right).
+\log q(x_{t-1} \mid x_t, x_0)
+&= -\frac{(x_t - \sqrt{\alpha_t}\, x_{t-1})^2}{2\beta_t} \\
+&\quad - \frac{(x_{t-1} - \sqrt{\bar\alpha_{t-1}}\, x_0)^2}{2(1 - \bar\alpha_{t-1})} + c \\
+&= -\tfrac12 \big(A\, x_{t-1}^2 - 2 B\, x_{t-1}\big) + c ,
 \end{aligned}
 $$
 
-The numerator simplifies by $\alpha_t(1 - \bar\alpha_{t-1}) + \beta_t = \alpha_t - \bar\alpha_t + \beta_t = 1 - \bar\alpha_t$, using $\bar\alpha_t = \alpha_t \bar\alpha_{t-1}$ and $\alpha_t + \beta_t = 1$. Inverting the precision and multiplying out the mean gives
+where expanding the squares gives
 
 $$
 \begin{aligned}
-\tilde\mu_t(x_t, x_0) &= \frac{\sqrt{\bar\alpha_{t-1}}\,\beta_t}{1 - \bar\alpha_t}\, x_0 \\
-&\quad + \frac{\sqrt{\alpha_t}\,(1 - \bar\alpha_{t-1})}{1 - \bar\alpha_t}\, x_t, \\
-\tilde\beta_t &= \frac{1 - \bar\alpha_{t-1}}{1 - \bar\alpha_t}\, \beta_t .
+A &= \frac{\alpha_t}{\beta_t} + \frac{1}{1 - \bar\alpha_{t-1}} , \\
+B &= \frac{\sqrt{\alpha_t}}{\beta_t}\, x_t + \frac{\sqrt{\bar\alpha_{t-1}}}{1 - \bar\alpha_{t-1}}\, x_0 .
 \end{aligned}
 $$
 
-The true posterior mean is a weighted mix of the image and the current noisy state.
+Completing the square, $A x^2 - 2 B x = A (x - B/A)^2 - B^2/A$, so the posterior is Gaussian with variance $1/A$ and mean $B/A$. Over a common denominator, and with $\alpha_t \bar\alpha_{t-1} = \bar\alpha_t$ and $\alpha_t + \beta_t = 1$,
+
+$$
+\begin{aligned}
+A &= \frac{\alpha_t (1 - \bar\alpha_{t-1}) + \beta_t}{\beta_t (1 - \bar\alpha_{t-1})} \\
+&= \frac{\alpha_t - \bar\alpha_t + \beta_t}{\beta_t (1 - \bar\alpha_{t-1})} \\
+&= \frac{1 - \bar\alpha_t}{\beta_t (1 - \bar\alpha_{t-1})} .
+\end{aligned}
+$$
+
+Inverting $A$ gives the variance, and multiplying $B$ by $1/A$ term by term gives the mean:
+
+$$
+\begin{aligned}
+\frac{\sqrt{\alpha_t}}{\beta_t} \cdot \frac{\beta_t (1 - \bar\alpha_{t-1})}{1 - \bar\alpha_t} &= \frac{\sqrt{\alpha_t}\, (1 - \bar\alpha_{t-1})}{1 - \bar\alpha_t} , \\
+\frac{\sqrt{\bar\alpha_{t-1}}}{1 - \bar\alpha_{t-1}} \cdot \frac{\beta_t (1 - \bar\alpha_{t-1})}{1 - \bar\alpha_t} &= \frac{\sqrt{\bar\alpha_{t-1}}\, \beta_t}{1 - \bar\alpha_t} .
+\end{aligned}
+$$
+
+Together:
+
+$$
+\boxed{
+\begin{aligned}
+q(x_{t-1} \mid x_t, x_0) &= \mathcal N\big(\tilde\mu_t(x_t, x_0),\; \tilde\beta_t I\big) , \\
+\tilde\beta_t &= \frac{1 - \bar\alpha_{t-1}}{1 - \bar\alpha_t}\, \beta_t , \\
+\tilde\mu_t &= \frac{\sqrt{\bar\alpha_{t-1}}\, \beta_t}{1 - \bar\alpha_t}\, x_0 + \frac{\sqrt{\alpha_t}\, (1 - \bar\alpha_{t-1})}{1 - \bar\alpha_t}\, x_t .
+\end{aligned}
+}
+$$
+
+This is DDPM's Eq. 6–7, and the same computation as the [normal–normal conjugate update](/notes/bayesian-methods/conjugate-priors#normal-normal-an-unknown-mean): the precisions add, and the mean is a precision-weighted average. **Toy example:** $\beta_1 = 0.1$ and $\beta_2 = 0.2$, so $\bar\alpha_1 = 0.9$ and $\bar\alpha_2 = 0.72$. Then $q(x_1 \mid x_2, x_0)$ has variance $\tilde\beta_2 = 0.1/0.28 \cdot 0.2 = 0.0714$ and mean $0.678\, x_0 + 0.319\, x_2$; the Code section recovers these numbers by simulation. At $t = 1$, $\bar\alpha_0 = 1$ gives $\tilde\beta_1 = 0$ and $\tilde\mu_1 = x_0$: given the image, there is nothing left to guess, which is why that step is handled by the decoder term $L_0$.
+
+The posterior needs $x_0$, and at generation time there is no image. The network must imitate it from $x_t$ alone.
 
 ## Matching two Gaussians: KL becomes L2
 
-We would still have to predict both $\mu_\theta$ and $\sigma_\theta$. DDPM simplifies further: **fix $\sigma_\theta$ to a schedule $\sigma_t$**, so it is not learned, and only learn the mean. Ho et al. use $\sigma_t^2 = \beta_t$ or $\sigma_t^2 = \tilde\beta_t$ and report similar results ([Ho, Jain and Abbeel, 2020](#references), §3.2); [Nichol and Dhariwal (2021)](#references), §3.1, later learn a variance that interpolates between the two.
-
-With fixed variances, the KL divergence between the two Gaussians depends on $\theta$ only through the distance between the means. For $q = \mathcal N(\tilde\mu_t, \tilde\beta_t I)$ and $p_\theta = \mathcal N(\mu_\theta, \sigma_t^2 I)$ in $d$ dimensions, the [KL divergence between two 1-D Gaussians](/notes/generative-models/fitting-distributions-with-kl#what-the-gradients-are), summed over the $d$ coordinates, gives
+DDPM does not learn the variance of the reverse step: $\sigma_t^2$ is fixed in advance. With $p_\theta = \mathcal N(\mu_\theta, \sigma_t^2 I)$, the [KL divergence between two 1-D Gaussians](/notes/generative-models/fitting-distributions-with-kl#what-the-gradients-are), summed over the $d$ coordinates, is
 
 $$
 \begin{aligned}
-D_{\mathrm{KL}}(q \,\|\, p_\theta)
-&= \frac{1}{2\sigma_t^2}\,\big\|\tilde\mu_t - \mu_\theta\big\|^2 \\
-&\quad + \underbrace{\frac d2\left(\frac{\tilde\beta_t}{\sigma_t^2} - 1 - \log\frac{\tilde\beta_t}{\sigma_t^2}\right)}_{\text{const; }0\text{ if }\sigma_t^2 = \tilde\beta_t} .
+D_{\mathrm{KL}}\big(q(x_{t-1} \mid x_t, x_0) \,\|\, p_\theta\big)
+&= \frac{\lVert \tilde\mu_t - \mu_\theta \rVert^2}{2\sigma_t^2} + C_t , \\
+C_t &= \frac d2 \Big(\frac{\tilde\beta_t}{\sigma_t^2} - 1 - \ln \frac{\tilde\beta_t}{\sigma_t^2}\Big) .
 \end{aligned}
 $$
 
-The same result follows from the general formula for two Gaussians in $d$ dimensions with positive definite covariances,
-
-$$
-\begin{aligned}
-& D_{\mathrm{KL}}\big(\mathcal N(\mu_q, \Sigma_q) \,\|\, \mathcal N(\mu_p, \Sigma_p)\big) \\
-&\quad = \tfrac12\Big[\operatorname{tr}(\Sigma_p^{-1}\Sigma_q) - d + \ln\frac{\det\Sigma_p}{\det\Sigma_q} \\
-&\qquad\quad + (\mu_p - \mu_q)^\top \Sigma_p^{-1} (\mu_p - \mu_q)\Big],
-\end{aligned}
-$$
-
-with $\Sigma_q = \tilde\beta_t I$ and $\Sigma_p = \sigma_t^2 I$: the trace gives $d\,\tilde\beta_t/\sigma_t^2$, the log-determinant ratio $d \ln(\sigma_t^2/\tilde\beta_t)$, and the quadratic form $\lVert\tilde\mu_t - \mu_\theta\rVert^2/\sigma_t^2$.
-
-So in fact the KL term is an **L2 loss**, $\frac{1}{2\sigma_t^2}\|\tilde\mu_t - \mu_\theta\|^2$, plus a constant. For one pair $(x_t, x_0)$ the L2 part would be zero with $\mu_\theta$ on $\tilde\mu_t$, and the whole KL term would vanish only if, in addition, $\sigma_t^2 = \tilde\beta_t$. But $\tilde\mu_t$ depends on $x_0$, which the network does not see, and many images are compatible with the same $x_t$. Since $\mu_\theta$ sees only $x_t$, the best it can do is the average of $\tilde\mu_t$ over all images $x_0$ compatible with $x_t$, because the [conditional mean minimises the expected squared error](/notes/probability/conditional-expectation#the-best-predictor):
-
-$$
-\mu_\theta^*(x_t, t) = \mathbb{E}_q\big[\tilde\mu_t(x_t, x_0) \mid x_t\big],
-$$
-
-the average over $x_0 \sim q(x_0 \mid x_t)$. By the tower property this is also $\mathbb{E}_q[x_{t-1} \mid x_t]$, the mean of the true reverse step $q(x_{t-1} \mid x_t)$. At the optimum the KL term is therefore not zero: what remains reflects how much $x_t$ leaves the image undetermined.
+$C_t$ does not depend on $\theta$, and it is $0$ when $\sigma_t^2 = \tilde\beta_t$. So each $L_{t-1}$ is a squared error between means, plus a constant ([Ho, Jain and Abbeel, 2020](#references), Eq. 8).
 
 <EqualVarianceKL />
 
-So:
+Which $\sigma_t^2$? Ho, Jain and Abbeel tried $\beta_t$ and $\tilde\beta_t$ and found similar results (§3.2). They are the right variance in two extreme cases. If the data are a single point, the true reverse step is the posterior itself, with variance $\tilde\beta_t$. If the data are $\mathcal N(0, I)$, every $x_t$ is $\mathcal N(0, I)$ and $\operatorname{Cov}(x_{t-1}, x_t) = \sqrt{\alpha_t}\, I$, so the [Gaussian conditional](/notes/probability/multivariate-gaussian#marginals-and-conditionals) has variance $1 - \alpha_t = \beta_t$.
+
+What does the network learn? The target $\tilde\mu_t$ depends on $x_0$, which it does not see, and many images are compatible with the same $x_t$. Since the [conditional mean minimizes the expected squared error](/notes/probability/conditional-expectation#the-best-predictor), the optimum is the average of $\tilde\mu_t$ over the images compatible with $x_t$, and by the tower property that is the mean of the true reverse step:
 
 $$
-\mathbb{E}_q\!\left[ \sum_{t > 1} \frac{1}{2\sigma_t^2}\, \big\| \tilde\mu_t - \mu_\theta(x_t, t) \big\|^2 \right] \;\to\; \min_\theta .
+\begin{aligned}
+\mu_\theta^*(x_t, t) &= \mathbb E\big[\tilde\mu_t(x_t, x_0) \mid x_t\big] \\
+&= \mathbb E[x_{t-1} \mid x_t] .
+\end{aligned}
 $$
+
+At this optimum the KL terms are not zero. What remains of the squared error is the variance of $\tilde\mu_t(x_t, x_0)$ given $x_t$. Since $\tilde\mu_t$ is linear in $x_0$, that is the square of its coefficient of $x_0$ times $\operatorname{Var}(x_0 \mid x_t)$, summed over pixels: it is zero only when $x_t$ determines the image.
 
 ## From means to noise
 
-The true posterior mean still contains $x_0$. Remove it with the **reparameterisation** of the forward shortcut, as in the VAE:
-
-$$
-\begin{gathered}
-x_t = \sqrt{\bar\alpha_t}\, x_0 + \sqrt{1 - \bar\alpha_t}\, \varepsilon, \quad \varepsilon \sim \mathcal N(0, I) \\
-\Longrightarrow\quad
-x_0 = \frac{1}{\sqrt{\bar\alpha_t}}\big(x_t - \sqrt{1 - \bar\alpha_t}\, \varepsilon\big).
-\end{gathered}
-$$
-
-Substitute into $\tilde\mu_t$. The key identity is $\bar\alpha_t = \alpha_t \bar\alpha_{t-1}$, so $\sqrt{\bar\alpha_{t-1}}/\sqrt{\bar\alpha_t} = 1/\sqrt{\alpha_t}$. The coefficient of $x_t$ collects to
+The network could output $\mu_\theta$ directly. The [lecture notes](#references) take a route through the image first. Since $\tilde\mu_t$ is linear in $x_0$ with coefficient $c_t = \sqrt{\bar\alpha_{t-1}}\, \beta_t / (1 - \bar\alpha_t)$, let a network $\hat x_\theta(x_t, t)$ guess the image and plug the guess into the posterior mean, $\mu_\theta = \tilde\mu_t(x_t, \hat x_\theta)$. Then the means differ only through the images:
 
 $$
 \begin{aligned}
-&\frac{\beta_t}{\sqrt{\alpha_t}\,(1 - \bar\alpha_t)} + \frac{\sqrt{\alpha_t}\,(1 - \bar\alpha_{t-1})}{1 - \bar\alpha_t} \\
-&\quad= \frac{\beta_t + \alpha_t - \bar\alpha_t}{\sqrt{\alpha_t}\,(1 - \bar\alpha_t)}
-= \frac{1 - \bar\alpha_t}{\sqrt{\alpha_t}\,(1 - \bar\alpha_t)}
-= \frac{1}{\sqrt{\alpha_t}},
+\tilde\mu_t(x_t, x_0) - \mu_\theta &= c_t\, \big(x_0 - \hat x_\theta(x_t, t)\big) , \\
+L_{t-1} &= \frac{c_t^2}{2\sigma_t^2}\, \mathbb E\, \lVert x_0 - \hat x_\theta(x_t, t) \rVert^2 + C_t .
 \end{aligned}
 $$
 
-using $\beta_t + \alpha_t = 1$. The coefficient of $\varepsilon$ is $-\frac{\beta_t}{\sqrt{\alpha_t}\,(1-\bar\alpha_t)}\sqrt{1 - \bar\alpha_t} = -\frac{\beta_t}{\sqrt{\alpha_t}\sqrt{1 - \bar\alpha_t}}$. Hence
+Training is regression of the clean image on the noisy one: a **denoiser**.
+
+DDPM goes one step further and predicts the noise ([Ho, Jain and Abbeel, 2020](#references), §3.2). The one-draw jump $x_t = \sqrt{\bar\alpha_t}\, x_0 + \sqrt{1 - \bar\alpha_t}\, \varepsilon$ can be solved for the image:
 
 $$
-\tilde\mu_t = \frac{1}{\sqrt{\alpha_t}}\left( x_t - \frac{\beta_t}{\sqrt{1 - \bar\alpha_t}}\, \varepsilon \right).
+x_0 = \frac{1}{\sqrt{\bar\alpha_t}} \big(x_t - \sqrt{1 - \bar\alpha_t}\, \varepsilon\big) .
 $$
 
-The denoiser has access to $x_t$ and $t$, but not to $\varepsilon$. So give the model's mean exactly the same form and let the network predict only the missing piece, the noise ([Ho, Jain and Abbeel, 2020](#references), Eq. 11):
-
-$$
-\mu_\theta(x_t, t) = \frac{1}{\sqrt{\alpha_t}}\left( x_t - \frac{\beta_t}{\sqrt{1 - \bar\alpha_t}}\, \varepsilon_\theta(x_t, t) \right).
-$$
-
-Now both $\tilde\mu_t$ and $\mu_\theta(x_t, t)$ are expressed using only $x_t$ and a noise. In the difference $x_t$ cancels, leaving $\tilde\mu_t - \mu_\theta = \frac{\beta_t}{\sqrt{\alpha_t}\sqrt{1 - \bar\alpha_t}}\big(\varepsilon_\theta - \varepsilon\big)$, and the loss becomes
+Substitute this into $\tilde\mu_t$ and use $\sqrt{\bar\alpha_{t-1}} / \sqrt{\bar\alpha_t} = 1/\sqrt{\alpha_t}$, from $\bar\alpha_t = \alpha_t \bar\alpha_{t-1}$. The coefficient of $x_t$ collects two terms, which add up by $\beta_t + \alpha_t = 1$:
 
 $$
 \begin{aligned}
-L = \mathbb{E}_q\Bigg[ & \sum_{t > 1} \frac{\beta_t^2}{2\sigma_t^2\, \alpha_t\, (1 - \bar\alpha_t)} \\
-& \cdot \big\| \varepsilon - \varepsilon_\theta(x_t, t) \big\|^2 \Bigg].
+\frac{\beta_t}{\sqrt{\alpha_t}\,(1 - \bar\alpha_t)} + \frac{\sqrt{\alpha_t}\,(1 - \bar\alpha_{t-1})}{1 - \bar\alpha_t}
+&= \frac{\beta_t + \alpha_t - \bar\alpha_t}{\sqrt{\alpha_t}\,(1 - \bar\alpha_t)} \\
+&= \frac{1}{\sqrt{\alpha_t}} .
 \end{aligned}
 $$
 
-This is Eq. 12 of [Ho, Jain and Abbeel (2020)](#references), summed over $t$. Here $\varepsilon_\theta(x_t, t)$ is the **network's prediction of the noise**. As for the means, it cannot recover the particular $\varepsilon$ that produced $x_t$, because it does not see $x_0$. The optimum is $\varepsilon_\theta^*(x_t, t) = \mathbb{E}[\varepsilon \mid x_t]$, the average noise consistent with $x_t$; this is the same optimum as $\mu_\theta^*$, since $\tilde\mu_t$ is an affine function of $\varepsilon$ for fixed $x_t$. The denoiser is a noise predictor.
+The coefficient of $\varepsilon$ is $-\beta_t \sqrt{1 - \bar\alpha_t} / \big(\sqrt{\alpha_t}\,(1 - \bar\alpha_t)\big) = -\beta_t / \big(\sqrt{\alpha_t} \sqrt{1 - \bar\alpha_t}\big)$. Hence
+
+$$
+\tilde\mu_t = \frac{1}{\sqrt{\alpha_t}} \Big(x_t - \frac{\beta_t}{\sqrt{1 - \bar\alpha_t}}\, \varepsilon\Big) .
+$$
+
+The network sees $x_t$ and $t$ but not $\varepsilon$, so DDPM gives the model's mean the same form and lets a network $\varepsilon_\theta$ predict the missing noise (Eq. 11):
+
+$$
+\boxed{\;\mu_\theta(x_t, t) = \frac{1}{\sqrt{\alpha_t}} \Big(x_t - \frac{\beta_t}{\sqrt{1 - \bar\alpha_t}}\, \varepsilon_\theta(x_t, t)\Big)\;}
+$$
+
+In the difference $\tilde\mu_t - \mu_\theta$ the $x_t$ terms cancel, leaving $\beta_t (\varepsilon_\theta - \varepsilon) / (\sqrt{\alpha_t}\sqrt{1 - \bar\alpha_t})$. Squaring and dividing by $2\sigma_t^2$ gives Eq. 12:
+
+$$
+\begin{aligned}
+L_{t-1} - C_t &= w_t\, \mathbb E_{x_0, \varepsilon} \big\lVert \varepsilon - \varepsilon_\theta(x_t, t) \big\rVert^2 , \\
+w_t &= \frac{\beta_t^2}{2\sigma_t^2\, \alpha_t\, (1 - \bar\alpha_t)} .
+\end{aligned}
+$$
+
+The three parameterizations describe the same model with the same bound. Define the image guess from the noise guess by the same solved jump, $\hat x_\theta = (x_t - \sqrt{1 - \bar\alpha_t}\, \varepsilon_\theta) / \sqrt{\bar\alpha_t}$; subtracting it from the expression for $x_0$ gives $x_0 - \hat x_\theta = -\sqrt{(1 - \bar\alpha_t)/\bar\alpha_t}\, (\varepsilon - \varepsilon_\theta)$, and $c_t^2 (1 - \bar\alpha_t)/\bar\alpha_t = 2\sigma_t^2 w_t$. They differ in what the network finds easy to output, and in what the unweighted losses below emphasize. Ho, Jain and Abbeel found that predicting $x_0$ gave worse samples early in their experiments, and that predicting $\tilde\mu$ trained well only with the true weights (§3.2, §4.2). The optimal noise predictor is $\varepsilon_\theta^* = \mathbb E[\varepsilon \mid x_t]$, the average noise consistent with $x_t$. Up to the factor $-\sqrt{1 - \bar\alpha_t}$ it is the score of $q(x_t)$, the gradient that appeared in the small-step mean of the reverse process ([score matching](/notes/generative-models/score-matching#the-same-model-as-ddpm)).
 
 ## Final simplification: a random timestep per sample
 
-Summing over all $T - 1$ terms for every training image is too expensive: it costs $T - 1$ network evaluations per image. Instead, pick a **random timestep for each sample**. Since $\sum_{t=2}^{T} f(t) = (T - 1)\, \mathbb{E}_{t \sim \mathrm{Uniform}\{2, \dots, T\}}\big[f(t)\big]$, one uniformly drawn $t$ gives an unbiased estimate of the sum divided by $T - 1$, and a constant factor does not change the minimiser. Averaging also over images $x_0 \sim q(x_0)$ and noises $\varepsilon \sim \mathcal N(0, I)$, with $t \sim \mathrm{Uniform}\{2, \dots, T\}$, the final loss is
+The bound now reads
 
 $$
-\begin{gathered}
-\mathbb{E}_{x_0,\, t,\, \varepsilon}\!\left[ \frac{\beta_t^2}{2\sigma_t^2\, \alpha_t\, (1 - \bar\alpha_t)}\, \big\| \varepsilon - \varepsilon_\theta(x_t, t) \big\|^2 \right], \\
-x_t = \sqrt{\bar\alpha_t}\, x_0 + \sqrt{1 - \bar\alpha_t}\, \varepsilon .
-\end{gathered}
+L(x_0) = \text{const} + \sum_{t=2}^{T} w_t\, \mathbb E_\varepsilon \lVert \varepsilon - \varepsilon_\theta(x_t, t) \rVert^2 + L_0 .
 $$
 
-**Pairing timesteps.** The estimate stays unbiased however the timesteps of a batch depend on each other, as long as each one on its own is uniform. A variance-reduction trick used in the public DDIM code ([Song, Meng and Ermon, 2021](#references)) draws $t$ for half of the batch and gives the other half the mirrored steps, $t' = T + 1 - t$ when $t$ runs over $1, \dots, T$, which are uniform too. Let $f(t)$ be the expected loss at step $t$. A mirrored pair estimates the mean of $f$ with variance $\tfrac12\big[\operatorname{Var} f(t) + \operatorname{Cov}\big(f(t), f(t')\big)\big]$, two independent draws with $\tfrac12 \operatorname{Var} f(t)$. If $f$ is monotone in $t$, then $f(t)$ and $f(T + 1 - t)$ move in opposite directions, the covariance is negative by Chebyshev's sum inequality, and the pair wins. **Toy example:** $T = 4$ and $f(t) = 1/t$, a loss that is largest at the least noisy step. Two independent draws give variance $0.0423$, a mirrored pair $0.0109$, about $3.9$ times less. The per-step loss of a real network is only roughly monotone in $t$, so the gain in practice is an empirical matter.
+Summing all $T - 1$ terms for every image would cost $T - 1$ network evaluations per image. Instead we draw one timestep per image. For any $f$, $\sum_{t=2}^{T} f(t) = (T - 1)\, \mathbb E_{t \sim \mathrm{Uniform}\{2, \dots, T\}} f(t)$, so one uniform $t$ gives an unbiased estimate of the sum up to a constant factor, which does not move the minimizer. Because $x_t$ comes from $x_0$ in one draw, no chain is ever simulated during training.
 
-**The training step.** One training step needs no chain at all: draw an image, a timestep and a noise, jump straight to $x_t$ with the shortcut, and regress the noise.
-
-<TrainingStep />
-
-<aside class="callout">
-
-<strong>Ho et al. drop the weight.</strong> The bound-derived objective keeps the factor $\beta_t^2 / (2\sigma_t^2 \alpha_t (1 - \bar\alpha_t))$. DDPM's best sample quality (FID 3.17 on CIFAR-10; [Ho, Jain and Abbeel, 2020](#references), Table 1) comes from the unweighted <em>simplified</em> loss (Eq. 14)
-
-$$
-L_{\text{simple}} = \mathbb{E}_{t, x_0, \varepsilon}\big[\|\varepsilon - \varepsilon_\theta(x_t, t)\|^2\big]
-$$
-
-with $t \sim \mathrm{Uniform}\{1, \dots, T\}$ and $x_t$ as above, where the $t = 1$ term stands in for the reconstruction term.
-
-</aside>
-
-Dropping the weight is a deliberate reweighting, not a cosmetic change. With the linear schedule of the paper ($T = 1000$, $\beta_t$ from $10^{-4}$ to $0.02$) and $\sigma_t^2 = \beta_t$, the weight simplifies to $\beta_t / (2\alpha_t(1 - \bar\alpha_t))$. It is $0.273$ at $t = 2$, falls to a minimum of $0.0050$ at $t = 349$, and climbs back to $0.0102$ at $t = T$. The true bound puts about $55$ times more weight at $t = 2$ than at the minimum. $L_{\text{simple}}$ weights every step equally, which shifts effort towards the harder, noisier steps. Ho et al. found that this gives better samples at the price of a slightly worse likelihood (§3.4 and Table 1: FID 3.17 against 13.51 for the true bound, but $3.75$ against $3.70$ bits per dimension).
-
-<LossWeight />
-
-## Sampling: running the chain backwards
-
-Training never runs the chain, but generation does. Start from pure noise $x_T \sim \mathcal N(0, I)$ and apply the learned reverse step $T$ times. Each step samples from $p_\theta(x_{t-1} \mid x_t) = \mathcal N(\mu_\theta(x_t, t), \sigma_t^2 I)$, using the noise form of the mean derived above, with fresh noise $z \sim \mathcal N(0, I)$ for $t > 1$ and $z = 0$ for $t = 1$ ([Ho, Jain and Abbeel, 2020](#references), Algorithm 2):
+Ho, Jain and Abbeel then drop the weight (Eq. 14):
 
 $$
 \begin{aligned}
-x_{t-1} = {} & \frac{1}{\sqrt{\alpha_t}}\left( x_t - \frac{\beta_t}{\sqrt{1 - \bar\alpha_t}}\, \varepsilon_\theta(x_t, t) \right) \\
-& + \sigma_t z .
+L_{\text{simple}}(\theta) &= \mathbb E_{t, x_0, \varepsilon} \big\lVert \varepsilon - \varepsilon_\theta(x_t, t) \big\rVert^2 , \\
+x_t &= \sqrt{\bar\alpha_t}\, x_0 + \sqrt{1 - \bar\alpha_t}\, \varepsilon ,
 \end{aligned}
 $$
 
-Each step removes the network's estimate of the noise, rescales, and adds a little fresh noise; the last step returns the mean without extra noise. Generation therefore costs $T$ network evaluations, one per step, which is the main practical drawback of DDPM. Later samplers such as DDIM ([Song, Meng and Ermon, 2021](#references)) reuse the same trained $\varepsilon_\theta$ with far fewer steps.
+with $t$ uniform on $\{1, \dots, T\}$. The $t = 1$ term stands in for $L_0$: the decoder's bin probability approximated by the Gaussian density times the bin width, ignoring $\sigma_1^2$ and the edge bins (§3.4).
+
+Dropping $w_t$ changes the objective. With DDPM's linear schedule and $\sigma_t^2 = \beta_t$, the weight simplifies to $w_t = \beta_t / (2\alpha_t (1 - \bar\alpha_t))$. It is $0.273$ at $t = 2$, falls to a minimum of $0.0050$ at $t = 349$ and ends at $0.0102$ at $t = T$: the bound puts $55$ times more weight on the nearly clean step $t = 2$ than at the minimum. $L_{\text{simple}}$ weights every step equally, so relative to the bound it down-weights the small-$t$ steps, where the noise is tiny and easy to remove, and spends the network's capacity on the harder, noisier ones. With unlimited capacity the weights would not matter: each step's term is minimized separately by $\varepsilon_\theta^* = \mathbb E[\varepsilon \mid x_t]$, whatever its positive weight. They matter because one network serves all steps and trades errors at one step against another, so minimizing $L_{\text{simple}}$ no longer minimizes the bound; Ho, Jain and Abbeel call it a weighted variational bound (§3.4). On CIFAR-10 it gave much better samples, FID $3.17$ against $13.51$ for the true bound, and a slightly worse likelihood, $3.75$ against $3.70$ bits per dimension (their Table 1).
+
+<LossWeight />
+
+The training loop is DDPM's Algorithm 1:
+
+1. Draw an image $x_0$ from the data.
+2. Draw a timestep $t$ uniformly from $\{1, \dots, T\}$ and noise $\varepsilon \sim \mathcal N(0, I)$.
+3. Form $x_t = \sqrt{\bar\alpha_t}\, x_0 + \sqrt{1 - \bar\alpha_t}\, \varepsilon$.
+4. Take a gradient step on $\lVert \varepsilon - \varepsilon_\theta(x_t, t) \rVert^2$, and repeat until converged.
+
+<TrainingStep />
+
+## Sampling: running the chain backwards
+
+Generation does run the chain. DDPM's Algorithm 2 samples each reverse step $p_\theta(x_{t-1} \mid x_t) = \mathcal N(\mu_\theta(x_t, t), \sigma_t^2 I)$ with the noise form of the mean:
+
+1. Draw $x_T \sim \mathcal N(0, I)$.
+2. For $t = T, \dots, 1$, draw $z \sim \mathcal N(0, I)$ if $t > 1$, else set $z = 0$, and compute
+
+$$
+x_{t-1} = \frac{1}{\sqrt{\alpha_t}} \Big(x_t - \frac{\beta_t}{\sqrt{1 - \bar\alpha_t}}\, \varepsilon_\theta(x_t, t)\Big) + \sigma_t z .
+$$
+
+3. Return $x_0$.
+
+Each step removes the network's estimate of the noise, rescales, and adds a little fresh noise of variance $\sigma_t^2$, either $\beta_t$ or $\tilde\beta_t$.
+
+The last step, with $z = 0$, returns the decoder's mean $\mu_\theta(x_1, 1)$, not a draw from $p_\theta(x_0 \mid x_1)$; Ho, Jain and Abbeel display this mean (§3.3). With $\sigma_1^2 = \tilde\beta_1 = 0$ the two coincide. With $\sigma_1^2 = \beta_1$ an exact sample needs the noise: it adds $\sigma_1 z$, or, for the discrete decoder, draws each pixel's bin with the probabilities of the folded block above. The mean is a cleaner picture, at the cost of no longer being a sample of the model.
+
+<details>
+<summary>How far an exact last step moves a pixel</summary>
+
+Take a mean exactly on a pixel value and $\sigma_1 = \sqrt{\beta_1} = 0.01$. The bins have half-width $1/255 = 0.39\,\sigma_1$, so the draw stays in the mean's bin with probability $2\Phi(0.392) - 1 = 0.305$, moves one level up or down with probability $2\big(\Phi(1.176) - \Phi(0.392)\big) = 0.456$, and moves further with probability $0.239$.
+
+</details>
+
+Generation costs $T = 1000$ network evaluations, one per step, against one for training on an image; this is the main practical cost of DDPM. Samplers that reuse the trained network with far fewer steps are in the [latent diffusion note](/notes/generative-models/latent-diffusion#fewer-steps).
+
+## Where it breaks: too few, too large steps
+
+The whole construction rests on the reverse step being nearly Gaussian, which holds only for small $\beta_t$. Take data that are two points, $x_0 \in \{-1, +1\}$ with equal weights. For this data the optimal noise predictor is known exactly: $\mathbb E[x_0 \mid x_t] = \tanh\big(\sqrt{\bar\alpha_t}\, x_t / (1 - \bar\alpha_t)\big)$, from Bayes' theorem with two Gaussian likelihoods, and $\mathbb E[\varepsilon \mid x_t]$ follows from the one-draw jump. Run Algorithm 2 with this perfect network and $\sigma_t^2 = \tilde\beta_t$, for two schedules that end at the same $\bar\alpha_T = 4.0 \times 10^{-5}$:
+
+| chain | samples within $0.05$ of $\pm 1$ | samples with $\lvert x \rvert < 0.5$ |
+| --- | --- | --- |
+| $T = 1000$, DDPM's linear schedule | $1.0$ | $0.0$ |
+| $T = 10$, constant $\beta = 0.636$ | $0.03$ | $0.47$ |
+
+With a thousand small steps the sampler reproduces the data. With ten large steps it fails although every step has the exact optimal mean $\mathbb E[x_{t-1} \mid x_t]$. The true reverse step averages the two posteriors over the image, by the law of total probability:
+
+$$
+\begin{aligned}
+q(x_{t-1} \mid x_t) = \textstyle\sum_{x_0 = \pm 1} {} & P(x_0 \mid x_t) \\
+& \cdot q(x_{t-1} \mid x_t, x_0) .
+\end{aligned}
+$$
+
+The two Gaussians have the same variance $\tilde\beta_t$, and their means differ by $2\sqrt{\bar\alpha_{t-1}}\, \beta_t / (1 - \bar\alpha_t)$, the coefficient of $x_0$ in $\tilde\mu_t$ times the distance between the images. The mixture is far from one Gaussian only where both weights $P(x_0 \mid x_t)$ are substantial and this gap is large next to the standard deviation $\sqrt{\tilde\beta_t}$. In the thousand-step chain the two never meet. In the ten-step chain they do at the last steps. At $t = 1$, where $\tilde\beta_1 = 0$, the true step goes to $-1$ or $+1$, while the sampler returns their weighted average, which lies between $-0.8$ and $0.8$ for $74\%$ of the $x_1$ of the forward process. Almost half the samples end near $0$, where the data have none.
+
+<details>
+<summary>The gap in numbers</summary>
+
+Divided by the standard deviation, the gap is
+
+$$
+r_t = \frac{2\sqrt{\bar\alpha_{t-1}\, \beta_t}}{\sqrt{(1 - \bar\alpha_t)(1 - \bar\alpha_{t-1})}} ,
+$$
+
+which shrinks like $\sqrt{\beta_t}$ at fixed noise levels. In the thousand-step chain, both weights first exceed $0.1$ for at least $1\%$ of the $x_t$ at $t = 110$, where $r_t = 0.74$, and $r_t$ only falls after that. The early steps, where $r_t$ is large ($148$ at $t = 2$), see an $x_t$ that still identifies the image, so one weight is close to $1$. In the ten-step chain $r_2 = 1.29$ with almost every $x_2$ ambiguous, and $r_1$ is infinite.
+
+</details>
 
 ## The denoising network
 
@@ -391,146 +472,157 @@ The derivation treats $\varepsilon_\theta(x_t, t)$ as a function of two argument
 
 <DenoiserFlow />
 
-1. The noisy image $x_t$ enters the encoder. Each level halves the resolution; DDPM adds self-attention at $16 \times 16$.
-2. The timestep $t$ becomes a vector of sines and cosines $e(t)$.
-3. A small MLP turns $e(t)$ into $m(t)$, and every residual block adds its own linear projection $A_k\,m(t)$ to its channels.
-4. The decoder doubles the resolution level by level; skip connections bring in the encoder's features of the same size.
-5. The output $\varepsilon_\theta(x_t, t)$ has the shape of $x_t$ and is compared with the true noise $\varepsilon$.
-
 ### One network for all timesteps
 
-A separate network per step would mean $T = 1000$ networks, each trained on a thousandth of the updates. Neighbouring steps solve almost the same problem: $x_{t-1}$ and $x_t$ differ by one small step: a rescaling by $\sqrt{1 - \beta_t} \ge 0.99$ and noise of variance $\beta_t \le 0.02$. DDPM therefore shares the parameters across time and tells the network which step it is at ([Ho, Jain and Abbeel, 2020](#references), §4). The step is needed because the same input calls for different outputs at different noise levels.
+Neighbouring steps solve almost the same problem, so DDPM shares the parameters across time instead of training a thousand networks, and tells the network which step it is at (§4). The same input calls for different outputs at different noise levels: the noise in a given $x_t$ is a small part of it when $t$ is small and almost all of it when $t$ is large.
 
-**Example.** For data $\mathcal N(0, 0.5^2)$ in one dimension, $\varepsilon$ and $x_t$ are jointly Gaussian with covariance $\sqrt{1 - \bar\alpha_t}$, so the optimal prediction is
+<details>
+<summary>An example: one input, two noise levels</summary>
+
+For 1-D data $\mathcal N(0, 0.5^2)$, $\varepsilon$ and $x_t$ are jointly Gaussian with covariance $\sqrt{1 - \bar\alpha_t}$, so the [Gaussian conditional mean](/notes/probability/multivariate-gaussian#marginals-and-conditionals) is
 
 $$
-\mathbb E[\varepsilon \mid x_t] = \frac{\sqrt{1 - \bar\alpha_t}}{0.25\,\bar\alpha_t + 1 - \bar\alpha_t}\, x_t .
+\mathbb E[\varepsilon \mid x_t] = \frac{\sqrt{1 - \bar\alpha_t}}{0.25\, \bar\alpha_t + 1 - \bar\alpha_t}\, x_t .
 $$
 
 With the linear schedule and $x_t = 1$ it is $0.17$ at $t = 10$ ($\bar\alpha_t = 0.998$), where $x_t$ is mostly image, and $1.02$ at $t = 500$ ($\bar\alpha_t = 0.079$), where $x_t$ is mostly noise.
 
+</details>
+
 ### A U-Net
 
-The output $\varepsilon_\theta(x_t, t)$ has the shape of the input, one noise value per pixel and channel, so the network solves a dense prediction problem, like segmentation. To tell noise from image detail at one pixel it needs context from far away and precision at the pixel itself. A **U-Net** ([Ronneberger, Fischer and Brox, 2015](#references); built in the [segmentation note](/notes/deep-learning/semantic-segmentation#u-net-an-encoder-a-decoder-and-skip-connections) of the Deep Learning course) provides both. An encoder halves the resolution level by level, so that the coarse levels see the whole image; a decoder doubles it back; and **skip connections** pass the encoder's features at each resolution to the decoder level of the same size, where they are concatenated with the upsampled features, so that fine detail reaches the output. Noise-conditional score networks use a U-Net variant for the same reason ([Song and Ermon, 2019](#references), §4.1 and App. A.3).
-
-DDPM's network ([Ho, Jain and Abbeel, 2020](#references), Appendix B):
-
-- the backbone of an unmasked [PixelCNN++](/notes/generative-models/autoregressive-models#pixelcnn-plus-plus), a U-Net built from Wide ResNet residual blocks;
-- group normalization ([Wu and He, 2018](#references)) instead of weight normalization: statistics over groups of channels within one image, so that, unlike [batch normalization](/notes/generative-models/training-background#batch-normalization), they do not depend on the other images of the batch;
-- four feature-map resolutions for $32 \times 32$ images ($32 \times 32$ down to $4 \times 4$) and six for $256 \times 256$, with two residual blocks per resolution;
-- self-attention at the $16 \times 16$ resolution, between the convolutional blocks;
-- the timestep added to every residual block through the Transformer sinusoidal embedding;
-- 35.7 million parameters for CIFAR-10, 114 million for LSUN and CelebA-HQ at $256 \times 256$, and about 256 million for a larger LSUN Bedroom variant.
+The output has the shape of the input, one noise value per pixel: a dense prediction problem that needs context from far away and precision at the pixel itself. A **U-Net**, built in the [segmentation note](/notes/deep-learning/semantic-segmentation#u-net-an-encoder-a-decoder-and-skip-connections) of the Deep Learning course, provides both: an encoder halves the resolution level by level, a decoder doubles it back, and skip connections bring the encoder's features of each size to the decoder. DDPM's network follows the PixelCNN++ backbone, a U-Net of Wide ResNet blocks, with group normalization and self-attention at the $16 \times 16$ resolution (§4 and Appendix B).
 
 ### Telling the network the timestep
 
 DDPM encodes $t$ the way a Transformer encodes a position ([positional encodings](/notes/nlp/positional-encoding#sinusoidal-encoding)):
 
 $$
-\begin{gathered}
-e(t)_{2i} = \sin(\omega_i t), \qquad e(t)_{2i+1} = \cos(\omega_i t), \\
-\omega_i = 10000^{-2i/d}, \qquad i = 0, \dots, d/2 - 1 .
-\end{gathered}
+\begin{aligned}
+e(t)_{2i} &= \sin(\omega_i t) , \\
+e(t)_{2i+1} &= \cos(\omega_i t) , \\
+\omega_i &= 10000^{-2i/d} ,
+\end{aligned}
 $$
 
-A small MLP turns the code into a feature vector, $m(t) = W_2\,\mathrm{SiLU}(W_1\, e(t))$ with $\mathrm{SiLU}(z) = z \cdot \mathrm{sigmoid}(z)$, and every residual block $k$ has its own linear map $A_k$ to its number of channels $C_k$. The result is added to the block's feature maps as one bias per channel, the same at every pixel:
+for $i = 0, \dots, d/2 - 1$.
 
-$$
-h_k[c, i, j] \;\leftarrow\; h_k[c, i, j] + \big(A_k\, m(t)\big)_c .
-$$
-
-Why not feed $t$ as a plain number? A scalar enters the first layer as one more input, and the network has to build every dependence on $t$ from it. The sinusoidal code is a vector whose components turn at rates from $1$ down to about $10^{-4}$ radians per step, so linear combinations of it can follow both fast and slow changes in $t$, and nearby steps get nearby codes. The order of the components, interleaved or sines first, does not matter: the next layer is linear and can permute its inputs.
-
-Other ways to give a network the step or another condition:
-
-- **Scale and shift.** The embedding sets a scale and a shift per channel after normalization, $h \leftarrow y_s(t) \odot \mathrm{GroupNorm}(h) + y_b(t)$: *adaptive group normalization* ([Dhariwal and Nichol, 2021](#references), §3.1). It is the diffusion counterpart of the adaptive instance normalization (AdaIN) with which StyleGAN injects its style vector ([Karras, Laine and Aila, 2019](#references), Eq. 1). On ImageNet $128 \times 128$ it improved FID from $15.08$, for addition followed by group normalization as in DDPM, to $13.06$ (their Table 3). Noise-conditional score networks use the same idea with one learned scale and shift per noise level ([score matching note](/notes/generative-models/score-matching#noise-conditional-scores-and-annealing)).
-- **An extra input channel.** Append $t/T$ to the image as a constant channel. This is the simplest option, but the step then enters only the first convolution and has to be carried through every later layer.
-- **A learned vector per step.** A table with one trainable vector per step, added to or multiplied with a hidden layer, works for small networks and short chains. The $T$ vectors share nothing, though: each is trained only by the examples drawn at its own step.
-- **Other conditions.** A class label or a pooled text embedding can be projected to the size of the time embedding and added to it, as Imagen does ([Saharia et al., 2022](#references), §2.5); a whole sequence of text vectors enters through cross-attention ([latent diffusion](/notes/generative-models/latent-diffusion#conditioning-through-cross-attention)).
+A small MLP turns the code into a feature vector $m(t)$, and every residual block $k$ adds its own linear projection $A_k\, m(t)$ to its feature maps, one bias per channel. A raw number $t$ would give the MLP one input running up to $1000$, from which it would have to build every function of $t$ it needs. The sinusoidal code supplies them ready-made: its components turn at rates from $\omega_0 = 1$ down to $\omega_{d/2-1} \approx 10^{-4}$ radians per step, periods from about $6$ to about $60{,}000$ steps, so linear combinations of it can follow both fast and slow changes in $t$. Alternatives set a scale and a shift of each channel after group normalization from the embedding ([Murphy, 2023](#references), §25.2), and text enters through [cross-attention](/notes/generative-models/latent-diffusion#conditioning-through-cross-attention).
 
 ### Why the pixels are scaled to [−1, 1] \{#why-the-pixels-are-scaled\}
 
-DDPM maps the pixel values $0, \dots, 255$ linearly to $[-1, 1]$ so that the reverse process works on inputs of a consistent scale, starting from the standard normal prior ([Ho, Jain and Abbeel, 2020](#references), §3.3). Three reasons make this matter:
+DDPM maps pixel values $0, \dots, 255$ linearly to $[-1, 1]$ (§3.3). The chain removes the image only by shrinking it, and with $\sqrt{\bar\alpha_T} = 0.0064$ the leftover is negligible only for values of order $1$ ([forward process](/notes/generative-models/ddpm-forward-process#where-it-breaks-a-chain-too-short-to-forget)). By the variance recursion $\operatorname{Var}(x_t) = \bar\alpha_t \operatorname{Var}(x_0) + 1 - \bar\alpha_t$, every step then sees inputs of similar size, and the decoder's bins of width $2/255$ end at $\pm 1$.
 
-1. **The chain must end at the prior.** The forward process removes the image only by shrinking it, $x_T = \sqrt{\bar\alpha_T}\,x_0 + \sqrt{1 - \bar\alpha_T}\,\varepsilon$, and with DDPM's schedule $\sqrt{\bar\alpha_T} = 0.0064$. For values in $[-1, 1]$ the leftover image is at most $0.0064$, negligible next to noise of standard deviation $1$. For raw values in $[0, 255]$ it would reach $1.6$: $x_T$ would still show the image, and sampling from $\mathcal N(0, I)$ would start from the wrong distribution.
-2. **Every step sees inputs of the same size.** By the [variance recursion](/notes/generative-models/ddpm-forward-process#the-objective-and-the-rescaled-step) $\operatorname{Var}(x_t) = \bar\alpha_t \operatorname{Var}(x_0) + 1 - \bar\alpha_t$, which lies between $\operatorname{Var}(x_0)$ and $1$ when $\operatorname{Var}(x_0) \le 1$, as values in $[-1, 1]$ guarantee. One network can then serve all steps; for raw pixel values the variance would fall from thousands to $1$ along the chain.
-3. **The data are centred like the prior**, and the [discretized decoder](#splitting-the-bound-into-kl-terms) has bins of width $2/255$ with its open edge bins at $\pm 1$.
+To display an image, $x$ is clipped to $[-1, 1]$ and mapped back by $255\,(x + 1)/2$, because noisy states leave the interval routinely.
 
-To display an image, $x$ is mapped back by $255\,(x + 1)/2$ after clipping to $[-1, 1]$. Noisy states leave the interval routinely: a pixel with $x_0 = 0.9$ at a step with $\bar\alpha_t = 0.5$ has $x_t \sim \mathcal N(0.64,\ 0.5)$, which falls outside $[-1, 1]$ with probability $0.31$. Without the clipping, the conversion to 8-bit integers turns such values into wrong colours.
+<details>
+<summary>How often, and what goes wrong without the clip</summary>
+
+A pixel with $x_0 = 0.9$ at a step with $\bar\alpha_t = 0.5$ has $x_t \sim \mathcal N(0.64,\ 0.5)$, which falls outside $[-1, 1]$ with probability $0.31$. Without the clipping, the conversion to 8-bit integers wraps such values around into wrong colours.
+
+</details>
 
 ## Training in practice: averaged weights and clipped gradients
-
-Two stabilisers are common in diffusion training loops.
 
 **An exponential moving average of the weights.** Keep a second copy $\bar\theta$ of the parameters and update it after every optimizer step:
 
 $$
-\bar\theta \;\leftarrow\; \mu\, \bar\theta + (1 - \mu)\, \theta .
+\bar\theta \leftarrow \mu\, \bar\theta + (1 - \mu)\, \theta .
 $$
 
-Unrolled over $n$ steps, $\bar\theta$ is a weighted average of the past iterates with weights $(1 - \mu)\,\mu^{n-k}$, plus $\mu^n$ times its starting value: roughly an average over the last $1/(1 - \mu)$ steps. Training continues with $\theta$; samples are drawn with $\bar\theta$. The reason is the noise of the gradient: every example brings its own image, timestep and noise, so the iterates $\theta$ jitter around a good region, and their average lies closer to its centre. DDPM uses $\mu = 0.9999$ (Appendix B), an average over about $10{,}000$ steps. [Nichol and Dhariwal (2021)](#references) swept the rate on class-conditional ImageNet $64 \times 64$ and found $0.9999$ and $0.99995$ best (their Figure 17). **Worked example:** the starting value keeps the weight $\mu^n$, which is $0.9999^{10\,000} = 0.37$ after ten thousand steps and $0.9999^{50\,000} = 0.0067$ after fifty thousand. The averaged weights are therefore worth using only after training has run several times longer than the window. With $\mu = 0.9$ the window is about $10$ steps, too short to average out much.
+Unrolled over $n$ steps, $\bar\theta$ is a weighted average of the past iterates with weights $(1 - \mu)\, \mu^{n-k}$, plus $\mu^n$ times its starting value: roughly an average over the last $1/(1 - \mu)$ steps, which carry the weight $1 - \mu^{1/(1-\mu)} \approx 1 - 1/e = 0.63$. Training continues with $\theta$; samples are drawn with $\bar\theta$. Every example brings its own image, timestep and noise, so the iterates jitter around a good region. By the triangle inequality, the distance from an average to any point is at most the average distance, so the average lies no farther from the centre than a typical iterate, and closer when their deviations point in different directions. DDPM uses $\mu = 0.9999$ (Appendix B), a window of about $10{,}000$ steps, and [Nichol and Dhariwal (2021)](#references) found $0.9999$ and $0.99995$ best in a sweep.
 
-**Gradient clipping.** Before each step, rescale the gradient $g$ when its norm exceeds a threshold $c$, $g \leftarrow g \cdot \min(1, c/\lVert g\rVert)$ ([training background](/notes/generative-models/training-background#common-remedies)). The direction is kept and only rare large gradients are shortened: with $c = 1$, a gradient of norm $4$ is divided by $4$, and one of norm $0.5$ is left as it is. The loss of a batch varies with the timesteps it happens to contain, and clipping keeps an unusual batch from moving the weights far.
+<details>
+<summary>When the average becomes usable</summary>
 
-**DDPM's settings** (Appendix B): Adam with learning rate $2 \times 10^{-4}$ ($2 \times 10^{-5}$ at $256 \times 256$), batch size 128 for CIFAR-10 and 64 for larger images, dropout $0.1$ on CIFAR-10 and none elsewhere, random horizontal flips, the EMA rate $0.9999$ and $T = 1000$. The CIFAR-10 model trained for 800K steps at 21 steps per second on a TPU v3-8, about 10.6 hours; sampling a batch of 256 images took 17 seconds.
+The starting value keeps the weight $\mu^n$: $0.9999^{10\,000} = 0.37$ and $0.9999^{50\,000} = 0.0067$, so the average is worth using only after training has run several times longer than its window.
 
-## Recap: from the likelihood to one training step
+</details>
 
-1. **Bound.** $-\log p_\theta(x_0)$ is at most the negative ELBO; the gap is a KL divergence, so lowering the bound does not by itself lower the negative log-likelihood.
-2. **Posterior targets.** The bound splits into KL terms that compare each reverse step $p_\theta(x_{t-1} \mid x_t)$ with the Gaussian true posterior $q(x_{t-1} \mid x_t, x_0)$, whose mean $\tilde\mu_t$ is known in closed form.
-3. **Weighted noise loss.** With fixed variances each KL term is an L2 distance between means plus a constant, and with $\mu_\theta$ written through a noise predictor it becomes $\frac{\beta_t^2}{2\sigma_t^2\, \alpha_t\, (1 - \bar\alpha_t)}\, \lVert \varepsilon - \varepsilon_\theta(x_t, t) \rVert^2$.
-4. **Reweighting.** $L_{\text{simple}}$ drops that weight. It is a different objective, not the bound: it shifts effort towards the noisier steps and gives better samples at a slightly worse likelihood.
-5. **One training step.** Draw $x_0$, $t$ and $\varepsilon$, form $x_t = \sqrt{\bar\alpha_t}\, x_0 + \sqrt{1 - \bar\alpha_t}\, \varepsilon$, and take a gradient step on $\lVert \varepsilon - \varepsilon_\theta(x_t, t) \rVert^2$.
-6. **Sampling.** From $x_T \sim \mathcal N(0, I)$ apply $x_{t-1} = \mu_\theta(x_t, t) + \sigma_t z$ for $t = T, \dots, 1$, with no noise at the last step.
+**Gradient clipping.** Before each step, rescale the gradient $g$ when its norm exceeds a threshold $c$, $g \leftarrow g \cdot \min(1, c / \lVert g \rVert)$ ([training background](/notes/generative-models/training-background#common-remedies)). The direction is kept and only rare large gradients are shortened. The loss of a batch varies with the timesteps it happens to contain, and clipping keeps an unusual batch from moving the weights far.
+
+## What you should remember
+
+- The bound splits into $L_T$ (constant), $L_{t-1} = \mathbb E\, D_{\mathrm{KL}}(q(x_{t-1} \mid x_t, x_0) \,\|\, p_\theta)$ and the decoder term $L_0$, which depends on $\theta$.
+- Given $x_0$ the reversed chain is Markov, and $q(x_{t-1} \mid x_t, x_0) = \mathcal N(\tilde\mu_t, \tilde\beta_t I)$ by Bayes and completing the square.
+- With fixed variances each KL is $\lVert \tilde\mu_t - \mu_\theta \rVert^2 / (2\sigma_t^2)$ plus a constant.
+- $\mu_\theta = \big(x_t - \beta_t \varepsilon_\theta / \sqrt{1 - \bar\alpha_t}\big) / \sqrt{\alpha_t}$ turns it into $w_t \lVert \varepsilon - \varepsilon_\theta \rVert^2$.
+- $L_{\text{simple}}$ sets $w_t = 1$: better samples, a slightly worse likelihood; it trades the steps off differently from the bound.
+- Training jumps straight to $x_t$; sampling takes $T$ steps, which must be small for the Gaussian step to hold.
+
+## Code
+
+The posterior of the toy example checked by simulation, the weights of the bound for DDPM's schedule, and Algorithm 2 with the exact noise predictor for two-point data, with many small steps and with ten large ones. It uses NumPy and runs in a few seconds.
+
+```python
+import numpy as np
+rng = np.random.default_rng(0)
+
+# 1. the posterior q(x1 | x2, x0) for beta1 = 0.1, beta2 = 0.2, by regression on simulated pairs
+b1, b2 = 0.1, 0.2
+ab1, ab2 = 1 - b1, (1 - b1) * (1 - b2)
+x0 = 1.0
+x1 = np.sqrt(ab1) * x0 + np.sqrt(1 - ab1) * rng.standard_normal(1_000_000)
+x2 = np.sqrt(1 - b2) * x1 + np.sqrt(b2) * rng.standard_normal(x1.size)
+slope, icpt = np.polyfit(x2, x1, 1)                      # for fixed x0, E[x1 | x2] is linear in x2
+resid = (x1 - slope * x2 - icpt).var()
+print(np.round([slope, icpt, resid], 4))                  # simulated
+print(np.round([np.sqrt(1 - b2) * (1 - ab1) / (1 - ab2),  # formula: coefficient of x_t,
+                np.sqrt(ab1) * b2 / (1 - ab2) * x0,       # coefficient of x0 times x0,
+                (1 - ab1) / (1 - ab2) * b2], 4))          # and the variance tilde beta
+# [0.3202 0.6771 0.0715]
+# [0.3194 0.6776 0.0714]
+
+# 2. the bound's weight on ||eps - eps_theta||^2 for DDPM's linear schedule, sigma_t^2 = beta_t
+T = 1000
+beta = np.linspace(1e-4, 0.02, T); alpha = 1 - beta; abar = np.cumprod(alpha)
+w = beta / (2 * alpha * (1 - abar))                       # beta^2 / (2 sigma^2 alpha (1 - abar)) with sigma^2 = beta
+t_min = np.argmin(w[1:]) + 2                              # steps t = 2..T
+print(round(w[1], 4), round(w.min(), 4), t_min, round(w[-1], 4), round(w[1] / w.min(), 1))
+# 0.2727 0.005 349 0.0102 54.9
+
+# 3. sampling (Algorithm 2) with the exact optimal noise predictor for data x0 in {-1, +1}
+def sample(beta, n=20_000):
+    alpha = 1 - beta; abar = np.cumprod(alpha)
+    abar_prev = np.concatenate([[1.0], abar[:-1]])
+    x = rng.standard_normal(n)
+    for t in range(len(beta) - 1, -1, -1):
+        x0_hat = np.tanh(np.sqrt(abar[t]) * x / (1 - abar[t]))          # E[x0 | x_t] for two equal points
+        eps = (x - np.sqrt(abar[t]) * x0_hat) / np.sqrt(1 - abar[t])    # E[eps | x_t]
+        mean = (x - beta[t] / np.sqrt(1 - abar[t]) * eps) / np.sqrt(alpha[t])
+        var = (1 - abar_prev[t]) / (1 - abar[t]) * beta[t]              # sigma_t^2 = tilde beta_t
+        x = mean + np.sqrt(var) * rng.standard_normal(n) if t > 0 else mean
+    return x
+
+few = np.full(10, 1 - abar[-1] ** 0.1)                    # 10 steps with the same abar_T as the 1000-step chain
+for b in (beta, few):
+    x = sample(b)
+    print(len(b), round(np.prod(1 - b), 7), round(np.mean(np.abs(np.abs(x) - 1) < 0.05), 3), round(np.mean(np.abs(x) < 0.5), 3))
+# 1000 4.04e-05 1.0 0.0
+# 10 4.04e-05 0.03 0.47
+```
 
 ## Notebook
 
-The [diffusion notebook](https://github.com/HSE-LAMBDA/DeepGenerativeModels/blob/spring-2025-long/seminars/10_Diffusion-Models/02_DPM_Models.ipynb) of the HSE-LAMBDA *Deep Generative Models* repository (pinned commit; cell numbers count every cell, markdown included, from 1; no saved outputs) trains two versions of the reverse process on a 2-D Swiss roll of 10,000 points with $T = 100$ and a sigmoid schedule between $10^{-5}$ and $10^{-2}$ ($\beta_1 \approx 3.5 \times 10^{-5}$, $\beta_{100} \approx 1.0 \times 10^{-2}$). Code indices are 0-based, so code step `t = 0` is $t = 1$ in the formulas.
+The [diffusion notebook](https://github.com/HSE-LAMBDA/DeepGenerativeModels/blob/spring-2025-long/seminars/10_Diffusion-Models/02_DPM_Models.ipynb) of the HSE-LAMBDA *Deep Generative Models* repository trains two reverse processes on a 2-D Swiss roll of 10,000 points, with $T = 100$ and the sigmoid schedule from $10^{-5}$ to $10^{-2}$ of the [forward process note](/notes/generative-models/ddpm-forward-process#notebook). The notebook has no saved outputs, so it documents procedures rather than results.
 
-- **Cells 17–18** (restated in cell 37): the true posterior. `q_posterior_mean_variance` uses the coefficients $\beta_t\sqrt{\bar\alpha_{t-1}}/(1-\bar\alpha_t)$ and $(1-\bar\alpha_{t-1})\sqrt{\alpha_t}/(1-\bar\alpha_t)$ and the variance $\tilde\beta_t$, as derived above. At code step `t = 0` the variance is $\tilde\beta_1 = 0$, the degenerate case of [the closed form](#the-true-posterior), and the "clipped" log-variance still takes $\log 0 = -\infty$. In `loss_likelihood_bound` (cell 31) this makes the KL infinite whenever a batch contains code step `t = 0`, so the loss printed in cell 33 can be `inf`; the gradients stay finite, because the infinite part does not depend on $\theta$. Using $\tilde\beta_2$ for the first entry avoids this.
-- **Cells 19–24: the original diffusion model** of Sohl-Dickstein et al. One network is shared by all steps and predicts a mean and a log-variance. Its `ConditionalLinear` layers multiply the output of a linear layer by a learned vector per step, $\gamma_t \odot (W h + b)$, with $\gamma$ an `nn.Embedding(n_steps, 128)` initialised uniformly on $[0, 1]$: the [learned vector per step](#telling-the-network-the-timestep), not a sinusoidal code. `p_sample` and `p_sample_loop` run the reverse chain.
-- **Cells 25–29: the bound.** Cell 26 writes the bound as the per-step log-ratios of the [first callout](#splitting-the-bound-into-kl-terms). Cell 27 then gives two more forms, neither quite right: the first (a prior term, all $T$ KL terms and one forward entropy) is not the standard bound, and the second puts the entropy terms of the [2015 form](#splitting-the-bound-into-kl-terms) with the signs they have in $K$, the lower bound on the log-likelihood, into a loss that should be $-K$, next to an extra prior term. `normal_kl` (cell 28) is the KL between diagonal Gaussians and `entropy` the Gaussian entropy $\tfrac12(1 + \ln 2\pi) + \tfrac12\ln\sigma^2$ per dimension. `compute_loss` (cell 29) gets the signs right: it returns $\big(T \cdot \mathrm{KL} + H_q(X_1 \mid X_0) - H_q(X_T \mid X_0) + H_p(X_T) - H_{\mathcal N(0,1)}\big)/\ln 2$, averaged over the batch and the two coordinates: a one-step estimate of $-K$ minus the entropy of a unit Gaussian, in bits per dimension, i.e. Sohl-Dickstein's $-(K - L_{\text{null}})$. The factor $T$ scales a single random step up to the sum, which in the bound has $T - 1$ terms ($t = 2, \dots, T$) and does not include code step `t = 0`.
-- **Cells 30–33: training at random timesteps.** Cell 30 explains the [mirrored timesteps](#final-simplification-a-random-timestep-per-sample) with $t = 5 \leftrightarrow 94$ in code indices ($t = 6 \leftrightarrow 95$ in the formulas): `loss_likelihood_bound` draws 65 steps and appends their partners `n_steps - t - 1`, keeping 128. The loop of cell 33 uses Adam with learning rate $10^{-3}$, batches of 128 (79 per pass over the 10,000 points), 5001 passes, and clips the gradient norm at $1.0$.
-- **Cells 34–36: DDPM.** `ConditionalModelDDPM` (three `ConditionalLinear` layers) predicts the noise, and `p_sample_ddpm` implements the sampling step above with $\sigma_t = \sqrt{\beta_t}$. It adds fresh noise at every step, including the last one, where Algorithm 2 adds none. The text of cell 34 says that $\tilde\beta_t$ is usually preferred for its better results; Ho et al. found the two choices similar (§3.2).
-- **Cells 38–41**: the variational loss with the [discretized decoder](#splitting-the-bound-into-kl-terms) at the first step. Cell 38 gives the KL between Gaussians with full covariances. `discretized_gaussian_log_likelihood` (cell 39) implements Eq. 13, with $\Phi$ approximated by $\tfrac12\big(1 + \tanh\big(\sqrt{2/\pi}\,(x + 0.044715\,x^3)\big)\big)$ (largest error $1.8 \times 10^{-4}$) and the open edge bins applied for $x < -0.999$ and $x > 0.999$. `loss_variational` (cell 41) averages the KL and the decoder term over dimensions and divides by $\ln 2$, bits per dimension, and picks the decoder term for code step `t = 0` with `torch.where`. The loss is shown for illustration and never trained. As written it calls `p_mean_variance` with the global `model`, the mean-and-variance network of cell 33, since the DDPM model returns only a noise estimate. The decoder also assumes 8-bit pixels in $[-1, 1]$, while the Swiss roll is continuous and about 31% of its points have a coordinate outside $[-1, 1]$, where the edge rule assigns them a whole tail.
-- **Cells 42–43**: `noise_estimation_loss`, the unweighted $L_{\text{simple}}$, `(noise - predicted_noise).square().mean()`, with the same mirrored timesteps. The text of cell 42 calls $L_{\text{simple}}$ a direct minimisation of the KL terms; as shown above, it reweights them.
-- **Cells 44–48**: the [moving average of the weights](#training-in-practice-averaged-weights-and-clipped-gradients) and the DDPM training loop (Adam $10^{-3}$, batch 128, 1000 passes, gradient norm clipped at $1.0$). The `EMA` class defaults to $\mu = 0.999$, but the loop uses $\mu = 0.9$, a window of about 10 updates, shorter than one pass over the data. `apply_shadow` would copy $\bar\theta$ into the model but is never called, so sampling uses the raw weights. The plotting cells (33 and 48) show `x_seq[10*j]`, the reverse chain after $10j$ steps (from $x_{90}$ down to the final sample), but title the panels $q(x_{100j})$: wrong scale, wrong direction, and $q$ instead of $p_\theta$.
+- The 2015 model: one small network for all steps predicts a mean and a log-variance and trains on the bound in bits (Adam at $10^{-3}$, batches of 128, 5001 passes, gradient norm clipped at $1$). Its `ConditionalLinear` layers multiply each linear output by a learned vector per step, $\gamma_t \odot (W h + b)$, instead of using a sinusoidal code.
+- Mirrored timesteps: both losses draw half a batch of steps $t$ and add their mirrors `n_steps - t - 1`. Each step alone is still uniform, so the estimate stays unbiased; for a per-step loss monotone in $t$ the two halves are negatively correlated, which lowers the variance.
+- DDPM: the same layers predict the noise and train on `noise_estimation_loss`, the unweighted $L_{\text{simple}}$, for 1000 passes. `p_sample_ddpm` uses $\sigma_t = \sqrt{\beta_t}$ and also adds noise at the last step, where Algorithm 2 adds none.
+- Averaged weights: the loop uses $\mu = 0.9$, a window of about 10 updates, and `apply_shadow` is never called, so sampling uses the raw weights.
 
-The [homework notebook `04_hw_diffusion`](https://github.com/HSE-LAMBDA/DeepGenerativeModels/blob/spring-2025-long/homeworks/04_hw_diffusion.ipynb) of the same repository (same cell convention) trains a DDPM on CelebA face photos at $32 \times 32$. Most of its code is a template with blanks to fill in, but it keeps saved outputs of a reference run on a Tesla T4 GPU; the numbers below are those outputs.
-
-- **Cells 9–11: data.** Batches of 128 images normalised to $[-1, 1]$, as [above](#why-the-pixels-are-scaled). Cell 10 prints the image shape as $3 \times 64 \times 64$ although `image_size = 32`, while the grids of cells 11 and 26 show $32 \times 32$ images: the saved outputs come from more than one run.
-- **Cells 13–14** restate the forward process, the noise-prediction mean, the two choices $\sigma_t^2 = \beta_t$ or $\tilde\beta_t$ and Algorithms 1 and 2, and name a U-Net or Imagen's Efficient U-Net as the network. The Efficient U-Net was designed for Imagen's super-resolution stages: it moves parameters to the low-resolution blocks, scales skip connections by $1/\sqrt2$ and reverses the order of the downsampling and upsampling operations to speed up the forward pass ([Saharia et al., 2022](#references), App. B.1).
-- **Cell 16: the `DDPM` class** holds the schedule (`n_steps`, `min_beta`, `max_beta`, left blank), `forward` draws $x_t$ from $x_0$ in one step, and `backward` calls the network for $\varepsilon_\theta(x_t, t)$.
-- **Cells 18–19.** `show_forward` noises a batch to 25, 50, 75 and 100% of $T$. `generate_new_images` runs Algorithm 2 from $x_T \sim \mathcal N(0, I)$, adds noise only while code step `t > 0`, so not at the last step, as Algorithm 2 prescribes, and writes the chain to a GIF.
-- **Cells 20–21: the U-Net.** The markdown lists the options for feeding $t$ (AdaIN as in StyleGAN, an extra channel, a sinusoidal encoding) and takes the sinusoidal one, adding that a projected text embedding could be added the same way (not used here). `sinusoidal_embedding(n, d)` fills a frozen `nn.Embedding` table with $d = 100$ sines and cosines for each of the $n = 1000$ steps. `_make_te` is the Linear–SiLU–Linear MLP that maps the code to the channel count of a block; `forward` adds the output of `te1` to the input image, and the blocks left blank can do the same with their own `_make_te` maps.
-- **Cells 22–23**: the reference model has 650,430 parameters; the count includes the frozen embedding table.
-- **Cells 26–27**: forward grids at 25–100% of $T$, and 16 samples of the untrained network, which are noise.
-- **Cells 29–31: training.** `training_loop` implements Algorithm 1 with `nn.MSELoss`, i.e. $L_{\text{simple}}$, and saves the checkpoint with the lowest training loss of an epoch. The saved log has 1272 batches of 128 per epoch, consistent with the 162,770 images of the CelebA training split. The loss fell from $0.037$ after epoch 1 to $0.033$ after epoch 16; 200 epochs were planned and the log stops at the start of epoch 17.
-- **Cells 33–36** reload the best checkpoint and generate 100 faces into a GIF; there are no saved samples.
-
-Issues:
-
-- `show_images` (cell 7) maps $x$ to $255\,(x + 1)/2$ and casts to `uint8` without clipping. Noised images leave $[-1, 1]$, so the forward grids of cell 26 show saturated, noise-like colours already at 25% of $T$; clip to $[-1, 1]$ before the cast. How much of the face would remain depends on the schedule, which the template leaves blank; with DDPM's linear schedule $\bar\alpha_{250} = 0.52$, so more than half of the signal variance is left at 25%.
-- The dataset class of cell 10 returns bare images, so a batch from the loader is a tensor of images, and `batch[0]` in `show_first_batch`, `show_forward` and `training_loop` picks the first image instead of the batch. The template comes from a dataset that returns (image, label) pairs; with this dataset, use the batch itself.
-- Cell 33 rebuilds the model as `DDPM(UNet(), n_steps=n_steps, device=device)`: `min_beta` and `max_beta` are not passed, so the class defaults are used, and `UNet()` takes its default 1000 steps. A schedule other than the defaults has to be passed again by hand.
-- `sinusoidal_embedding` computes $d$ frequencies $w_k = 10000^{-2k/d}$, $k = 0, \dots, d - 1$, but fills only $d$ values. The Transformer encoding uses the first $d/2$ frequencies, each once in a sine and once in a cosine. Taking the cosines from the second half instead gives frequencies of at most $10^{-4}$, for which $\cos(w_k t) \ge 0.995$ over all $t \le 1000$: those components barely change.
+The [homework notebook `04_hw_diffusion`](https://github.com/HSE-LAMBDA/DeepGenerativeModels/blob/spring-2025-long/homeworks/04_hw_diffusion.ipynb) of the same repository is a template for a DDPM on CelebA faces at `image_size = 32`, with the transform, the schedule and parts of the U-Net left to fill in. Its saved output prints an image shape of $3 \times 64 \times 64$, so it does not come from the $32 \times 32$ setting. `show_images` maps $x$ to $255\,(x + 1)/2$ and casts to `uint8` without clipping, the [wrap-around](#why-the-pixels-are-scaled) described above; clip to $[-1, 1]$ first.
 
 ## Next
 
-DDPM reaches its loss through a likelihood bound. The [next note](/notes/generative-models/score-matching) reaches the same loss without one: it learns the gradient of the log-density of the noised data and samples by following it, and shows that the noise predictor of DDPM is that gradient up to a known scale.
+DDPM reaches its loss through a likelihood bound. The [next note](/notes/generative-models/score-matching) reaches the same loss without one: it learns the gradient of the log-density of noised data, samples by following it, and shows that the noise predictor is that gradient up to a known scale.
 
 ## References
 
-- J. Ho, A. Jain, P. Abbeel. [Denoising diffusion probabilistic models](https://arxiv.org/abs/2006.11239). NeurIPS, 2020.
-- J. Sohl-Dickstein, E. A. Weiss, N. Maheswaranathan, S. Ganguli. [Deep unsupervised learning using nonequilibrium thermodynamics](https://arxiv.org/abs/1503.03585). ICML, 2015.
-- W. Feller. [On the theory of stochastic processes, with particular reference to applications](https://projecteuclid.org/euclid.bsmsp/1166219215). *Proceedings of the First Berkeley Symposium on Mathematical Statistics and Probability*, 1949.
-- J. Song, C. Meng, S. Ermon. [Denoising diffusion implicit models](https://arxiv.org/abs/2010.02502). ICLR, 2021. Code: [ermongroup/ddim](https://github.com/ermongroup/ddim) (mirrored timesteps in `runners/diffusion.py`).
-- A. Q. Nichol, P. Dhariwal. [Improved denoising diffusion probabilistic models](https://arxiv.org/abs/2102.09672). ICML, 2021.
-- C. Luo. [Understanding diffusion models: A unified perspective](https://arxiv.org/abs/2208.11970). arXiv:2208.11970, 2022.
-- P. Dhariwal, A. Nichol. [Diffusion models beat GANs on image synthesis](https://arxiv.org/abs/2105.05233). NeurIPS, 2021. §3 (the U-Net of DDPM) and §3.1, Table 3 (adaptive group normalization).
-- Y. Song, S. Ermon. [Generative modeling by estimating gradients of the data distribution](https://arxiv.org/abs/1907.05600). NeurIPS, 2019. §4.1 and Appendix A (architecture of the score network).
-- O. Ronneberger, P. Fischer, T. Brox. [U-Net: Convolutional networks for biomedical image segmentation](https://arxiv.org/abs/1505.04597). MICCAI, 2015.
-- Y. Wu, K. He. [Group normalization](https://arxiv.org/abs/1803.08494). ECCV, 2018.
-- T. Karras, S. Laine, T. Aila. [A style-based generator architecture for generative adversarial networks](https://arxiv.org/abs/1812.04948). CVPR, 2019. §2, Eq. 1 (AdaIN).
-- C. Saharia, W. Chan, S. Saxena, L. Li, J. Whang, E. Denton, S. K. S. Ghasemipour, B. K. Ayan, S. S. Mahdavi, R. G. Lopes, T. Salimans, J. Ho, D. J. Fleet, M. Norouzi. [Photorealistic text-to-image diffusion models with deep language understanding](https://arxiv.org/abs/2205.11487). NeurIPS, 2022. Imagen: §2.5 (conditioning) and Appendix B.1 (Efficient U-Net).
+- J. Ho, A. Jain, P. Abbeel. [Denoising diffusion probabilistic models](https://arxiv.org/abs/2006.11239). NeurIPS, 2020. §2 and Eq. 5–14 (the bound, the posterior and the parameterizations), §3.3–3.4 (the decoder and $L_{\text{simple}}$), Algorithms 1 and 2, §4 and Table 1, Appendix B (architecture and training settings).
+- Конспект курса «Байесовские методы в анализе данных», 2026, [github.com/bmml-team/bmml_ftda](https://github.com/bmml-team/bmml_ftda), лекция 5 (the ELBO of the chain, Lemma 1, the split into $L_0$, $L_t$, $L_T$, the parameterizations and the algorithms).
+- R. Isachenko. *Deep Generative Models*, MIPT and Yandex School of Data Analysis, 2025. [Course repository](https://github.com/r-isachenko/2025-DGM-MIPT-YSDA-course); lecture 7 (the reverse process and the small-step result), lecture 8 (Gaussian diffusion as a VAE, the ELBO and its reparameterization).
+- K. P. Murphy. [*Probabilistic Machine Learning: Advanced Topics*](https://probml.github.io/pml-book/book2.html). MIT Press, 2023. §25.2 (DDPM as a hierarchical VAE with a fixed encoder, model fitting, the U-Net and time conditioning).
+- J. Sohl-Dickstein, E. A. Weiss, N. Maheswaranathan, S. Ganguli. [Deep unsupervised learning using nonequilibrium thermodynamics](https://arxiv.org/abs/1503.03585). ICML, 2015. §2.2 (the reverse of a small Gaussian step is Gaussian, after Feller).
+- A. Q. Nichol, P. Dhariwal. [Improved denoising diffusion probabilistic models](https://arxiv.org/abs/2102.09672). ICML, 2021. Appendix F and Figure 17 (the EMA sweep).
 - HSE-LAMBDA, *Deep Generative Models* course repository: [`02_DPM_Models.ipynb`](https://github.com/HSE-LAMBDA/DeepGenerativeModels/blob/spring-2025-long/seminars/10_Diffusion-Models/02_DPM_Models.ipynb) and [`04_hw_diffusion.ipynb`](https://github.com/HSE-LAMBDA/DeepGenerativeModels/blob/spring-2025-long/homeworks/04_hw_diffusion.ipynb).

@@ -1,0 +1,433 @@
+---
+title: Continuous-time diffusion and flow matching
+description: "Let DDPM's steps shrink to zero and the noising chain becomes a stochastic differential equation. Its density equation gives a reverse-time sampler, a deterministic ODE with the same marginals, and flow matching."
+course: generative-models
+section: Diffusion Models
+order: 28
+status: published
+tags: [diffusion, sde, fokker-planck, probability-flow-ode, reverse-sde, flow-matching, rectified-flow, discrete-diffusion]
+prerequisites: [Score matching and Langevin dynamics, "DDPM: reverse process and training objective"]
+---
+
+DDPM trains with $T = 1000$ steps whose noise variances $\beta_t$ grow linearly from $10^{-4}$ to $0.02$. Halve every $\beta_t$ and double $T$, and the chain destroys an image at almost the same pace. What matters is how much noise has been added by a given fraction of the way, not how that way is cut into steps.
+
+Make this precise. Treat the schedule as a rate, $\beta(t) = 0.1 + 19.9\, t$ on $t \in [0, 1]$, and cut it into $T$ steps of variance $\beta_i = \beta(i/T)/T$. The signal coefficient $\bar\alpha = \prod_i (1 - \beta_i)$ halfway through is:
+
+| Steps $T$ | $\bar\alpha$ at $t = 0.5$ |
+| --- | --- |
+| 50 | 0.0585 |
+| 200 | 0.0738 |
+| 1000 | 0.0780 |
+| limit $T \to \infty$ | 0.0791 |
+
+The chains converge to one continuous process. A network trained on any of them learns the score of the noised data at a noise level, as the [score matching note](/notes/generative-models/score-matching#the-same-model-as-ddpm) showed, and nothing in that function refers to the step size. So why should generation use the training steps? If we knew the continuous process and how to run it backwards, any method that integrates it could generate, with a thousand small steps or twenty large ones.
+
+Time runs from $t = 0$, the data, to $t = 1$, almost pure noise, as in the DDPM notes. We write $p_t$ for the density of the noised data at time $t$, which those notes call $q(x_t)$.
+
+## From DDPM steps to a stochastic differential equation
+
+Write $\Delta t = 1/T$, so that the step at time $t$ has variance $\beta(t)\,\Delta t$. One DDPM step is
+
+$$
+x(t + \Delta t) = \sqrt{1 - \beta(t)\Delta t}\; x(t) + \sqrt{\beta(t)\Delta t}\;\varepsilon ,
+$$
+
+where $\varepsilon \sim \mathcal N(0, I)$ is fresh noise. The Taylor expansion $\sqrt{1 - u} = 1 - u/2 + O(u^2)$ turns it into an increment:
+
+$$
+\begin{aligned}
+x(t + \Delta t) - x(t) ={}& -\tfrac12 \beta(t)\, x(t)\, \Delta t \\
+&+ \sqrt{\beta(t)}\, \sqrt{\Delta t}\, \varepsilon + O(\Delta t^2) .
+\end{aligned}
+$$
+
+The drift is proportional to $\Delta t$, the noise to $\sqrt{\Delta t}$. The square root is forced. Over a unit of time there are $1/\Delta t$ independent steps, and their variances add; for the total to stay finite and nonzero as $\Delta t \to 0$, each step must have variance proportional to $\Delta t$, hence a standard deviation proportional to $\sqrt{\Delta t}$.
+
+A **Wiener process** (Brownian motion) $w(t)$ is defined by exactly this: $w(0) = 0$, continuous paths, and increments $w(t + \Delta t) - w(t) \sim \mathcal N(0, \Delta t\, I)$ independent of the past. So $\sqrt{\Delta t}\,\varepsilon$ is one increment $dw$, and the limit of DDPM's chain is the **variance-preserving SDE** ([Song et al., 2021](#references), §3.4 and App. B):
+
+$$
+dx = -\tfrac12 \beta(t)\, x\, dt + \sqrt{\beta(t)}\, dw .
+$$
+
+The general form is $dx = f(x, t)\,dt + g(t)\,dw$, with a **drift** $f$ and a **diffusion coefficient** $g$. Read it as shorthand for the limit of **Euler–Maruyama** steps, $x \leftarrow x + f\,\Delta t + g\sqrt{\Delta t}\,\varepsilon$; DDPM's chain is such a discretization up to $O(\Delta t^2)$ per step. The rigorous meaning, through Itô integrals, is in [Särkkä and Solin (2019)](#references), chapter 4; [Murphy (2023](#references), §25.4.1) takes the same limit. NCSN's chain $x_i = x_{i-1} + \sqrt{\sigma_i^2 - \sigma_{i-1}^2}\, z_i$ of growing noise levels gives, since $\sigma_i^2 - \sigma_{i-1}^2 \approx (d\sigma^2/dt)\,\Delta t$, the variance-exploding SDE $dx = \sqrt{d\sigma^2/dt}\; dw$.
+
+**The jump from $x(0)$.** Take the expectation of the step given $x(0)$. The noise has mean zero, so the mean $m(t)$ obeys $m(t + \Delta t) = (1 - \frac12\beta\Delta t)\, m(t)$. The variance $V(t)$ of one coordinate is scaled by the square of the same factor and gains $\beta\Delta t$. Dropping terms of order $\Delta t^2$ and dividing by $\Delta t$:
+
+$$
+\begin{aligned}
+\frac{dm}{dt} &= -\tfrac12 \beta(t)\, m , \\
+\frac{dV}{dt} &= \beta(t)\,\big(1 - V\big) .
+\end{aligned}
+$$
+
+With $m(0) = x(0)$, $V(0) = 0$ and $\bar\alpha(t) = \exp\big(-\int_0^t \beta(s)\,ds\big)$, the solutions are $m = \sqrt{\bar\alpha(t)}\; x(0)$ and $V = 1 - \bar\alpha(t)$, as differentiating with $\bar\alpha' = -\beta\bar\alpha$ confirms. Each step is linear in $x$ plus independent Gaussian noise, so $x(t)$ given $x(0)$ stays Gaussian:
+
+$$
+x(t) \mid x(0) \sim \mathcal N\big(\sqrt{\bar\alpha(t)}\, x(0),\; (1 - \bar\alpha(t))\, I\big) .
+$$
+
+This is DDPM's [jump to any step](/notes/generative-models/ddpm-forward-process#the-jump-from-x-to-any-step). The discrete product converges to the exponential because $\log(1 - \beta_i) = -\beta_i + O(\Delta t^2)$, and $\sum_i \beta(i/T)\,\Delta t$ is a Riemann sum for $\int \beta$. For the linear schedule $\int_0^t \beta = 0.1\,t + 9.95\,t^2$, which gives $\bar\alpha(0.5) = 0.0791$, the limit in the table, and $\bar\alpha(1) = 4.3 \times 10^{-5}$.
+
+## How densities move: the Fokker–Planck equation
+
+A sampler needs the density $p_t$ of the whole cloud of noised points, not one path. Its equation follows from one Euler–Maruyama step and a Taylor expansion. We work in one dimension.
+
+Take any smooth test function $\varphi$ that vanishes far away, together with its derivatives. One step moves $x$ to $x' = x + f\Delta t + g\sqrt{\Delta t}\,\varepsilon$. Expand $\varphi(x')$ around $x$ to second order:
+
+$$
+\begin{aligned}
+\varphi(x') ={}& \varphi(x) + \varphi'(x)\,\big(f\Delta t + g\sqrt{\Delta t}\,\varepsilon\big) \\
+&+ \tfrac12 \varphi''(x)\, g^2 \Delta t\, \varepsilon^2 + o(\Delta t) .
+\end{aligned}
+$$
+
+The other second-order terms carry $\Delta t^{3/2}$ or $\Delta t^2$. Average over $\varepsilon$, which is independent of $x$, with $\mathbb E\,\varepsilon = 0$ and $\mathbb E\,\varepsilon^2 = 1$, then over $x \sim p_t$, and let $\Delta t \to 0$:
+
+$$
+\frac{d}{dt} \int \varphi\, p_t\, dx = \int \Big(\varphi' f + \tfrac12 g^2 \varphi''\Big)\, p_t\, dx .
+$$
+
+Move the derivatives from $\varphi$ to the other factor by integrating by parts, once for the first term and twice for the second; the boundary terms vanish because $\varphi$ does. The result is $\int \varphi\, \big[\partial_t p_t + (f p_t)' - \frac12 g^2 p_t''\big]\, dx = 0$ for every test function, so the bracket is zero. In $d$ dimensions the same steps per coordinate give the **Fokker–Planck equation**:
+
+$$
+\partial_t p_t = -\nabla \cdot \big(f\, p_t\big) + \tfrac12 g(t)^2\, \Delta p_t . \tag{2}
+$$
+
+Here $\nabla \cdot$ is the divergence and $\Delta$ the Laplacian. The derivation assumes a smooth density that decays at infinity with its derivatives; the rigorous version replaces the Taylor step by Itô's formula and is Theorem 5.4 of [Särkkä and Solin (2019)](#references), proved by the same test-function argument.
+
+The first term moves probability: $f p_t$ is a flux, mass times velocity, and its divergence is the net outflow. The second term spreads probability at the rate $\tfrac12 g^2$, as heat spreads. The Code section checks equation (2) at one point for the VP SDE: both sides are $0.31003$.
+
+Two special cases are used below. With the drift $f = \frac12 g^2 \nabla \log p$ the right side of (2) vanishes, because $p\nabla \log p = \nabla p$: Langevin dynamics leaves $p$ unchanged, the balance the [MCMC note](/notes/generative-models/mcmc-samplers#the-langevin-equation) used. With $g = 0$ the equation becomes the **continuity equation** of the ODE $dx/dt = f$:
+
+$$
+\partial_t p_t = -\nabla \cdot \big(f\, p_t\big) .
+$$
+
+Along one trajectory of that ODE, the chain rule gives
+
+$$
+\begin{aligned}
+\frac{d}{dt} \log p_t(x(t)) &= \frac{\partial_t p_t + f \cdot \nabla p_t}{p_t} \\
+&= -\nabla \cdot f .
+\end{aligned}
+$$
+
+The log-density changes at the rate minus the trace of the Jacobian of $f$. This is the density of a **neural ODE**, or **continuous normalizing flow**: a flow whose layers have become infinitely thin, as in the [flow architectures note](/notes/generative-models/flow-architectures#g-planar-and-radial-flows-cheap-determinants-without-triangles).
+
+## The probability-flow ODE
+
+The diffusion term of (2) can be written as a transport term. Since $p_t \nabla \log p_t = \nabla p_t$,
+
+$$
+\begin{aligned}
+\tfrac12 g^2\, \Delta p_t &= \nabla \cdot \big(\tfrac12 g^2\, \nabla p_t\big) \\
+&= \nabla \cdot \big(\tfrac12 g^2\, p_t\, \nabla \log p_t\big) ,
+\end{aligned}
+$$
+
+and the Fokker–Planck equation becomes a continuity equation:
+
+$$
+\partial_t p_t = -\nabla \cdot \Big[\big(f - \tfrac12 g^2\, \nabla \log p_t\big)\, p_t\Big] .
+$$
+
+It is the equation of the deterministic ODE
+
+$$
+\boxed{\;\frac{dx}{dt} = f(x, t) - \tfrac12 g(t)^2\, \nabla \log p_t(x)\;} \tag{3}
+$$
+
+called the **probability-flow ODE** ([Song et al., 2021](#references), §4.3 and App. D.1). Start the ODE from the same $p_0$ as the SDE. The velocity $v = f - \frac12 g^2 \nabla \log p_t$ is now a fixed field, built from the SDE's densities. The density of the ODE's points and the SDE's $p_t$ both solve the continuity equation of this one field from the same initial condition, so they coincide at every $t$ if that equation has only one solution. It does when $v$ is smooth and Lipschitz in $x$; the argument runs through the trajectories and is folded below. The paths differ completely: the SDE moves each point at random, the ODE moves each point with the local average flow of probability, flux divided by density.
+
+<details>
+<summary>Why the continuity equation has only one solution</summary>
+
+The tool is the **Picard–Lindelöf theorem** ([Teschl, 2012](#references), Theorem 2.2). Let $v(x, t)$ be continuous and Lipschitz in $x$, uniformly in $t$: $\lVert v(x, t) - v(y, t)\rVert \le L\, \lVert x - y\rVert$. Then the ODE $dx/dt = v$ started at any point has exactly one solution on some interval around the start; if the bound holds on all of $\mathbb R^d$, the solution exists on the whole of $[0, 1]$ (Corollary 2.6 there). The intuition: two solutions from one point drift apart at most at the rate $L$ times their distance, and a distance that starts at zero and grows no faster than $L$ times itself stays zero.
+
+So every starting point has one trajectory, and running the ODE backwards from any point at time $t$ gives one starting point: every point at time $t$ lies on exactly one trajectory. Now take any smooth solution $p_t$ of the continuity equation $\partial_t p_t = -\nabla \cdot (v\, p_t)$. The chain rule along a trajectory, as in the previous section, gives a linear equation for one number, which integrates in closed form:
+
+$$
+\begin{aligned}
+\frac{d}{dt}\, p_t(x(t)) &= \partial_t p_t + v \cdot \nabla p_t \\
+&= -p_t(x(t))\; \nabla \cdot v , \\
+p_t(x(t)) &= p_0(x(0))\, e^{-\int_0^t \nabla \cdot v\, ds} .
+\end{aligned}
+$$
+
+The second line expands $\nabla \cdot (v\, p_t) = v \cdot \nabla p_t + p_t\, \nabla \cdot v$. The last line depends only on $p_0$ and the trajectory, not on which solution we took, so any two solutions agree at every point. For Gaussian data the score is affine in $x$, so $v$ is Lipschitz; for a learned score the condition is an assumption on the network.
+
+</details>
+
+For the VP SDE, $f = -\frac12\beta x$ and $g^2 = \beta$; with the score written through DDPM's noise predictor, $\nabla \log p_t \approx -\varepsilon_\theta / \sqrt{1 - \bar\alpha}$:
+
+$$
+\begin{aligned}
+\frac{dx}{dt} &= -\tfrac12 \beta(t)\, \big[x + \nabla \log p_t(x)\big] \\
+&\approx -\tfrac12 \beta(t)\, \Big[x - \frac{\varepsilon_\theta(x, t)}{\sqrt{1 - \bar\alpha(t)}}\Big] .
+\end{aligned}
+$$
+
+**Gaussian data.** Let the data be $\mathcal N(\mu_0, v_0)$ in one dimension. The noised density is Gaussian with mean $m_t = \sqrt{\bar\alpha}\,\mu_0$ and variance $V_t = \bar\alpha v_0 + 1 - \bar\alpha$, and its score is $-(x - m_t)/V_t$. The claim is that the ODE keeps every point's $z$-score, $x(t) = m_t + \sqrt{V_t / v_0}\,\big(x(0) - \mu_0\big)$. Differentiate, using $m_t' = -\frac12\beta m_t$ and $V_t' = \beta(1 - V_t)$, which follow from $\bar\alpha' = -\beta\bar\alpha$:
+
+$$
+\begin{aligned}
+\frac{dx}{dt} &= m_t' + \frac{V_t'}{2 V_t}\,(x - m_t) \\
+&= -\tfrac12 \beta\, m_t + \tfrac12 \beta\, \frac{1 - V_t}{V_t}\,(x - m_t) \\
+&= -\tfrac12 \beta\, \Big[x - \frac{x - m_t}{V_t}\Big] \\
+&= -\tfrac12 \beta\, \big[x + \nabla \log p_t(x)\big] .
+\end{aligned}
+$$
+
+The third line collects the terms in $m_t$ and in $x - m_t$. For data $\mathcal N(2, 0.5^2)$ the point $x(0) = 2.5$, one standard deviation above the mean, travels to $x(1) = 1.013$, one standard deviation above the noise mean $0.013$. Run backwards, the ODE returns it to $2.5$ exactly.
+
+What the ODE buys follows from it being deterministic. It is a bijection between noise and data, so an image can be encoded into its noise by integrating forward. Its log-likelihood is computable with the trace formula of the previous section. And any ODE solver can integrate it, with as few steps as its accuracy allows: DDIM is Euler's method for (3) in rescaled coordinates, derived in the [latent diffusion note](/notes/generative-models/latent-diffusion#fewer-steps).
+
+## Running the SDE backwards
+
+Generation starts at $p_1 \approx \mathcal N(0, I)$ and must reach $p_0$. The ODE (3) can simply be integrated from $t = 1$ down to $0$. Is there also a stochastic way back? Build one from the reversed ODE in two moves, with the reversed time $\tau = 1 - t$, following [Isachenko (2025](#references), lecture 10).
+
+1. In $\tau$ the ODE has velocity $-\big(f - \frac12 g^2 \nabla \log p_t\big)$ and carries $p_t$ backwards along the same path of densities.
+2. Add a Langevin pair, the drift $\frac12 g^2 \nabla \log p_t$ and the noise $g\,dw$. By the first special case of the Fokker–Planck equation, its two terms cancel in (2), so at every moment it leaves the density $p_t$ where it is.
+
+The sum is an SDE in $\tau$ with drift $-f + g^2 \nabla \log p_t$ and the same densities. Written in the original time, with $dt < 0$, it is the **reverse-time SDE**:
+
+$$
+dx = \big[f(x, t) - g(t)^2\, \nabla \log p_t(x)\big]\, dt + g(t)\, d\bar w , \tag{4}
+$$
+
+where $\bar w$ is a Wiener process running backwards. The derivation shows that the marginals agree, which is all a sampler needs. [Anderson (1982)](#references) proved more: under regularity conditions the time-reversed process itself solves (4), so its joint distributions at several times also match those of the forward process. [Song et al. (2021](#references), §3.2) state this result and build their sampler on it.
+
+The score drift in (4) is twice the one in (3). Half of it reverses the forward spreading, as in the ODE; the other half cancels the spreading caused by the fresh noise that the reverse step adds itself.
+
+**DDPM's sampler is this SDE.** One Euler–Maruyama step of (4) for the VP SDE, from $t$ to $t - \Delta t$, is $x + \frac12\beta x\,\Delta t + \beta\, \nabla\log p_t\, \Delta t + \sqrt{\beta\Delta t}\; z$. DDPM's step in score form is $\big(x + \beta_t\, s_\theta\big)/\sqrt{1 - \beta_t} + \sigma_t z$ ([score matching note](/notes/generative-models/score-matching#the-same-model-as-ddpm)). With $\beta_t = \beta\Delta t$, $\sigma_t^2 = \beta_t$ and $1/\sqrt{1 - \beta_t} = 1 + \frac12\beta_t + O(\beta_t^2)$, the two agree up to $O(\Delta t^2)$.
+
+**The two samplers on a mixture.** Take the data of the score matching note, $p_0 = 0.8\,\mathcal N(-4, 1) + 0.2\,\mathcal N(4, 1)$, where Langevin dynamics at a single noise level put only $0.52$ of the chains in the left mode. Under the VP SDE each component keeps variance $1$ and only its mean shrinks, so the exact score of every $p_t$ is available. Start from $\mathcal N(0, 1)$, use $N$ Euler steps and 200,000 samples:
+
+| Steps $N$ | SDE: share left | SDE: sd in left mode | ODE: share left | ODE: sd in left mode |
+| --- | --- | --- | --- | --- |
+| 10 | 0.782 | 1.122 | 0.782 | 1.071 |
+| 100 | 0.799 | 1.012 | 0.793 | 1.007 |
+| 1000 | 0.799 | 0.999 | 0.795 | 0.994 |
+
+Both recover the weights that a single noise level lost; the targets are $0.8$ and $1$.
+
+**Where the ODE breaks: it remembers its start.** The ODE stalls at $0.795$ however many steps it takes. The start is to blame: $p_1$ has component means $\pm 4\sqrt{\bar\alpha(1)} = \pm 0.026$, not exactly $\mathcal N(0, 1)$. The ODE is a bijection, so it carries that small error all the way to $t = 0$; started from the exact $p_1$, it gives $0.802$. The SDE reaches $0.799$ from the same wrong start.
+
+By its construction above, the reverse SDE contains a Langevin pair, which leaves $p_t$ in place and, run long enough at one fixed density, draws other distributions toward it under the conditions stated in the [MCMC note](/notes/generative-models/mcmc-samplers#the-langevin-equation). Here each $p_t$ gets only a short stretch of time, so this is a tendency, not a guarantee, and the table checks it only for an error in the start. [Song et al. (2021](#references), §4.2) use the same idea on purpose: their predictor–corrector samplers add Langevin steps after each solver step to correct the distribution of the samples. The ODE in exchange is deterministic and invertible.
+
+## Flow matching
+
+Diffusion fixes the path of densities through an SDE and then learns the score that drives it. Why not choose a path from data to noise directly and learn the velocity of an ODE that follows it? A network $v_\theta(x, t)$ defines the ODE $dx/dt = v_\theta$. If some velocity $u_t$ moves the density along the chosen path $p_t$, the natural loss is
+
+$$
+\mathcal L_{\text{FM}}(\theta) = \mathbb E_{t,\; x \sim p_t} \big\lVert v_\theta(x, t) - u_t(x)\big\rVert^2 ,
+$$
+
+with $t$ uniform on $[0, 1]$. Neither $p_t$ nor $u_t$ is known in closed form. [Lipman et al. (2023)](#references) build both from simple pieces.
+
+**The straight-line path.** Draw an image $x_0$ and a noise $\varepsilon \sim \mathcal N(0, I)$, and move between them on a straight line:
+
+$$
+x_t = (1 - t)\, x_0 + t\, \varepsilon .
+$$
+
+Given $x_0$, the point $x_t$ is $\mathcal N\big((1 - t)\, x_0,\; t^2 I\big)$, a **conditional path** that starts at the image and ends at noise. Averaged over images, it gives the marginal path $p_t$, which is the data at $t = 0$ and exactly $\mathcal N(0, I)$ at $t = 1$. Each point moves with constant velocity; substituting $\varepsilon = (x_t - (1 - t)\,x_0)/t$ writes it as a function of the position:
+
+$$
+\begin{aligned}
+\frac{dx_t}{dt} &= \varepsilon - x_0 \\
+&= \frac{x_t - x_0}{t} =: u_t(x_t \mid x_0) .
+\end{aligned}
+$$
+
+Lipman et al. run time the other way, from noise at $0$ to data at $1$, and their straight path (their Eq. 20–23) stops short of the image: it ends at $\mathcal N(x_0, \sigma_{\min}^2 I)$ with a small $\sigma_{\min} > 0$, so that the path has a positive density everywhere, which their Theorem 2 below assumes. With $\sigma_{\min} = 0$ and $t \mapsto 1 - t$ their formulas become ours; this limit is the path of rectified flow below.
+
+**The averaged velocity moves the average path.** Define the marginal velocity as the conditional one averaged over the images that could have produced $x$, $u_t(x) = \mathbb E[\varepsilon - x_0 \mid x_t = x]$. It moves $p_t$ ([Lipman et al., 2023](#references), Theorem 1). The particles of each conditional path follow the ODE with velocity $u_t(x \mid x_0)$, so its density satisfies the continuity equation. Then:
+
+$$
+\begin{aligned}
+\partial_t p_t(x) &= \int \partial_t p_t(x \mid x_0)\, p(x_0)\, dx_0 \\
+&= -\int \nabla \cdot \big(u_t(x \mid x_0)\, p_t(x \mid x_0)\big)\, p(x_0)\, dx_0 \\
+&= -\nabla \cdot \int u_t(x \mid x_0)\, p_t(x \mid x_0)\, p(x_0)\, dx_0 \\
+&= -\nabla \cdot \big(u_t(x)\, p_t(x)\big) .
+\end{aligned}
+$$
+
+The first line differentiates under the integral, the second uses the continuity equation of each conditional path, and the third the linearity of the divergence. The last uses Bayes' rule, $p_t(x \mid x_0)\, p(x_0) = p(x_0 \mid x_t = x)\, p_t(x)$, so the integral is $p_t(x)$ times the posterior average of $u_t(x \mid x_0)$, which is $u_t(x)$.
+
+**The conditional loss has the same gradient.** The marginal velocity is still an intractable average. The **conditional flow matching** loss regresses on the per-sample velocity instead:
+
+$$
+\mathcal L_{\text{CFM}}(\theta) = \mathbb E_{t,\, x_0,\, \varepsilon} \big\lVert v_\theta(x_t, t) - (\varepsilon - x_0)\big\rVert^2 .
+$$
+
+Fix $t$ and expand both squares. The terms $\mathbb E\lVert v_\theta\rVert^2$ are equal, since $x_t$ has the density $p_t$ in both. The cross terms are equal by the tower property of conditional expectation:
+
+$$
+\begin{aligned}
+\mathbb E\big[v_\theta(x_t)^\top (\varepsilon - x_0)\big] &= \mathbb E\Big[v_\theta(x_t)^\top\, \mathbb E\big[\varepsilon - x_0 \mid x_t\big]\Big] \\
+&= \mathbb E_{x \sim p_t}\big[v_\theta(x)^\top u_t(x)\big] .
+\end{aligned}
+$$
+
+The remaining terms, $\mathbb E\lVert\varepsilon - x_0\rVert^2$ and $\mathbb E\lVert u_t\rVert^2$, do not contain $\theta$. So $\mathcal L_{\text{CFM}} = \mathcal L_{\text{FM}} + C$, and the two have the same gradient and the same minimizer ([Lipman et al., 2023](#references), Theorem 2, which assumes $p_t > 0$ everywhere so that $u_t$ is defined). The constant is the average conditional variance of $\varepsilon - x_0$ given $x_t$, the part of the per-sample target that no function of $x_t$ can predict. It is the same trick as [denoising score matching](/notes/generative-models/score-matching#two-cheaper-objectives): a conditional target whose regression has the marginal quantity as its minimizer.
+
+On the mixture at $t = 0.5$, with four million samples, the two losses differ by the same amount for any $v$:
+
+| $v$ | $\mathcal L_{\text{CFM}}$ | $\mathcal L_{\text{FM}}$ | difference |
+| --- | --- | --- | --- |
+| the exact $u_t$ | 2.09 | 0 | 2.09 |
+| $0.5\, x$ | 27.13 | 25.03 | 2.10 |
+| $0$ | 18.01 | 15.91 | 2.10 |
+
+Training is one line: draw $x_0$, $\varepsilon$ and $t$, form $x_t$, and regress $v_\theta(x_t, t)$ onto $\varepsilon - x_0$. Generation draws $x(1) \sim \mathcal N(0, I)$ and integrates $dx/dt = v_\theta$ from $t = 1$ down to $0$.
+
+**The same network as diffusion.** The per-sample target can be written through the image alone, $u_t(x \mid x_0) = (x - x_0)/t$, so $u_t(x) = \big(x - \mathbb E[x_0 \mid x_t = x]\big)/t$. The score of the path is an average too, $\nabla \log p_t(x) = \mathbb E\big[\nabla_x \log p_t(x \mid x_0) \mid x_t = x\big]$, by the identity $\nabla p_t = \int \nabla p_t(x \mid x_0)\, p(x_0)\, dx_0$ of denoising score matching. With the Gaussian conditional path:
+
+$$
+\begin{aligned}
+u_t(x) &= \frac{x - \mathbb E[x_0 \mid x]}{t} , \\
+\nabla \log p_t(x) &= -\frac{x - (1 - t)\, \mathbb E[x_0 \mid x]}{t^2} .
+\end{aligned}
+$$
+
+Both are affine in the same denoiser $\mathbb E[x_0 \mid x_t]$. A flow-matching network and a diffusion network learn one function in different coordinates, and the straight line is one Gaussian path among many; the VP path of diffusion is another ([Lipman et al., 2023](#references), §4).
+
+**Where few steps break.** The conditional paths are straight, the marginal ones are not: lines from different images cross, and an ODE's trajectories cannot cross, so the averaged velocity bends them. Euler steps with the exact $u_t$ on the mixture:
+
+| Steps | share left | sd in left mode | mean |
+| --- | --- | --- | --- |
+| 1 | 1.000 | 0.000 | −2.40 |
+| 2 | 0.997 | 0.536 | −3.17 |
+| 10 | 0.834 | 0.977 | −2.60 |
+| 100 | 0.802 | 0.999 | −2.41 |
+
+One step from $t = 1$ gives $x - u_1(x) = \mathbb E[x_0 \mid x_1]$. At $t = 1$ the point is pure noise, independent of the image, so this is the data mean $-2.4$ for every sample: one first-order step collapses the distribution, exactly as one DDIM step does.
+
+**Rectified flow** ([Liu, Gong and Liu, 2023](#references)) trains with the same straight-line loss and then straightens the marginal paths. Generate pairs by running the trained ODE, noise $\varepsilon$ to sample $\hat x_0$, and train a new flow on these pairs in place of independent ones; this is the **reflow** step. The pairs are already matched by a deterministic map, so the lines between them cross less. Liu et al. prove three things. Reflow never increases convex transport costs, by Jensen's inequality (their Theorem 3.5). A coupling is left unchanged by reflow exactly when its straight lines do not cross (Theorem 3.6). After $k$ reflows, the straightest flow so far is within $O(1/k)$ of straight, in a measure of how much its paths bend (Theorem 3.7).
+
+How straight one reflow gets is measured, not proved. The comparison also needs **distillation**: a final training run in which the network learns to map each noise $\varepsilon$ straight to its generated sample, $\hat x_0 = \varepsilon - v(\varepsilon, 1)$, with an LPIPS loss for one step. On CIFAR-10, with a single Euler step ([Liu et al.](#references), Table 1(a) and App. A):
+
+| One Euler step | FID | FID after distillation |
+| --- | --- | --- |
+| first flow, no reflow | 378 | 6.18 |
+| after one reflow | 12.21 | 4.85 |
+| after two reflows | 8.15 | 5.21 |
+
+Lower is better. One reflow alone takes the one-step FID from 378 to 12.21; the strong one-step result, 4.85, is one reflow plus distillation, and distillation without reflow already gives 6.18. Reflow is not free when the ODE is solved accurately: with an adaptive Runge–Kutta solver, about 100 to 130 network evaluations, FID goes from 2.58 to 3.36 after one reflow. The price in training is a second run and 4 million generated pairs per reflow.
+
+## Discrete data: diffusion over tokens
+
+Words and other categories cannot receive Gaussian noise. Discrete diffusion replaces the Gaussian step by a transition matrix between categories, $q(x_t \mid x_{t-1}) = \mathrm{Cat}(Q_t\, x_{t-1})$ for a one-hot $x$ ([Austin et al., 2021](#references)). The uniform choice replaces a token by a random one with probability $\beta_t$. The **absorbing** choice replaces it by a special [MASK] token with probability $\beta_t$, and a masked token stays masked. A token then survives $t$ steps with probability $\prod_{s \le t}(1 - \beta_s)$, the same product $\bar\alpha_t$ as in the Gaussian case, and the chain ends with every position masked. Austin et al. show that the bound for the absorbing chain reduces to a reweighted masked-language-model loss. The [text diffusion note](/notes/nlp/text-diffusion) of the NLP course derives that loss in continuous time and generates text by unmasking.
+
+## What you should remember
+
+- DDPM with $\beta_i = \beta(t)\,\Delta t$ discretizes $dx = -\frac12\beta x\,dt + \sqrt\beta\,dw$; $\bar\alpha(t) = e^{-\int_0^t \beta}$.
+- Fokker–Planck: $\partial_t p = -\nabla \cdot (f p) + \frac12 g^2 \Delta p$, from a Taylor step and integration by parts.
+- Probability-flow ODE: $dx/dt = f - \frac12 g^2 \nabla \log p_t$, the same marginals as the SDE, deterministic and invertible.
+- Reverse SDE: $dx = [f - g^2 \nabla \log p_t]\,dt + g\,d\bar w$; DDPM's sampler discretizes it, and on the mixture it corrects a start error that the ODE carries to the end.
+- Flow matching regresses $v_\theta\big((1 - t)x_0 + t\varepsilon, t\big)$ onto $\varepsilon - x_0$; its gradient is that of the intractable marginal loss.
+- Curved marginal paths make few steps fail: one Euler step returns the data mean.
+
+## Code
+
+The limit of the DDPM chains, a check of the Fokker–Planck equation, the reverse SDE and the probability-flow ODE with the exact score of a Gaussian mixture, flow matching on the same mixture, the constant gap between the conditional and the marginal loss, and the Gaussian example. NumPy only; it runs in about 30 seconds, and Monte Carlo numbers can differ slightly with the library version.
+
+```python
+import numpy as np
+
+beta = lambda t: 0.1 + 19.9 * t                      # DDPM's linear schedule in continuous time, t in [0, 1]
+abar = lambda t: np.exp(-(0.1 * t + 9.95 * t ** 2))  # exp of minus the integral of beta from 0 to t
+
+# 1. DDPM chains with T steps and beta_i = beta(i / T) / T approach the continuous abar
+for T in [50, 200, 1000]:
+    i = np.arange(1, T // 2 + 1)
+    print(T, round(np.prod(1 - beta(i / T) / T), 5))
+print("limit", round(abar(0.5), 5))
+# 50 0.05852 / 200 0.07378 / 1000 0.078 / limit 0.07906
+
+# data: the mixture 0.8 N(-4, 1) + 0.2 N(4, 1); under the VP SDE each component keeps variance 1
+w, mu = np.array([0.8, 0.2]), np.array([-4.0, 4.0])
+def p(x, t):                                          # marginal density p_t(x)
+    m = np.sqrt(abar(t)) * mu
+    return (w * np.exp(-(x[:, None] - m) ** 2 / 2)).sum(1) / np.sqrt(2 * np.pi)
+def score(x, t):                                      # grad log p_t(x)
+    m = np.sqrt(abar(t)) * mu
+    r = w * np.exp(-(x[:, None] - m) ** 2 / 2)
+    return (r * (m - x[:, None])).sum(1) / r.sum(1)
+
+# 2. Fokker-Planck check at one point: dp/dt = -d(f p)/dx + (1/2) g^2 d2p/dx2, f = -beta x / 2, g^2 = beta
+x0, t0, h = np.array([1.0]), 0.3, 1e-4
+lhs = (p(x0, t0 + h) - p(x0, t0 - h)) / (2 * h)
+fp = lambda x: -beta(t0) * x / 2 * p(x, t0)
+rhs = -(fp(x0 + h) - fp(x0 - h)) / (2 * h) + beta(t0) / 2 * (p(x0 + h, t0) - 2 * p(x0, t0) + p(x0 - h, t0)) / h ** 2
+print(np.round([lhs[0], rhs[0]], 5))                 # [0.31003 0.31003]
+
+# 3. sampling with the exact score: reverse SDE and probability-flow ODE, N Euler steps from t = 1 to 0
+rng = np.random.default_rng(0)
+def sample(N, sde, x):
+    dt = 1 / N
+    for k in range(N, 0, -1):
+        t = k * dt
+        if sde:   # dx = [f - g^2 s] dt + g dw, run with dt < 0
+            x = x + (beta(t) * x / 2 + beta(t) * score(x, t)) * dt + np.sqrt(beta(t) * dt) * rng.standard_normal(n)
+        else:     # dx/dt = f - g^2 s / 2
+            x = x + (beta(t) * x / 2 + beta(t) * score(x, t) / 2) * dt
+    return x
+n = 200_000
+for N in [10, 100, 1000]:
+    for sde in [True, False]:
+        x = sample(N, sde, rng.standard_normal(n))
+        print(N, "SDE" if sde else "ODE", round((x < 0).mean(), 3), round(x[x < 0].std(), 3))
+# 10 SDE 0.782 1.122 / 10 ODE 0.782 1.071 / 100 SDE 0.799 1.012 / 100 ODE 0.793 1.007
+# 1000 SDE 0.799 0.999 / 1000 ODE 0.795 0.994
+x1 = np.sqrt(abar(1.0)) * np.where(rng.random(n) < w[1], mu[1], mu[0]) + rng.standard_normal(n)  # exact p_1
+x = sample(1000, False, x1)
+print("ODE from p_1", round((x < 0).mean(), 3))      # ODE from p_1 0.802
+
+# 4. flow matching with the straight path x_t = (1 - t) x0 + t eps; exact marginal velocity u = (x - E[x0 | x_t]) / t
+def velocity(x, t):
+    m, v = (1 - t) * mu, (1 - t) ** 2 + t ** 2       # component k of p_t: N((1 - t) mu_k, v)
+    r = w * np.exp(-(x[:, None] - m) ** 2 / (2 * v))
+    r /= r.sum(1, keepdims=True)
+    x0hat = (r * (mu + (1 - t) / v * (x[:, None] - m))).sum(1)
+    return (x - x0hat) / t
+for N in [1, 2, 10, 100]:
+    x, dt = rng.standard_normal(100_000), 1 / N
+    for k in range(N, 0, -1):
+        x = x - velocity(x, k * dt) * dt               # Euler from t = 1 down to t = 0
+    print(N, round((x < 0).mean(), 3), round(x[x < 0].std(), 3), round(x.mean(), 3))
+# 1 1.0 0.0 -2.4 / 2 0.997 0.536 -3.174 / 10 0.834 0.977 -2.601 / 100 0.802 0.999 -2.41
+
+# 5. the conditional and the marginal loss differ by the same constant for any v (here at t = 0.5)
+n, t = 4_000_000, 0.5
+comp = rng.random(n) < w[1]
+xd = np.where(comp, mu[1], mu[0]) + rng.standard_normal(n)
+eps = rng.standard_normal(n)
+xt = (1 - t) * xd + t * eps
+for v in [velocity(xt, t), 0.5 * xt, np.zeros(n)]:
+    L_cfm = ((v - (eps - xd)) ** 2).mean()
+    L_fm = ((v - velocity(xt, t)) ** 2).mean()
+    print(round(L_cfm, 2), round(L_fm, 2), round(L_cfm - L_fm, 2))
+# 2.09 0.0 2.09 / 27.13 25.03 2.1 / 18.01 15.91 2.1
+
+# 6. Gaussian data N(2, 0.5^2): the ODE keeps each point's z-score; x(0) = 2.5 ends at
+a1 = abar(1.0)
+print(f"{a1:.2e}", round(np.sqrt(a1) * 2 + np.sqrt(a1 * 0.25 + 1 - a1) / 0.5 * 0.5, 4))   # 4.32e-05 1.0131
+```
+
+## Next
+
+The network of the continuous view is the same noise predictor or velocity as before, and the ODE turns sampling into a choice of solver. The [next note](/notes/generative-models/latent-diffusion) puts these pieces to work at scale: it runs the diffusion in the latent space of an autoencoder, steers it toward a prompt with guidance, and samples it in tens of steps with DDIM, which is Euler's method for the probability-flow ODE.
+
+## References
+
+- Y. Song, J. Sohl-Dickstein, D. P. Kingma, A. Kumar, S. Ermon, B. Poole. [Score-Based Generative Modeling through Stochastic Differential Equations](https://arxiv.org/abs/2011.13456). ICLR, 2021. §3.2 (the reverse-time SDE), §3.4 and App. B (VE and VP SDEs as limits of NCSN and DDPM), §4.2 (predictor–corrector samplers), §4.3 and App. D.1 (the probability-flow ODE).
+- B. D. O. Anderson. [Reverse-time diffusion equation models](https://doi.org/10.1016/0304-4149(82)90051-5). *Stochastic Processes and their Applications*, 12(3), 313–326, 1982.
+- S. Särkkä, A. Solin. [*Applied Stochastic Differential Equations*](https://users.aalto.fi/~asolin/sde-book/sde-book.pdf). Cambridge University Press, 2019. §2.7 (the Picard–Lindelöf theorem, stated without proof), chapter 4 (Itô calculus), Theorem 5.4 (the Fokker–Planck–Kolmogorov equation), §5.5 (means and covariances of SDE solutions).
+- Y. Lipman, R. T. Q. Chen, H. Ben-Hamu, M. Nickel, M. Le. [Flow Matching for Generative Modeling](https://arxiv.org/abs/2210.02747). ICLR, 2023. Theorems 1–2 (§3), Gaussian conditional paths and their relation to diffusion (§4).
+- X. Liu, C. Gong, Q. Liu. [Flow Straight and Fast: Learning to Generate and Transfer Data with Rectified Flow](https://arxiv.org/abs/2209.03003). ICLR, 2023. Numbers from arXiv:2209.03003v1 (2022): Theorems 3.5–3.7 (transport costs, straight couplings, the straightening rate), Table 1(a) (CIFAR-10), App. A (reflow and distillation settings).
+- G. Teschl. [*Ordinary Differential Equations and Dynamical Systems*](https://www.mat.univie.ac.at/~gerald/ftp/book-ode/ode.pdf). American Mathematical Society, 2012. Theorem 2.2 (Picard–Lindelöf), Corollary 2.6 (existence on the whole interval under a global Lipschitz bound).
+- J. Austin, D. D. Johnson, J. Ho, D. Tarlow, R. van den Berg. [Structured Denoising Diffusion Models in Discrete State-Spaces](https://arxiv.org/abs/2107.03006). NeurIPS, 2021. §3 (transition matrices, absorbing state), §4 (the connection to masked language models).
+- R. Isachenko. *Deep Generative Models*, MIPT and YSDA, 2025. [Course repository](https://github.com/r-isachenko/2025-DGM-MIPT-YSDA-course); lecture 10 (the Fokker–Planck equation, the probability-flow ODE, the reverse SDE), lecture 11 (VE and VP SDEs, flow matching), lecture 12 (conditional flow matching, straight paths), lecture 13 (flow matching and diffusion, discrete diffusion).
+- K. P. Murphy. [*Probabilistic Machine Learning: Advanced Topics*](https://probml.github.io/pml-book/book2.html). MIT Press, 2023. §25.4 (continuous-time models: forward and reverse SDEs and ODEs).
