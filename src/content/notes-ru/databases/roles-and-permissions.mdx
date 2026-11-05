@@ -1,0 +1,102 @@
+---
+title: Роли и права доступа
+description: "Открываем отчётному заданию суммы заказов, прослеживаем, откуда берётся право чтения, и проверяем доступ от имени задания."
+course: databases
+section: Жизнь модели данных
+order: 17
+status: published
+tags: [databases, postgresql, roles, privileges, views]
+prerequisites: [От предметной области к модели, CTE и представления]
+---
+
+import ReportAccess from '../../../components/figures/databases-roles-and-permissions/ReportAccess.astro';
+
+Отчётному заданию нужны суммы двух заказов. В таблице заказов у каждой строки есть также email покупателя. Заданию достаточно суммы и идентификатора заказа. Если оно подключится как владелец таблицы, оно сможет менять таблицу и читать все столбцы. У соединения будет больше полномочий, чем требует задача.
+
+## Назначаем заданию учётную запись и роль \{#give-a-job-an-identity-and-a-role\}
+
+**Аутентификация** устанавливает, кто подключается. **Авторизация** определяет, может ли подключившаяся сторона выполнить операцию над объектом базы. В PostgreSQL **роль** (role) может представлять учётную запись для входа, группу с правами или сочетать оба назначения. **Право доступа** (privilege) разрешает операцию вроде `SELECT` для отношения или `USAGE` для схемы. Владелец имеет дополнительные полномочия, включая право изменить или удалить объект. [PostgreSQL 18, §5.8 и гл. 21](#references)
+
+Отчёт может работать под собственной учётной записью. Права даёт членство в роли для отчётности. Второму заданию можно выдать собственную учётную запись с тем же членством. Назначение ролей пользователям отделено от назначения операций ролям. Здесь используется эта часть модели управления доступом на основе ролей (role-based access control, RBAC). Она позволяет дать заданию нужные полномочия без передачи владения базой. [Ferraiolo и Kuhn, 1992, RBAC model](#references)
+
+## Выбираем столбцы для отчёта \{#choose-the-columns-the-report-needs\}
+
+Запустим подготовку в тестовой базе под администратором, который может создать схемы и роли, а также переключиться на демонстрационную учётную запись. Оставим транзакцию открытой на время проверки. Команда `ROLLBACK` в конце отменит подготовку.
+
+```sql
+BEGIN;
+
+CREATE ROLE report_reader NOLOGIN;
+CREATE ROLE report_job LOGIN;
+
+CREATE SCHEMA shop_private;
+CREATE SCHEMA shop_report;
+
+CREATE TABLE shop_private.order_headers (
+    order_id integer PRIMARY KEY,
+    amount_cents integer NOT NULL,
+    customer_email text NOT NULL
+);
+
+INSERT INTO shop_private.order_headers VALUES
+    (101, 1300, 'order101@example.test'),
+    (102, 350, 'order102@example.test');
+
+CREATE VIEW shop_report.order_amounts AS
+SELECT order_id, amount_cents
+FROM shop_private.order_headers;
+
+GRANT USAGE ON SCHEMA shop_report TO report_reader;
+GRANT SELECT ON shop_report.order_amounts TO report_reader;
+GRANT report_reader TO report_job WITH INHERIT TRUE;
+```
+
+Право на схему разрешает искать в ней объекты по именам. Право на представление разрешает читать открытые им строки и столбцы. Членство с `INHERIT TRUE` даёт `report_job` обычные права `report_reader` без переключения на эту роль. Для нужного запроса этого достаточно. Так работает **принцип наименьших привилегий** (least privilege). [PostgreSQL 18, §§5.8 и 21.3](#references) [Saltzer и Schroeder, 1975, §I.C](#references)
+
+<ReportAccess />
+
+## Проверяем с правами задания \{#test-with-the-jobs-authority\}
+
+Сменим действующую роль в сеансе. Так можно проверить запросы с правами задания без нового подключения. После проверки администратор сможет вернуть исходную роль.
+
+```sql
+SET ROLE report_job;
+
+SELECT order_id, amount_cents
+FROM shop_report.order_amounts
+ORDER BY order_id;
+```
+
+| order_id | amount_cents |
+| --- | --- |
+| 101 | 1300 |
+| 102 | 350 |
+
+По умолчанию PostgreSQL проверяет доступ к исходным отношениям с правами владельца представления. В примере владелец представления создал и таблицу, поэтому через представление можно прочитать два указанных столбца. У задания нет прямого доступа к исходной схеме и таблице. Если создать представление с `security_invoker = true`, проверка прав на исходные отношения выполняется для вызывающей роли. Тогда заданию понадобилось бы дополнительное право на чтение нужных столбцов исходной таблицы. [PostgreSQL 18, CREATE VIEW](#references)
+
+Чтобы попробовать прямое чтение, сначала поставим точку сохранения. Команда `SELECT` должна завершиться ошибкой доступа. Выполним последние три команды, чтобы восстановить транзакцию и отменить подготовку.
+
+```sql
+SAVEPOINT before_denied_read;
+SELECT customer_email FROM shop_private.order_headers;
+ROLLBACK TO SAVEPOINT before_denied_read;
+
+RESET ROLE;
+ROLLBACK;
+```
+
+## Проверяем остальные пути доступа \{#check-the-other-ways-in\}
+
+Возможность прочитать исходную таблицу зависит от всех действующих прав задания. Если другая унаследованная роль получит доступ к закрытой схеме и таблице, задание сможет прочитать исходные данные через неё. Отзыв прав у одной роли убирает только этот путь. Дополнительный доступ могут давать прямые разрешения и права `PUBLIC`, действующие для всех ролей. Проверяем разрешённые и запрещённые операции с той ролью, которую использует приложение. [PostgreSQL 18, §5.8](#references)
+
+Обычное представление может ограничить выдачу выбранными столбцами. Его права не регулируют копии, которые отчёт создаёт после чтения. Для представления с фильтром строк отдельно разбирают, что пользователь сможет вывести из результатов. Здесь выбранных столбцов хватает для одного отчёта. Другим потребителям могут понадобиться другие интерфейсы и полномочия.
+
+## Дальше \{#next\}
+
+Представление даёт читателям именованный интерфейс к части схемы. Изменение таблицы под ним требует отдельного решения. В конспекте [«Эволюция схемы»](/ru/notes/databases/schema-evolution) проследим изменение столбца, пока работают старая и новая версии приложения.
+
+## Источники \{#references\}
+
+1. PostgreSQL Global Development Group. Документация PostgreSQL 18, 2025. [Privileges](https://www.postgresql.org/docs/18/ddl-priv.html), [database roles](https://www.postgresql.org/docs/18/database-roles.html), [role membership](https://www.postgresql.org/docs/18/role-membership.html) и [CREATE VIEW](https://www.postgresql.org/docs/18/sql-createview.html) описывают права, наследование и проверку доступа через представления.
+2. David F. Ferraiolo и D. Richard Kuhn. [Role-Based Access Controls](https://csrc.nist.gov/CSRC/media/Projects/Role-Based-Access-Control/documents/ferraiolo-kuhn-92.pdf). 15th National Computer Security Conference, 554–563, 1992. Описывает назначение прав доступа ролям.
+3. Jerome H. Saltzer и Michael D. Schroeder. [The Protection of Information in Computer Systems](https://www.cs.virginia.edu/~evans/cs551/saltzer/). *Proceedings of the IEEE*, 63(9), 1278–1308, 1975. §I.C формулирует принципы проектирования, включая принцип наименьших привилегий.

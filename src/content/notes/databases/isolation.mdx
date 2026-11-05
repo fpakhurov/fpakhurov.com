@@ -1,0 +1,73 @@
+---
+title: Isolation and serializability
+description: "Read concurrent schedules, distinguish statement and transaction snapshots, and derive a write skew from an inventory service rule."
+course: databases
+section: Concurrency and Recovery
+order: 13
+status: published
+tags: [databases, transactions, isolation, serializability, write-skew]
+prerequisites: [Transactions and invariants]
+---
+
+import WriteSkew from '../../../components/figures/databases-isolation/WriteSkew.astro';
+
+Two pickup counters are open. Each supervisor can close their own counter if another stays open. Each reads that two counters are open, then closes one. The two writes affect different rows. The result still breaks the rule that the shop must keep a counter open.
+
+## Read a schedule
+
+A **schedule** lists the operations of several transactions in their execution order while preserving each transaction's own program order. A **serial** schedule runs one complete transaction before the next. In a serial order, the first supervisor sees two open counters and closes one. The second sees one and leaves it open. Either order leaves one open counter, though the surviving counter differs.
+
+The same rule can run against the following shared table in a disposable PostgreSQL database. The setup commits before the two sessions begin. Each session uses the count to decide whether to issue its own update.
+
+```sql
+CREATE TABLE pickup_counters (
+    counter text PRIMARY KEY,
+    is_open boolean NOT NULL
+);
+INSERT INTO pickup_counters VALUES ('A', true), ('B', true);
+```
+
+| Step | T1 | T2 |
+| --- | --- | --- |
+| 1 | Begin `REPEATABLE READ` | Begin `REPEATABLE READ` |
+| 2 | Count open counters → 2 | |
+| 3 | | Count open counters → 2 |
+| 4 | Set A to closed | |
+| 5 | | Set B to closed |
+| 6 | Commit | Commit |
+
+Use `SELECT COUNT(*) FROM pickup_counters WHERE is_open` for the count. Each update sets `is_open = false` with a predicate on one counter key. In PostgreSQL Repeatable Read, both can commit in this schedule because the transactions update different rows and the database permits this outcome. The final count is zero. No serial ordering of these transactions, with the same decision rule, would produce that history. This is **write skew**. [PostgreSQL 18, §13.2.2](#references) [Berenson et al., 1995, §4](#references)
+
+<WriteSkew />
+
+## What does a reader see?
+
+A **snapshot** determines which row versions a command can observe. In PostgreSQL Read Committed, an ordinary `SELECT` sees data committed before that statement began, as well as the transaction's own earlier changes. Two statements can therefore read different committed states. In Repeatable Read, the first statement that takes a snapshot establishes the transaction snapshot. A later read uses that same snapshot and also sees the transaction's own changes. [PostgreSQL 18, §§13.2.1–13.2.2](#references)
+
+Suppose T1 reads that A is open, T2 closes A and commits, and T1 reads A again. In Read Committed the second read can see that A is closed. That is a **nonrepeatable read** of one existing row. If T2 adds an open counter C and the second query looks for all open counters, the newly matching row is a **phantom**. A **dirty read** would observe a concurrent change before its writer committed. PostgreSQL maps a request for Read Uncommitted to Read Committed and therefore forbids dirty reads at all its levels. [PostgreSQL 18, §13.2](#references)
+
+| PostgreSQL level | Snapshot for ordinary reads | What can still happen |
+| --- | --- | --- |
+| Read Committed, also requested as Read Uncommitted | One per statement | Nonrepeatable reads, phantoms, serialization anomalies |
+| Repeatable Read | One per transaction for snapshot reads | Write skew |
+| Serializable | One per transaction for snapshot reads, with additional conflict tracking | A transaction can fail and require a retry |
+
+An absence of changing read results is weaker than a guarantee about the combined effect of reads and writes. Each supervisor reads a stable snapshot in the counter example. The two decisions still depend on values that the other writer changes. This is why a list of the early read phenomena alone does not characterize snapshot isolation. [Berenson et al., 1995, §§2 and 4](#references)
+
+## Require a serial explanation
+
+**Serializability** requires the successful transactions' effects and observations to be consistent with some serial order. The actual operations can overlap. In the counter example T1 reads B open before T2 changes B, which requires T1 to precede T2 in a serial explanation. T2 reads A open before T1 changes A, which requires T2 to precede T1. Both requirements cannot hold. [Ports and Grittner, 2012, §§2–3](#references)
+
+In PostgreSQL, rerunning the schedule from two open counters with both transactions at `SERIALIZABLE` cannot produce two successful commits. PostgreSQL's Serializable Snapshot Isolation tracks dependencies that could lead to a serialization anomaly. It can abort a transaction with SQLSTATE `40001`. An application retries the whole transaction from a fresh snapshot. Retrying only the last write would reuse a decision made from the old count. On retry after a successful closure, the count is one, so the retried operation leaves the remaining counter open. [PostgreSQL 18, §13.2.3](#references) [Ports and Grittner, 2012, §3](#references)
+
+This reasoning covers transactions that participate in the isolation protocol and apply the same decision rule. A direct update that closes the last counter in a single transaction is wrong even in a serial order. The isolation level supplies a guarantee about interleavings. The application still supplies the invariant and its correct transition.
+
+## Next
+
+Snapshots explain why a read can continue while another transaction writes. When two writers need the same row, the database must still coordinate the writes. [Locks and MVCC](/notes/databases/locks-and-mvcc) follows both mechanisms through one stock update and a cycle of waiting transactions.
+
+## References
+
+1. PostgreSQL Global Development Group. PostgreSQL 18 documentation. [Transaction Isolation, §13.2](https://www.postgresql.org/docs/18/transaction-iso.html). Defines PostgreSQL's isolation levels, read phenomena and retry behavior.
+2. Hal Berenson, Phil Bernstein, Jim Gray, Jim Melton, Elizabeth O'Neil and Patrick O'Neil. [A Critique of ANSI SQL Isolation Levels](https://www.microsoft.com/en-us/research/wp-content/uploads/2016/02/tr-95-51.pdf), 1995, §§2 and 4. Distinguishes read phenomena from snapshot isolation and write skew.
+3. Dan R. K. Ports and Kevin Grittner. [Serializable Snapshot Isolation in PostgreSQL](https://vldb.org/pvldb/vol5/p1850_danrkports_vldb2012.pdf), 2012, §§2–3. Explains dependency cycles and the SSI algorithm implemented in PostgreSQL.

@@ -1,0 +1,59 @@
+---
+title: Full and incremental loads
+description: "Choose a consistent input boundary, compare rebuilding and merging, and check what an incremental cursor can miss."
+course: big-data
+section: Delivering Changes
+order: 19
+status: published
+tags: [big-data, ingestion, snapshots, watermarks, etl]
+prerequisites: [History in a warehouse]
+---
+
+import DeliveryTrace from '../../../components/figures/big-data-delivery/DeliveryTrace.astro';
+
+An order fact changed from 700 to 900 cents. Yesterday's copy contains 700. An import that simply appends the new row leaves two amounts for the same fact, so a report may count 1600. Loading data means choosing an input boundary and deciding how the destination applies the records within it.
+
+## Copy one state or move between states
+
+A **full load** reads the entire intended input. For a table of current orders, it can build a new copy and publish it once all rows are available. If the source no longer contains an order, the replacement omits it. That is correct only if absence from the complete input represents a deletion. An incomplete extract must not be treated as a complete replacement.
+
+For a changing database, several independent reads can observe different committed states. A PostgreSQL Repeatable Read transaction can use one snapshot for several reads of the source. For files, use a manifest of immutable input objects for the run. For a paginated API, check whether its cursor holds a snapshot or simply points into changing data. The same page number does not establish a stable extraction boundary. [PostgreSQL 18, §13.2.2](#references)
+
+An **incremental load** reads a subset since a saved source position. It merges changed rows into the existing destination by a stable key. Replaying the same source version can leave the same row values when the target replaces by key and version. An additive update can count that version twice. As a planning example, one million rows of 120 bytes each require 120 MB of row payload in a full load. Five thousand changed rows at the same width require 600 kB. The ratio is 200, before indexing, metadata, scanning and merge costs.
+
+## Save both bounds
+
+Suppose the source uses `(updated_at, order_id)` as an ordered cursor. The saved cursor is `(10:00, 101)`, and the next run selects through `(10:02, 103)`. Comparing only timestamps with `updated_at > 10:00` would lose order 102. Compare pairs lexicographically, with the order identifier breaking the tie. This is a load cursor. The event-time watermark used later serves a different purpose. [Microsoft, Incremental copy](#references) [PostgreSQL 18, §9.25.5](#references)
+
+<DeliveryTrace example="load" />
+
+```sql
+SELECT order_id
+FROM (VALUES (TIME '10:00', 101),
+             (TIME '10:00', 102),
+             (TIME '10:02', 103),
+             (TIME '10:03', 104)) AS changes(updated_at, order_id)
+WHERE (updated_at, order_id) > (TIME '10:00', 101)
+  AND (updated_at, order_id) <= (TIME '10:02', 103)
+ORDER BY updated_at, order_id;
+```
+
+This returns 102 and 103. The cursor advances only after their destination changes are durable. If a crash occurs after the changes and before the cursor update, the run can see them again. Versioned replacement gives that replay a defined effect. Advancing the cursor first could skip rows the destination never stored.
+
+## What a row cursor cannot see
+
+The pair is sufficient only when changes become visible in a way that cannot place new work behind the saved cursor. Suppose a transaction writes an update with timestamp 09:59 but commits after the run saves 10:02. It was absent from the run's snapshot and falls below the next lower bound. A tie-breaker does not fix that ordering problem. Overlapping extraction intervals can handle a known amount of delay with deduplication. Without a bound on delay they can still miss changes.
+
+Polling surviving rows also cannot observe an ordinary hard delete. The source can expose deletion records, maintain a soft-delete marker, or give the consumer a consistent snapshot and a log of later changes. That last option makes progress refer to a committed source history rather than a timestamp assigned to a row. [Debezium, PostgreSQL connector](#references)
+
+Extraction, transformation and loading are separate stages. In ETL the transformation precedes the load into the analytical destination. In ELT the raw input reaches the destination first and the transformation runs there. In either arrangement, publish the output only for a defined and recoverable input.
+
+## Next
+
+A log can report the change from 700 to 900 and later record the order's deletion. [Change data capture](/notes/big-data/change-data-capture) connects an initial snapshot to that log without leaving an interval of unobserved writes.
+
+## References
+
+1. Microsoft. [Incrementally copy a table using Azure Data Factory](https://learn.microsoft.com/en-us/azure/data-factory/tutorial-incremental-copy-portal). Describes successive extraction watermarks and when a pipeline records progress.
+2. PostgreSQL Global Development Group. PostgreSQL 18 documentation. [Transaction isolation, §13.2.2](https://www.postgresql.org/docs/18/transaction-iso.html#XACT-REPEATABLE-READ) and [row comparisons, §9.25.5](https://www.postgresql.org/docs/18/functions-comparisons.html#ROW-WISE-COMPARISON). Gives snapshot and pair comparison semantics.
+3. Debezium Project. [Debezium connector for PostgreSQL](https://debezium.io/documentation/reference/stable/connectors/postgresql.html). Describes snapshot-to-log handover and captured row changes.

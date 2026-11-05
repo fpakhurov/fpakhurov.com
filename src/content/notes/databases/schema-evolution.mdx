@@ -1,0 +1,119 @@
+---
+title: Schema evolution
+description: "Add a replacement column while old clients still write, fill historical rows, and check when the old column can be removed."
+course: databases
+section: Operating a Data Model
+order: 18
+status: published
+tags: [databases, postgresql, schema-evolution, migrations]
+prerequisites: [Roles and permissions]
+---
+
+import MigrationStates from '../../../components/figures/databases-schema-evolution/MigrationStates.astro';
+
+An order table exposes an integer `amount_cents`. The next version of the checkout service will call it `total_cents` and use a wider integer. A direct rename changes which SQL statements can execute. A worker that has not yet been restarted still reads and writes `amount_cents`. The database schema and the clients that use it can change at different times.
+
+## Establish what each version can use
+
+A **migration** is a controlled change to the schema and, when required, the stored data. For an additive transition, first make a schema that can serve both versions. Let the old field remain the only application write target while the two versions overlap. Give the new reader an expression that prefers the new field and falls back to the old value. This works only when both fields describe the same quantity. Here both represent the final order total in cents, and conversion from `integer` to `bigint` preserves every existing value.
+
+The fixture has two orders. The migration first adds a nullable column and a trigger, which is code the database invokes when a table event occurs. The database sets the new value before storing an inserted row or a row whose old amount is updated.
+
+```sql
+CREATE TEMP TABLE migration_orders (
+    order_id integer PRIMARY KEY,
+    amount_cents integer NOT NULL
+);
+
+INSERT INTO migration_orders VALUES (101, 1300), (102, 350);
+
+BEGIN;
+ALTER TABLE migration_orders ADD COLUMN total_cents bigint;
+
+CREATE FUNCTION pg_temp.sync_order_total() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    NEW.total_cents := NEW.amount_cents;
+    RETURN NEW;
+END
+$$;
+
+CREATE TRIGGER sync_order_total
+BEFORE INSERT OR UPDATE OF amount_cents ON migration_orders
+FOR EACH ROW EXECUTE FUNCTION pg_temp.sync_order_total();
+COMMIT;
+```
+
+The trigger handles incoming writes after the schema change. The two existing rows still have `NULL` in `total_cents`. The reader can use `COALESCE(total_cents, amount_cents)` as a temporary expression. Every client that uses positional row decoding or `SELECT *` also needs checking, because adding a column can change the shape it receives. [PostgreSQL 18, ALTER TABLE and CREATE TRIGGER](#references)
+
+## Fill old rows while preserving new writes
+
+Suppose the old checkout updates order 101 from 1300 to 1400. The trigger copies 1400 to the new column within the same row change. Then we can fill the remaining rows.
+
+```sql
+UPDATE migration_orders
+SET amount_cents = 1400
+WHERE order_id = 101;
+
+UPDATE migration_orders
+SET total_cents = amount_cents
+WHERE total_cents IS NULL;
+
+SELECT order_id, amount_cents, total_cents
+FROM migration_orders
+ORDER BY order_id;
+```
+
+| order_id | amount_cents | total_cents |
+| --- | --- | --- |
+| 101 | 1400 | 1400 |
+| 102 | 350 | 350 |
+
+The second update is a **backfill**. It gives historical rows a value in a new field. It updates only order 102 because the live write already filled order 101. All application writes still go through the old field. If a client could write the new field on its own, an old client might continue to see a different amount. The overlap needs a single rule for which value controls a write. A full-table backfill can consume I/O and create row versions and WAL. On a large table, a bounded key range per transaction gives the database a chance to release locks and the operator a place to resume. The predicate makes a repeated batch skip already filled rows.
+
+<MigrationStates />
+
+The trigger and backfill use separate mechanisms to reach the same representation. Google F1 makes a related distinction at the engine level. A new element can accept writes before it becomes readable. A reorganization fills the historical entries before the element becomes public. That protocol has its own assumptions about how far server schema versions can differ. [Rae et al., 2013, §3.3.2](#references)
+
+## Validate before switching the contract
+
+Check agreement before dropping the fallback. `IS DISTINCT FROM` returns true when the old value is present and the new one is missing. In the sample the query returns zero rows.
+
+```sql
+SELECT order_id
+FROM migration_orders
+WHERE total_cents IS DISTINCT FROM amount_cents;
+
+ALTER TABLE migration_orders
+    ADD CONSTRAINT total_present CHECK (total_cents IS NOT NULL) NOT VALID;
+ALTER TABLE migration_orders VALIDATE CONSTRAINT total_present;
+```
+
+PostgreSQL checks the new constraint on subsequent writes immediately. The `NOT VALID` flag defers the check of existing rows to `VALIDATE CONSTRAINT`. Validation still reads the table. It uses a weaker lock than adding and validating the check together, and can run alongside ordinary updates. A successful validation proves the column is populated under the current schema. Agreement also depends on maintaining the write rule until cutover. [PostgreSQL 18, ALTER TABLE](#references)
+
+## Retire the old interface
+
+Make sure old clients and dependent queries have stopped using `amount_cents`. For this example, pause writes briefly, let old transactions finish, change the schema, and resume with a client that reads and writes `total_cents`. The sample has no other objects referencing the old column.
+
+```sql
+BEGIN;
+ALTER TABLE migration_orders ALTER COLUMN total_cents SET NOT NULL;
+DROP TRIGGER sync_order_total ON migration_orders;
+ALTER TABLE migration_orders DROP COLUMN amount_cents;
+ALTER TABLE migration_orders DROP CONSTRAINT total_present;
+COMMIT;
+```
+
+The validated check proves that `total_cents` is present. PostgreSQL can use it to skip the scan normally required by `SET NOT NULL`. The schema command can still wait to acquire its lock. A fast catalog change and a short wait for the lock are different properties. Before this cutover, the old client can continue to use the old field. Afterwards, rolling the application back by itself leaves it referring to a missing column. The old interface would need its own restoration plan.
+
+The example separates compatibility, historical conversion and removal. Engine support can move some work into another phase. BullFrog studies a design that converts historical rows on demand while transactions run against the new schema. It achieves that by changing the engine's concurrency control and layout handling. The PostgreSQL example instead exposes the phases as ordinary operations. [PostgreSQL 18, ALTER TABLE](#references) [Bhattacherjee et al., 2021](#references)
+
+## Next
+
+The order table serves a checkout operation that finds a few rows. The same shop also needs to sum a day of orders across stores. [Transactional and analytical systems](/notes/databases/transactional-and-analytical-systems) compares what those requests need from storage and execution.
+
+## References
+
+1. PostgreSQL Global Development Group. PostgreSQL 18 documentation, 2025. [ALTER TABLE](https://www.postgresql.org/docs/18/sql-altertable.html) gives lock and validation rules. [CREATE TRIGGER](https://www.postgresql.org/docs/18/sql-createtrigger.html) specifies when row triggers run.
+2. Ian Rae, Eric Rollins, Jeff Shute, Sukhdeep Sodhi and Radek Vingralek. [Online, Asynchronous Schema Change in F1](https://research.google/pubs/online-asynchronous-schema-change-in-f1/). *PVLDB*, 6(11), 1045–1056, 2013. §3.3.2 describes intermediate schema states and historical conversion.
+3. Souvik Bhattacherjee, Gang Liao, Michael Hicks and Daniel J. Abadi. [BullFrog. Online Schema Evolution via Lazy Evaluation](https://www.cs.umd.edu/~mwh/papers/bhattacherjee21bullfrog.html). *ACM SIGMOD*, 2021. Explores engine support for lazy conversion of existing data.

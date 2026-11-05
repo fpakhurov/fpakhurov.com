@@ -1,0 +1,115 @@
+---
+title: Оконные рамки
+description: "Выбираем строки для накопительных и скользящих вычислений и разбираем эффект равных ключей сортировки."
+course: sql
+section: Построение запросов
+order: 12
+status: published
+tags: [sql, postgresql, window-frames, moving-average, peers]
+prerequisites: ["Оконные функции"]
+---
+
+import PrefixFrames from '../../../components/figures/sql-window-frames/PrefixFrames.astro';
+
+2 января магазин регистрирует две продажи чая на 200 и 300 копеек. Должна ли накопительная сумма в первой строке уже включать вторую продажу? Ответ зависит от того, нужен ли итог по эту дату или по эту продажу включительно.
+
+## В одном разделе несколько рамок \{#a-partition-contains-several-frames\}
+
+Возьмём [семь продаж](/ru/notes/sql/window-functions#give-every-row-its-product-total) из примера с оконными функциями. Оставим чай, так что все пять оставшихся строк образуют один раздел. **Оконная рамка** (window frame) — подмножество строк раздела, по которому считаем значение для текущей строки. Её границы перемещаются вместе с текущей строкой, если они не закреплены на границах раздела.
+
+```sql
+SELECT sale_id, sold_on, cents,
+       SUM(cents) OVER (ORDER BY sold_on) AS date_prefix,
+       SUM(cents) OVER (
+           ORDER BY sold_on, sale_id
+           ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+       ) AS row_prefix
+FROM sales
+WHERE product = 'tea'
+ORDER BY sold_on, sale_id;
+```
+
+| ID продажи | Дата | Сумма | `date_prefix` | `row_prefix` |
+| --- | --- | --- | --- | --- |
+| 201 | 2026-01-01 | 100 | 100 | 100 |
+| 202 | 2026-01-02 | 200 | 600 | 300 |
+| 203 | 2026-01-02 | 300 | 600 | 600 |
+| 204 | 2026-01-05 | 300 | 900 | 900 |
+| 205 | 2026-01-06 | 500 | 1400 | 1400 |
+
+В PostgreSQL упорядоченное окно без явной рамки использует `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`. Эта рамка идёт от начала раздела до последней строки, равной текущей по ключам сортировки. Здесь строки с одним `sold_on` равны по порядку, поэтому обе продажи 2 января видят $100+200+300=600$. Явная рамка `ROWS` отсчитывает позиции в отсортированном разделе и заканчивается на текущей строке. Добавим `sale_id`, чтобы зафиксировать порядок внутри даты. Продажа 202 тогда видит только $100+200=300$. Без оконного `ORDER BY` рамка по умолчанию охватывает весь раздел, потому что все строки равны по порядку. ([PostgreSQL 18, §4.2.8](#references), [SQLite, §2.2](#references))
+
+<PrefixFrames lang="ru" />
+
+Порядок вывода в конце оператора не разрешает равенство ключей внутри `OVER`. Если рамка `ROWS` считает позиции и оконные ключи оставляют совпадения, на границу могут попасть разные равные строки. Для однозначного порядка в окне нужны ключи, которые различают эти строки.
+
+## Выберем единицы отсчёта границ \{#choose-what-a-boundary-counts\}
+
+Пусть в отчёте нужны текущая и предыдущая продажа, диапазон за текущую дату и один день назад или текущая и предыдущая дата с продажами. У всех рамок одинаковая верхняя граница `CURRENT ROW`, а единицы отсчёта нижней границы различаются.
+
+```sql
+SELECT sale_id, sold_on,
+       SUM(cents) OVER (
+           ORDER BY sold_on, sale_id
+           ROWS BETWEEN 1 PRECEDING AND CURRENT ROW
+       ) AS two_rows,
+       SUM(cents) OVER (
+           ORDER BY sold_on
+           RANGE BETWEEN INTERVAL '1 day' PRECEDING AND CURRENT ROW
+       ) AS date_range,
+       SUM(cents) OVER (
+           ORDER BY sold_on
+           GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW
+       ) AS two_date_groups
+FROM sales
+WHERE product = 'tea'
+ORDER BY sold_on, sale_id;
+```
+
+| ID продажи | `two_rows` | `date_range` | `two_date_groups` |
+| --- | --- | --- | --- |
+| 201 | 100 | 100 | 100 |
+| 202 | 300 | 600 | 600 |
+| 203 | 500 | 600 | 600 |
+| 204 | 600 | 300 | 800 |
+| 205 | 800 | 800 | 800 |
+
+Для продажи 204 за 5 января `ROWS` отсчитывает одну позицию назад, продажу 203. Сумма равна $300+300=600$. `RANGE` измеряет расстояние между значениями ключа сортировки. В отрезок с 4 по 5 января входит только продажа 204, получаем 300. При смещении в `RANGE` PostgreSQL требует ровно одно выражение в оконной сортировке. `GROUPS` считает группы равных строк, поэтому предыдущая группа содержит обе продажи 2 января, а текущая — продажу 5 января. Сумма равна $200+300+300=800$. В режимах `RANGE` и `GROUPS` граница `CURRENT ROW` включает все строки, равные текущей по порядку, с этой стороны рамки. ([PostgreSQL 18, §4.2.8](#references), [SQLite, §2.2](#references), [DuckDB 1.4, Framing](#references))
+
+Диапазон дат включает свои концы. Строк для пропущенных дат он не создаёт. Агрегат по диапазону видит существующие продажи. Если в отчёте нужна строка на каждый день и дни без продаж должны давать ноль, сначала построим календарный результат и присоединим к нему дневные итоги.
+
+## Посчитаем среднее пары и найдём последнее значение \{#average-a-moving-pair-and-find-the-actual-last-value\}
+
+Скользящее среднее использует те же границы, что и скользящая сумма. `AVG` делит сумму известных значений на их число. Для продажи 201 в двухпозиционной рамке только одна строка, поэтому среднее равно 100. Для продажи 205 берём продажи 204 и 205 и получаем $(300+500)/2=400$. Рамка не выходит за пределы раздела.
+
+```sql
+SELECT sale_id,
+       AVG(cents) OVER (
+           ORDER BY sold_on, sale_id
+           ROWS BETWEEN 1 PRECEDING AND CURRENT ROW
+       ) AS two_row_mean,
+       LAST_VALUE(cents) OVER (
+           ORDER BY sold_on, sale_id
+       ) AS last_in_prefix,
+       LAST_VALUE(cents) OVER (
+           ORDER BY sold_on, sale_id
+           ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+       ) AS last_in_partition
+FROM sales
+WHERE product = 'tea'
+ORDER BY sold_on, sale_id;
+```
+
+Для продажи 202 три вычисленных значения равны 150, 200 и 500. Первое усредняет 100 и 200. Второе получено через `LAST_VALUE`, которая читает последнюю строку своей рамки. В рамке по умолчанию с уникальными ключами сортировки последняя строка — сама продажа 202. Третье выражение задаёт оба конца раздела, поэтому каждая продажа читает итоговое значение 500. Функции `LAG` и `LEAD` из предыдущего конспекта используют смещения в упорядоченном разделе. Сужение рамки не ограничивает их соседей. ([PostgreSQL 18, §9.22](#references), [SQLite, §3](#references))
+
+Рамка может быть пустой. Например, в режиме `ROWS` для последней строки границы от `1 FOLLOWING` до `1 FOLLOWING` лежат за разделом. Тогда `COUNT(*)` даёт ноль, а `SUM` или `AVG` возвращает `NULL`. Подстановка нуля требует отдельного решения о смысле пропуска. ([PostgreSQL 18, §9.21](#references))
+
+## Дальше \{#next\}
+
+В рамке по значениям использовались календарные даты. Для метки времени условие «все продажи 5 января» требует ещё часового пояса и точной границы. В [датах, времени и тексте](/ru/notes/sql/dates-and-text) разберём эти границы и различие между типизированной датой и её текстовым представлением.
+
+## Источники \{#references\}
+
+1. PostgreSQL Global Development Group. Документация PostgreSQL 18. [Window Function Calls](https://www.postgresql.org/docs/18/sql-expressions.html#SYNTAX-WINDOW-FUNCTIONS), §4.2.8, [Aggregate Functions](https://www.postgresql.org/docs/18/functions-aggregate.html), §9.21, и [Window Functions](https://www.postgresql.org/docs/18/functions-window.html), §9.22. Типы рамок, границы по умолчанию и поведение отдельных функций.
+2. SQLite Project. [Window Functions](https://www.sqlite.org/windowfunctions.html), §§2.2 и 3. Сравнивает единицы отсчёта рамок и перечисляет встроенные функции, которые учитывают рамку.
+3. DuckDB Foundation. [Window Functions](https://duckdb.org/docs/1.4/sql/functions/window_functions#framing), DuckDB 1.4, Framing. Скользящие агрегаты по диапазону значений при пропусках дат.

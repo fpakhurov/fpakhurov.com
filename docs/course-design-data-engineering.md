@@ -288,7 +288,7 @@ Resolve valid findings and record the reason for rejecting a finding. Review Eng
 
 ## Initial implementation and publication state
 
-The first release puts all three outlines on the shared course graph and opens each course with bilingual notes. The existing Python course supplies the entry readings. The remaining topics retain planned status.
+The first release puts all three outlines on the shared course graph and opens each course with bilingual notes. The existing Python course supplies the entry readings. The remaining topics were initially marked as planned. The complete release includes 17 SQL notes, 19 Databases notes and 35 Big Data notes, including all three extensions.
 
 Planned course entries can be visible with their published-note counts and planned topics, but planned notes have no article links or fabricated completed status. Avoid links to future `Next` targets until their routes exist; name the next problem and link to the course plan instead. Counts and progress are calculated from real published notes.
 

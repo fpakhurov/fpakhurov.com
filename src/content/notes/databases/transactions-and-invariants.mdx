@@ -1,0 +1,86 @@
+---
+title: Transactions and invariants
+description: "Use an inventory invariant to separate a correct state change from the guarantees of committing it."
+course: databases
+section: Concurrency and Recovery
+order: 12
+status: published
+tags: [databases, transactions, acid, invariants]
+prerequisites: [Statistics and query optimization]
+---
+
+import StockInvariant from '../../../components/figures/databases-transactions-and-invariants/StockInvariant.astro';
+
+The checkout records two reserved packs of tea. Five packs were available and one was already reserved, for six in total. If the available count drops to three while the new reservation is missing, the data now account for four packs. A fast plan can execute both commands. We still need a rule for which states the operation may leave behind.
+
+## A correct transition preserves a rule
+
+An **invariant** is a property required of every admissible state. In this model no packs arrive or leave while a reservation is being made. Let $a$ be the number of available packs and let $r$ be the total quantity in reservations for tea. The inventory rule is $a+r=6$. We also require $a \ge 0$ and positive quantities for individual reservations. These are rules for this inventory model. Shipping a pack or receiving new stock would change the accounting. [Gray, 1981, General model](#references)
+
+When reserving $q$ packs, the two planned changes are $a \mapsto a-q$ and $r \mapsto r+q$. Their sum stays $a+r$ because the two occurrences of $q$ cancel. For $q=2$, the transition changes $(a,r)=(5,1)$ to $(3,3)$. A partial change would leave $(3,1)$ and break the rule.
+
+<StockInvariant />
+
+Atomicity also permits an operation to leave the initial state when it aborts. It does not check that the two quantities in the program agree. An update by two and a reservation of one can both succeed under the row constraints. They can commit atomically and leave $3+2=5$. The invariant spans two tables, so a check such as `available >= 0` on one row cannot enforce it by itself. The program or schema must express the relationship.
+
+## Make both writes use the same quantity
+
+Use a fresh PostgreSQL session for the example. The baseline matches [the SQL reservation](/notes/sql/transactions#where-does-one-operation-end). The tables are temporary to keep the example local to this session.
+
+```sql
+CREATE TEMP TABLE stock (
+    product text PRIMARY KEY,
+    available integer NOT NULL CHECK (available >= 0)
+);
+
+CREATE TEMP TABLE reservations (
+    reservation_id integer PRIMARY KEY,
+    product text NOT NULL REFERENCES stock (product),
+    quantity integer NOT NULL CHECK (quantity > 0)
+);
+
+INSERT INTO stock VALUES ('tea', 5);
+INSERT INTO reservations VALUES (700, 'tea', 1);
+```
+
+The statement below makes the requested quantity a value shared by both writes. The update returns a row only if it found enough stock. The insert takes its input from that returned row. The statement runs in a transaction, including when a client runs it by itself with autocommit. [PostgreSQL 18, §§3.4 and 7.8.4](#references)
+
+```sql
+WITH request (product, quantity) AS (
+    VALUES ('tea', 2)
+), moved AS (
+    UPDATE stock AS s
+    SET available = s.available - r.quantity
+    FROM request AS r
+    WHERE s.product = r.product AND s.available >= r.quantity
+    RETURNING s.product, r.quantity
+)
+INSERT INTO reservations
+SELECT 701, product, quantity
+FROM moved
+RETURNING reservation_id, quantity;
+```
+
+This returns reservation 701 with quantity 2. The tables contain 3 available packs and 3 reserved packs. If stock is insufficient, `moved` returns no row, the insert returns no row and neither table changes. If a request with enough stock proposes the occupied identifier 701, the insert fails and the stock update from that statement cannot survive on its own. The caller distinguishes a returned reservation, a result with zero rows and an error. The client-side choice of `COMMIT` or `ROLLBACK` for a wider group of statements was covered in the SQL course.
+
+## What ACID describes
+
+**Atomicity** concerns the unit of success or failure. A reservation cannot leave a committed stock deduction without its corresponding committed insert. There can still be two physical writes at different times. SQLite's rollback-journal protocol is one example of creating the all-or-nothing effect with separate storage operations. [SQLite, Atomic Commit, §§1–3](#references)
+
+**Consistency** means taking an admissible state to another admissible state. In this example the conservation equation is part of what defines admissibility. Declared constraints protect the rules they express. Preserving other rules depends on the operations the application allows and on how those operations are coordinated. [Gray, 1981, General model](#references)
+
+**Isolation** controls what overlapping operations can observe and how their effects interact. The strongest SQL isolation level, serializable, requires the outcome of successfully committed serializable transactions to agree with some serial order. Weaker levels allow more outcomes. A single valid transition in isolation is therefore only part of the argument for the application. [PostgreSQL 18, §13.2](#references)
+
+**Durability** concerns which committed effects survive the assumed failures. With a durable commit configuration and intact durable storage, restarting after a process or machine crash must preserve the committed reservation. The exact promise depends on the engine, its configuration and which parts of storage survive. The tables above are temporary, so this SQL example demonstrates the state transition rather than crash durability. [PostgreSQL 18, §§3.4 and 28.4](#references)
+
+The transaction boundary covers changes controlled by the database. An email sent during the operation can reach the customer before the database commit. A rollback cannot retrieve it. The application can record an intention to send the email inside the transaction and handle the external delivery separately. That creates a committed record from which the delivery process can resume. [Gray, 1981, General model](#references)
+
+## Next
+
+The conservation rule is easy to check for one request. When two transactions read a common state and then write different rows, each may make a valid decision alone and still leave an invalid result together. [Isolation and serializability](/notes/databases/isolation) examines the schedule that makes this possible.
+
+## References
+
+1. Jim Gray. [The Transaction Concept: Virtues and Limitations](https://web.stanford.edu/class/archive/cs/cs240/cs240.1036/readings/Gray81.pdf), 1981. The general model describes state constraints, atomic transitions and effects outside their protection.
+2. PostgreSQL Global Development Group. PostgreSQL 18 documentation. [Transactions, §3.4](https://www.postgresql.org/docs/18/tutorial-transactions.html), [data-modifying statements in WITH, §7.8.4](https://www.postgresql.org/docs/18/queries-with.html#QUERIES-WITH-MODIFYING), [isolation, §13.2](https://www.postgresql.org/docs/18/transaction-iso.html) and [asynchronous commit, §28.4](https://www.postgresql.org/docs/18/wal-async-commit.html) describe the example and its guarantees.
+3. SQLite Project. [Atomic Commit in SQLite](https://www.sqlite.org/atomiccommit.html), §§1–3. Describes atomic commit in rollback-journal mode and the storage assumptions behind it.

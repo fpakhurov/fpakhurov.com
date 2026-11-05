@@ -1,0 +1,144 @@
+---
+title: Изменение строк и обработка конфликтов
+description: "Определим результат INSERT, UPDATE и DELETE, затем сведём входную пачку к одному предложенному изменению на ключ."
+course: sql
+section: Изменение данных
+order: 15
+status: published
+tags: [sql, postgresql, insert, update, delete, upsert]
+prerequisites: [Таблицы и ограничения]
+---
+
+import ConflictBranch from '../../../components/figures/sql-changing-data/ConflictBranch.astro';
+
+Магазин импортирует изменения позиций заказов. Один файл добавляет позицию и меняет количество в уже существующей позиции. Тот же файл может поступить повторно. Перед записью команд нужно отделить идентификатор строки, новое значение и правило для повторных входных данных.
+
+## Выбор строк для изменения \{#select-the-rows-to-change\}
+
+Начнём с временной таблицы в новом сеансе PostgreSQL. В примере используется только таблица позиций, с тем же ключом и правилами для строк, что в [разделе о таблицах и ограничениях](/ru/notes/sql/tables-and-constraints). Команды ниже выполняются по порядку.
+
+```sql
+CREATE TEMP TABLE order_lines (
+    order_id integer,
+    line_no integer CHECK (line_no > 0),
+    product text NOT NULL,
+    quantity integer NOT NULL CHECK (quantity > 0),
+    unit_price_cents integer NOT NULL CHECK (unit_price_cents >= 0),
+    PRIMARY KEY (order_id, line_no)
+);
+
+INSERT INTO order_lines VALUES
+    (101, 1, 'tea', 2, 350),
+    (101, 2, 'coffee', 1, 600);
+```
+
+`INSERT` формирует новые строки. Перечисляем столбцы целевой таблицы, затем даём значения в том же порядке. Конструкция PostgreSQL `RETURNING` возвращает значения затронутых строк. Следующая команда записывает позицию 102/1 и возвращает `(102, 1, 1)` — номер заказа, номер позиции и количество. [PostgreSQL 18, INSERT](#references)
+
+```sql
+INSERT INTO order_lines (
+    order_id, line_no, product, quantity, unit_price_cents
+) VALUES (102, 1, 'tea', 1, 350)
+RETURNING order_id, line_no, quantity;
+```
+
+`UPDATE` находит существующие строки по условию и присваивает столбцам новые значения. Полный ключ ограничивает изменение позицией с чаем. С одним условием `WHERE order_id = 101` изменились бы обе позиции заказа 101. Если источником для обновления служит вторая таблица в PostgreSQL `UPDATE ... FROM`, каждой целевой строке должна соответствовать не более чем одна строка источника. При нескольких совпадениях PostgreSQL использует одну из строк источника. Какую именно, СУБД не гарантирует. [PostgreSQL 18, UPDATE](#references)
+
+```sql
+UPDATE order_lines
+SET quantity = 3
+WHERE order_id = 101 AND line_no = 1
+RETURNING order_id, line_no, quantity;
+```
+
+Результат — `(101, 1, 3)`. `DELETE` выбирает строки для удаления по условию. Возвращаемые значения берутся из удалённой строки. Без `WHERE` эти формы `UPDATE` и `DELETE` затрагивают каждую строку. [PostgreSQL 18, UPDATE и DELETE](#references)
+
+```sql
+DELETE FROM order_lines
+WHERE order_id = 101 AND line_no = 2
+RETURNING order_id, line_no, product;
+```
+
+Запрос возвращает `(101, 2, 'coffee')`. Остаются две позиции. У 101/1 количество 3, у 102/1 — 1. Ограничения строки действуют и на новые, и на обновлённые значения. Например, обновление количества до нуля завершится ошибкой, даже если условие нашло нужную строку.
+
+## Какому конфликту назначить альтернативу \{#name-the-conflict-that-has-an-alternative\}
+
+Допустим, следующий файл содержит все актуальные значения для позиций 101/1 и 103/1. Обычная вставка нарушит первичный ключ для 101/1. Можно указать альтернативу для этого конфликта. В PostgreSQL `ON CONFLICT (order_id, line_no)` перечисляет столбцы подходящего уникального ключа. Когда входная строка конфликтует по этому ключу, `DO UPDATE` применяет присваивания к сохранённой строке. `EXCLUDED` даёт значения строки, предложенной для вставки. Если ключ свободен, PostgreSQL вставляет предложенную строку. Эту операцию называют **вставкой или обновлением** (upsert). [PostgreSQL 18, INSERT](#references)
+
+```sql
+INSERT INTO order_lines AS saved (
+    order_id, line_no, product, quantity, unit_price_cents
+) VALUES
+    (101, 1, 'tea', 4, 350),
+    (103, 1, 'cocoa', 2, 400)
+ON CONFLICT (order_id, line_no) DO UPDATE
+SET product = EXCLUDED.product,
+    quantity = EXCLUDED.quantity,
+    unit_price_cents = EXCLUDED.unit_price_cents
+WHERE (saved.product, saved.quantity, saved.unit_price_cents)
+      IS DISTINCT FROM
+      (EXCLUDED.product, EXCLUDED.quantity, EXCLUDED.unit_price_cents)
+RETURNING order_id, line_no, quantity;
+```
+
+<ConflictBranch />
+
+Команда возвращает 101/1 с количеством 4 и 103/1 с количеством 2. Порядок вывода не запрошен. У позиции 102/1 остаётся количество 1. `WHERE` в действии при конфликте сравнивает сохранённые значения с входными. `IS DISTINCT FROM` считает два пропуска равными для такого сравнения и всегда возвращает истину или ложь. Если выполнить ту же команду на полученной таблице без промежуточных изменений, обе строки уже имеют нужные значения. Оба обновления пропускаются, а `RETURNING` возвращает ноль строк. В PostgreSQL конфликтующие строки при этом всё равно могут блокироваться. [PostgreSQL 18, INSERT и §9.25.5](#references)
+
+`ON CONFLICT (order_id, line_no) DO NOTHING` подходит, если существующая строка должна остаться без проверки её содержимого. Команда обрабатывает конфликт уникальности по указанному ключу. Нулевое количество всё ещё может нарушить ограничение. Правило замены, пропуска или отклонения повтора задаётся договором импорта.
+
+Присваивание количества выше заменяет сохранённый снимок. Если использовать `quantity = saved.quantity + EXCLUDED.quantity`, то одно и то же входное значение 4 при каждой обработке будет прибавлять ещё 4. Для нового приращения это может быть правильно. При повторной доставке приращений приложению нужен способ отличить уже применённое событие от нового.
+
+## Одна строка источника на ключ \{#choose-a-single-source-row-per-key\}
+
+В файле могут оказаться две версии позиции 101/1. В PostgreSQL одна команда `INSERT ... ON CONFLICT DO UPDATE` может затронуть каждую существующую строку не более одного раза. На текущей таблице следующая команда нарушает это условие. Обе предложенные строки нацелены на одну сохранённую позицию. Выполним команду отдельно, чтобы увидеть ошибку кардинальности. [PostgreSQL 18, INSERT](#references)
+
+```sql
+INSERT INTO order_lines (order_id, line_no, product, quantity, unit_price_cents)
+VALUES (101, 1, 'tea', 5, 350), (101, 1, 'tea', 6, 350)
+ON CONFLICT (order_id, line_no) DO UPDATE
+SET quantity = EXCLUDED.quantity;
+```
+
+Пусть источник считает большее значение `source_version` более новым. При равных версиях предпочтение получает строка с большим уникальным `event_id`. Зададим тот же порядок в [оконной функции](/ru/notes/sql/window-functions). Секция окна соответствует целевому ключу, а `ROW_NUMBER()` позволяет выбрать одно значение для этого ключа. В этой пачке версия 8 позиции 101/1 выигрывает и даёт количество 6. Для позиции 103/1 есть одно предложение с количеством 1.
+
+```sql
+WITH incoming (
+    order_id, line_no, product, quantity, unit_price_cents,
+    source_version, event_id
+) AS (
+    VALUES
+        (101, 1, 'tea', 5, 350, 7, 701),
+        (101, 1, 'tea', 6, 350, 8, 801),
+        (103, 1, 'cocoa', 1, 400, 2, 802)
+), ranked AS (
+    SELECT *,
+           ROW_NUMBER() OVER (
+               PARTITION BY order_id, line_no
+               ORDER BY source_version DESC, event_id DESC
+           ) AS priority
+    FROM incoming
+)
+INSERT INTO order_lines (order_id, line_no, product, quantity, unit_price_cents)
+SELECT order_id, line_no, product, quantity, unit_price_cents
+FROM ranked
+WHERE priority = 1
+ON CONFLICT (order_id, line_no) DO UPDATE
+SET product = EXCLUDED.product,
+    quantity = EXCLUDED.quantity,
+    unit_price_cents = EXCLUDED.unit_price_cents
+RETURNING order_id, line_no, quantity;
+```
+
+После команды у позиций 101/1, 102/1 и 103/1 количества 6, 1 и 1. Ранжирование разрешает конкуренцию внутри этого файла. В целевой таблице версия источника не хранится, поэтому применённый позже старый файл всё ещё может перезаписать новое значение. Чтобы этого избежать, в схеме можно сохранить версию и поле разрешения равенства, а затем допускать только более новое предложение в действии при конфликте.
+
+Обработка повторных ключей зависит от диалекта. В SQLite UPSERT принимает решение отдельно для каждой входной строки и может обновить одну строку несколько раз в одной вставке. В MySQL 8.4 применяется `ON DUPLICATE KEY UPDATE`. Эта конструкция может сработать при повторе первичного ключа или любого уникального индекса. Явной цели конфликта, как в PostgreSQL, у неё нет. Руководство MySQL предостерегает от использования этой конструкции с несколькими уникальными индексами. Выбор одной строки источника на целевой ключ и явное правило уникальности позволяют видеть, где различаются диалекты. [SQLite, UPSERT](#references) [MySQL 8.4, §15.2.7.2](#references)
+
+## Далее \{#next\}
+
+У импорта теперь есть правило для каждой строки. Реальная операция может также записывать чек и уменьшать остаток. Если первая команда выполнится, а вторая завершится ошибкой, клиенту нужно определить, что станет с успешным изменением. [Транзакции со стороны клиента](/ru/notes/sql/transactions) объединяют такие команды в одну операцию.
+
+## Источники \{#references\}
+
+1. PostgreSQL Global Development Group. Документация PostgreSQL 18. [INSERT](https://www.postgresql.org/docs/18/sql-insert.html), [UPDATE](https://www.postgresql.org/docs/18/sql-update.html), [DELETE](https://www.postgresql.org/docs/18/sql-delete.html) и [сравнение строк, §9.25.5](https://www.postgresql.org/docs/18/functions-comparisons.html#ROW-WISE-COMPARISON) задают выбор целевых строк, возвращаемые значения, обработку конфликтов и сравнение с пропусками.
+2. SQLite Project. [UPSERT](https://sqlite.org/lang_upsert.html), §2. Определяет обработку конфликта для каждой предложенной строки.
+3. Oracle. MySQL 8.4 Reference Manual. [INSERT ... ON DUPLICATE KEY UPDATE, §15.2.7.2](https://dev.mysql.com/doc/refman/8.4/en/insert-on-duplicate.html). Описывает обновление по повторному ключу и работу с несколькими уникальными индексами.
