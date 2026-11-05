@@ -1,0 +1,71 @@
+---
+title: Delivery and processing guarantees
+description: "Locate the crash gap between acknowledging a sale and recording its effect, then close the gap inside one destination transaction."
+course: big-data
+section: Delivering Changes
+order: 22
+status: published
+tags: [big-data, delivery, idempotency, deduplication, kafka]
+prerequisites: [Queues and event logs]
+---
+
+import DeliveryTrace from '../../../components/figures/big-data-delivery/DeliveryTrace.astro';
+
+Event e7 adds 700 cents to a store total of 2500. The consumer writes 3200 to a database and crashes before recording its input progress. A replacement starts from the same event. A broker can deliver the event correctly on both attempts and the report can still become wrong.
+
+## Put the failure between the two writes
+
+If the consumer records its input progress first, a crash can leave the total at 2500 and make the replacement skip e7. This is an **at-most-once** pattern. The effect can be lost, and the retry path avoids a repeat. If it applies the effect first and acknowledges afterward, the crash can repeat e7 and make the total 3900. This is an **at-least-once** pattern when the input remains available and attempts continue until success. It trades possible loss at that boundary for possible repetition. [Apache Kafka 4.1, Message Delivery Semantics](#references)
+
+A useful **exactly-once** claim names the effect and the boundary. In this example it can mean that each accepted source sale affects the database total once. It need not mean a process reads or computes the event once. The effect can be made **idempotent**, so applying an already processed identity leaves the result unchanged. Remembering processed identities is part of the application state. [Helland, 2007, Remembering Messages as State](#references)
+
+## Record the identity and the effect together
+
+Use a stable event identifier within one logical consumer. The same identity always describes the same event. In PostgreSQL, a unique key can decide whether this is the first application. The following small example keeps the identity and the total in the same database. The foreign key requires that the store total exists.
+
+```sql
+CREATE TEMP TABLE sales_totals (
+    store_id integer PRIMARY KEY,
+    amount_cents integer NOT NULL
+);
+CREATE TEMP TABLE applied_events (
+    consumer text,
+    event_id text,
+    store_id integer NOT NULL REFERENCES sales_totals,
+    PRIMARY KEY (consumer, event_id)
+);
+INSERT INTO sales_totals VALUES (11, 2500);
+```
+
+```sql
+WITH first_application AS (
+    INSERT INTO applied_events VALUES ('daily-report', 'e7', 11)
+    ON CONFLICT (consumer, event_id) DO NOTHING
+    RETURNING store_id
+)
+UPDATE sales_totals AS t
+SET amount_cents = t.amount_cents + 700
+FROM first_application AS f
+WHERE t.store_id = f.store_id
+RETURNING t.amount_cents;
+```
+
+The first execution returns 3200. Repeating the statement yields zero rows and the total stays 3200. If the statement fails, the marker and its update cannot commit separately. An acknowledgement after durable commit may still be lost. A retry then finds the existing marker and skips the effect. Deleting old markers is safe only when the corresponding events cannot be delivered or replayed again under the consumer's policy. [PostgreSQL 18, INSERT and §7.8.4](#references)
+
+<DeliveryTrace example="delivery" />
+
+## Name the system that commits the effect
+
+Kafka transactions can commit output records and consumer offsets together when processing reads Kafka topics and writes Kafka topics. Downstream readers use `read_committed` to avoid seeing aborted transactional output. A PostgreSQL write or an email lies outside that transaction. It needs a cooperating sink protocol, an idempotent application rule, or a different consistency contract. [Apache Kafka 4.1, Using Transactions](#references)
+
+The database example makes one durable effect repeatable under a stable event identity. It leaves questions about ordering, missing input history and contradictory payloads with the same key to the source contract. A guarantee about duplicate effects cannot repair those problems on its own.
+
+## Next
+
+A sale can now affect a total once. [From batch to streaming](/notes/big-data/batch-and-streaming) asks when to publish that total while the input keeps growing.
+
+## References
+
+1. Apache Software Foundation. [Apache Kafka 4.1 Design](https://kafka.apache.org/41/design/design/), Message Delivery Semantics and Using Transactions. Describes crash gaps and transaction boundaries.
+2. Pat Helland. [Life beyond Distributed Transactions: an Apostate's Opinion](https://ics.uci.edu/~cs223/papers/cidr07p15.pdf), CIDR, 2007. The section Remembering Messages as State explains why duplicate-safe effects need durable identity state.
+3. PostgreSQL Global Development Group. PostgreSQL 18 documentation. [INSERT](https://www.postgresql.org/docs/18/sql-insert.html) and [data-modifying statements in WITH, §7.8.4](https://www.postgresql.org/docs/18/queries-with.html#QUERIES-WITH-MODIFYING). Defines conflict handling and passing modified rows to the rest of a statement.

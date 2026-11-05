@@ -1,0 +1,71 @@
+---
+title: Гарантии доставки и обработки
+description: "Найдём окно сбоя между подтверждением продажи и записью эффекта, затем закроем его внутри одной транзакции приёмника."
+course: big-data
+section: Доставка изменений
+order: 22
+status: published
+tags: [big-data, delivery, idempotency, deduplication, kafka]
+prerequisites: [Очереди и журналы событий]
+---
+
+import DeliveryTrace from '../../../components/figures/big-data-delivery/DeliveryTrace.astro';
+
+Событие e7 добавляет 700 копеек к итогу магазина 2500. Потребитель записывает 3200 в базу и падает до сохранения позиции входа. Новый исполнитель начинает с того же события. Брокер может правильно доставить его в обеих попытках, а итог всё равно окажется неверным.
+
+## Помещаем сбой между двумя записями \{#put-the-failure-between-the-two-writes\}
+
+Если сначала сохранить позицию входа, сбой может оставить итог 2500, а новый исполнитель пропустит e7. Это вариант **не более одного раза** (at-most-once). Эффект может потеряться, а повтор не произойдёт. Если сначала применить эффект и потом подтвердить, сбой может повторить e7 и дать итог 3900. При доступном входе и повторах до успеха это вариант **хотя бы один раз** (at-least-once). Возможная потеря на этой границе заменяется возможным повтором. [Apache Kafka 4.1, Message Delivery Semantics](#references)
+
+Гарантия **ровно один раз** (exactly-once) требует назвать эффект и границу. В этом примере каждая принятая продажа может влиять на итог базы ровно один раз. Процесс при этом может читать и вычислять событие повторно. Эффект можно сделать **идемпотентным** (idempotent). Применение уже обработанного идентификатора оставляет результат прежним. Сведения об обработанных идентификаторах становятся частью состояния приложения. [Helland, 2007, Remembering Messages as State](#references)
+
+## Записываем идентификатор вместе с эффектом \{#record-the-identity-and-the-effect-together\}
+
+Используем устойчивый идентификатор события в пределах одного логического потребителя. Один идентификатор всегда описывает одно и то же событие. В PostgreSQL уникальный ключ позволяет определить, применяется ли оно впервые. Следующий небольшой пример хранит и идентификатор, и итог в одной базе. Внешний ключ требует, чтобы строка итога магазина существовала.
+
+```sql
+CREATE TEMP TABLE sales_totals (
+    store_id integer PRIMARY KEY,
+    amount_cents integer NOT NULL
+);
+CREATE TEMP TABLE applied_events (
+    consumer text,
+    event_id text,
+    store_id integer NOT NULL REFERENCES sales_totals,
+    PRIMARY KEY (consumer, event_id)
+);
+INSERT INTO sales_totals VALUES (11, 2500);
+```
+
+```sql
+WITH first_application AS (
+    INSERT INTO applied_events VALUES ('daily-report', 'e7', 11)
+    ON CONFLICT (consumer, event_id) DO NOTHING
+    RETURNING store_id
+)
+UPDATE sales_totals AS t
+SET amount_cents = t.amount_cents + 700
+FROM first_application AS f
+WHERE t.store_id = f.store_id
+RETURNING t.amount_cents;
+```
+
+Первое выполнение возвращает 3200. Повтор команды даёт ноль строк, и итог остаётся 3200. Если команда завершится ошибкой, отметка и обновление не могут зафиксироваться отдельно. Подтверждение после долговечной фиксации всё ещё может потеряться. При повторе отметка уже найдётся, и эффект будет пропущен. Удалять старые отметки безопасно только когда соответствующие события больше не могут поступить повторно по правилам потребителя. [PostgreSQL 18, INSERT и §7.8.4](#references)
+
+<DeliveryTrace example="delivery" />
+
+## Называем систему, которая фиксирует эффект \{#name-the-system-that-commits-the-effect\}
+
+Транзакции Kafka могут вместе фиксировать выходные записи и смещения потребителя, когда обработка читает топики Kafka и пишет в топики Kafka. Читатели дальше по цепочке используют `read_committed`, чтобы не видеть отменённые транзакционные записи. Запись в PostgreSQL или отправка письма лежит за пределами этой транзакции. Для них нужен протокол с участием приёмника, идемпотентное правило приложения или другая договорённость о согласованности. [Apache Kafka 4.1, Using Transactions](#references)
+
+Пример с базой защищает один долговечный эффект от повторов по устойчивому идентификатору. Порядок, потерянная история входа и несовместимые значения с тем же ключом остаются частью договора источника. Гарантия о повторных эффектах сама по себе эти проблемы не исправляет.
+
+## Далее \{#next\}
+
+Продажа теперь может влиять на итог один раз. [От пакетной обработки к потоковой](/ru/notes/big-data/batch-and-streaming) разбирает, когда публиковать итог, пока вход продолжает расти.
+
+## Источники \{#references\}
+
+1. Apache Software Foundation. [Apache Kafka 4.1 Design](https://kafka.apache.org/41/design/design/), Message Delivery Semantics и Using Transactions. Описывает окна сбоя и границы транзакций.
+2. Pat Helland. [Life beyond Distributed Transactions: an Apostate's Opinion](https://ics.uci.edu/~cs223/papers/cidr07p15.pdf), CIDR, 2007. Раздел Remembering Messages as State объясняет, зачем для защиты от повторов хранить идентификаторы.
+3. PostgreSQL Global Development Group. Документация PostgreSQL 18. [INSERT](https://www.postgresql.org/docs/18/sql-insert.html) и [изменяющие команды в WITH, §7.8.4](https://www.postgresql.org/docs/18/queries-with.html#QUERIES-WITH-MODIFYING). Определяет обработку конфликтов и передачу изменённых строк остальной команде.

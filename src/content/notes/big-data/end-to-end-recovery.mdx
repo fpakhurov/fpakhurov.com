@@ -1,0 +1,52 @@
+---
+title: End-to-end recovery
+description: "Trace a crash across input position, operator state and output, then compare two ways to make recovery safe for readers."
+course: big-data
+section: Streams and State
+order: 26
+status: published
+tags: [big-data, streaming, recovery, exactly-once, sinks]
+prerequisites: [State and checkpoints]
+---
+
+import DeliveryTrace from '../../../components/figures/big-data-delivery/DeliveryTrace.astro';
+
+The processor reads offset 42, adds 70 to the window's 150 and appends a revision with value 220 to a destination. It crashes before its next checkpoint completes. The old checkpoint restores 150 and replays offset 42. Internally the computation gives 220 again. The destination can now contain two copies of the revision.
+
+## State recovery and output recovery have different boundaries
+
+Checkpoint C contains the sum 150 and next position 42. Assume the input record is retained, the calculation is deterministic and the destination append survives the crash. If the destination accepts a fresh row every time, replay leaves two rows with 220. A second implementation could save the new checkpoint with sum 220 and next position 43 before the output is durable. A failure in that interval would leave the reader with the old value of 150 even though recovery skips offset 42. Both cases use internally consistent checkpoints.
+
+<DeliveryTrace example="recovery" />
+
+The recovery contract must relate three things. Input positions say what to replay, operator state says what the replay starts from, and the sink says which outputs readers can already see. A checkpoint is useful only when the source can supply the required records. A source retaining records for one hour cannot replay an offset that fell out of retention overnight.
+
+## Make a repeated output safe
+
+One option is to persist results under a stable identity. In this example use the store, the window boundary and the revision associated with offset 42 in this input partition. In a real job, choose an identity that covers all the inputs and remains stable after restart. The first attempt inserts the revision. Replaying the same identity with the same value changes nothing. If readers need only the current value, a sink can instead replace by store and window with a version check that rejects obsolete revisions. [Delivery and processing guarantees](/notes/big-data/processing-guarantees) develops the equivalent rule for increments.
+
+A stable identity helps when the output is retried, including a crash after the sink has committed. The job still needs to ensure that an output pending at the checkpoint can be recovered or that checkpoint progress waits for its durable effect. Committing source progress early can lose the output even when the sink handles duplicates correctly. Spark Structured Streaming exposes a batch identifier to `foreachBatch` so applications can deduplicate sink writes. The callback alone gives at-least-once writes, so the application must retain the matching identity at its destination. [Apache Spark 4.0.1, ForeachBatch](#references)
+
+## Coordinate a transactional sink
+
+A checkpoint can also coordinate with a sink that can stage writes in a transaction. Before checkpoint completion, the sink prepares the pending output and records the transaction identity in its checkpoint state. The prepared output is not yet visible to ordinary committed readers. After the checkpoint becomes durable, the sink is instructed to commit. The sink must support finishing that decision after restart. [Apache Flink, End-to-End Exactly-Once Processing](#references)
+
+| Failure point | Recovery action |
+| --- | --- |
+| Before the checkpoint completes | Discard or abort the uncommitted sink work, restore C, replay 42 |
+| After completion but before the sink commit | Restore the newer checkpoint and finish the prepared sink transaction |
+| After the sink commit but before its acknowledgement | Recover the outcome or retry completion with the same transaction identity |
+
+The newer checkpoint with next offset 43 may skip 42 only because its associated sink transaction can still complete. The protocol assumes replayable input, durable checkpoint state, a recoverable sink transaction and readers that hide uncommitted output. The transaction must remain recoverable for the actual downtime. A connector cannot make an unrelated HTTP effect part of its transaction.
+
+Flink's Kafka sink offers an exactly-once mode that uses Kafka transactions with checkpointing. Kafka readers need committed isolation to see the intended output. A different sink needs its own corresponding capability. Those are properties of the configured path, so an end-to-end claim should name the source, processing boundary, destination and visible effect. [Apache Flink, Kafka connector](#references) [Apache Kafka 4.1, Using Transactions](#references)
+
+## Next
+
+A correct restart handles a failed run. It does not decide which intervals should be recomputed after a changed rule or corrected input. [Orchestration and historical recomputation](/notes/big-data/orchestration) uses stable intervals and output identities to make those reruns explicit.
+
+## References
+
+1. Piotr Nowojski and Mike Winters. [An Overview of End-to-End Exactly-Once Processing in Apache Flink](https://flink.apache.org/2018/02/28/an-overview-of-end-to-end-exactly-once-processing-in-apache-flink-with-apache-kafka-too/), 2018. Describes staging, completion callbacks and recovery of pending commits. [Flink 2.1 Kafka connector](https://nightlies.apache.org/flink/flink-docs-release-2.1/docs/connectors/datastream/kafka/) documents the connector mode.
+2. Apache Software Foundation. [Apache Kafka 4.1 Design](https://kafka.apache.org/41/design/design/), Using Transactions. Describes transactional output and committed-read visibility.
+3. Apache Software Foundation. [Spark 4.0.1 Structured Streaming APIs](https://spark.apache.org/docs/4.0.1/streaming/apis-on-dataframes-and-datasets.html#foreachbatch), ForeachBatch. Documents delivery behavior and the batch identifier.
