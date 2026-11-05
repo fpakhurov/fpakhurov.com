@@ -1,0 +1,84 @@
+---
+title: Statistics and query optimization
+description: "Compare an independence estimate with measured row counts. Read what planner costs and EXPLAIN ANALYZE can tell us."
+course: databases
+section: Storage and Execution
+order: 11
+status: published
+tags: [databases, query-optimizer, statistics, cardinality, explain]
+prerequisites: ["Join algorithms"]
+---
+
+import EstimateBars from '../../../components/figures/databases-query-optimization/EstimateBars.astro';
+
+The shop joins its web orders to payment details. An index lookup for each order may be cheap if the first filter leaves 60 rows. If it leaves many more, a plan that scans the payment table once can be preferable. Before executing either, the planner needs to estimate how many rows reach the join.
+
+## Estimate the number of rows
+
+An optimizer considers access paths, join orders and operators. For each plan it estimates the amount of work. A **cardinality estimate** predicts the number of rows a node will return. It affects later estimates. A nested loop, for example, may pay for one inner search for every row the outer child emits. System R made such estimates part of cost-based plan selection. ([Selinger et al., 1979](#references); [PostgreSQL 18, §§14.1–14.2](#references))
+
+Take 1000 orders. Shop 1 accounts for 200, and the web channel accounts for 300. Let $N$ be the total row count and $s_1$, $s_2$ the fractions selected by the two predicates. Under independence, we estimate $N s_1 s_2$ rows for the conjunction. With $N=1000$, $s_1=0.2$ and $s_2=0.3$, the estimate is $1000 \cdot 0.2 \cdot 0.3 = 60$.
+
+| Shop | Web | Counter | Total |
+| --- | ---: | ---: | ---: |
+| 1 | 180 | 20 | 200 |
+| 2 | 120 | 680 | 800 |
+| Total | 300 | 700 | 1000 |
+
+Shop 1 sells mostly online, so the actual overlap is 180. The estimate is low by a factor of three. Accurate per-column counts can still give an inaccurate intersection. Leis et al. found large estimation errors in a benchmark with real data and join queries. Such errors matter when they change the relative cost of candidate plans. ([Leis et al., 2015](#references))
+
+<EstimateBars />
+
+## Read estimated and actual rows
+
+The following fixture creates the same counts and collects statistics for the columns.
+
+```sql
+CREATE TEMP TABLE planner_orders AS
+SELECT n AS order_id,
+       CASE WHEN n <= 200 THEN 1 ELSE 2 END AS shop_id,
+       CASE WHEN n <= 180 OR n BETWEEN 201 AND 320
+            THEN 'web' ELSE 'counter' END AS channel
+FROM generate_series(1, 1000) AS g(n);
+
+ANALYZE planner_orders;
+
+EXPLAIN (ANALYZE, TIMING OFF, SUMMARY OFF)
+SELECT order_id
+FROM planner_orders
+WHERE shop_id = 1 AND channel = 'web';
+```
+
+The scan in PostgreSQL 18.6 reported estimated `rows=60`, `actual rows=180.00 loops=1` and 820 rows removed by the filter. The estimated `rows` count is the output after filtering. With multiple executions of a node, actual rows is an average per loop. `EXPLAIN` alone describes a plan, while `EXPLAIN ANALYZE` executes the statement. Use a read query to inspect actual work without applying a change. ([PostgreSQL 18, §14.1](#references))
+
+A cost such as `0.00..23.00` has two fields. Startup cost estimates work before the first output. Total cost estimates work to completion, including descendants. These numbers are units of the planner's model rather than milliseconds. Changing an estimate can change the preferred plan without changing the semantics of the query.
+
+## Tell the planner about joint values
+
+PostgreSQL can collect **extended statistics** for columns used together. A multivariate most-common-value list can represent how often a specific combination occurs. Add one for the shop and channel, collect its data and repeat the plan inspection. ([PostgreSQL 18, §14.2.2.3](#references))
+
+```sql
+CREATE STATISTICS shop_channel (mcv)
+ON shop_id, channel FROM planner_orders;
+
+ANALYZE planner_orders;
+
+EXPLAIN (ANALYZE, TIMING OFF, SUMMARY OFF)
+SELECT order_id
+FROM planner_orders
+WHERE shop_id = 1 AND channel = 'web';
+```
+
+In the same run, the estimated rows changed to 180 and the actual rows stayed 180. The scan itself remained a sequential scan. The fixture offers no faster alternative access path. The new statistics improve a prediction for this data and predicate. They do not guarantee exact estimates on larger samples, on combinations absent from the statistics or on joins across tables.
+
+When a plan behaves unexpectedly, compare estimated and actual rows from the scans upward. Find the first large discrepancy before blaming the final operator. Check whether statistics reflect the current distribution and whether related conditions need joint information. A correct estimate still does not guarantee the best physical plan. The optimizer may lack a suitable access path, and its cost model is an approximation.
+
+## Next
+
+A physical plan explains how the database reads and changes rows. When several writes form one operation, the database also needs rules for failure and overlap. [Transactions and invariants](/notes/databases/transactions-and-invariants) start from the state that must stay valid when a set of changes takes effect.
+
+## References
+
+1. PostgreSQL Global Development Group. PostgreSQL 18 documentation. [Using EXPLAIN, §14.1](https://www.postgresql.org/docs/18/using-explain.html) defines estimates, startup and total costs, actual rows and loops. [Statistics Used by the Planner, §14.2](https://www.postgresql.org/docs/18/planner-stats.html) describes single-column and extended statistics.
+2. Patricia G. Selinger et al. [Access Path Selection in a Relational Database Management System](https://web.eecs.umich.edu/~michjc/eecs584/Papers/selinger_1979.pdf). SIGMOD, 1979. Describes selectivity, cost models and plan search in System R.
+3. Viktor Leis et al. [How Good Are Query Optimizers, Really?](https://vldb.org/pvldb/vol9/p204-leis.pdf). Proceedings of the VLDB Endowment, 9(3), 204–215, 2015. Reports estimation errors and their effects on join planning.

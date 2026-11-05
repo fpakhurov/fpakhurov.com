@@ -1,0 +1,119 @@
+---
+title: Эволюция схемы
+description: "Добавляем новый столбец, пока старые клиенты продолжают запись, заполняем исторические строки и проверяем, когда можно удалить старый столбец."
+course: databases
+section: Жизнь модели данных
+order: 18
+status: published
+tags: [databases, postgresql, schema-evolution, migrations]
+prerequisites: [Роли и права доступа]
+---
+
+import MigrationStates from '../../../components/figures/databases-schema-evolution/MigrationStates.astro';
+
+Таблица заказов отдаёт целочисленный `amount_cents`. В следующей версии кассового сервиса поле будет называться `total_cents` и использовать более широкий целочисленный тип. Прямое переименование меняет набор SQL-команд, которые база может выполнить. Ещё не перезапущенный процесс читает и пишет `amount_cents`. Схема базы и работающие с ней клиенты могут меняться в разное время.
+
+## Определяем контракт каждой версии \{#establish-what-each-version-can-use\}
+
+**Миграция** (migration) — управляемое изменение схемы, а при необходимости и сохранённых данных. При переходе через добавление сначала создаём схему, с которой работают обе версии. Пока версии пересекаются, приложение пишет только в старое поле. Новый читатель предпочитает новое поле и при отсутствии значения берёт старое. Это работает, когда оба поля описывают одну величину. Здесь оба хранят итог заказа в копейках, а преобразование `integer` в `bigint` сохраняет все существующие значения.
+
+В примере два заказа. Миграция сначала добавляет столбец, в котором пока разрешён `NULL`, и триггер (trigger). База запускает этот код при событии в таблице. Она задаёт новое значение перед сохранением вставленной строки или строки с изменённой старой суммой.
+
+```sql
+CREATE TEMP TABLE migration_orders (
+    order_id integer PRIMARY KEY,
+    amount_cents integer NOT NULL
+);
+
+INSERT INTO migration_orders VALUES (101, 1300), (102, 350);
+
+BEGIN;
+ALTER TABLE migration_orders ADD COLUMN total_cents bigint;
+
+CREATE FUNCTION pg_temp.sync_order_total() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    NEW.total_cents := NEW.amount_cents;
+    RETURN NEW;
+END
+$$;
+
+CREATE TRIGGER sync_order_total
+BEFORE INSERT OR UPDATE OF amount_cents ON migration_orders
+FOR EACH ROW EXECUTE FUNCTION pg_temp.sync_order_total();
+COMMIT;
+```
+
+Триггер обрабатывает записи после изменения схемы. В двух старых строках пока остаётся `NULL` в `total_cents`. Читатель может временно использовать `COALESCE(total_cents, amount_cents)`. Отдельно проверяем клиентов, которые разбирают строки по позициям или используют `SELECT *`. Дополнительный столбец может изменить форму результата. [PostgreSQL 18, ALTER TABLE и CREATE TRIGGER](#references)
+
+## Заполняем старые строки и сохраняем новые изменения \{#fill-old-rows-while-preserving-new-writes\}
+
+Пусть старая касса меняет сумму заказа 101 с 1300 на 1400. Триггер копирует 1400 в новый столбец при том же обновлении строки. Затем заполняем оставшиеся строки.
+
+```sql
+UPDATE migration_orders
+SET amount_cents = 1400
+WHERE order_id = 101;
+
+UPDATE migration_orders
+SET total_cents = amount_cents
+WHERE total_cents IS NULL;
+
+SELECT order_id, amount_cents, total_cents
+FROM migration_orders
+ORDER BY order_id;
+```
+
+| order_id | amount_cents | total_cents |
+| --- | --- | --- |
+| 101 | 1400 | 1400 |
+| 102 | 350 | 350 |
+
+Второе обновление — **заполнение исторических данных** (backfill). Оно задаёт значение нового поля в уже существующих строках. Меняется только заказ 102, потому что рабочая запись уже заполнила заказ 101. Все записи приложения по-прежнему идут через старое поле. Если клиент начнёт менять новое поле напрямую, старая версия может прочитать другую сумму. Пока версии сосуществуют, нужно единое правило записи. Обновление всей таблицы расходует ресурсы ввода-вывода и создаёт версии строк и записи WAL. На большой таблице ограниченный диапазон ключей в транзакции позволяет отпускать блокировки и даёт точку возобновления. При повторе того же диапазона условие пропускает заполненные строки.
+
+<MigrationStates />
+
+Триггер и заполнение приводят к одному представлению данных разными способами. В Google F1 похожее разделение реализовано в движке. Новый элемент может принимать записи до того, как становится доступным для чтения. Перестройка заполняет исторические записи перед тем, как элемент становится общедоступным. У этого протокола есть свои условия на допустимое расхождение версий схемы между серверами. [Rae и др., 2013, §3.3.2](#references)
+
+## Проверяем данные перед сменой контракта \{#validate-before-switching-the-contract\}
+
+Проверим совпадение перед удалением чтения из старого поля. `IS DISTINCT FROM` возвращает истину, когда старое значение есть, а новое отсутствует. В примере запрос возвращает ноль строк.
+
+```sql
+SELECT order_id
+FROM migration_orders
+WHERE total_cents IS DISTINCT FROM amount_cents;
+
+ALTER TABLE migration_orders
+    ADD CONSTRAINT total_present CHECK (total_cents IS NOT NULL) NOT VALID;
+ALTER TABLE migration_orders VALIDATE CONSTRAINT total_present;
+```
+
+PostgreSQL сразу проверяет новое ограничение на последующих записях. `NOT VALID` откладывает проверку существующих строк до `VALIDATE CONSTRAINT`. Проверка всё равно читает таблицу. Она использует более слабую блокировку, чем добавление ограничения с немедленной проверкой, и может идти одновременно с обычными обновлениями. Успешная проверка подтверждает заполненность нового столбца при текущей схеме. Совпадение значений также зависит от соблюдения правила записи до переключения. [PostgreSQL 18, ALTER TABLE](#references)
+
+## Убираем старый интерфейс \{#retire-the-old-interface\}
+
+Проверим, что старые клиенты и зависимые запросы перестали использовать `amount_cents`. В этом примере ненадолго приостанавливаем запись, дожидаемся завершения старых транзакций, меняем схему и возобновляем работу клиентом, который читает и пишет `total_cents`. В примере нет других объектов, которые ссылаются на старый столбец.
+
+```sql
+BEGIN;
+ALTER TABLE migration_orders ALTER COLUMN total_cents SET NOT NULL;
+DROP TRIGGER sync_order_total ON migration_orders;
+ALTER TABLE migration_orders DROP COLUMN amount_cents;
+ALTER TABLE migration_orders DROP CONSTRAINT total_present;
+COMMIT;
+```
+
+Проверенное ограничение доказывает, что `total_cents` заполнен. PostgreSQL может использовать это доказательство и пропустить чтение таблицы, которое обычно требуется для `SET NOT NULL`. Команда всё ещё может ждать блокировку. Быстрое изменение каталога и короткое ожидание блокировки — разные свойства. До переключения старый клиент может использовать старое поле. После него откат одного приложения вернёт запросы к отсутствующему столбцу. Для восстановления старого интерфейса нужен свой план.
+
+Пример разделяет совместимость, преобразование старых данных и удаление поля. Поддержка в движке может перенести часть работы на другую фазу. В BullFrog исследуется подход, при котором старые строки преобразуются по мере обращения, пока транзакции работают с новой схемой. Для этого авторы меняют управление конкурентным выполнением и форматом хранения. Пример PostgreSQL использует обычные операции для каждой фазы. [PostgreSQL 18, ALTER TABLE](#references) [Bhattacherjee и др., 2021](#references)
+
+## Дальше \{#next\}
+
+Кассовая операция находит в таблице заказов несколько строк. Этому же магазину нужна сумма заказов за день по всем магазинам. В конспекте [«Транзакционные и аналитические системы»](/ru/notes/databases/transactional-and-analytical-systems) сравним, чего эти запросы требуют от хранения и выполнения.
+
+## Источники \{#references\}
+
+1. PostgreSQL Global Development Group. Документация PostgreSQL 18, 2025. [ALTER TABLE](https://www.postgresql.org/docs/18/sql-altertable.html) задаёт правила блокировки и проверки. [CREATE TRIGGER](https://www.postgresql.org/docs/18/sql-createtrigger.html) описывает запуск триггеров строк.
+2. Ian Rae, Eric Rollins, Jeff Shute, Sukhdeep Sodhi и Radek Vingralek. [Online, Asynchronous Schema Change in F1](https://research.google/pubs/online-asynchronous-schema-change-in-f1/). *PVLDB*, 6(11), 1045–1056, 2013. §3.3.2 описывает промежуточные состояния схемы и преобразование исторических данных.
+3. Souvik Bhattacherjee, Gang Liao, Michael Hicks и Daniel J. Abadi. [BullFrog. Online Schema Evolution via Lazy Evaluation](https://www.cs.umd.edu/~mwh/papers/bhattacherjee21bullfrog.html). *ACM SIGMOD*, 2021. Исследует поддержку ленивого преобразования существующих данных в движке.

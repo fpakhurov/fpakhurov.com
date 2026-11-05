@@ -1,0 +1,59 @@
+---
+title: Locks and MVCC
+description: "Follow two stock updates through row visibility and blocking, then diagnose a deadlock from its wait cycle."
+course: databases
+section: Concurrency and Recovery
+order: 14
+status: published
+tags: [databases, concurrency, locks, mvcc, deadlocks]
+prerequisites: [Isolation and serializability]
+---
+
+import WaitCycle from '../../../components/figures/databases-locks-and-mvcc/WaitCycle.astro';
+
+One checkout reduces the stock of tea from five to three and has yet to commit. A report reads the old count of five. A second checkout tries to reserve four from the same row and waits. The two sessions touch the same stock, but a reader can use a previous value while a competing writer needs permission to change the row.
+
+## Keep versions for readers
+
+**Multiversion concurrency control**, or MVCC, keeps versions of data so a read can choose one according to its snapshot. A write produces a new version. The old version remains available while a reader can still need it. In PostgreSQL, transactions can see their own changes, and snapshots determine which other changes are visible. The transaction which made a version and the status of that transaction matter to visibility. A newer physical copy need not be visible to a given reader. [Bernstein and Goodman, 1983, §§1 and 3](#references) [PostgreSQL 18, §§13.1–13.2](#references)
+
+Take a single row with `product = 'tea'` and `available = 5`. T1 changes the value to 3. An ordinary Read Committed query in T2 that begins before T1 commits sees 5. A new query beginning after T1 commits can see 3. A Repeatable Read transaction that already acquired the old snapshot can continue seeing 5. MVCC lets this ordinary read proceed without waiting for a conflicting row update. Table-level locks taken by some schema changes can still block the query. [PostgreSQL 18, §§13.1–13.3](#references)
+
+Keeping old versions has a cost. Once a version cannot be needed by any transaction, PostgreSQL can reclaim its space through vacuuming. A long-lived transaction that retains an old snapshot can delay this cleanup. That is one reason why leaving a read transaction open can have a storage cost even if it writes nothing. [PostgreSQL 18, §24.1](#references)
+
+## Coordinate competing writers
+
+A **lock** controls which operations may proceed together on a resource. Compatible lock requests can be granted at the same time. Incompatible ones wait, fail under a specified policy, or end when the holder releases its lock. PostgreSQL row locks block conflicting writes and locking reads of the same row. Ordinary snapshot reads do not take a conflicting row lock. [PostgreSQL 18, §13.3.2](#references)
+
+T2 attempts the following update while T1 still holds the row. Assume Read Committed, no timeout and no other writers.
+
+```sql
+UPDATE stock
+SET available = available - 4
+WHERE product = 'tea' AND available >= 4
+RETURNING available;
+```
+
+At first the version visible to T2 has enough stock. The write waits on T1. If T1 commits its value of 3, PostgreSQL rechecks the predicate against the updated row. Three is below four, so the command returns zero rows and leaves 3. If T1 rolls back, the value remains 5 and the subtraction can return 1. This is why checking for stock in the update itself is different from reading five in an earlier query and later assigning a value based on that old read. At Repeatable Read, attempting to update a row changed since the snapshot can instead raise a serialization failure. [PostgreSQL 18, §§13.2.1–13.2.2](#references)
+
+Use `SELECT ... FOR UPDATE` within a transaction when a read and a later decision both need exclusive access against competing row writers. The locking read can itself wait. The locks generally last until the transaction ends, so a separate autocommit read releases them before a later command. The statement locks the rows it finds. A missing row provides no row to lock, and a predicate over many rows may require a different design. [PostgreSQL 18, §13.3.2](#references)
+
+## Follow the waiting edges
+
+Suppose two transactions reserve one tea pack and one coffee pack together. Label the rows A for tea and B for coffee. T1 updates A, and T2 updates B. Both transactions keep their acquired locks. T1 now tries to update B and waits for T2. T2 tries to update A and waits for T1. The **wait-for graph** has an edge from each waiter to the holder it needs. The cycle means neither can reach commit by waiting alone. This is a **deadlock**. [PostgreSQL 18, §13.3.4](#references) [MySQL 8.4, §17.7.5](#references)
+
+<WaitCycle />
+
+PostgreSQL detects the deadlock and aborts one participant. The other can continue after the conflicting lock is released. The application must be prepared for either participant to fail. It can retry the aborted transaction with a fresh decision. Acquiring both rows in the same order, for example A before B in every checkout, removes this two-row cycle. A transaction waiting on A would then hold neither A nor B from that pair. Other resources or code paths can still create different cycles. [PostgreSQL 18, §13.3.4](#references)
+
+A lock wait may be harmless if the holder can finish. A cycle prevents everyone in the cycle from finishing on their own. Monitor waiting transactions and their blockers to distinguish a busy row from a dependency problem. The lock mechanisms described here coordinate concurrent operations while the server is running.
+
+## Next
+
+Once an operation commits, its locks can go away. Its changes may still be in memory, so a crash raises another question about what can be reconstructed. [Logging and recovery](/notes/databases/logging-and-recovery) follows that question from a dirty page to a durable commit.
+
+## References
+
+1. Philip A. Bernstein and Nathan Goodman. [Multiversion Concurrency Control—Theory and Algorithms](https://www.cs.cmu.edu/afs/cs.cmu.edu/academic/class/15712-f17/www/papers/bernstein83.pdf), 1983, §§1 and 3. Introduces retained versions and their use in concurrency control.
+2. PostgreSQL Global Development Group. PostgreSQL 18 documentation. [MVCC, §13.1](https://www.postgresql.org/docs/18/mvcc-intro.html), [isolation, §13.2](https://www.postgresql.org/docs/18/transaction-iso.html), [explicit locking and deadlocks, §13.3](https://www.postgresql.org/docs/18/explicit-locking.html) and [vacuuming, §24.1](https://www.postgresql.org/docs/18/routine-vacuuming.html) specify PostgreSQL's behavior.
+3. Oracle. MySQL 8.4 Reference Manual. [Deadlocks in InnoDB, §17.7.5](https://dev.mysql.com/doc/refman/8.4/en/innodb-deadlocks.html). Explains incompatible requests, lock order and aborted transactions in another engine.

@@ -1,0 +1,80 @@
+---
+title: Transactional and analytical systems
+description: "Compare a checkout update with a daily sales report and derive how row and column layouts change the work of a scan."
+course: databases
+section: Operating a Data Model
+order: 19
+status: published
+tags: [databases, oltp, olap, column-stores, analytics]
+prerequisites: [Schema evolution, "Pages, records and the buffer pool"]
+---
+
+import ScanBytes from '../../../components/figures/databases-transactional-and-analytical-systems/ScanBytes.astro';
+
+A cashier reserves two packs of tea. The operation checks a small amount of current state and changes the affected rows before reporting success. At the end of the day, a report totals sales for every store. It reads many committed orders and returns one row per store. Both requests use SQL. The useful units of work are different.
+
+## Count what each request touches
+
+**Online transaction processing** (OLTP) handles operational requests such as creating an order, reserving stock or recording a payment. The reservation is a short transaction with an indexable key, a conditional update and an insert. The system serves many such requests concurrently. It has to keep their effects correct and make each response fast enough for the caller.
+
+**Online analytical processing** (OLAP) answers questions over collections of data, often by grouping, filtering and combining historical records. The report asks a different question about the same shop. It needs an amount from every line of the day, even when the output contains only two stores. General analytical requests may group the same records by product, store or time. The fact that a grouped query returns few rows says little about how many it has to read. [Gray et al., 1997, §1](#references)
+
+Here is a small analytical input for one day. Each row represents an order line. Its amount is the quantity times the price recorded on that line. The input already contains the store identifier. Joining an order total to each of its lines would produce a different measure and could count that total multiple times.
+
+```sql
+SELECT store_id, SUM(amount_cents) AS total_cents
+FROM (
+    VALUES
+        (11, 700), (11, 600), (11, 350),
+        (22, 1200), (22, 350), (22, 1200)
+) AS day_order_lines(store_id, amount_cents)
+GROUP BY store_id
+ORDER BY store_id;
+```
+
+| store_id | total_cents |
+| --- | --- |
+| 11 | 1650 |
+| 22 | 2750 |
+
+Store 11 contributes $700 + 600 + 350 = 1650$ cents. Store 22 contributes $1200 + 350 + 1200 = 2750$ cents. The operation works over the day's input even if the shop has already advanced to the next day.
+
+## Lay out the fields that are read together
+
+A **row layout** keeps the fields of a record together. This is convenient when an index lookup locates a small number of complete records and the caller uses several fields of each. A **column layout** keeps values of the same field together, with a way to associate the fields belonging to the same record. A scan that uses two fields can read those fields without reading the other columns. C-Store uses column-oriented projections to serve analytical queries. [Stonebraker et al., 2005, §§1–2](#references)
+
+Use a toy day with $N = 10{,}000{,}000$ lines. Assume each line occupies 120 bytes. Of those, 4 bytes hold `store_id` and 8 bytes hold `amount_cents`. The other fields occupy 108 bytes. Assume a full sequential scan, fixed-size uncompressed values and no storage headers. The day is already selected, so the scan needs no date field.
+
+For a full scan of row storage, the volume is
+
+$$
+N \cdot 120 = 1{,}200{,}000{,}000\ \mathrm{bytes}.
+$$
+
+For a scan of only the two column streams, it is
+
+$$
+N \cdot (4+8) = 120{,}000{,}000\ \mathrm{bytes}.
+$$
+
+The second model reads one tenth of the bytes. That ratio describes this input layout and query. An index, compression, alignment, the working set already in memory and the cost of reconstructing full rows can change the observed time.
+
+<ScanBytes />
+
+Layouts can also mix the two organizations. PAX keeps all the values for a page together on disk and groups values of each attribute within that page. It can improve use of CPU caches when a scan touches a few attributes. Reading the page from disk still brings in the other fields. This separates two costs that a single word such as “columnar” can hide. [Ailamaki et al., 2001, §3](#references)
+
+## Decide when the report may see a change
+
+A checkout needs to know whether its own operation succeeded. A daily report needs a consistent account of the period it describes. An analytical copy can reduce contention for I/O and memory in the checkout database. It introduces another boundary. If the copy is refreshed at 02:00, an order committed at 02:01 will become visible to the copy according to the next refresh or change-delivery rule.
+
+A single database can serve both kinds of queries if the data size, freshness and resource budgets allow it. Separating the workloads becomes more valuable when a long scan interferes with latency-sensitive requests. The choice also depends on what needs to be copied, when readers see corrections and how a delayed load is recovered. Those questions remain even when the scan itself is fast.
+
+## Next
+
+Our model changed which bytes a query reads on one machine. As the input grows, another limit can dominate even with a good layout. [The limits of one machine](/notes/big-data/beyond-one-machine) starts with a 600 GB report and separates capacity, scan rate and network transfer.
+
+## References
+
+1. Michael Stonebraker et al. [C-Store. A Column-oriented DBMS](https://www.vldb.org/archives/website/2005/program/paper/thu/p553-stonebraker.pdf). *VLDB*, 553–564, 2005. §§1–2 motivate a read-optimized column layout and describe projections.
+2. Anastassia Ailamaki, David J. DeWitt, Mark D. Hill and Marios Skounakis. [Weaving Relations for Cache Performance](https://www.vldb.org/conf/2001/P169.pdf). *VLDB*, 169–180, 2001. §3 explains PAX and the distinction between cache use and disk I/O.
+3. Jim Gray et al. [Data Cube. A Relational Aggregation Operator Generalizing Group-By, Cross-Tab, and Sub-Totals](https://arxiv.org/abs/cs/0701155). *Data Mining and Knowledge Discovery*, 1, 29–53, 1997. §1 motivates aggregating an analytical dataset along several dimensions.

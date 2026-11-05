@@ -43,6 +43,8 @@ const background: Record<string, PrerequisiteTarget> = {
   'Файлы и исключения': { note: 'python/files-and-exceptions' },
   'Iteration, comprehensions and generators': { note: 'python/iteration-and-generators' },
   'Итерация, включения и генераторы': { note: 'python/iteration-and-generators' },
+  'Common table expressions and views': { note: 'sql/ctes-and-views' },
+  'CTE и представления': { note: 'sql/ctes-and-views' },
   // Sections of the course notes.
   'Entropy': { note: 'generative-models/entropy-and-divergences', anchor: 'entropy-expected-surprise' },
   'Энтропия': { note: 'generative-models/entropy-and-divergences', anchor: 'entropy-expected-surprise' },
