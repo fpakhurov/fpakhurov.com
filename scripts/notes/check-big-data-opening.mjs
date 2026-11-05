@@ -67,8 +67,7 @@ assert.equal(links(en).length, 5);
 assert.deepEqual(links(ru), links(en));
 for (const [note, prefix] of [[en, ''], [ru, '/ru']]) {
   assert.ok(note.includes('(' + prefix + '/notes/databases#section-4)'));
-  assert.ok(note.includes('(' + prefix + '/notes/big-data#section-1)'));
-  assert.doesNotMatch(note, /\/big-data\/partial-failures/);
+  assert.ok(note.includes('(' + prefix + '/notes/big-data/partial-failures)'));
 }
 assert.match(ru, /^## Литература \\\{#references\\\}$/m);
 

@@ -1,0 +1,77 @@
+---
+title: Partial failures and timeouts
+description: "Follow a missing reply through a distributed sales report, then retry the work without adding the same subtotal twice."
+course: big-data
+section: Beyond One Machine
+order: 2
+status: published
+tags: [distributed-systems, timeouts, retries, idempotency]
+prerequisites: [The limits of one machine]
+---
+
+import TimeoutHistories from '../../../components/figures/big-data-partial-failures/TimeoutHistories.astro';
+import RetryTotals from '../../../components/figures/big-data-partial-failures/RetryTotals.astro';
+
+Three workers have returned their subtotals for the [sales report](/notes/big-data/beyond-one-machine). The fourth worker is silent. The coordinator needs its part to finish the report. It can ask another worker to compute it, but then the original worker can still reply. Before we decide what to add, we need to separate the state of a task from what the coordinator has heard about it.
+
+## What does a timeout tell us?
+
+A remote call has at least three steps. The caller sends a request, the receiver carries out the work, and the receiver sends a reply. Each side runs independently. The coordinator and the first three workers can continue while the fourth worker is unreachable. This is a **partial failure**. A component or a path can fail while the rest of the system is still running. [Birrell and Nelson, 1984, §§1.1 and 3.1](#references)
+
+Suppose the coordinator waits $100\ \mathrm{ms}$ for a reply to its request for part 4. We use a toy clock with time 0 at the send event. There are several histories consistent with the coordinator's observation.
+
+| History | What happens remotely | What the coordinator has by 100 ms |
+| --- | --- | --- |
+| Request lost | The worker receives nothing. | No reply |
+| Reply lost | The worker finishes at 60 ms. Its reply is lost. | No reply |
+| Reply delayed | The worker finishes at 140 ms. Its reply arrives at 170 ms. | No reply |
+
+<TimeoutHistories />
+
+At the timeout all three histories look the same to the coordinator. In one of them the work is already complete. In another it has yet to finish. A **timeout** is a limit on waiting at one place. Reaching it leaves the remote outcome unknown. An acknowledgement can narrow the uncertainty only as far as its meaning goes. An acknowledgement of receipt can tell us that the worker got the request. Confirmation of a durable result requires a different promise. [Birrell and Nelson, 1984, §§3.1–3.2](#references)
+
+## What does a retry repeat?
+
+Keep the report's input snapshot fixed. Suppose part 4 can also be read by a second worker and that both workers compute the same subtotal. Call the original execution attempt A. After waiting another $25\ \mathrm{ms}$ beyond the timeout, the coordinator starts attempt B at $125\ \mathrm{ms}$. It receives B's result at $160\ \mathrm{ms}$. A's reply from the delayed history arrives at $170\ \mathrm{ms}$.
+
+Consider one store. The coordinator already has 1100, 800 and 600 cents from parts 1–3, for a subtotal of 2500 cents. Each attempt for part 4 returns 700 cents. Adding B completes the report with $2500 + 700 = 3200$ cents. Adding A as well gives $3200 + 700 = 3900$ cents. The worker computation only reads data. The error comes from the coordinator counting the same part twice.
+
+<RetryTotals />
+
+Give the report a run identifier, say `r17`. Both attempts carry the same **task identity**, `(r17, part 4)`, and distinct **attempt identities**, A and B. Record one accepted subtotal per task. If a result arrives for a completed task, the coordinator keeps the existing result. It sums those accepted subtotals when all four expected parts are present. The fixed snapshot, the deterministic calculation and the requirement that the parts are disjoint make either result for part 4 valid. Using attempt identity as the key would admit both.
+
+**Idempotency** is about the effect of repeating an operation. With the same task identity and subtotal, accepting a result twice has the same effect as accepting it once. Re-executing the computation may still consume storage bandwidth and CPU. In Google’s MapReduce, the master ignores extra completion messages for an already completed map task. Reduce tasks use atomic file replacement so competing attempts leave one final output for a task. [Dean and Ghemawat, 2004, §3.3](#references)
+
+## What has to survive a restart?
+
+Suppose the coordinator increments a durable total, then crashes before recording that it accepted part 4. On restart the total is already 3200 cents, but the task still appears pending. Accepting the retry increments the total to 3900 cents. Reversing the two writes only moves the gap. If the coordinator records completion first and crashes before incrementing, it can skip the retry and leave the total at 2500 cents.
+
+For this report, store the subtotal itself under a unique `(report_id, part_id)` key in a durable table. The committed row is the completion record. Concurrent attempts compete to insert that same key, and at most one row can be committed for it. Deriving the total from those rows removes the separate increment. The mechanism depends on the storage system enforcing uniqueness and recovering committed rows. It does not by itself cover effects in a different system, such as sending the completed report to another service. [Transactions and atomic changes](/notes/databases/why-databases#when-a-payment-takes-two-writes)
+
+## How long can the caller keep trying?
+
+The **deadline** applies to the operation as a whole, including waits between attempts. Suppose the toy report has a deadline at $220\ \mathrm{ms}$ and each attempt can wait for at most $100\ \mathrm{ms}$. To keep this calculation simple, give result merging zero additional time. Attempt B starts at $125\ \mathrm{ms}$, so the most it can wait is
+
+$$
+\min(100,\ 220-125)\ \mathrm{ms}=95\ \mathrm{ms}.
+$$
+
+With the observed reply at $160\ \mathrm{ms}$, B uses $160-125=35\ \mathrm{ms}$ of that time. In a real report the deadline also needs to cover merging, and the next attempt can start only if enough time remains to be useful. A short attempt timeout can leave time to recover from a slow worker. It also makes healthy but slow responses more likely to trigger duplicate work. [Brooker, 2019, Timeouts](#references)
+
+If many reports time out together, their retries can keep the workers overloaded. A pause before a retry is **backoff**. Increasing the pause on successive failures reduces the pressure from a single caller. Adding random variation, or **jitter**, spreads retries from different callers across time. The caller still caps the number of attempts and stops at the deadline. If both the report coordinator and the storage client under each worker allow three total attempts, one logical call can trigger up to $3\cdot3=9$ storage calls when each worker attempt issues one logical storage call. Even a small limit at one layer can be expensive once retries at another layer multiply it. [Brooker, 2019, Retries and backoff and Jitter](#references)
+
+## What can a heartbeat confirm?
+
+A **heartbeat** is a periodic message used to show that a worker or its communication loop is responsive. A missing heartbeat gives the coordinator a reason to treat the worker as unavailable and reschedule its work. A pause or delayed packet can cause the same observation, so an earlier attempt can still produce a late result. A received heartbeat shows that the sender responded at some earlier point. A delayed heartbeat can be stale, and the task can still be stuck waiting for storage.
+
+Google's MapReduce master probes workers and reschedules work when a worker stops replying. Even completed map work may need to run again if its output exists only on the unavailable machine. Completed reduce output is stored in a shared distributed file system and is handled differently. Restarting a task is useful only when another worker can read its input. [Dean and Ghemawat, 2004, §3.3](#references)
+
+## Next
+
+We have treated part 4 as a named piece of the input that a second worker can read. Before rescheduling it, the coordinator needs to know which rows belong to that part and where to find them. *Partitioning and rebalancing* starts with the rule that assigns each key to a part and follows what changes when a node joins or leaves. [Course plan](/notes/big-data#section-1)
+
+## References
+
+- Andrew D. Birrell and Bruce Jay Nelson. [Implementing Remote Procedure Calls](https://www.cs.cmu.edu/~15712/papers/birrell84.pdf). ACM Transactions on Computer Systems, 1984, §§1.1 and 3.1–3.2 on the request and reply path, uncertainty after failure and call identifiers.
+- Jeffrey Dean and Sanjay Ghemawat. [MapReduce: Simplified Data Processing on Large Clusters](https://www.usenix.org/legacy/event/osdi04/tech/full_papers/dean/dean_html/). OSDI, 2004, §3.3 on failure detection, task re-execution and committing output.
+- Marc Brooker. [Timeouts, retries, and backoff with jitter](https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/). Amazon Builders' Library, 2019, on choosing timeouts and controlling retry load.

@@ -1,0 +1,153 @@
+---
+title: Types and NULL
+description: "Use types to predict arithmetic and comparisons, and trace what a missing price does to a calculation and a filter."
+course: sql
+section: Reading Tables
+order: 3
+status: published
+tags: [sql, postgresql, types, numeric, null-values, three-valued-logic]
+prerequisites: [Expressions and filtering]
+---
+
+import DivisionTypes from '../../../components/figures/sql-types-and-null/DivisionTypes.astro';
+import NullFilter from '../../../components/figures/sql-types-and-null/NullFilter.astro';
+
+One unit of tea costs 350 cents. Divide by 100 in a PostgreSQL query and the result is 3 dollars. On another line the price is still pending. Multiplying its quantity by the price gives no amount to compare with a threshold. Both results follow from the operands of an expression. First check the type of each operand, then check whether it has a value.
+
+## The type chooses the operation
+
+A **data type** determines which values an expression can produce and which operators can use them. In the earlier [line amount calculation](/notes/sql/select-and-expressions#which-boundaries-are-included), both quantity and unit price were of type `integer`. Multiplication produced a whole number of cents. To display a price in dollars, the calculation has to preserve fractions.
+
+```sql
+SELECT 350 / 100 AS whole_dollars,
+       CAST(350 / 100 AS numeric) AS cast_after,
+       CAST(350 AS numeric) / 100 AS cast_before;
+```
+
+| whole_dollars | cast_after | cast_before |
+| --- | --- | --- |
+| 3 | 3 | 3.5 |
+
+In PostgreSQL, the two small whole-number literals start out as `integer`. The division for integer operands truncates toward zero. `CAST(expression AS type)` converts the result of its argument to the requested type. Applied outside the division, the cast therefore receives 3. Applied to an operand, it gives PostgreSQL a `numeric` and an `integer` to divide. PostgreSQL promotes the integer to `numeric` for this operator, and the division can retain the half dollar. The table shows values. A client may display the decimal result with trailing zeroes. [PostgreSQL 18, §§4.1.2.6 and 9.3](#references)
+
+<DivisionTypes />
+
+PostgreSQL's choice of operator is part of the dialect. In DuckDB, `350 / 100` with two integers gives 3.5. DuckDB uses `//` for integer division. The same-looking query can give a different value when moved to a different engine. [DuckDB 1.4, Numeric functions](#references)
+
+## Choose where rounding happens
+
+Integer cents represent values in steps of one cent. That representation works for addition and subtraction, and for multiplication by an integer quantity, as long as the results fit in the chosen integer type. A percentage calculation can produce a fraction of a cent. The amount and the rule that rounds it to a cent are separate decisions.
+
+PostgreSQL `numeric` can represent finite decimal fractions such as `0.1` and `0.2` exactly. The floating-point type `double precision` represents many decimal fractions approximately in binary. A finite binary fraction has a power of two as its denominator. The reduced denominator of 0.1 is 10, which contains a factor of 5, so there is no finite binary representation for it. In the following comparison, the sum of the two stored approximations rounds to a different floating-point number than the stored approximation of 0.3.
+
+```sql
+SELECT 0.1 + 0.2 = 0.3 AS decimal_equal,
+       CAST(0.1 AS double precision) + CAST(0.2 AS double precision)
+           = CAST(0.3 AS double precision) AS float_equal,
+       CAST(3.505 AS numeric(5, 2)) AS rounded_amount;
+```
+
+| decimal_equal | float_equal | rounded_amount |
+| --- | --- | --- |
+| `TRUE` | `FALSE` | 3.51 |
+
+The first comparison uses `numeric` literals in PostgreSQL. In the last column, `numeric(5, 2)` sets **precision** to five decimal digits and **scale** to two digits after the decimal point. A finite value rounded to that scale can have up to three digits before the point. The value 3.505 lies midway between 3.50 and 3.51. PostgreSQL rounds a `numeric` tie away from zero, so the result is 3.51. A value that needs four integer digits after rounding raises an error. That limit matters when a field meant to hold a unit price is reused for a much larger amount. [PostgreSQL 18, §8.1](#references)
+
+## A comparison needs compatible types
+
+Suppose a CSV export supplies the price as text. PostgreSQL can compare the integer 350 with the quoted literal `'350'`. The literal has an unspecified type at first. For this comparison PostgreSQL resolves it as an integer using the type of the other operand. A column declared as `text` already has a type. Compare these two expressions with a third that states the conversion explicitly.
+
+```sql
+SELECT 350 = '350' AS literal_match,
+       350 = CAST(text '350' AS integer) AS converted_match;
+```
+
+Both results are `TRUE`. In the next query, `text '350'` is a typed literal that stands in for a text column. PostgreSQL raises `operator does not exist: integer = text`. The supported explicit cast in the preceding query parses the text as an integer. That cast itself raises an error on a value like `'pending'`, so the importer needs a policy for invalid values. [PostgreSQL 18, §§4.1.2 and 10.2](#references)
+
+```sql
+SELECT 350 = text '350';
+```
+
+SQLite also uses the operands to decide when to convert. For example, its comparison rules apply numeric affinity to well-formed numeric text on the other side of a comparison with a column of numeric affinity. Affinity is a type preference. SQLite assigns one to each table column and to certain expressions. The PostgreSQL error above describes PostgreSQL's operator rules. [SQLite, Datatypes, §§3.2 and 4.2](#references)
+
+## An unknown price leaves an unknown amount
+
+The same shop prepares a quote before every unit price has arrived. Set up four sample lines. The price on 103/1 is missing, and 105/1 is a free sample whose known price is zero.
+
+```sql
+CREATE TEMP TABLE order_line_quotes (
+    line_key text,
+    quantity integer,
+    unit_price_cents integer
+);
+
+INSERT INTO order_line_quotes VALUES
+    ('101/1', 2, 350),
+    ('102/1', 1, 350),
+    ('103/1', 2, NULL),
+    ('105/1', 1, 0);
+```
+
+`NULL` marks the absence of a value. A nullable integer column can contain that marker in one row and an ordinary integer in the next. In this table the application gives it the meaning “price pending”. Both `2 * NULL` and `NULL >= 700` yield `NULL`. The first expression lacks the amount. The second lacks the truth value of a comparison. The quantity and a price of zero are both known on line 105/1, so the amount is exactly zero.
+
+```sql
+SELECT line_key,
+       quantity * unit_price_cents AS amount_cents,
+       quantity * unit_price_cents >= 700 AS reaches_threshold
+FROM order_line_quotes
+ORDER BY line_key;
+```
+
+| line_key | amount_cents | reaches_threshold |
+| --- | --- | --- |
+| 101/1 | 700 | `TRUE` |
+| 102/1 | 350 | `FALSE` |
+| 103/1 | `NULL` | `NULL` |
+| 105/1 | 0 | `FALSE` |
+
+## A filter keeps only TRUE
+
+Call the threshold predicate $P$. SQL uses **three-valued logic**. Its third truth value is unknown, represented by `NULL` in a Boolean expression. For an unknown input, `NOT` still cannot establish a truth value. Thus `WHERE NOT (quantity * unit_price_cents >= 700)` returns 102/1 and 105/1. It leaves out 103/1. For that line, neither $P$ nor `NOT P` is true, and `WHERE` requires a true result. [PostgreSQL 18, §§7.2.2 and 9.1](#references)
+
+<NullFilter />
+
+A known operand can settle a compound predicate. A false operand makes `AND` false regardless of the other operand. A true operand makes `OR` true. For line 103/1, `quantity = 1 AND P` would be false because the quantity is 2, while `quantity >= 2 OR P` would be true. In these examples `P` is shorthand for the threshold expression, and the rules describe the logical result independently of evaluation order.
+
+| Expression with `P` unknown | Result |
+| --- | --- |
+| `NOT P` | `NULL` |
+| `FALSE AND P` | `FALSE` |
+| `TRUE AND P` | `NULL` |
+| `FALSE OR P` | `NULL` |
+| `TRUE OR P` | `TRUE` |
+
+## Test for absence before choosing a substitute
+
+Ordinary equality also returns unknown for a scalar comparison with `NULL`, including `NULL = NULL`. Therefore `WHERE unit_price_cents = NULL` yields zero rows under the standard comparison rules. `IS NULL` asks whether the value is missing and returns a definite Boolean. The following query yields 103/1. [PostgreSQL 18, §9.2](#references)
+
+```sql
+SELECT line_key
+FROM order_line_quotes
+WHERE unit_price_cents IS NULL;
+```
+
+Sometimes the result has to be a text label for display. `COALESCE` gives the first present argument in its list and uses a common result type. Here both arguments can be text, and the fallback reads “pending”.
+
+```sql
+SELECT line_key,
+       COALESCE(CAST(unit_price_cents AS text), 'pending') AS display_price
+FROM order_line_quotes
+ORDER BY line_key;
+```
+
+The display strings are `350`, `350`, `pending` and `0`. Putting `COALESCE(unit_price_cents, 0)` inside the original multiplication would instead produce an amount of zero for 103/1. Its price is pending, so that substitution would make it pass the filter for amounts below 700. A substitute inside a calculation is a rule about the data and can change which rows the query returns. [PostgreSQL 18, §9.18.2](#references)
+
+## Next
+
+The two known prices of 350 come from different lines. A query that selects the price alone still emits two rows containing 350. [Duplicates and ordering](/notes/sql/duplicates-and-order) separates repeated output values from repeated input rows and explains how to choose the first few results.
+
+## References
+
+1. PostgreSQL Global Development Group. PostgreSQL 18 documentation, 2025. [Numeric constants, §4.1.2.6](https://www.postgresql.org/docs/18/sql-syntax-lexical.html#SQL-SYNTAX-CONSTANTS-NUMERIC), [numeric types, §8.1](https://www.postgresql.org/docs/18/datatype-numeric.html), [mathematical operators, §9.3](https://www.postgresql.org/docs/18/functions-math.html) and [operator resolution, §10.2](https://www.postgresql.org/docs/18/typeconv-oper.html) specify the arithmetic and conversion rules. [WHERE, §7.2.2](https://www.postgresql.org/docs/18/queries-table-expressions.html#QUERIES-WHERE), [logical operators, §9.1](https://www.postgresql.org/docs/18/functions-logical.html), [comparison predicates, §9.2](https://www.postgresql.org/docs/18/functions-comparison.html) and [COALESCE, §9.18.2](https://www.postgresql.org/docs/18/functions-conditional.html#FUNCTIONS-COALESCE-NVL-IFNULL) specify how the example handles missing values.
+2. DuckDB Foundation. DuckDB 1.4. [Numeric functions](https://duckdb.org/docs/1.4/sql/functions/numeric.html), division and modulo operators. Documents the difference between `/` and `//` for integer operands.
+3. SQLite Project. [Datatypes in SQLite](https://www.sqlite.org/datatype3.html), §§3.2 and 4.2. Specifies when comparisons apply an operand's affinity.

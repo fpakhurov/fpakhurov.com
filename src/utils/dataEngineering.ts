@@ -42,8 +42,8 @@ export const dataCoursePlans: DataCoursePlan[] = [
         topics: [
           topic('tables-and-queries', 'Tables and the first query', 'Таблицы и первый запрос', true),
           topic('select-and-expressions', 'Expressions and filtering', 'Выражения и фильтрация', true),
-          topic('types-and-null', 'Types and NULL', 'Типы и NULL'),
-          topic('duplicates-and-order', 'Duplicates and ordering', 'Дубликаты и порядок строк'),
+          topic('types-and-null', 'Types and NULL', 'Типы и NULL', true),
+          topic('duplicates-and-order', 'Duplicates and ordering', 'Дубликаты и порядок строк', true),
         ],
       },
       {
@@ -98,7 +98,7 @@ export const dataCoursePlans: DataCoursePlan[] = [
         outcome: ['Choose keys and decompose a schema without losing information.', 'Выбирать ключи и декомпозировать схему без потери информации.'],
         topics: [
           topic('why-databases', 'Why databases exist', 'Зачем нужны базы данных', true),
-          topic('data-modeling', 'From a domain to a data model', 'От предметной области к модели'),
+          topic('data-modeling', 'From a domain to a data model', 'От предметной области к модели', true),
           topic('relational-model', 'The relational model and algebra', 'Реляционная модель и алгебра'),
           topic('functional-dependencies', 'Functional dependencies', 'Функциональные зависимости'),
           topic('normalization', 'Normalization and decomposition', 'Нормализация и декомпозиция'),
@@ -152,7 +152,7 @@ export const dataCoursePlans: DataCoursePlan[] = [
         outcome: ['Distinguish partitioning from replication and explain a read during a network partition.', 'Различать партиционирование и репликацию и объяснять чтение при сетевом разделении.'],
         topics: [
           topic('beyond-one-machine', 'The limits of one machine', 'Пределы одной машины', true),
-          topic('partial-failures', 'Partial failures and timeouts', 'Частичные отказы и тайм-ауты'),
+          topic('partial-failures', 'Partial failures and timeouts', 'Частичные отказы и тайм-ауты', true),
           topic('partitioning', 'Partitioning and rebalancing', 'Партиционирование и перераспределение'),
           topic('replication', 'Replication and failover', 'Репликация и переключение после сбоя'),
           topic('consistency', 'Consistency between nodes', 'Согласованность между узлами'),
