@@ -1,0 +1,118 @@
+---
+title: Транзакции со стороны клиента
+description: "Объединяем изменение остатка и запись брони в одну операцию и прослеживаем, что происходит со строками при фиксации, откате и возврате к точке сохранения."
+course: sql
+section: Изменение данных
+order: 16
+status: published
+tags: [sql, postgresql, transactions, rollback, savepoints]
+prerequisites: [Изменение строк и обработка конфликтов]
+---
+
+import ReservationState from '../../../components/figures/sql-transactions/ReservationState.astro';
+
+Доступно пять пачек чая. Чтобы забронировать две, магазин вычитает две пачки из остатка и записывает бронь. Вторая команда может завершиться ошибкой, если номер брони уже занят. Первая команда сама по себе оставляет три доступные пачки и ни одной записи о новой брони.
+
+## Где заканчивается одна операция \{#where-does-one-operation-end\}
+
+Возьмём новый сеанс PostgreSQL. В доступное количество не входят пачки, которые уже забронировали. Исходный остаток пять уже учитывает бронь 700.
+
+```sql
+CREATE TEMP TABLE stock (
+    product text PRIMARY KEY,
+    available integer NOT NULL CHECK (available >= 0)
+);
+
+CREATE TEMP TABLE reservations (
+    reservation_id integer PRIMARY KEY,
+    product text NOT NULL REFERENCES stock (product),
+    quantity integer NOT NULL CHECK (quantity > 0)
+);
+
+INSERT INTO stock VALUES ('tea', 5);
+INSERT INTO reservations VALUES (700, 'tea', 1);
+```
+
+**Транзакция** (transaction) объединяет команды так, что их изменения в базе могут вступить в силу вместе. В PostgreSQL любая обычная команда выполняется в транзакции. Когда клиент отправляет команды по одной и использует автофиксацию (autocommit), успешное обновление может зафиксироваться до начала вставки. Ошибка повторяющегося ключа откатывает собственную транзакцию вставки. Уже зафиксированный остаток три сохраняется. SQLite тоже начинает неявную транзакцию, когда она нужна команде. Момент окончания такой транзакции зависит от движка и клиента. [PostgreSQL 18, §3.4](#references) [SQLite, §2](#references)
+
+## Откат всей брони \{#undo-the-whole-reservation\}
+
+Начнём транзакцию до первого изменения. В следующем блоке обновление остатка может изменить одну строку. При вставке намеренно используем занятый номер.
+
+```sql
+BEGIN;
+
+UPDATE stock
+SET available = available - 2
+WHERE product = 'tea' AND available >= 2
+RETURNING available;
+
+INSERT INTO reservations VALUES (700, 'tea', 2);
+
+ROLLBACK;
+```
+
+Обновление возвращает `3`. Вставка сообщает о нарушении уникальности. После этой ошибки транзакция PostgreSQL переходит в состояние отказа. Чтобы снова выполнять обычные команды, клиент завершает транзакцию с помощью `ROLLBACK` или возвращается к заранее установленной точке сохранения. В интерактивном сеансе отправляем `ROLLBACK` после ошибки. В приложении такое решение принимает обработчик ошибок. [PostgreSQL 18, §3.4](#references)
+
+<ReservationState />
+
+После отката `SELECT available FROM stock WHERE product = 'tea'` возвращает 5. В брони 700 по-прежнему одна пачка. Неудачная операция не оставила ни одного из задуманных изменений. Откат касается работы после `BEGIN`. Ранее зафиксированные изменения сохраняются.
+
+## Фиксация после успешных шагов \{#commit-only-when-the-steps-succeeded\}
+
+Используем то же обновление и новый номер брони. Перед вставкой клиент проверяет, что `RETURNING` вернул одну строку. Ноль строк означает, что в момент обновления товар отсутствовал или остатка не хватало. В обоих случаях нужен откат без записи брони. Обновление нуля строк считается успешной SQL-командой. Оно не вызывает ошибки. [PostgreSQL 18, UPDATE](#references)
+
+```sql
+BEGIN;
+
+UPDATE stock
+SET available = available - 2
+WHERE product = 'tea' AND available >= 2
+RETURNING available;
+
+-- Continue only when the update returned one row.
+INSERT INTO reservations VALUES (701, 'tea', 2);
+
+COMMIT;
+```
+
+В примере обновление возвращает одну строку с числом 3. После фиксации доступны три пачки, ещё две записаны в новой брони. Открытая транзакция читает свои изменения до `COMMIT`. Другие транзакции увидят зафиксированные изменения, когда правила их чтения позволят увидеть эту фиксацию. Эти правила зависят от изоляции. Во [вводном конспекте по базам данных](/ru/notes/databases/why-databases#when-a-payment-takes-two-writes) можно проследить пример с двумя сеансами.
+
+Некоторые драйверы управляют границей транзакции. В Python DB-API методы `commit()` и `rollback()` принадлежат соединению. Драйвер может неявно начать транзакцию при первой команде. Приложение всё равно решает, какие операции входят в эту границу и что делать при отсутствии строки или исключении. [PEP 249, Connection methods](#references)
+
+## Что сохранится до точки сохранения \{#keep-the-part-before-a-savepoint\}
+
+Следующая бронь нужна для одной пачки. В транзакции уменьшаем остаток с трёх до двух. Затем ставим точку сохранения (savepoint) и записываем неверное количество. Можно вернуться к отметке и записать верное количество без повторного обновления остатка.
+
+```sql
+BEGIN;
+
+UPDATE stock
+SET available = available - 1
+WHERE product = 'tea' AND available >= 1
+RETURNING available;
+
+-- Continue only when the update returned one row.
+SAVEPOINT before_reservation;
+INSERT INTO reservations VALUES (702, 'tea', 2);
+
+ROLLBACK TO SAVEPOINT before_reservation;
+INSERT INTO reservations VALUES (702, 'tea', 1);
+RELEASE SAVEPOINT before_reservation;
+
+COMMIT;
+```
+
+`ROLLBACK TO` отменяет первую вставку. Обновление остатка выполнено до отметки и остаётся в открытой транзакции. Освобождение точки сохранения убирает отметку и оставляет исправленную вставку в транзакции. Её завершает только последний `COMMIT`. В результате доступны две пачки, а в брони 702 записана одна. [PostgreSQL 18, SAVEPOINT и ROLLBACK TO](#references)
+
+Транзакция базы данных координирует изменения внутри этой базы. Если клиент ещё и отправил уведомление по сети, откат базы его не отзовёт. Даже внутри базы транзакция может зафиксировать неверное количество, если клиент передал такое значение и ни одно ограничение его не отклонило. Граница объединяет шаги. Приложение и схема задают, какие именно шаги выполнить.
+
+## Дальше \{#next\}
+
+Условия в комментариях отмечают решение, которое приложение принимает по результату команды. В конспекте [«SQL из Python»](/ru/notes/sql/sql-from-python) программа передаёт параметры, читает строки и фиксирует или откатывает изменения с помощью контекста транзакции.
+
+## Источники \{#references\}
+
+1. PostgreSQL Global Development Group. Документация PostgreSQL 18, 2025. [Transactions, §3.4](https://www.postgresql.org/docs/18/tutorial-transactions.html) описывает неявные и явные транзакции. [UPDATE](https://www.postgresql.org/docs/18/sql-update.html) определяет число строк и `RETURNING`. [SAVEPOINT](https://www.postgresql.org/docs/18/sql-savepoint.html), [ROLLBACK TO](https://www.postgresql.org/docs/18/sql-rollback-to.html) и [RELEASE](https://www.postgresql.org/docs/18/sql-release-savepoint.html) задают область действия точки сохранения.
+2. SQLite Project. [Transaction](https://www.sqlite.org/lang_transaction.html), §2. Описывает границы неявных и явных транзакций SQLite.
+3. Marc-André Lemburg. [PEP 249. Python Database API Specification v2.0](https://peps.python.org/pep-0249/#connection-methods), 1999. Определяет `commit()`, `rollback()` и исходную настройку автофиксации для драйверов с поддержкой транзакций.

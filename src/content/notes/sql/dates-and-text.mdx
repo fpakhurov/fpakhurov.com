@@ -1,0 +1,139 @@
+---
+title: Dates, time and text
+description: "Build a report for a local calendar day, then turn raw text labels into keys whose grouping rules are explicit."
+course: sql
+section: Structuring Queries
+order: 13
+status: published
+tags: [sql, postgresql, dates, time-zones, text, unicode]
+prerequisites: [Window frames]
+---
+
+import LocalDay from '../../../components/figures/sql-dates-and-text/LocalDay.astro';
+
+The New York shop closes its report for March 9, 2025 at midnight. An order arrived at 04:59:59 UTC on March 9. At the shop it was still March 8. The report needs a rule that assigns an instant to a shop day. The same report groups orders by source. If imports call one source `' WEB '` and `'web'`, the grouping needs a rule for those labels too.
+
+## An instant and a calendar value
+
+A `date` is a day on a calendar. A `timestamp without time zone` pairs a calendar date with a clock reading. It can represent a store opening at 09:00 on a future date. A `timestamp with time zone`, abbreviated `timestamptz` in PostgreSQL, represents an instant. PostgreSQL uses a zone or an offset to interpret the input, converts it to UTC and stores the instant. It displays the instant in the session's time zone. The original zone name is not retained, so keep it separately if the report needs to know which shop's calendar applies. [PostgreSQL 18, §8.5](#references)
+
+The operator `AT TIME ZONE` has two directions. Given a local `timestamp`, it interprets the clock reading in the specified zone and returns an instant. Given a `timestamptz`, it returns the local `timestamp` seen on a clock in that zone. Here we display the instant from the first conversion in UTC so that the result is independent of the session setting.
+
+```sql
+SELECT
+    (TIMESTAMP '2025-03-09 00:00'
+        AT TIME ZONE 'America/New_York') AT TIME ZONE 'UTC' AS utc_clock,
+    TIMESTAMPTZ '2025-03-09 04:59:59+00'
+        AT TIME ZONE 'America/New_York' AS shop_clock;
+```
+
+| utc_clock | shop_clock |
+| --- | --- |
+| 2025-03-09 05:00:00 | 2025-03-08 23:59:59 |
+
+Use typed literals in examples. In PostgreSQL, `TIMESTAMP '2025-03-09 05:00+00'` has type `timestamp without time zone`, so the `+00` is ignored. In a `TIMESTAMPTZ` literal an explicit offset is used to interpret the instant. Without an offset or zone, PostgreSQL uses the session setting to interpret a `timestamptz` input. [PostgreSQL 18, §§8.5 and 9.9](#references)
+
+## Two midnights define the period
+
+Let $t_0$ be the instant of local midnight at the beginning of the report day, and $t_1$ the instant of the next local midnight. For an order recorded at instant $t$, the filter is $t_0 \le t < t_1$. The day after uses $t_1$ as its lower bound. The strict upper bound assigns an event at the shared boundary to exactly one day. `BETWEEN` includes both endpoints, so adjacent reports using it can count a boundary event twice.
+
+In New York the clock moves forward on March 9, 2025. Midnight at the start has offset −05:00. The next midnight has offset −04:00. Converting both yields 05:00 UTC on March 9 and 04:00 UTC on March 10. The difference is 23 hours. The named zone supplies a rule that varies with the date. An offset of −05:00 for both midnights would move the upper boundary an hour later. [IANA, Scope and timezone identifiers](#references) [PostgreSQL 18, §9.9](#references)
+
+<LocalDay />
+
+Create four toy orders around the interval, with source labels from the import.
+
+```sql
+CREATE TEMP TABLE order_events (
+    order_id integer,
+    paid_at timestamptz,
+    raw_channel text
+);
+
+INSERT INTO order_events VALUES
+    (101, '2025-03-09 04:59:59+00', ' web '),
+    (102, '2025-03-09 05:00:00+00', ' WEB '),
+    (103, '2025-03-09 07:00:00+00', 'web'),
+    (104, '2025-03-10 04:00:00+00', NULL);
+```
+
+```sql
+SELECT order_id
+FROM order_events
+WHERE paid_at >= (TIMESTAMP '2025-03-09 00:00'
+                    AT TIME ZONE 'America/New_York')
+  AND paid_at <  (TIMESTAMP '2025-03-10 00:00'
+                    AT TIME ZONE 'America/New_York')
+ORDER BY order_id;
+```
+
+The query returns 102 and 103. Order 101 is one second before the lower bound. Order 104 is at the upper bound and is included in the following day. We can also subtract the bounds in SQL. The result is an `interval`, which represents a span of time.
+
+```sql
+SELECT (TIMESTAMP '2025-03-10 00:00' AT TIME ZONE 'America/New_York')
+     - (TIMESTAMP '2025-03-09 00:00' AT TIME ZONE 'America/New_York')
+       AS day_length;
+```
+
+The result is `23:00:00`. A calendar day can have a different elapsed length near a clock change. Months vary too. For example, adding `INTERVAL '1 month'` to `DATE '2025-01-31'` gives midnight on February 28 because January's last day exceeds the length of February. Adding `INTERVAL '30 days'` instead gives March 2. Choose a calendar step when the question is about the calendar. [PostgreSQL 18, §9.9](#references)
+
+Converting a local reading to an instant can also require more information. On November 2, 2025 in New York, 01:30 occurs twice. The offsets −04:00 and −05:00 distinguish 05:30 UTC and 06:30 UTC. If an event feed sends only the local clock reading, the source must resolve that ambiguity for us to know which occurrence it recorded. [IANA, Scope and timezone identifiers](#references)
+
+## Group by the shop calendar
+
+A daily report can compute the local day for each event, then group by that value. First convert the instant to the shop clock and cast to `date`. A direct cast from `timestamptz` to `date` would use the session zone.
+
+```sql
+SELECT (paid_at AT TIME ZONE 'America/New_York')::date AS shop_day,
+       COUNT(*) AS orders
+FROM order_events
+GROUP BY shop_day
+ORDER BY shop_day;
+```
+
+| shop_day | orders |
+| --- | --- |
+| 2025-03-08 | 1 |
+| 2025-03-09 | 2 |
+| 2025-03-10 | 1 |
+
+For a month key, use `date_trunc('month', paid_at AT TIME ZONE 'America/New_York')::date`. The conversion picks the shop clock, and `date_trunc` sets the day and time to the start of its month. All four rows have month key `2025-03-01`. Keeping the key as a date also preserves the calendar order when the result is displayed. [PostgreSQL 18, §9.9](#references)
+
+## A text key needs a rule
+
+The shop treats ASCII channel codes as case-insensitive and ignores surrounding spaces. `trim` removes leading and trailing spaces by default. `lower` converts the case using the applicable locale. The example selects the `"C"` collation for ASCII case conversion, so `' WEB '` and `'web'` both yield `'web'`. The rule is specific to channel codes. A free-text customer name needs its own comparison policy.
+
+```sql
+SELECT lower(trim(raw_channel) COLLATE "C") AS channel_key,
+       COUNT(*) AS orders
+FROM order_events
+GROUP BY channel_key
+ORDER BY channel_key NULLS LAST;
+```
+
+| channel_key | orders |
+| --- | --- |
+| web | 3 |
+| NULL | 1 |
+
+`trim(NULL)` and `lower(NULL)` yield `NULL`. The group of one represents an order whose channel is unknown. A string of spaces would instead yield an empty string. If the import contract treats that as missing, `NULLIF(lower(trim(raw_channel) COLLATE "C"), '')` makes that decision explicit. Other transformations serve different contracts. `split_part('web:partner', ':', 1)` gives `web`, whereas `replace('web:partner', ':', '/')` gives `web/partner`. An import with a missing delimiter still needs a rule for malformed source labels. [PostgreSQL 18, §9.4](#references)
+
+Unicode can represent the same abstract character with different code-point sequences. The last letter of `Café` can be U+00E9, or it can be U+0065 followed by U+0301. In a UTF-8 PostgreSQL database, `char_length` counts 4 and 5 characters respectively for the two strings. `octet_length` counts 5 and 6 bytes. NFC normalization composes both examples to the first sequence. It does not supply a case policy, remove punctuation or decide that two business labels mean the same thing. [PostgreSQL 18, §9.4](#references) [Unicode, §§1.1–1.2](#references)
+
+```sql
+SELECT char_length(U&'Caf\00E9') AS composed_chars,
+       octet_length(U&'Caf\00E9') AS composed_bytes,
+       char_length(U&'Cafe\0301') AS decomposed_chars,
+       octet_length(U&'Cafe\0301') AS decomposed_bytes,
+       normalize(U&'Cafe\0301', NFC) AS normalized;
+```
+
+## Next
+
+The report can derive the day and channel keys from the recorded values. To guarantee that every stored position has an identifier, a positive quantity and an existing order, the table needs rules at write time. [Tables and constraints](/notes/sql/tables-and-constraints) expresses those rules in the schema.
+
+## References
+
+1. PostgreSQL Global Development Group. PostgreSQL 18 documentation. [Date/time types, §8.5](https://www.postgresql.org/docs/18/datatype-datetime.html), [date/time functions and operators, §9.9](https://www.postgresql.org/docs/18/functions-datetime.html) and [string functions and operators, §9.4](https://www.postgresql.org/docs/18/functions-string.html) describe the input types, zone conversions and text functions used here.
+2. IANA Time Zone Database. [Theory and pragmatics of the tz code and data](https://data.iana.org/time-zones/tzdb/theory.html). The sections on scope and timezone identifiers explain location-based time zones and clock transitions.
+3. The Unicode Consortium. [Unicode Standard Annex #15, Unicode Normalization Forms](https://www.unicode.org/reports/tr15/), §§1.1–1.2. Defines canonical equivalence and the NFC form.

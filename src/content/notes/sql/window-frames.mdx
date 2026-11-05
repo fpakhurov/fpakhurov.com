@@ -1,0 +1,115 @@
+---
+title: Window frames
+description: "Choose the rows that contribute to a running or moving calculation and explain the effect of ties."
+course: sql
+section: Structuring Queries
+order: 12
+status: published
+tags: [sql, postgresql, window-frames, moving-average, peers]
+prerequisites: ["Window functions"]
+---
+
+import PrefixFrames from '../../../components/figures/sql-window-frames/PrefixFrames.astro';
+
+On 2 January the shop records two tea sales, for 200 and 300 cents. At the first of those rows, should the running total already include the second? The answer depends on whether the total means “through this date” or “through this sale”.
+
+## A partition contains several frames
+
+Use the [seven sales](/notes/sql/window-functions#give-every-row-its-product-total) from the window functions example. We filter to tea, so all five remaining rows form one partition. The **window frame** is the subset of the partition used for a calculation at the current row. Its boundaries move with the current row unless they are fixed at the partition boundaries.
+
+```sql
+SELECT sale_id, sold_on, cents,
+       SUM(cents) OVER (ORDER BY sold_on) AS date_prefix,
+       SUM(cents) OVER (
+           ORDER BY sold_on, sale_id
+           ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+       ) AS row_prefix
+FROM sales
+WHERE product = 'tea'
+ORDER BY sold_on, sale_id;
+```
+
+| Sale ID | Date | Amount | `date_prefix` | `row_prefix` |
+| --- | --- | --- | --- | --- |
+| 201 | 2026-01-01 | 100 | 100 | 100 |
+| 202 | 2026-01-02 | 200 | 600 | 300 |
+| 203 | 2026-01-02 | 300 | 600 | 600 |
+| 204 | 2026-01-05 | 300 | 900 | 900 |
+| 205 | 2026-01-06 | 500 | 1400 | 1400 |
+
+In PostgreSQL an ordered window without an explicit frame uses `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`. It reaches from the start of the partition to the last peer of the current row. Rows with the same `sold_on` are peers here, so both 2 January sales see $100+200+300=600$. The explicit `ROWS` frame follows positions in the ordered partition and ends at the current row. We add `sale_id` to fix the order within a date. Sale 202 then sees only $100+200=300$. Without any window `ORDER BY`, the default frame spans the partition because every row is a peer. ([PostgreSQL 18, §4.2.8](#references), [SQLite, §2.2](#references))
+
+<PrefixFrames />
+
+A display order at the end of the statement cannot fix a tie inside `OVER`. If a `ROWS` frame counts positions and the window sort keys leave ties, the choice of which peer occupies a boundary can vary. A deterministic order in the window needs keys that distinguish those rows.
+
+## Choose what a boundary counts
+
+Suppose the report asks for the current and previous sale, a trailing one-day date range, or the current and previous date with sales. These frames have the same upper-bound spelling, `CURRENT ROW`, and different units for the lower bound.
+
+```sql
+SELECT sale_id, sold_on,
+       SUM(cents) OVER (
+           ORDER BY sold_on, sale_id
+           ROWS BETWEEN 1 PRECEDING AND CURRENT ROW
+       ) AS two_rows,
+       SUM(cents) OVER (
+           ORDER BY sold_on
+           RANGE BETWEEN INTERVAL '1 day' PRECEDING AND CURRENT ROW
+       ) AS date_range,
+       SUM(cents) OVER (
+           ORDER BY sold_on
+           GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW
+       ) AS two_date_groups
+FROM sales
+WHERE product = 'tea'
+ORDER BY sold_on, sale_id;
+```
+
+| Sale ID | `two_rows` | `date_range` | `two_date_groups` |
+| --- | --- | --- | --- |
+| 201 | 100 | 100 | 100 |
+| 202 | 300 | 600 | 600 |
+| 203 | 500 | 600 | 600 |
+| 204 | 600 | 300 | 800 |
+| 205 | 800 | 800 | 800 |
+
+For sale 204 on 5 January, `ROWS` counts one preceding position, sale 203. The sum is $300+300=600$. `RANGE` counts distance in the ordering value. The interval from 4 to 5 January contains only sale 204, giving 300. With an offset in `RANGE`, PostgreSQL requires exactly one window sort expression. `GROUPS` counts groups of peers, so the previous group is both sales on 2 January and the current group is the 5 January sale. The sum is $200+300+300=800$. In `RANGE` and `GROUPS`, a `CURRENT ROW` bound includes all the current peers on that side of the frame. ([PostgreSQL 18, §4.2.8](#references), [SQLite, §2.2](#references), [DuckDB 1.4, Framing](#references))
+
+The date range includes its endpoints. It does not create records for missing dates. A range aggregate over sales counts the rows that exist. If the report needs one row per day and days without sales should contribute zero, first build a calendar result and join daily totals to it.
+
+## Average a moving pair and find the actual last value
+
+A moving average uses the same bounds as a moving sum. `AVG` divides the sum of non-null amounts by their count. At sale 201 there is only one row in the two-position frame, so the mean is 100. At sale 205 it uses sales 204 and 205, giving $(300+500)/2=400$. Frames stop at the partition boundary.
+
+```sql
+SELECT sale_id,
+       AVG(cents) OVER (
+           ORDER BY sold_on, sale_id
+           ROWS BETWEEN 1 PRECEDING AND CURRENT ROW
+       ) AS two_row_mean,
+       LAST_VALUE(cents) OVER (
+           ORDER BY sold_on, sale_id
+       ) AS last_in_prefix,
+       LAST_VALUE(cents) OVER (
+           ORDER BY sold_on, sale_id
+           ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+       ) AS last_in_partition
+FROM sales
+WHERE product = 'tea'
+ORDER BY sold_on, sale_id;
+```
+
+At sale 202 the three calculated values are 150, 200 and 500. The first value averages 100 and 200. The second comes from `LAST_VALUE`, which reads the last row of its frame. With the default frame and unique ordering keys, that row is sale 202 itself. The third expression sets both partition endpoints, so every sale reads the final amount 500. `LAG` and `LEAD` from the previous note use offsets in the ordered partition, so narrowing the frame does not make them stop at its edges. ([PostgreSQL 18, §9.22](#references), [SQLite, §3](#references))
+
+A frame can even be empty, for instance a frame from `1 FOLLOWING` to `1 FOLLOWING` at the last row in `ROWS` mode. `COUNT(*)` then returns zero, and `SUM` or `AVG` returns `NULL`. Zero is an extra choice about the meaning of a missing result. ([PostgreSQL 18, §9.21](#references))
+
+## Next
+
+The value-based frame used calendar dates. For a timestamp, “all sales on 5 January” also needs a time zone and a precise cutoff. [Dates, time and text](/notes/sql/dates-and-text) develops those boundaries and distinguishes typed dates from their textual display.
+
+## References
+
+1. PostgreSQL Global Development Group. PostgreSQL 18 documentation. [Window Function Calls](https://www.postgresql.org/docs/18/sql-expressions.html#SYNTAX-WINDOW-FUNCTIONS), §4.2.8, [Aggregate Functions](https://www.postgresql.org/docs/18/functions-aggregate.html), §9.21, and [Window Functions](https://www.postgresql.org/docs/18/functions-window.html), §9.22. Define frame types, default bounds and the behaviour of individual functions.
+2. SQLite Project. [Window Functions](https://www.sqlite.org/windowfunctions.html), §§2.2 and 3. Compares frame units and identifies the built-in functions that use the frame.
+3. DuckDB Foundation. [Window Functions](https://duckdb.org/docs/1.4/sql/functions/window_functions#framing), DuckDB 1.4, Framing. Includes moving aggregates with date gaps and a value-based range.

@@ -1,0 +1,98 @@
+---
+title: Common table expressions and views
+description: "Name stages of a query, decide where to keep the definition, and follow a recursive query until it stops."
+course: sql
+section: Structuring Queries
+order: 10
+status: published
+tags: [sql, postgresql, cte, with, views, recursion]
+prerequisites: ["Set operations"]
+---
+
+import OrderTotalsStages from '../../../components/figures/sql-ctes-and-views/OrderTotalsStages.astro';
+
+The shop wants the orders worth at least 1200 cents. Starting from [six positions](/notes/sql/tables-and-queries#a-reproducible-table), we compute a line amount, sum those amounts by order and filter the sums. Two reports need the same line amount. A third needs to unpack nested bundles, so the number of stages depends on the data.
+
+## Give each stage a name
+
+A **common table expression** (CTE) is a named query result available within a single statement. In a `WITH` clause, write the name and put the query in parentheses after `AS`. The first CTE below has one row per position. The second reads that result and produces one row per order. Run the order-line setup from the [first query](/notes/sql/tables-and-queries#a-reproducible-table) before running this example. ([PostgreSQL 18, §7.8.1](#references), [SQLite, §2](#references))
+
+```sql
+WITH line_amounts AS (
+    SELECT order_id, line_no, quantity * unit_price_cents AS cents
+    FROM order_lines
+),
+order_totals AS (
+    SELECT order_id, SUM(cents) AS total_cents
+    FROM line_amounts
+    GROUP BY order_id
+)
+SELECT order_id, total_cents
+FROM order_totals
+WHERE total_cents >= 1200
+ORDER BY order_id;
+```
+
+The first two positions give order 101 a sum of $700+600=1300$ cents. Order 102 contributes 350, order 103 contributes $1200+350=1550$ and order 104 contributes 1200. The main `SELECT` keeps orders 101, 103 and 104 with totals 1300, 1550 and 1200. Order 104 qualifies exactly at the threshold.
+
+<OrderTotalsStages />
+
+The final `WHERE` reads a result that already contains one row per order. Filtering the first CTE by `cents >= 1200` would ask which individual positions reach the threshold. It would lose both positions of order 101, even though their combined total qualifies. Reading the grain at each named boundary makes this difference visible.
+
+The names describe logical inputs. They do not prescribe a storage plan. In PostgreSQL a non-recursive, side-effect-free `SELECT` CTE can be folded into its parent, ordinarily when referenced once. A multiply referenced CTE is ordinarily evaluated separately. DuckDB 1.4 documents a different default and inlining heuristics. The query above uses names for composition, without relying on either engine's execution choices. ([PostgreSQL 18, §7.8.3](#references), [DuckDB 1.4, WITH](#references))
+
+## Keep a definition between statements
+
+A later statement cannot refer to the earlier CTE. If several queries need the same formula for line amount, a **view** gives the query definition a name in the database. The example uses a temporary view because the source table is temporary. Other statements in this session can use it until the session ends.
+
+```sql
+CREATE TEMP VIEW line_amounts AS
+SELECT order_id, line_no, quantity * unit_price_cents AS cents
+FROM order_lines;
+
+SELECT order_id, SUM(cents) AS total_cents
+FROM line_amounts
+GROUP BY order_id
+HAVING SUM(cents) >= 1200
+ORDER BY order_id;
+```
+
+The result is the same three orders. PostgreSQL evaluates an ordinary view against the data visible to the query that reads it. If a new 200-cent position is added to order 104 and is visible to the next read, the amount for that order becomes 1400. A **materialized view** stores query results and can keep an earlier value until refreshed. Changing a view's underlying logic can change every consumer, so treat its column names, types and meaning as an interface. ([PostgreSQL 18, CREATE VIEW and §39.3](#references))
+
+## Follow an unknown number of steps
+
+A gift bundle contains tea and coffee. The tea contains leaves. Suppose a faulty catalogue also lists the gift bundle inside its own leaf entry. A fixed chain of joins can follow a fixed number of links. A recursive CTE lets each result of one step become an input for the next.
+
+```sql
+WITH RECURSIVE
+edges(bundle, part) AS (
+    VALUES ('gift', 'tea'), ('gift', 'coffee'),
+           ('tea', 'leaf'), ('leaf', 'gift')
+),
+walk(item, depth, path) AS (
+    SELECT 'gift'::text, 0, ARRAY['gift']::text[]
+    UNION ALL
+    SELECT e.part, w.depth + 1, w.path || e.part
+    FROM walk AS w
+    JOIN edges AS e ON e.bundle = w.item
+    WHERE NOT (e.part = ANY(w.path))
+)
+SELECT item, depth
+FROM walk
+WHERE depth > 0
+ORDER BY depth, item;
+```
+
+The first branch gives the starting row `gift` at depth 0. The recursive branch reads the current working rows of `walk`, follows the edges that start at those items and creates a new group of working rows. At depth 1 it finds `coffee` and `tea`. At depth 2 only tea contributes another row, `leaf`. The next candidate would revisit `gift`. It is already in the path, so the predicate rejects it. The working set becomes empty and the query stops. The outer `WHERE` omits the seed, giving `(coffee, 1)`, `(tea, 1)` and `(leaf, 2)` in the requested order. ([PostgreSQL 18, §7.8.2](#references), [SQLite, §§3.2–3.3](#references))
+
+The path check is local to one route. If two different branches reach the same item, both paths can produce it. The output grain is a visit along a path. Use a separate projection and deduplication if the report needs only reachable item names. Replacing `UNION ALL` with `UNION` does not by itself stop revisits when the output also records depth or path, since those fields change on each visit. An outer `ORDER BY` requests presentation order without dictating how the engine traverses the graph. ([PostgreSQL 18, §§7.8.2.1–7.8.2.2](#references))
+
+## Next
+
+The totals query replaced several lines with one row per order. To keep every line while displaying its order total or the amount of the preceding line, we need a calculation that leaves the row grain intact. [Window functions](/notes/sql/window-functions) provide that operation.
+
+## References
+
+1. PostgreSQL Global Development Group. PostgreSQL 18 documentation. [WITH Queries](https://www.postgresql.org/docs/18/queries-with.html), §§7.8.1–7.8.3, [CREATE VIEW](https://www.postgresql.org/docs/18/sql-createview.html) and [Materialized Views](https://www.postgresql.org/docs/18/rules-materializedviews.html) define scope, evaluation, recursion and stored results.
+2. SQLite Project. [The WITH Clause](https://www.sqlite.org/lang_with.html), §§2–3.3. Shows statement-scoped definitions and recursive traversal of hierarchies and graphs.
+3. DuckDB Foundation. [WITH Clause](https://duckdb.org/docs/1.4/sql/query_syntax/with), DuckDB 1.4, CTE Materialization. Describes the engine's materialization and inlining rules.

@@ -1,0 +1,178 @@
+---
+title: SQL from Python
+description: "Send values separately from SQL text, consume a result in batches and put two writes inside one Python transaction block."
+course: sql
+section: Python and SQL
+order: 17
+status: published
+tags: [sql, postgresql, python, psycopg, parameters, cursors]
+prerequisites: [Transactions at the client, Files and exceptions, "Iteration, comprehensions and generators"]
+---
+
+import BindValue from '../../../components/figures/sql-from-python/BindValue.astro';
+
+The shop's program receives a product name and retrieves the matching order lines. For `tea`, the result contains three rows. The next name can contain a quote. If we insert it between quotes in a string of SQL, that quote can end the value early. The database then parses some of the input as part of the command.
+
+## Send a statement and its values
+
+A **connection** represents a conversation with the database. A **cursor** runs a command on that connection and gives the program access to the result. Python's DB-API specifies the common connection and cursor methods. The placeholder syntax is driver-specific. Psycopg uses `%s` for a positional value regardless of whether the Python value is a string or an integer. [PEP 249, Module Interface and Cursor Objects](#references) [Psycopg 3, Passing parameters](#references)
+
+```python
+def find_lines(conn, product):
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT order_id, line_no, quantity
+            FROM order_lines
+            WHERE product = %s
+            ORDER BY order_id, line_no
+            """,
+            (product,),
+        )
+        return cur.fetchall()
+```
+
+The comma makes `(product,)` a one-element tuple. Leave the placeholder unquoted and pass the tuple as the second argument to `execute()`. With the ordinary Psycopg cursor, the driver sends a query containing a parameter and sends its value separately. PostgreSQL parses the statement with the parameter in the comparison. It then binds the string as a value. Even `tea' OR TRUE --` is one product name. It has no matches in the example. [Psycopg 3, Passing parameters](#references) [PostgreSQL 18, §54.2.3](#references)
+
+<BindValue />
+
+The cursor returns each row as a tuple by default. The three fields above are integers, so the results for `tea` are `[(101, 1, 2), (102, 1, 1), (103, 2, 1)]`. Psycopg maps a PostgreSQL integer result to a Python `int`, `numeric` to a `Decimal`, and SQL `NULL` to `None`. A database type still constrains what can be stored. Passing a large Python integer does not expand the type of an existing PostgreSQL column. [Psycopg 3, Adapting basic Python types](#references)
+
+## A column name is part of the statement
+
+Suppose the program also lets a caller choose a column to display. `SELECT %s` returns a supplied value. If the value is the string `quantity`, it returns that text, whereas `SELECT quantity` reads a column. In SQL, a column name is an **identifier**. It is resolved as part of the statement structure.
+
+```python
+from psycopg import sql
+
+def values_for_order(conn, order_id, field):
+    allowed_fields = {"product", "quantity"}
+    if field not in allowed_fields:
+        raise ValueError("Unknown field")
+
+    statement = sql.SQL(
+        "SELECT {} FROM order_lines WHERE order_id = %s ORDER BY line_no"
+    ).format(sql.Identifier(field))
+
+    with conn.cursor() as cur:
+        cur.execute(statement, (order_id,))
+        return [value for (value,) in cur]
+```
+
+`Identifier` quotes the name as an identifier. The set of allowed fields decides what the caller may select. Those are separate decisions. The order number still enters as a value parameter. For order 101 and field `quantity`, the list is `[2, 1]`. [Psycopg 3, SQL string composition](#references)
+
+## Read a large result in batches
+
+`find_lines()` builds a list of all matching rows. Iterating over an ordinary Psycopg cursor can avoid that list, but the cursor has already received the result on the client. To fetch rows in batches from PostgreSQL, give the cursor a name. The server holds a cursor for the query and the driver fetches pieces of its result as the loop advances. [Psycopg 3, Cursor types](#references)
+
+```python
+def print_large_lines(conn, minimum_cents):
+    with conn.cursor(name="line_amounts") as cur:
+        cur.itersize = 2
+        cur.execute(
+            """
+            SELECT order_id, line_no, quantity * unit_price_cents AS amount_cents
+            FROM order_lines
+            WHERE quantity * unit_price_cents >= %s
+            ORDER BY order_id, line_no
+            """,
+            (minimum_cents,),
+        )
+        for order_id, line_no, amount_cents in cur:
+            print(order_id, line_no, amount_cents)
+```
+
+With a threshold of 700, this query yields three rows. The loop can receive two rows in one batch and the third in the next. The batch size limits how many rows are requested at a time. It does not bound the byte size of a large row, and PostgreSQL can still need its own working memory to compute or sort the result. The connection, transaction and named cursor stay open during iteration. Finish consuming the result inside their contexts. [Psycopg 3, Cursor types](#references)
+
+## Put the transaction around the whole operation
+
+The [stock and reservation example](/notes/sql/transactions#where-does-one-operation-end) has two steps. A missing result from `UPDATE ... RETURNING` means there is no stock change to pair with a new reservation. It needs a deliberate failure path.
+
+```python
+def reserve(conn, reservation_id, product, quantity):
+    if quantity <= 0:
+        raise ValueError("Quantity must be positive")
+
+    with conn.transaction():
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE stock
+                SET available = available - %s
+                WHERE product = %s AND available >= %s
+                RETURNING available
+                """,
+                (quantity, product, quantity),
+            )
+            row = cur.fetchone()
+            if row is None:
+                raise ValueError("No matching stock with enough units")
+
+            cur.execute(
+                "INSERT INTO reservations VALUES (%s, %s, %s)",
+                (reservation_id, product, quantity),
+            )
+            return row[0]
+```
+
+Call `reserve()` on an idle connection. Its transaction context commits on normal exit and rolls back if an exception leaves the block. This includes a duplicate reservation error after a successful update. If there is already a transaction, Psycopg uses a savepoint for the nested block and the outer transaction decides when the changes become permanent. A return value from a nested block only reports the new count inside that still-open outer transaction. [Psycopg 3, Transactions management](#references)
+
+A new Psycopg connection normally starts a transaction with the first command, even a `SELECT`. A connection context closes the connection on exit and handles an open transaction. When the application needs a precise boundary, it can enable autocommit and open an explicit `conn.transaction()` for the related work. The outer connection context owns the connection lifetime. The inner transaction context owns the changes. [Psycopg 3, Transactions management](#references)
+
+## Run the three queries
+
+Use a fresh PostgreSQL database connection and Psycopg 3. The [Python notes on environments](/notes/python/modules-and-packages#why-environments-exist) explain how to isolate the dependency. Install `psycopg[binary]` in that environment and put the connection string for your database in `SHOP_DSN`. Put the imports and functions above in one file, followed by the block below. It builds the opening [order-line sample](/notes/sql/tables-and-queries#what-does-one-row-mean) in a temporary table in the same session.
+
+```python
+import os
+import psycopg
+
+with psycopg.connect(os.environ["SHOP_DSN"], autocommit=True) as conn:
+    with conn.transaction():
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TEMP TABLE order_lines (
+                    order_id integer, line_no integer, product text,
+                    quantity integer, unit_price_cents integer
+                )
+                """
+            )
+            cur.executemany(
+                "INSERT INTO order_lines VALUES (%s, %s, %s, %s, %s)",
+                [
+                    (101, 1, "tea", 2, 350),
+                    (101, 2, "coffee", 1, 600),
+                    (102, 1, "tea", 1, 350),
+                    (103, 1, "coffee", 2, 600),
+                    (103, 2, "tea", 1, 350),
+                    (104, 1, "cocoa", 3, 400),
+                ],
+            )
+
+        print(find_lines(conn, "tea"))
+        print(find_lines(conn, "tea' OR TRUE --"))
+        print(values_for_order(conn, 101, "quantity"))
+        print_large_lines(conn, 700)
+```
+
+```text
+[(101, 1, 2), (102, 1, 1), (103, 2, 1)]
+[]
+[2, 1]
+101 1 700
+103 1 1200
+104 1 1200
+```
+
+Closing the connection removes the temporary table. The three read functions use it before that point. The write function instead expects the `stock` and `reservations` tables from the transaction example.
+
+## Next
+
+A client expresses the query, sends its parameters and chooses a transaction boundary. The server still decides how to find the rows and coordinate with other sessions. [Why databases exist](/notes/databases/why-databases) starts from the shared state these mechanisms have to protect.
+
+## References
+
+1. Marc-André Lemburg. [PEP 249. Python Database API Specification v2.0](https://peps.python.org/pep-0249/), 1999. Module Interface, Connection Objects and Cursor Objects specify parameters, fetching and transaction methods.
+2. Psycopg contributors. Psycopg 3 documentation. [Passing parameters](https://www.psycopg.org/psycopg3/docs/basic/params.html), [SQL composition](https://www.psycopg.org/psycopg3/docs/api/sql.html), [type adaptation](https://www.psycopg.org/psycopg3/docs/basic/adapt.html), [cursor types](https://www.psycopg.org/psycopg3/docs/advanced/cursors.html) and [transactions](https://www.psycopg.org/psycopg3/docs/basic/transactions.html) give the behavior of the driver used here.
+3. PostgreSQL Global Development Group. [PostgreSQL 18 documentation, §54.2.3 Extended Query](https://www.postgresql.org/docs/18/protocol-flow.html#PROTOCOL-FLOW-EXT-QUERY), 2025. Describes parsing, parameter binding and execution as separate protocol steps.

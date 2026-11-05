@@ -1,0 +1,118 @@
+---
+title: Transactions at the client
+description: "Group a stock change and a reservation into one operation, then trace what commit, rollback and a savepoint do to the rows."
+course: sql
+section: Changing Data
+order: 16
+status: published
+tags: [sql, postgresql, transactions, rollback, savepoints]
+prerequisites: [Changing rows and handling conflicts]
+---
+
+import ReservationState from '../../../components/figures/sql-transactions/ReservationState.astro';
+
+Five packs of tea are available. To reserve two, the shop subtracts two from available stock and inserts a reservation. The second command can fail if the reservation number has already been used. The first command by itself leaves three available packs and no record of the new reservation.
+
+## Where does one operation end?
+
+Use a fresh PostgreSQL session. The available count excludes units already reserved. The starting count of five therefore already accounts for reservation 700.
+
+```sql
+CREATE TEMP TABLE stock (
+    product text PRIMARY KEY,
+    available integer NOT NULL CHECK (available >= 0)
+);
+
+CREATE TEMP TABLE reservations (
+    reservation_id integer PRIMARY KEY,
+    product text NOT NULL REFERENCES stock (product),
+    quantity integer NOT NULL CHECK (quantity > 0)
+);
+
+INSERT INTO stock VALUES ('tea', 5);
+INSERT INTO reservations VALUES (700, 'tea', 1);
+```
+
+A **transaction** is a group of commands whose database changes can take effect together. In PostgreSQL, every ordinary command runs in a transaction. When the client sends each command separately and uses autocommit, a successful update can commit before a later insert starts. The duplicate-key error rolls back the insert's own transaction. It leaves the already committed stock count at three. SQLite also opens an implicit transaction when a statement needs one, though the rule for when an implicit transaction finishes depends on the engine and client. [PostgreSQL 18, §3.4](#references) [SQLite, §2](#references)
+
+## Undo the whole reservation
+
+Start the transaction before the first change. In the following block, the stock update can change one row. The following insert deliberately uses the occupied identifier.
+
+```sql
+BEGIN;
+
+UPDATE stock
+SET available = available - 2
+WHERE product = 'tea' AND available >= 2
+RETURNING available;
+
+INSERT INTO reservations VALUES (700, 'tea', 2);
+
+ROLLBACK;
+```
+
+The update returns `3`. The insert reports a unique violation. After that error the PostgreSQL transaction is in an aborted state. The client must end it with `ROLLBACK`, or recover from a previously established savepoint, before it can continue with ordinary statements in it. In an interactive session, issue `ROLLBACK` after the error. An application needs an error path that makes the same decision. [PostgreSQL 18, §3.4](#references)
+
+<ReservationState />
+
+After rollback, `SELECT available FROM stock WHERE product = 'tea'` returns 5. Reservation 700 still has quantity 1. The failed operation left neither of its proposed effects. The rollback affects the work since `BEGIN`. It leaves previously committed work intact.
+
+## Commit only when the steps succeeded
+
+Use the same update and a new reservation number. Before inserting, the client checks that `RETURNING` produced one row. If it produced zero rows, the product was absent or its stock was insufficient at the update. Both conditions call for a rollback and no reservation. An update of zero rows is a successful SQL statement. It does not raise an error. [PostgreSQL 18, UPDATE](#references)
+
+```sql
+BEGIN;
+
+UPDATE stock
+SET available = available - 2
+WHERE product = 'tea' AND available >= 2
+RETURNING available;
+
+-- Continue only when the update returned one row.
+INSERT INTO reservations VALUES (701, 'tea', 2);
+
+COMMIT;
+```
+
+In the sample, the update returns one row with 3. The committed result has three available packs and a new reservation of two. An open transaction can read its own writes before `COMMIT`. Other transactions can only read the new committed changes when their read rules allow them to see that commit. Those rules depend on isolation, which the [opening Databases note](/notes/databases/why-databases#when-a-payment-takes-two-writes) illustrates with two sessions.
+
+Some drivers manage the boundary for us. The Python DB-API exposes `commit()` and `rollback()` on the connection. A driver can start a transaction implicitly on the first statement. The application still decides which operations belong in that boundary and how to react to a missing row or an exception. [PEP 249, Connection methods](#references)
+
+## Keep the part before a savepoint
+
+The next reservation is for one pack. Within a transaction we reduce the count from three to two. We then record a savepoint and insert the line with the wrong quantity. We can return to the mark and record the correct quantity without repeating the stock update.
+
+```sql
+BEGIN;
+
+UPDATE stock
+SET available = available - 1
+WHERE product = 'tea' AND available >= 1
+RETURNING available;
+
+-- Continue only when the update returned one row.
+SAVEPOINT before_reservation;
+INSERT INTO reservations VALUES (702, 'tea', 2);
+
+ROLLBACK TO SAVEPOINT before_reservation;
+INSERT INTO reservations VALUES (702, 'tea', 1);
+RELEASE SAVEPOINT before_reservation;
+
+COMMIT;
+```
+
+`ROLLBACK TO` discards the first insert. The update is earlier than the mark and remains in the open transaction. Releasing the savepoint removes the mark and leaves the effects of the corrected insert pending. Only the final `COMMIT` completes the transaction. The resulting count is 2 and reservation 702 has quantity 1. [PostgreSQL 18, SAVEPOINT and ROLLBACK TO](#references)
+
+A database transaction coordinates changes made inside that database. If the client also sends a notification over the network, database rollback cannot recall it. Even within the database, a transaction can commit an incorrect quantity if the client used the wrong value and no constraint rejected it. The boundary groups the steps. The caller and schema still have to encode the right steps.
+
+## Next
+
+The conditional comments mark a decision that an application must make after reading a result. [SQL from Python](/notes/sql/sql-from-python) shows how a program sends parameters, reads rows and lets a transaction context handle commit or rollback.
+
+## References
+
+1. PostgreSQL Global Development Group. PostgreSQL 18 documentation, 2025. [Transactions, §3.4](https://www.postgresql.org/docs/18/tutorial-transactions.html) covers implicit and explicit transactions. [UPDATE](https://www.postgresql.org/docs/18/sql-update.html) specifies the row count and `RETURNING`. [SAVEPOINT](https://www.postgresql.org/docs/18/sql-savepoint.html), [ROLLBACK TO](https://www.postgresql.org/docs/18/sql-rollback-to.html) and [RELEASE](https://www.postgresql.org/docs/18/sql-release-savepoint.html) give the scope of a savepoint.
+2. SQLite Project. [Transaction](https://www.sqlite.org/lang_transaction.html), §2. Describes SQLite's implicit and explicit transaction boundaries.
+3. Marc-André Lemburg. [PEP 249. Python Database API Specification v2.0](https://peps.python.org/pep-0249/#connection-methods), 1999. Defines `commit()`, `rollback()` and the initial autocommit setting for transaction-capable drivers.

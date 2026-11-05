@@ -1,0 +1,178 @@
+---
+title: SQL из Python
+description: "Передаём значения отдельно от текста SQL, читаем результат порциями и выполняем две записи в одной транзакции из Python."
+course: sql
+section: Python и SQL
+order: 17
+status: published
+tags: [sql, postgresql, python, psycopg, parameters, cursors]
+prerequisites: [Транзакции со стороны клиента, Файлы и исключения, "Итерация, включения и генераторы"]
+---
+
+import BindValue from '../../../components/figures/sql-from-python/BindValue.astro';
+
+Программа магазина получает название товара и читает подходящие позиции заказа. Для `tea` результат содержит три строки. Следующее название может содержать апостроф. Если подставить такое название между кавычками в строке SQL, апостроф может закончить значение раньше времени. Тогда база разберёт часть ввода как часть команды.
+
+## Команда и значения передаются отдельно \{#send-a-statement-and-its-values\}
+
+**Соединение** (connection) представляет обмен с базой данных. **Курсор** (cursor) выполняет команду на этом соединении и даёт программе доступ к результату. Python DB-API определяет общие методы соединений и курсоров. Синтаксис плейсхолдеров зависит от драйвера. Psycopg использует `%s` для позиционного значения, будь это строка или целое число. [PEP 249, Module Interface и Cursor Objects](#references) [Psycopg 3, Passing parameters](#references)
+
+```python
+def find_lines(conn, product):
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT order_id, line_no, quantity
+            FROM order_lines
+            WHERE product = %s
+            ORDER BY order_id, line_no
+            """,
+            (product,),
+        )
+        return cur.fetchall()
+```
+
+Запятая превращает `(product,)` в кортеж из одного элемента. Плейсхолдер оставляем без кавычек, кортеж передаём вторым аргументом в `execute()`. В обычном курсоре Psycopg драйвер посылает запрос с параметром и отдельно передаёт его значение. PostgreSQL разбирает команду с параметром в сравнении, затем связывает с ним строку. Даже `tea' OR TRUE --` целиком передаётся как одно название. В примере таких товаров нет. [Psycopg 3, Passing parameters](#references) [PostgreSQL 18, §54.2.3](#references)
+
+<BindValue />
+
+По умолчанию курсор возвращает каждую строку как кортеж. Все три поля целочисленные, поэтому результат для `tea` равен `[(101, 1, 2), (102, 1, 1), (103, 2, 1)]`. Psycopg преобразует целые числа PostgreSQL в `int`, `numeric` в `Decimal`, а SQL `NULL` в `None`. Тип базы по-прежнему ограничивает допустимые значения. Передача большого целого числа Python не расширяет тип существующего столбца PostgreSQL. [Psycopg 3, Adapting basic Python types](#references)
+
+## Имя столбца входит в текст команды \{#a-column-name-is-part-of-the-statement\}
+
+Пусть программа позволяет выбрать столбец для отображения. `SELECT %s` возвращает переданное значение. Для строки `quantity` это будет сам текст. `SELECT quantity` читает столбец. Имя столбца в SQL — **идентификатор** (identifier). Оно разрешается как часть структуры команды.
+
+```python
+from psycopg import sql
+
+def values_for_order(conn, order_id, field):
+    allowed_fields = {"product", "quantity"}
+    if field not in allowed_fields:
+        raise ValueError("Unknown field")
+
+    statement = sql.SQL(
+        "SELECT {} FROM order_lines WHERE order_id = %s ORDER BY line_no"
+    ).format(sql.Identifier(field))
+
+    with conn.cursor() as cur:
+        cur.execute(statement, (order_id,))
+        return [value for (value,) in cur]
+```
+
+`Identifier` заключает имя в кавычки по правилам SQL для идентификаторов. Множество разрешённых полей определяет, что можно выбрать. Номер заказа по-прежнему передаётся как параметр-значение. Для заказа 101 и поля `quantity` получаем список `[2, 1]`. [Psycopg 3, SQL string composition](#references)
+
+## Большой результат читаем порциями \{#read-a-large-result-in-batches\}
+
+`find_lines()` строит список всех подходящих строк. Итерация по обычному курсору Psycopg позволяет обойтись без этого списка, но курсор уже получил весь результат на стороне клиента. Чтобы выбирать строки из PostgreSQL порциями, дадим курсору имя. Сервер хранит курсор для запроса, а драйвер забирает части результата по ходу цикла. [Psycopg 3, Cursor types](#references)
+
+```python
+def print_large_lines(conn, minimum_cents):
+    with conn.cursor(name="line_amounts") as cur:
+        cur.itersize = 2
+        cur.execute(
+            """
+            SELECT order_id, line_no, quantity * unit_price_cents AS amount_cents
+            FROM order_lines
+            WHERE quantity * unit_price_cents >= %s
+            ORDER BY order_id, line_no
+            """,
+            (minimum_cents,),
+        )
+        for order_id, line_no, amount_cents in cur:
+            print(order_id, line_no, amount_cents)
+```
+
+Для порога 700 запрос возвращает три строки. Цикл может получить две строки первой порцией и третью следующей. Размер порции ограничивает число строк, запрашиваемых за один раз. Объём отдельной строки в байтах он не ограничивает, а PostgreSQL может понадобиться рабочая память для вычисления или сортировки. Соединение, транзакция и именованный курсор остаются открытыми во время итерации. Чтение заканчиваем внутри их контекстов. [Psycopg 3, Cursor types](#references)
+
+## Транзакция охватывает всю операцию \{#put-the-transaction-around-the-whole-operation\}
+
+В [примере с остатком и бронью](/ru/notes/sql/transactions#where-does-one-operation-end) два шага. Если `UPDATE ... RETURNING` не вернул строку, изменения остатка не произошло. Вставку брони в таком случае нужно отменить явным решением.
+
+```python
+def reserve(conn, reservation_id, product, quantity):
+    if quantity <= 0:
+        raise ValueError("Quantity must be positive")
+
+    with conn.transaction():
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE stock
+                SET available = available - %s
+                WHERE product = %s AND available >= %s
+                RETURNING available
+                """,
+                (quantity, product, quantity),
+            )
+            row = cur.fetchone()
+            if row is None:
+                raise ValueError("No matching stock with enough units")
+
+            cur.execute(
+                "INSERT INTO reservations VALUES (%s, %s, %s)",
+                (reservation_id, product, quantity),
+            )
+            return row[0]
+```
+
+Вызываем `reserve()` на соединении без открытой транзакции. Контекст транзакции фиксирует изменения при нормальном выходе и откатывает их, если из блока выходит исключение. Так произойдёт и при ошибке повторяющегося номера брони после успешного обновления. Если транзакция уже открыта, Psycopg использует для вложенного блока точку сохранения. Момент окончательной фиксации тогда определяет внешняя транзакция. Возвращённое значение из вложенного блока сообщает лишь новый остаток внутри этой ещё открытой транзакции. [Psycopg 3, Transactions management](#references)
+
+Новое соединение Psycopg обычно начинает транзакцию при первой команде, даже при `SELECT`. Контекст соединения при выходе обрабатывает открытую транзакцию и закрывает соединение. Когда приложению нужна точная граница, можно включить автофиксацию и явно открыть `conn.transaction()` для связанных шагов. Внешний контекст управляет временем жизни соединения. Внутренний управляет изменениями. [Psycopg 3, Transactions management](#references)
+
+## Запуск трёх запросов \{#run-the-three-queries\}
+
+Используем новое соединение PostgreSQL и Psycopg 3. В [конспекте про окружения](/ru/notes/python/modules-and-packages#why-environments-exist) описано, как изолировать зависимость. Устанавливаем `psycopg[binary]` в это окружение и передаём строку подключения к своей базе через `SHOP_DSN`. Собираем импорты и функции выше в один файл, затем добавляем блок ниже. Он создаёт [исходный пример с позициями заказов](/ru/notes/sql/tables-and-queries#what-does-one-row-mean) во временной таблице в том же сеансе.
+
+```python
+import os
+import psycopg
+
+with psycopg.connect(os.environ["SHOP_DSN"], autocommit=True) as conn:
+    with conn.transaction():
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TEMP TABLE order_lines (
+                    order_id integer, line_no integer, product text,
+                    quantity integer, unit_price_cents integer
+                )
+                """
+            )
+            cur.executemany(
+                "INSERT INTO order_lines VALUES (%s, %s, %s, %s, %s)",
+                [
+                    (101, 1, "tea", 2, 350),
+                    (101, 2, "coffee", 1, 600),
+                    (102, 1, "tea", 1, 350),
+                    (103, 1, "coffee", 2, 600),
+                    (103, 2, "tea", 1, 350),
+                    (104, 1, "cocoa", 3, 400),
+                ],
+            )
+
+        print(find_lines(conn, "tea"))
+        print(find_lines(conn, "tea' OR TRUE --"))
+        print(values_for_order(conn, 101, "quantity"))
+        print_large_lines(conn, 700)
+```
+
+```text
+[(101, 1, 2), (102, 1, 1), (103, 2, 1)]
+[]
+[2, 1]
+101 1 700
+103 1 1200
+104 1 1200
+```
+
+При закрытии соединения временная таблица исчезает. Три функции чтения используют её до этого момента. Функция записи ожидает таблицы `stock` и `reservations` из примера с транзакцией.
+
+## Дальше \{#next\}
+
+Клиент формулирует запрос, передаёт параметры и выбирает границу транзакции. Сервер решает, как найти строки и согласовать работу сеансов. Конспект [«Зачем нужны базы данных»](/ru/notes/databases/why-databases) начинает с общего состояния, которое должны защищать эти механизмы.
+
+## Источники \{#references\}
+
+1. Marc-André Lemburg. [PEP 249. Python Database API Specification v2.0](https://peps.python.org/pep-0249/), 1999. Разделы Module Interface, Connection Objects и Cursor Objects описывают параметры, чтение результатов и методы транзакций.
+2. Psycopg contributors. Документация Psycopg 3. [Passing parameters](https://www.psycopg.org/psycopg3/docs/basic/params.html), [SQL composition](https://www.psycopg.org/psycopg3/docs/api/sql.html), [type adaptation](https://www.psycopg.org/psycopg3/docs/basic/adapt.html), [cursor types](https://www.psycopg.org/psycopg3/docs/advanced/cursors.html) и [transactions](https://www.psycopg.org/psycopg3/docs/basic/transactions.html) описывают поведение драйвера.
+3. PostgreSQL Global Development Group. [PostgreSQL 18 documentation, §54.2.3 Extended Query](https://www.postgresql.org/docs/18/protocol-flow.html#PROTOCOL-FLOW-EXT-QUERY), 2025. Описывает разбор, связывание параметров и выполнение как отдельные этапы протокола.
