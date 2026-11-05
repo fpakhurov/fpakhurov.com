@@ -1,4 +1,6 @@
-export type CourseKey = 'probability' | 'ml' | 'deep-learning' | 'bayesian-methods' | 'generative-models' | 'nlp' | 'acos' | 'agents' | 'math' | 'python' | 'devops' | 'mlops';
+import { dataEngineeringCourses } from './dataEngineering';
+
+export type CourseKey = 'probability' | 'ml' | 'deep-learning' | 'bayesian-methods' | 'generative-models' | 'nlp' | 'acos' | 'agents' | 'math' | 'python' | 'devops' | 'mlops' | 'sql' | 'databases' | 'big-data';
 
 export type CourseTopic = string | { title: string; note: string; anchor?: string };
 
@@ -48,6 +50,7 @@ function noteTopic(title: string, note: string, anchor?: string): CourseTopic {
 }
 
 export const courses: Record<CourseKey, Course> = {
+  ...dataEngineeringCourses,
   probability: {
     title: 'Probability Theory',
     requires: [],
@@ -1765,9 +1768,8 @@ export function sectionOf(course: CourseKey, noteId: string): string | undefined
   return courses[course].sections.find((section) => section.topics.some((topic) => typeof topic !== 'string' && topic.note === noteId && !topic.anchor))?.title;
 }
 
-// Course numbers shown on course pages and in the graph follow the order of study: the machine-learning
-// track first, then the systems track. The test below keeps the list complete.
-export const learningOrder: CourseKey[] = ['probability', 'math', 'python', 'ml', 'deep-learning', 'bayesian-methods', 'generative-models', 'nlp', 'agents', 'acos', 'devops', 'mlops'];
+// Keep the course numbers stable as the machine-learning, systems and data-engineering routes grow.
+export const learningOrder: CourseKey[] = ['probability', 'math', 'python', 'ml', 'deep-learning', 'bayesian-methods', 'generative-models', 'nlp', 'agents', 'acos', 'devops', 'mlops', 'sql', 'databases', 'big-data'];
 if (learningOrder.length !== Object.keys(courses).length || !Object.keys(courses).every((key) => learningOrder.includes(key as CourseKey))) {
   throw new Error('learningOrder must list every course exactly once');
 }
