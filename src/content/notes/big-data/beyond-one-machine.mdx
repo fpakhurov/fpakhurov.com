@@ -1,0 +1,122 @@
+---
+title: The limits of one machine
+description: "Estimate how much a sales report reads, locate its limiting resource and compare a larger machine with workers that share the calculation."
+course: big-data
+section: Beyond One Machine
+order: 1
+status: published
+tags: [big-data, olap, bandwidth, latency, scale-up, scale-out]
+prerequisites: []
+---
+
+import ResourceFloors from '../../../components/figures/big-data-beyond-one-machine/ResourceFloors.astro';
+import PartitionFloors from '../../../components/figures/big-data-beyond-one-machine/PartitionFloors.astro';
+import NetworkTraffic from '../../../components/figures/big-data-beyond-one-machine/NetworkTraffic.astro';
+
+The sales team wants one total for each store within three minutes. PostgreSQL already records individual orders as they arrive. Looking up one order belongs to online transaction processing (OLTP). A report that combines a year of sales belongs to online analytical processing (OLAP). Its scan can compete with order processing for storage and CPU. The database course plan covers the comparison in its final section. [Database course plan](/notes/databases#section-4)
+
+## How much does the report read?
+
+We take a fixed analytical snapshot of the completed order lines for 2025. One row is one position of a completed order. Every row has a store, a date, a quantity and a unit price in integer cents of the same currency. For this example, sales means the sum of line amounts before any refunds. The query returns one row per store that has sales.
+
+```sql
+SELECT store_id,
+       SUM(CAST(quantity AS bigint) * unit_price_cents) AS sales_cents
+FROM order_lines
+WHERE sold_on >= DATE '2025-01-01'
+  AND sold_on < DATE '2026-01-01'
+GROUP BY store_id;
+```
+
+A small result says little about how much input the database needs. All the lines in the snapshot qualify, and we assume that no ready-made totals or smaller access paths are available. Suppose there are $N=5\times10^9$ lines and the baseline layout occupies an average of $b=120$ stored bytes per line. We use decimal units, so one GB is $10^9$ bytes. A cold read means that the bytes counted in the calculation must come from storage. The input size $D$ is
+
+$$
+\begin{aligned}
+D &= Nb \\
+  &= 5\times10^9 \cdot 120\ \mathrm{B} \\
+  &= 600\ \mathrm{GB}.
+\end{aligned}
+$$
+
+The row count and the stored bytes per line are assumptions in a toy model. The width includes storage overhead in this layout. For a real storage estimate we would obtain that average for the physical layout in use. A different physical layout, a useful summary or a cache hit changes the amount of physical reading even when the query returns the same values.
+
+## How fast can those bytes arrive?
+
+Let $B_{\mathrm{read}}$ be an upper bound on the sustained rate of reading the input. In $T$ seconds at most $T B_{\mathrm{read}}$ bytes arrive. To read the required $D$ bytes, the report must therefore satisfy
+
+$$
+T \ge \frac{D}{B_{\mathrm{read}}}.
+$$
+
+Give the baseline machine a hypothetical ceiling of $1\ \mathrm{GB/s}$ for this cold read. Dividing $600\ \mathrm{GB}$ by that rate gives $600\ \mathrm{s}$, or ten minutes. This is already longer than the $180\ \mathrm{s}$ deadline. Faster computation alone cannot make that plan finish in time. The division gives a lower bound under the stated assumptions. The query can take longer if throughput drops or other work lies on its path.
+
+The important numerator is the data that this execution must read. A column-oriented layout can skip unneeded columns, and compression can reduce the bytes in columns it does read. Suppose the same report reads $150\ \mathrm{GB}$ from a more compact layout. At the same rate the read floor is $150\ \mathrm{s}$. This shows why reducing the input can have the same effect on the read bound as providing faster storage.
+
+## When does the limit move to CPU?
+
+After bytes arrive, the machine decodes values, computes the line amount and updates a total for the store. Let $R_{\mathrm{cpu}}$ be a ceiling on the rate at which the available CPU cores can do that work, measured in rows per second without waiting for storage. For the model we hold that rate at $25\times10^6$ rows per second in both layouts. The CPU work alone therefore requires at least $N/R_{\mathrm{cpu}}=200\ \mathrm{s}$. In a real system a format change can also change the cost of decoding and grouping.
+
+Read and CPU work can overlap. While one buffer is being processed, the next can be filled. The longer of the two bounds is valid whether they overlap or run in sequence.
+
+$$
+T \ge \max\left(
+\frac{D}{B_{\mathrm{read}}},
+\frac{N}{R_{\mathrm{cpu}}}
+\right).
+$$
+
+On the original input that maximum is $600\ \mathrm{s}$. For the more compact input it is $200\ \mathrm{s}$. In the second case the read floor falls below the deadline, but the CPU floor still exceeds it. The maximum is a test for an impossible target. A result below the target leaves open the cost of scheduling, any work that cannot overlap and contention with other queries.
+
+<ResourceFloors />
+
+## Capacity, throughput and latency
+
+**Capacity** is an amount of data that can be held at once. The analytical snapshot needs space for its stored data, plus any indexes, temporary files or other copies the design keeps. RAM capacity is a separate budget. The report can scan the table a buffer at a time and maintain a small working set, including one running sum per store. An operator with a much larger working set may have to write intermediate data to disk, increasing the work on the read and write path.
+
+**Throughput** is work completed per unit time. Disk throughput in GB/s describes one resource, while reports per hour describes the whole service. Suppose independent cold reports cannot share cached input, and each needs $600\ \mathrm{GB}$. At $1\ \mathrm{GB/s}$ the storage can supply at most six such reads per hour. If one report arrives every five minutes, twelve arrive each hour. Even before we account for CPU, the system cannot keep up and requests will wait.
+
+**Latency** is elapsed time for one request, including its wait before it begins to run. With a light workload the report can start immediately and still miss the deadline because of its own scan. Under heavier load, requests also share resources and queue. A service can increase completed reports per hour by running several requests concurrently while each request spends more time waiting for its share of CPU or I/O.
+
+## What changes when we add resources?
+
+**Scale-up** adds resources to a machine. If its read ceiling doubles to $2\ \mathrm{GB/s}$, the original scan floor becomes $300\ \mathrm{s}$. The storage can supply more scans per hour. This single scan still misses the deadline. Adding RAM could help if it keeps data that would otherwise be reread. Its effect depends on how much can be reused between requests.
+
+**Scale-out** adds machines. For the baseline $600\ \mathrm{GB}$, give each of four workers a separate, equal part of the input on local storage. If each reads at up to $1\ \mathrm{GB/s}$ in parallel, each reads $150\ \mathrm{GB}$ and the reading floor becomes $150\ \mathrm{s}$. The workers also divide the row work when each part has the same row count. The actual report still needs startup, coordination and a final result.
+
+For a fixed input, reducing the elapsed time gives *speedup*. For a growing input, holding the elapsed time steady while resources grow is the goal of *scaleup*. With four machines and four times the original volume, $2{,}400\ \mathrm{GB}$, the model gives the same read floor of $600\ \mathrm{s}$. That comparison assumes balanced local reads and leaves the remaining stages out of the estimate. A shared resource, startup work or an uneven split can prevent both improvements. [DeWitt and Gray, 1992, §§2.1–2.3](#references)
+
+In particular, one worker can receive $240\ \mathrm{GB}$ while the other three each receive $120\ \mathrm{GB}$. The total stays at $600\ \mathrm{GB}$. The report needs all four parts, so the read floor is now $240\ \mathrm{s}$, the time required by the largest part. Summing disk rates is useful only if the data can keep those disks busy for about the same time.
+
+<PartitionFloors />
+
+## Which bytes have to cross the network?
+
+Four fast workers can share one slow input. Suppose all $600\ \mathrm{GB}$ arrive from remote storage through one common link rated at $10\ \mathrm{Gbit/s}$. With eight bits per byte, that is at most $1.25\ \mathrm{GB/s}$ before framing and competing traffic. The transfer alone needs at least
+
+$$
+\frac{600\ \mathrm{GB}}{1.25\ \mathrm{GB/s}}
+=480\ \mathrm{s}.
+$$
+
+There is another way to run the same query. Put each worker next to its part of the data. Each sums the line amounts per store locally, and the receiver adds the subtotals for each store. The parts are disjoint and cover the snapshot, so each line contributes exactly once to its store's total. Integer cent amounts can be added in this order without a change in the result if the arithmetic is exact and the chosen representation is large enough.
+
+With 500 stores, each worker sends at most 500 pairs of store ID and subtotal. Assume each pair fits in a 16-byte payload in this model. The four workers then send at most $4\cdot500\cdot16\ \mathrm{B}=32\ \mathrm{kB}$ of subtotal payload, excluding message framing and coordination. The scan still reads the same local data. This calculation isolates what needs to move. If the system must fetch the source rows before the scan, those transfers still belong to its design and cost. Keeping computation near the input and combining values locally are separate ways to reduce traffic. [Dean and Ghemawat, 2004, §§3.4 and 4.3](#references)
+
+<NetworkTraffic />
+
+## How would we check the estimate?
+
+Start by identifying which bytes crossed which boundary in the actual run. A cold storage read, data served by the operating system cache and a transfer from another node are different paths. In PostgreSQL, `EXPLAIN (ANALYZE, BUFFERS)` executes the statement and reports block activity alongside the plan. A `shared read` counts a block fetched after a miss in shared buffers. The operating system may serve that read from its cache. Use storage and network measurements for their respective traffic, and compare runs with similar cache conditions and background load. [PostgreSQL 18, §§14.1 and 27.2.2](#references)
+
+The cost model gives a way to choose the next measurement. If a ceiling rules out the target, change the data path or the resource at that ceiling. A deployment can also start with a faster single machine and add workers later when input grows. Distinguishing a capacity problem from a scan or transfer problem gives us a basis for that choice. Parallel analytical databases and distributed storage are two paths we will develop from here. [Modern Storages and Data Warehousing, weeks 3–5](#references)
+
+## Next
+
+The coordinator expects four sets of partial totals. Suppose it receives only three by the deadline. The fourth worker may be slow, may have stopped or may have sent a reply that never arrived. Adding that worker's totals twice would give the wrong answer. *Partial failures and timeouts* starts from what the coordinator can know when a reply is missing. [Course plan](/notes/big-data#section-1)
+
+## References
+
+- David J. DeWitt and Jim Gray. [Parallel Database Systems: The Future of High Performance Database Processing](https://pages.cs.wisc.edu/~dewitt/includes/paralleldb/cacm.pdf). Communications of the ACM, 1992, §§2.1–2.3 on speedup, scaleup and partitioned execution.
+- Jeffrey Dean and Sanjay Ghemawat. [MapReduce: Simplified Data Processing on Large Clusters](https://www.usenix.org/legacy/event/osdi04/tech/full_papers/dean/dean_html/). OSDI, 2004, §§3.4 and 4.3 on locality and partial combining.
+- PostgreSQL Global Development Group. PostgreSQL 18 documentation, [Using EXPLAIN](https://www.postgresql.org/docs/18/using-explain.html) and [I/O statistics](https://www.postgresql.org/docs/18/monitoring-stats.html#MONITORING-PG-STAT-IO-VIEW), on buffers and I/O measurements.
+- HSE University, Faculty of Computer Science, FTDA. [Modern Storages and Data Warehousing](https://github.com/mgcrp/hse_ftda_dwh_course_2026#readme), 2026. The course programme places parallel databases, distributed storage and distributed computation in weeks 3–5.

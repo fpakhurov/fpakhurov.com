@@ -40,6 +40,8 @@ How the Generative Models notes were written and reviewed, as a guide for the ne
 8. **Next**: one paragraph that hands over to the next note.
 9. **References**: full entries with links.
 
+For the Python → SQL → Databases → Big Data track, follow [its course design](course-design-data-engineering.md). The requested format is lecture notes with small executable examples. There are no quizzes, self-checks, projects or assignments, and no compulsory Notebook section. Add a Code section only when an executable example helps explain or verify the mechanism; do not create a notebook to fill the structure above. English and Russian versions remain part of the same change set.
+
 ## 4a. Depth and density
 
 A note should leave the reader able to explain the method, derive its key formula, compute a small example by hand and say when it fails. Everything in the note serves one of these four abilities; what serves none of them goes.
@@ -73,6 +75,7 @@ A note should leave the reader able to explain the method, derive its key formul
 - Cite the primary paper for every model, loss and named result, plus a textbook or review for background. Cite inline as `([Ho, Jain and Abbeel, 2020](#references))` and list full entries under **References**: authors, linked title (arXiv abstract page or DOI), venue, year, and the section or theorem when a specific result is used.
 - Cite only what has been checked. If a claim comes from general knowledge of a codebase or paper that was not re-read, either verify it or soften it.
 - Prefer stable links: arXiv `abs/` pages, DOIs, proceedings pages. Open each link once before publishing.
+- Each newly authored note in the data-engineering track uses three or four distinct sources that were read for that note. Each reference supports a specific definition, mechanism, result or comparison; several links into one manual count as one source. Record the checked passages and relevant versions while writing. A future source list is a set of candidates until those passages are verified, and a topic with incomplete source work stays planned.
 
 ## 7. Notebooks
 

@@ -1,0 +1,112 @@
+---
+title: Why databases exist
+description: "Two writers can lose a payment while replacing a file. A database server gives clients a shared place to read and change records, and a transaction publishes related changes together."
+course: databases
+section: Models and Integrity
+order: 1
+status: published
+tags: [databases, files, transactions, sessions, integrity]
+prerequisites: []
+---
+
+import FileReplacement from '../../../components/figures/databases-why-databases/FileReplacement.astro';
+import DatabaseSessions from '../../../components/figures/databases-why-databases/DatabaseSessions.astro';
+
+The shop now records payments for the orders from the [first SQL note](/notes/sql/tables-and-queries). Two checkout programs accept different payments almost simultaneously. Both report success. The file they share contains only the second payment. How can a complete, readable file have lost a completed operation?
+
+## Two writers read the same file
+
+Keep one row per payment in `payments.csv`. A row contains a payment number, an order number and an amount in integer cents. In `order_lines`, order 101 costs 1300 cents from its two lines of 700 and 600. Order 103 costs 1550 cents from its lines of 1200 and 350. Checkout A records payment 501 for order 101. Checkout B records payment 502 for order 103. The file starts with a header and no payment rows.
+
+Each process reads the current file into memory, adds its payment to its copy, writes a complete replacement to a temporary file in the same directory and replaces `payments.csv`. When one writer finishes each operation before starting the next, the second read includes the first payment. A successful `os.replace` on the same filesystem switches the shared name to the complete new file in one step. ([Python 3.14, `os.replace`](#references))
+
+<FileReplacement />
+
+In the schedule above, both reads happen before either replacement. A publishes a file containing row 501. B publishes a file containing row 502, which it built from the earlier version with no payments. A's record is gone. The remaining payment totals 1550 cents, down from the 2850 cents expected from both payments. Every operation in this schedule can succeed and every file version can be valid CSV. The lost update comes from computing B's replacement against stale input.
+
+A single writer can complete each read, modification and replacement before starting the next request. Several writers can use one common lock if each acquires it exclusively for that entire cycle. A lock around replacement alone still allows the two earlier reads. Coordination becomes part of the storage interface as soon as several programs share mutable records. [Pavlo, 2025, §2](#references)
+
+## One system owns the shared records
+
+A **database** is the organized collection of related data. A **database management system** or DBMS is the software through which programs define, read and change it. A shop can store its records in files and implement coordination itself. With a DBMS, programs send operations on named tables and leave the management of the shared records to that system. ([Pavlo, 2025, §§1–3](#references))
+
+For example, checkout A can request the insertion of payment 501 and checkout B can request the insertion of payment 502. Each request supplies one new row in `payments`. For distinct valid payment rows, both insertions can succeed and leave both rows present. The application expresses the change at the level of the row. The DBMS makes the change in storage.
+
+In PostgreSQL, a **client** is a program that sends requests and receives results. A checkout service, a reporting tool and the `psql` command-line program can all be clients. The **server** accepts their connections and executes requests against the database. A client and server can run on the same machine or communicate over a network. The client supplies SQL and values through its connection. The server works with the files of the database it manages. ([PostgreSQL 18, §1.2](#references))
+
+<DatabaseSessions />
+
+A **connection** carries messages between a client and the server. A **session** is the client's context on the server over that connection. For instance, the server keeps track of whether that session has started a transaction. Two sessions can work with the same tables and have different transactions in progress. A session can run another transaction after the current one ends. Committed rows in ordinary application tables remain available to later sessions when the client closes its connection. ([PostgreSQL 18, §§1.2 and 3.4](#references))
+
+## When a payment takes two writes
+
+The shop also records whether the order is `open` or `paid`. A checkout first inserts a payment and then changes the order to `paid`. In the file version, the equivalent steps replace `payments.csv` and `orders.csv`. A report can read the new payment and the old order status if it runs between those replacements. A checkout process that exits after the first replacement leaves that pair of files for the next reader. Each file has its own point of publication.
+
+We want the two changes to take effect together. A **transaction** groups operations into one unit. In PostgreSQL, `BEGIN` opens a transaction block, `COMMIT` makes its changes take effect and `ROLLBACK` discards them. The two changes use the same session and transaction. Commands submitted independently can have their own transactions, depending on the client. An application must choose the boundary that matches the operation it wants to publish. ([PostgreSQL 18, §3.4](#references))
+
+Run the following example in an empty database used for examples. `orders` contains one row per order and `payments` contains one row per payment. The payment number identifies the payment. Its order number refers to an existing order. We use the recorded line prices to supply the payment amount for this example.
+
+```sql
+CREATE TABLE orders (
+    order_id integer PRIMARY KEY,
+    status text NOT NULL
+);
+
+CREATE TABLE payments (
+    payment_id integer PRIMARY KEY,
+    order_id integer NOT NULL REFERENCES orders (order_id),
+    amount_cents integer NOT NULL
+);
+
+INSERT INTO orders (order_id, status)
+VALUES (101, 'open'), (103, 'open');
+```
+
+The following read returns the current status of order 101 and the number of its payment rows. The expression in parentheses counts payments for the same order. Initially the result is `open, 0`.
+
+```sql
+SELECT status,
+       (SELECT count(*) FROM payments WHERE order_id = 101) AS payment_count
+FROM orders
+WHERE order_id = 101;
+```
+
+First, write the payment and cancel the operation before changing the order. A repeat of the read after `ROLLBACK` returns `open, 0`. The insertion belonged to the transaction that was discarded.
+
+```sql
+BEGIN;
+INSERT INTO payments VALUES (501, 101, 1300);
+ROLLBACK;
+```
+
+Now run both changes within one transaction. After `COMMIT`, a repeat of the read returns `paid, 1`.
+
+```sql
+BEGIN;
+INSERT INTO payments VALUES (501, 101, 1300);
+UPDATE orders SET status = 'paid' WHERE order_id = 101;
+COMMIT;
+```
+
+## What can the report see?
+
+The schedule starts from the committed setup, with order 101 open and no payments. The checkout runs each write in session A. A report runs the single `SELECT` above in session B at PostgreSQL's default `READ COMMITTED` setting. A plain `SELECT` there reads changes committed before it starts, together with its own transaction's preceding writes. Assume the report only reads, and the checkout is the only writer for order 101. [PostgreSQL 18, §13.2.1](#references)
+
+| Point in the schedule | Status and count from a new read in A | Status and count from a new read in B |
+| --- | --- | --- |
+| Before `BEGIN` | `open, 0` | `open, 0` |
+| After the insertion inside the transaction | `open, 1` | `open, 0` |
+| After the status update inside the transaction | `paid, 1` | `open, 0` |
+| After `COMMIT` | `paid, 1` | `paid, 1` |
+
+The checkout can inspect the records it has written while deciding whether to finish the operation. The report keeps seeing the earlier pair until the checkout commits. A new report read after the commit sees both changes. The guarantee in this example applies to that single read of the two tables. If a report submits two separate queries and a commit falls between them, the queries can observe different moments even at this same setting. ([PostgreSQL 18, §§3.4 and 13.2.1](#references))
+
+## Next
+
+The transaction publishes the requested changes together. It can also publish an incorrect combination if checkout supplies the wrong amount or updates the wrong order. The design has to say which object each row represents and how identities and relationships restrict the states we can store. Start with those choices in the next planned topic, “From a domain to a data model”, in the [Databases course](/notes/databases#section-1).
+
+## References
+
+1. Andy Pavlo. *Relational Model & Algebra*. CMU 15-445/645, Fall 2025. §§1–3 define database and DBMS and describe the coordination and integrity problems of flat files. [Lecture notes](https://15445.courses.cs.cmu.edu/fall2025/notes/01-relationalmodel.pdf)
+2. Python Software Foundation. *Python 3.14 documentation*. The `os.replace` entry specifies the successful atomic replacement used in the file schedule. [Operating system interfaces](https://docs.python.org/3.14/library/os.html#os.replace)
+3. PostgreSQL Global Development Group. *PostgreSQL 18 documentation*. §1.2 explains the client/server architecture. §3.4 defines transaction blocks and rollback. §13.2.1 specifies the visibility of a plain read under Read Committed. [Architecture](https://www.postgresql.org/docs/18/tutorial-arch.html), [Transactions](https://www.postgresql.org/docs/18/tutorial-transactions.html), [Read Committed](https://www.postgresql.org/docs/18/transaction-iso.html#XACT-READ-COMMITTED)
