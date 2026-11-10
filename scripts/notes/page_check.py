@@ -17,7 +17,10 @@ print('katex-error:', page.count('katex-error'))
 ids = re.findall(r'\sid="([^"]+)"', page)
 print('duplicate ids:', [i for i, c in collections.Counter(ids).items() if c > 1])
 print('broken in-page anchors:', [f for f in re.findall(r'href="#([^"]+)"', page) if f not in set(ids)])
-body = re.search(r'<div class="prose">(.*)</div>\s*<nav class="note-pagination"', page, re.S).group(1)
+body_match = re.search(r'<div class="prose">(.*?)</div>\s*(?=<aside\b[^>]*\bdata-biased-practice\b|<nav class="note-pagination")', page, re.S)
+if body_match is None:
+    raise SystemExit('Rendered note prose was not found')
+body = body_match.group(1)
 cache = {}
 for path, frag in sorted(set(re.findall(r'href="(/(?:ru/)?notes/[^"#]+?)/?(?:#([^"]*))?"', body))):
     try:
