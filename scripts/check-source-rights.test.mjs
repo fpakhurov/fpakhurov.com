@@ -115,6 +115,30 @@ test('a complete review cannot omit an imported legacy figure', async (t) => {
   await assert.rejects(checkRights(f.root),/omits local dependency/);
   f.review.files[figure]=digest('<svg></svg>'); f.approve(); await checkRights(f.root);
 });
+test('BIASED notebook preview and download routes require the actual reviewed notebook', async (t) => {
+  const f=fixture(t,'biased'); f.revise();
+  f.review.upstream={repository:'fpakhurov/fpakhurov.com',revision:'b'.repeat(40),reviewPath:'content-rights/reviews/demo-example.json',reviewSha256:'c'.repeat(64),notes:[{path:f.en,sha256:digest(f.text)},{path:f.ru,sha256:digest(f.text)}]};
+  const text=f.text+'\n[Preview](/notebooks/demo-lab/?lang=en#code)\n[Download](/api/notebooks/demo-lab)\n';
+  f.write(f.en,text); f.write(f.ru,text); f.review.files[f.en]=digest(text); f.review.files[f.ru]=digest(text); f.approve();
+  await assert.rejects(checkRights(f.root),/Cannot resolve reviewed local dependency/);
+  const notebook='content/notebooks/demo-lab.ipynb';
+  const bytes=JSON.stringify({cells:[],nbformat:4,nbformat_minor:5,metadata:{}});
+  f.write(notebook,bytes);
+  await assert.rejects(checkRights(f.root),/omits local dependency content\/notebooks\/demo-lab.ipynb/);
+  f.review.files[notebook]=digest(bytes); f.approve(); await checkRights(f.root);
+  f.write(notebook,bytes+'\n');
+  await assert.rejects(checkRights(f.root),/stale review: content\/notebooks\/demo-lab.ipynb/);
+});
+test('notebook files with extensions keep static asset resolution on both sites', async (t) => {
+  for (const project of ['fpakhurov','biased']) {
+    const f=fixture(t,project); f.revise();
+    if (project==='biased') f.review.upstream={repository:'fpakhurov/fpakhurov.com',revision:'b'.repeat(40),reviewPath:'content-rights/reviews/demo-example.json',reviewSha256:'c'.repeat(64),notes:[{path:f.en,sha256:digest(f.text)},{path:f.ru,sha256:digest(f.text)}]};
+    const text=f.text+'\n[Static download](/notebooks/example.ipynb)\n';
+    f.write(f.en,text); f.write(f.ru,text); f.review.files[f.en]=digest(text); f.review.files[f.ru]=digest(text);
+    const asset=(project==='biased'?'apps/web/public':'public')+'/notebooks/example.ipynb';
+    f.write(asset,'{}'); f.review.files[asset]=digest('{}'); f.approve(); await checkRights(f.root);
+  }
+});
 test('the baseline cannot be advanced to a newer real commit', async (t) => {
   const f=fixture(t); const git=(args)=>execFileSync('git',args,{cwd:f.root,encoding:'utf8'}).trim();
   git(['init','-q']); git(['add','src']);
