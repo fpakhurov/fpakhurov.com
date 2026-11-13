@@ -8,7 +8,7 @@ import { gaussian } from '../geometry';
 export const flow1d = (z: number) => z + 0.8 * Math.tanh(2 * z);
 export const flow1dPrime = (z: number) => 1 + 1.6 / Math.cosh(2 * z) ** 2;
 
-/** Inverse of flow1d by bisection (flow1d is strictly increasing). */
+/** Inverse for the plotted range; the fixed z bracket [-20, 20] is not a general-purpose solver. */
 export function flow1dInverse(x: number): number {
   let lo = -20;
   let hi = 20;
