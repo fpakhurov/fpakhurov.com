@@ -90,6 +90,8 @@ export const exactContour = (k: number) => contour((t) => logGam(t, exact.a, exa
 /** Contour of a factorization q(μ) q(λ) at relative level e^(−k). */
 export const mfContour = (q: MF, k: number) => contour((t) => logGam(t, q.a, q.b), q.m, () => q.lam, k);
 
+/** Mulberry32: Tommy Ettinger (2017), CC0-1.0; JavaScript by bryc, public domain.
+ * Pinned sources, local changes and dedication: /licenses/mulberry32.txt. */
 /** Seeded uniforms (mulberry32), standard normals (Box–Muller) and gamma draws (Marsaglia–Tsang, shape ≥ 1, rate b). */
 export function rng(seed: number) {
   let s = seed >>> 0;

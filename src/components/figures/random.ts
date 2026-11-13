@@ -1,5 +1,7 @@
 /** Seeded random numbers for figures that run a small simulation at build time. */
 
+/** Mulberry32: Tommy Ettinger (2017), CC0-1.0; JavaScript by bryc, public domain.
+ * Pinned sources, local changes and dedication: /licenses/mulberry32.txt. */
 /** Mulberry32: a small 32-bit generator; returns a function giving uniforms in [0, 1). */
 export const mulberry32 = (seed: number) => () => {
   let a = (seed = (seed + 0x6d2b79f5) | 0);
