@@ -1,12 +1,218 @@
 ---
 title: LSTM and GRU
-description: "This note is withheld pending an independent source review."
+description: "Gates control retention, writing and exposure of recurrent state. A complete LSTM Jacobian and a GRU matrix counterexample clarify which gradient paths and implementation conventions matter."
 course: nlp
 section: Neural Sequence Models
 order: 12
-status: needs-review
-tags: []
-prerequisites: []
+status: published
+tags: [lstm, gru, gates, long-term-dependencies, recurrent]
+prerequisites: [Recurrent neural networks]
 ---
 
-This note is withheld pending an independent source review.
+A plain recurrent network transforms its entire state at every position. Information from an early input must survive repeated multiplication and nonlinearities before a later prediction can use it. A gated update creates explicit choices about retention and replacement. Those choices are learned functions of the current input and preceding state.
+
+LSTM separates a memory cell from the state exposed to other computations. GRU blends an old state with a new candidate using fewer transformations. We will compute one LSTM step, inspect its complete two-state Jacobian, and use a small matrix example to distinguish two common GRU conventions. The examples use chosen numbers and require no text corpus or pretrained model.
+
+## Baseline: one state, overwritten every step
+
+The tanh recurrence from the [preceding topic](/notes/nlp/recurrent-networks) is
+
+$$
+h_t=\tanh(W_xx_t+W_hh_{t-1}+b).
+$$
+
+Every coordinate is recomputed, even when the desired behavior would be to preserve a value while ignoring several irrelevant inputs. The model can sometimes learn suitable dynamics, but the architecture does not provide a separately controlled copy path. Its temporal Jacobian contains both the recurrent matrix and the derivative of tanh.
+
+Gates introduce coordinate-wise coefficients between zero and one. A sigmoid gate is differentiable, so gradient-based learning can adjust when the coefficient approaches either endpoint. This is a continuous control mechanism. An output of $0.4$ scales a value by $0.4$; it is not automatically a random decision with probability $0.4$.
+
+## LSTM
+
+Use input width $D$ and state width $H$. In the common non-peephole, non-projected LSTM, both the cell state $c_t$ and hidden state $h_t$ have width $H$. Four affine transformations produce an input gate, forget gate, candidate and output gate:
+
+$$
+\begin{aligned}
+i_t&=\sigma(W_ix_t+U_ih_{t-1}+b_i),\\
+f_t&=\sigma(W_fx_t+U_fh_{t-1}+b_f),\\
+g_t&=\tanh(W_gx_t+U_gh_{t-1}+b_g),\\
+o_t&=\sigma(W_ox_t+U_oh_{t-1}+b_o).
+\end{aligned}
+$$
+
+Each input matrix has shape $H\times D$, each recurrent matrix has shape $H\times H$, and each bias has width $H$. The three sigmoid vectors scale information coordinate by coordinate. The candidate can be negative because its nonlinearity is tanh. We then update and expose memory:
+
+$$
+\begin{aligned}
+c_t&=f_t\odot c_{t-1}+i_t\odot g_t,\\
+h_t&=o_t\odot\tanh(c_t).
+\end{aligned}
+$$
+
+Here $\odot$ denotes elementwise multiplication. Retention and writing use separate gates: keeping an old value and adding a new contribution need not sum to one. The cell itself is not passed through tanh after every addition, although the exposed hidden state is. Repeated positive writes can therefore increase the cell magnitude; bounded gate outputs do not make every internal quantity bounded.
+
+[Hochreiter and Schmidhuber](#references) introduced LSTM's controlled memory path. [Gers, Schmidhuber and Cummins](#references) later introduced adaptive forgetting for continuous input streams. The formulas here describe the common modern forget-gate variant, verified against the pinned PyTorch contract, rather than claiming that all its details already appeared in the 1997 formulation.
+
+### Worked example
+
+Take a scalar input $x=0.4$, previous hidden state $h=-0.2$ and previous cell $c=0.6$. Specify one input weight, recurrent weight and bias for each transformation:
+
+| Transformation | Input weight | Recurrent weight | Bias |
+| --- | ---: | ---: | ---: |
+| Input gate | 0.5 | -0.1 | 0.1 |
+| Forget gate | -0.4 | 0.2 | -0.2 |
+| Candidate | 0.3 | 0.4 | 0.05 |
+| Output gate | 0.2 | -0.3 | 0 |
+
+For example, the input-gate preactivation is $0.5(0.4)-0.1(-0.2)+0.1=0.32$. Applying all four transformations gives:
+
+| Quantity | Preactivation | Activated value |
+| --- | ---: | ---: |
+| Input gate | 0.32 | 0.579324 |
+| Forget gate | -0.40 | 0.401312 |
+| Candidate | 0.09 | 0.089758 |
+| Output gate | 0.14 | 0.534943 |
+
+The new states are
+
+$$
+\begin{aligned}
+c_{\mathrm{new}}&\approx 0.401312(0.6)+0.579324(0.089758)\\
+&\approx 0.292786,\\
+h_{\mathrm{new}}&\approx 0.534943\tanh(0.292786)\\
+&\approx 0.152297.
+\end{aligned}
+$$
+
+The forget gate preserves part of the previous cell, and the input gate adds a small positive candidate. The output gate then exposes only part of the transformed cell. The hidden and cell values are different state variables; passing only one of them between chunks would not reproduce this LSTM transition.
+
+### Step by step
+
+First compute all gates from the same input and preceding hidden state. Next form the new cell using the old cell. Finally compute the new hidden state from that new cell. Updating the hidden state early and using it in another gate would define a different recurrence.
+
+A vector implementation performs these operations in parallel across coordinates, often combining the four affine transformations into a larger matrix multiplication. That optimization does not change the dependency graph. The order of the gate blocks in the packed matrix is an API detail that must be preserved when importing weights; a shape match alone does not establish that weights have the same meaning.
+
+At a masked padding position, preserve both states for that batch item. Reset both between unrelated sequences. An input mask and an output-loss mask serve different purposes: suppressing the loss at a padded token does not by itself stop that token from changing the state used by a later prediction.
+
+### The direct memory path and the full gradient \{#why-the-gradient-survives\}
+
+In this non-peephole variant, treat the preceding hidden and cell states as independent inputs to one transition. Holding the hidden input fixed keeps the gates fixed. The partial derivative along the direct cell edge is then
+
+$$
+\left.\frac{\partial c_t}{\partial c_{t-1}}\right|_{h_{t-1}\ \mathrm{fixed}}
+=\operatorname{diag}(f_t).
+$$
+
+Along a path consisting only of successive cell-to-cell edges, coefficients multiply. Twenty fixed gates of $0.95$ retain a direct-path factor of approximately $0.358486$; twenty gates of $0.5$ give approximately $0.000000953674$. Gates near one can preserve this particular path much better than small gates. Learned gates need not stay near one, so the architecture does not guarantee an undiminished gradient.
+
+The full recurrent state is the pair of hidden and cell values. Changing an earlier cell also changes a hidden state, which may change later gates. To see the missing paths, differentiate our scalar one-step transition. Let primes denote derivatives with respect to the previous hidden state. The cell derivative is
+
+$$
+\frac{\partial c_{\mathrm{new}}}{\partial h}
+=f'c+i'g+ig'.
+$$
+
+Each term follows the product rule. For a sigmoid gate, its derivative is the gate times one minus the gate, multiplied by its recurrent coefficient. The candidate uses the tanh derivative. Differentiating the hidden output adds the output-gate path and the path through the new cell:
+
+$$
+\begin{aligned}
+\frac{\partial h_{\mathrm{new}}}{\partial h}
+&=o'\tanh(c_{\mathrm{new}})\\
+&\quad+o\bigl(1-\tanh^2(c_{\mathrm{new}})\bigr)
+\frac{\partial c_{\mathrm{new}}}{\partial h}.
+\end{aligned}
+$$
+
+Our complete Jacobian, with output order hidden/cell and input order previous hidden/previous cell, is approximately
+
+$$
+J=
+\begin{pmatrix}
+0.104847&0.197279\\
+0.256507&0.401312
+\end{pmatrix}.
+$$
+
+The lower-right entry is the forget gate. The other nonzero entries show why multiplying forget gates alone is not the full derivative through a multi-step LSTM. The complete derivative multiplies these state Jacobians and includes additional paths. All four entries agree with centered finite differences for the supplied transition.
+
+There is another tradeoff: a sigmoid very near an endpoint has a small derivative with respect to its preactivation. A gate can preserve a cell value while being slow to change its own decision. Large cell magnitudes can also saturate the output tanh. Direct memory retention, gate learning and output sensitivity must therefore be examined separately.
+
+### Cost
+
+With one combined bias for each transformation, one LSTM layer has $4H(D+H+1)$ cell parameters. For $D=3$ and $H=2$, this is forty-eight, compared with twelve for a plain tanh RNN. A split input/recurrent bias convention adds four more width-$H$ vectors and gives fifty-six in this example. Embeddings, projections and output heads are outside these counts.
+
+Training stores or recomputes more intermediate values per time step. The gates can improve control of information, but every step still depends on the preceding state. Neither parameter count nor the presence of a cell state alone determines actual throughput; batch shapes, sequence lengths, kernels and hardware also matter.
+
+## GRU
+
+A GRU keeps one recurrent state and constructs a reset gate, update gate and candidate. In the original reset-before form, using the convention that the update gate controls retention,
+
+$$
+\begin{aligned}
+r_t&=\sigma(W_rx_t+U_rh_{t-1}+b_r),\\
+z_t&=\sigma(W_zx_t+U_zh_{t-1}+b_z),\\
+v_t&=W_nx_t+b_n,\\
+\widetilde h_t&=\tanh(v_t+U_n(r_t\odot h_{t-1})),\\
+h_t&=z_t\odot h_{t-1}+(1-z_t)\odot\widetilde h_t.
+\end{aligned}
+$$
+
+When an update coordinate approaches one, that coordinate mostly retains the old state. When it approaches zero, the candidate mostly replaces it. Some descriptions use the complementary gate and reverse these coefficients. Compare the complete update formula before interpreting a gate name or moving weights between implementations.
+
+The reset gate controls which parts of the old state contribute to the candidate. [Cho and colleagues](#references) apply it before the recurrent matrix. The pinned PyTorch GRU instead applies it after the matrix, also gating the recurrent bias. This difference cannot generally be removed by moving parentheses.
+
+To isolate the distinction, choose zero biases and
+
+$$
+\begin{aligned}
+U&=\begin{pmatrix}1&2\\3&4\end{pmatrix},\\
+h&=(1/5,-3/10),\\
+r&=(1/4,3/4).
+\end{aligned}
+$$
+
+The two possible candidate contributions are
+
+$$
+\begin{aligned}
+U(r\odot h)&=(-2/5,-3/4),\\
+r\odot(Uh)&=(-1/10,-9/20).
+\end{aligned}
+$$
+
+Resetting before the matrix scales each input-state coordinate before it is mixed into every output. Resetting after the matrix scales each output of that mixing. The matrices corresponding to these operations are $U\operatorname{diag}(r)$ and $\operatorname{diag}(r)U$; they need not commute. Their differing values already occur before tanh, so using the same remaining parameters does not make the two cells equivalent.
+
+A GRU uses three affine groups rather than four, giving $3H(D+H+1)$ parameters under the combined-bias convention: thirty-six for our dimensions. There is no separate output gate or separately carried cell. These are architectural differences with different possible tradeoffs, not a general proof that one cell is more accurate than the other.
+
+## Reading in both directions
+
+If the complete input is available, a forward network can read from the beginning while another network reads from the end. Concatenate their states at corresponding original positions. Each representation then depends on information on both sides. The two directions have separate recurrent parameters and separately maintained states.
+
+This is appropriate for classifying a complete message or encoding a source sentence before translation. It is incompatible with an ordinary causal next-token predictor if the backward network reads the very future tokens being predicted. Availability of future input is part of the task specification. Bidirectionality changes that information boundary, rather than simply making a causal model deeper.
+
+## What changed
+
+The plain recurrence's single replacement operation became controlled retention and writing. LSTM introduces a separate cell path; GRU blends its old state and candidate. Both retain sequential computation, and both can still lose information. The exact gate placement and state convention determine what transition is actually implemented.
+
+## Limitations
+
+A gate does not know which information matters before learning. Long retention can preserve irrelevant history; aggressive forgetting can remove a needed fact. Saturation can slow gate adaptation or attenuate the exposed signal. A fixed-width state still compresses the input, and padding or reset mistakes can invalidate an otherwise correct cell.
+
+The calculations above check specified transitions, derivatives and parameter counts. They do not compare trained model quality. Such a comparison would require the same data split, tokenization, readout, parameter-budget decision and optimization protocol, with uncertainty across appropriate runs.
+
+## What you should remember
+
+LSTM carries both hidden and cell states. Its direct cell derivative is controlled by the forget gate under a stated partial-derivative convention. The full derivative includes gate and hidden paths. GRU variants can place reset multiplication on different sides of a matrix. Future context is available to a bidirectional encoder only when the task permits it.
+
+## Reproducible example \{#notebook\}
+
+- The gated calculation in the [standalone script](https://github.com/fpakhurov/fpakhurov.com/blob/main/scripts/notes/nlp-sequence-cases.py) contains the scalar LSTM transition, all four Jacobian entries and finite-difference checks, exact rational GRU counterexample, direct-path products and parameter counts. [Saved results](https://github.com/fpakhurov/fpakhurov.com/blob/main/docs/reports/2026-11-13-licensed-source-renewal/nlp-sequence-results.json) retain the inputs and outputs. The example uses only the standard library.
+
+## Next
+
+[Sequence-to-sequence models](/notes/nlp/seq2seq) connect an encoder of the input to a decoder of a possibly different-length output. That connection makes the information carried by the state a concrete modeling bottleneck.
+
+## References
+
+- Sepp Hochreiter, Jürgen Schmidhuber. [Long Short-Term Memory](https://doi.org/10.1162/neco.1997.9.8.1735). Neural Computation, 1997. Historical attribution for the controlled memory path; no paper figure or task is reproduced.
+- Felix A. Gers, Jürgen Schmidhuber, Fred Cummins. [Learning to Forget: Continual Prediction with LSTM](https://doi.org/10.1162/089976600300015015). Neural Computation, 2000. Abstract: adaptive forgetting for continual streams.
+- Kyunghyun Cho, Bart van Merriënboer, Caglar Gulcehre, Dzmitry Bahdanau, Fethi Bougares, Holger Schwenk, Yoshua Bengio. [Learning Phrase Representations using RNN Encoder–Decoder for Statistical Machine Translation](https://arxiv.org/abs/1406.1078v3), 2014, section 2.3: reset-before candidate and update-gate convention.
+- PyTorch contributors. [LSTM and GRU source/API definitions](https://github.com/pytorch/pytorch/blob/1d8e8560dc4c9182cba96c81c36e096fc2a063c1/torch/nn/modules/rnn.py#L831), pinned revision 1d8e856: modern LSTM formulas, bias arrays and the explicit GRU reset-after difference. Referenced for mechanism and API facts; its implementation and examples are not copied.
