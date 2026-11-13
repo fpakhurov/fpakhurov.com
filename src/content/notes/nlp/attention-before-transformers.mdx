@@ -1,12 +1,216 @@
 ---
 title: Attention before Transformers
-description: "This note is withheld pending an independent source review."
+description: "A decoder can read a different weighted mixture of source states at each step. Derive scores, masks and all gradient paths, then examine what attention weights can explain."
 course: nlp
 section: Neural Sequence Models
 order: 14
-status: needs-review
-tags: []
-prerequisites: []
+status: published
+tags: [attention, seq2seq, alignment, softmax, machine-translation]
+prerequisites: [Sequence-to-sequence models]
 ---
 
-This note is withheld pending an independent source review.
+A fixed-context encoder–decoder asks one vector to preserve everything that any future output position might need. An alternative is to retain all encoder states and let the decoder choose a different weighted summary at each step. Attention makes this selection differentiable, so the prediction loss can train both the representations and the selection rule.
+
+We will calculate the weights for three supplied vectors, derive their gradients, and inspect a case where different weight patterns produce the same summary. The numbers are independently constructed. There is no trained translation model, copied alignment map or benchmark comparison behind the example.
+
+## Baseline: the final state as the only channel
+
+In the [preceding encoder–decoder](/notes/nlp/seq2seq), the source entered the decoder through its final state. If an output later needed a detail from an early position, that detail had to remain available in the final representation. Adding decoder capacity alone did not restore information already lost by the encoder.
+
+Instead, retain the sequence $h_1,\ldots,h_T$ of encoder states. Each can encode its local input together with surrounding context. A bidirectional source encoder is possible when the complete source is available before decoding. Attention does not recover omitted inputs: tokenization, truncation and the encoder still determine what these states contain.
+
+The decoder maintains its own state for the generated prefix. That state can serve as a query about which source information is useful now. The resulting context may change from one output position to the next. This is cross-attention between a target-side query and source-side states, even though the surrounding architecture remains recurrent.
+
+## The mechanism
+
+Let query $q_u$ describe decoder step $u$. A score function compares it with each source state. Softmax normalizes the scores, then a weighted sum constructs context:
+
+$$
+\begin{aligned}
+e_{ut}&=a(q_u,h_t),\\
+\alpha_{ut}&=\frac{\exp(e_{ut})}{\sum_{j=1}^{T}\exp(e_{uj})},\\
+c_u&=\sum_{t=1}^{T}\alpha_{ut}h_t.
+\end{aligned}
+$$
+
+The weights are nonnegative and sum to one, so the context lies in the convex hull of the supplied states. The scoring rule determines which mixture is selected. In this simple form, the same state acts both as the object being scored and as the vector being averaged. Later architectures can use separate key and value projections.
+
+The context must then affect prediction. One design supplies it to the decoder transition along with the preceding token. Another first computes a decoder state, combines that state with the context, and forms output logits. An attention module whose context is never used would not change the predicted distribution, however appealing its weight plot looked.
+
+The timing differs in the original recurrent architectures. [Bahdanau, Cho and Bengio](#references) score annotations using the previous decoder state and use the context in computing the next one. [Luong, Pham and Manning](#references) describe global attention based on the current decoder state and combine it with the context for prediction. These are explicit computation graphs. A generic query notation should not hide which state is already available.
+
+### Worked example
+
+Choose query $q=(0.6,-0.2)$ and source states
+
+$$
+\begin{aligned}
+h_1&=(1,0),\\
+h_2&=(0,1),\\
+h_3&=(1,1).
+\end{aligned}
+$$
+
+With dot-product score $a(q,h_t)=q^\top h_t$, the scores are $0.6$, $-0.2$ and $0.4$. Their softmax gives:
+
+| Source position | Score | Weight |
+| --- | ---: | ---: |
+| 1 | 0.6 | 0.440905 |
+| 2 | -0.2 | 0.198112 |
+| 3 | 0.4 | 0.360983 |
+
+The context coordinates follow from the weighted sum:
+
+$$
+\begin{aligned}
+c^{(1)}&=\alpha_1+\alpha_3\approx0.801888,\\
+c^{(2)}&=\alpha_2+\alpha_3\approx0.559095.
+\end{aligned}
+$$
+
+The first source state receives the largest weight, but the context is not a copy of that state. Every positive weight contributes. Replacing soft attention with a hard selection of the largest score would produce a different vector and a different gradient computation.
+
+For numerical stability, subtract the largest score before exponentiating. Adding the same finite constant to all scores does not change softmax because the common exponential factor cancels between numerator and denominator. This transformation preserves the mathematical weights while avoiding unnecessarily large exponentials.
+
+Padding must be excluded from normalization. Suppose a fourth, invalid position has score $99$. If it enters softmax, it overwhelms the real positions despite carrying no source evidence. Masking it produces exactly the three weights above followed by zero. Validating the mask before softmax also makes the all-masked case explicit: our convention raises an error because there is no source position to normalize over.
+
+Setting an invalid score to zero is insufficient; zero still has positive exponential weight. Masking after softmax and leaving the remaining weights unnormalized is also a different operation. Conceptually, normalize over valid positions only. Practical array implementations often represent exclusion with negative infinity, while ensuring the all-masked case is handled separately.
+
+### Scoring functions
+
+Dot-product scoring requires query and state widths to match. A learned bilinear score uses a matrix $A$ to compare different or transformed coordinates:
+
+$$
+a(q,h)=q^\top Ah.
+$$
+
+If the query width is $D_q$ and source-state width is $D_h$, then $A$ has shape $D_q\times D_h$. The matrix changes which directions match. A high raw score has meaning only relative to the other valid scores for the same query; softmax is unchanged by a common shift.
+
+An additive score uses a small hidden layer:
+
+$$
+\begin{aligned}
+v(q,h)&=\tanh(Wq+Uh+b),\\
+a(q,h)&=r^\top v(q,h).
+\end{aligned}
+$$
+
+Here the hidden width can differ from both input widths. The nonlinearity allows the query and source state to interact before the scalar readout. Without it, the query-only contribution would be identical for every source position and would cancel in softmax; a merely added query term would not change the weights.
+
+For another explicitly chosen score, use a two-coordinate hidden vector. Its preactivations and output are
+
+$$
+\begin{aligned}
+v_1&=\tanh(0.3q^{(1)}-0.2q^{(2)}+h^{(1)}+0.1),\\
+v_2&=\tanh(0.1q^{(1)}+0.5q^{(2)}+0.6h^{(2)}-0.1),\\
+a(q,h)&=0.7v_1-0.4v_2.
+\end{aligned}
+$$
+
+In this formula, $h^{(1)},h^{(2)}$ mean the two coordinates of the source vector currently being scored. Evaluating it on the same three states gives scores approximately $0.662386$, $0.044621$ and $0.434715$. The weights become approximately $0.428167$, $0.230846$ and $0.340987$. The example illustrates a different score parameterization; it does not establish that additive scoring is better than dot scoring.
+
+The additive mechanism is associated with Bahdanau attention, while Luong and colleagues compare dot, general and concatenation-based global scores. Our chosen coefficients and optional bias are not a replication of those authors' trained parameters. The important interface is the score, normalization and context computation together with their place in the decoder.
+
+## A local loss and all of its gradient paths \{#evidence-removing-the-bottleneck-from-a-transformer\}
+
+To see how attention can learn, attach a simple loss directly to the dot-product context. Choose target vector $t=(0.2,0.4)$ and squared-error loss
+
+$$
+L=\frac12\lVert c-t\rVert_2^2.
+$$
+
+With the context above, the loss is approximately $0.193790$. This is a constructed regression objective on the context, not a translation loss or quality metric. Its gradient with respect to the context is $g=c-t$.
+
+The softmax Jacobian follows by differentiating the numerator and normalizing denominator:
+
+$$
+\frac{\partial\alpha_j}{\partial e_k}
+=\alpha_j(\delta_{jk}-\alpha_k),
+$$
+
+where $\delta_{jk}$ is one when the indices coincide and zero otherwise. Increasing one score raises its own normalized weight and reduces the others. Inserting that derivative into the weighted sum gives
+
+$$
+\begin{aligned}
+\frac{\partial c}{\partial e_k}
+&=\sum_j h_j\alpha_j(\delta_{jk}-\alpha_k)\\
+&=\alpha_k(h_k-c).
+\end{aligned}
+$$
+
+The context moves toward the state whose score increases. Applying the chain rule to the scalar loss gives
+
+$$
+\frac{\partial L}{\partial e_k}
+=\alpha_k g^\top(h_k-c).
+$$
+
+Thus a score update depends on the state's direction relative to the current context and the direction in which the loss wants the context to move. A large existing weight alone does not determine the update sign.
+
+For the supplied case, the three score derivatives are approximately $0.013356$, $-0.081721$ and $0.068365$. They sum to zero up to rounding, consistent with invariance to shifting all scores together. Gradient descent decreases the positively differentiated scores and increases the negative one locally; the result depends on the chosen target.
+
+For dot-product scores, differentiating the query yields
+
+$$
+\frac{\partial L}{\partial q}
+=\sum_k\frac{\partial L}{\partial e_k}h_k.
+$$
+
+The result is approximately $(0.081721,-0.013356)$. Each source state has two roles: it contributes its value directly to the context, and it changes the score used to construct the weights. Its full derivative therefore is
+
+$$
+\frac{\partial L}{\partial h_k}
+=\alpha_k g+\frac{\partial L}{\partial e_k}q.
+$$
+
+Ignoring the first term would freeze the direct value path; ignoring the second would treat the weights as independent of source states. Neither is the full derivative of this graph. The supplied calculation checks all eight coordinates of query and three source vectors using centered finite differences; the maximum discrepancy is below $10^{-8}$.
+
+This local example explains how a downstream objective can train selection and content together. In an encoder–decoder, gradients would continue through the encoder states and the decoder query into their generating networks. Those paths depend on the surrounding recurrent architecture and are not included in our isolated eight-coordinate check.
+
+## What attention gives
+
+Retaining all encoder states gives a later decoder step a direct route to different source positions. It no longer has to obtain every needed fact exclusively from the final source state. This can ease a fixed-context constraint, but it does not guarantee that the encoder represents the right distinctions or that the score finds them.
+
+For dot attention with $T$ source positions, $U$ target positions and common width $D$, scoring all source positions costs order $UTD$ arithmetic. Retaining source states costs order $TD$ storage; saving all attention weights for all target steps adds order $UT$ values. These counts describe the chosen dense operation, excluding the encoder, decoder, batching and implementation overhead.
+
+A recurrent decoder still generates its states in sequence. Adding attention does not make its target-side transitions parallel. Likewise, attention over a full source is appropriate only if that source is already available. A streaming system must define which positions are visible at each step; that visibility mask is part of the model's information boundary.
+
+Attention weights are useful diagnostics of what was mixed. They are not automatically unique explanations. Consider four value vectors forming the square with corners $(1,0)$, $(0,1)$, $(1,1)$ and $(0,0)$. Both of these positive weight sets sum to one:
+
+| Position | Weight set A | Weight set B |
+| --- | ---: | ---: |
+| 1 | 1/4 | 2/5 |
+| 2 | 1/4 | 2/5 |
+| 3 | 1/4 | 1/10 |
+| 4 | 1/4 | 1/10 |
+
+Both weighted sums equal $(1/2,1/2)$. Each weight set is representable by some finite softmax scores, using logarithms of its weights. We are not claiming that the same fixed dot-scoring parameterization produces both for the same query. The example establishes that the weighted-sum map itself can be many-to-one.
+
+A downstream component that receives only this context cannot distinguish those two weight patterns. Establishing a causal contribution would require an intervention and its assumptions, including how changing an input alters the encoder states and later computation. A heatmap alone does not supply that analysis.
+
+## What changed
+
+The decoder gained a step-dependent read from a stored sequence. Scores controlled a normalized mixture; the loss could change both its weights and its values. The information route changed without requiring a Transformer. Which states form the query, keys and values remains a concrete architectural choice.
+
+## Limitations
+
+A soft weighted average can combine incompatible source facts. A sharp distribution can select the wrong state, while a diffuse distribution can blur details. Missing or truncated source positions cannot be recovered by weighting. Incorrect masks can turn padding into the dominant value. Attention also adds work and storage as source and target lengths grow.
+
+The supplied calculations validate mechanisms and derivatives, not a trained model's accuracy. The next architecture will reuse attention in another role: source positions themselves will query one another. That change must specify visibility and position information as carefully as the recurrent encoder–decoder does.
+
+## What you should remember
+
+Attention scores valid source states, normalizes scores and mixes values. Decoder timing determines what the query means. Source vectors may receive gradients through both score and value paths. Masking must precede normalization. Different weights can yield the same context, so diagnostic alignment and causal explanation require different evidence.
+
+## Reproducible example \{#notebook\}
+
+- The attention calculation in the [standalone script](https://github.com/fpakhurov/fpakhurov.com/blob/main/scripts/notes/nlp-sequence-cases.py) evaluates dot and additive scores, a masked high-score position, explicit rejection of an all-masked input, the context loss and all eight derivative checks. Exact fractions verify the two-weight-set counterexample. [Saved results](https://github.com/fpakhurov/fpakhurov.com/blob/main/docs/reports/2026-11-13-licensed-source-renewal/nlp-sequence-results.json) contain all supplied vectors and outputs. No model weights or external dataset are used.
+
+## Next
+
+[Self-attention and multi-head attention](/notes/nlp/attention) make positions in the same sequence query one another. Separate projections and head structure refine the score-and-mixture mechanism; masks determine which information each position may use.
+
+## References
+
+- Dzmitry Bahdanau, Kyunghyun Cho, Yoshua Bengio. [Neural Machine Translation by Jointly Learning to Align and Translate](https://arxiv.org/abs/1409.0473v7). ICLR, 2015; version 7, 2016. Sections 3.1–3.2 and appendix A.1.2: step-dependent weighted annotations, previous decoder-state query and additive alignment scoring. No paper alignment figure, sentence pair, trained weights or result table is reproduced.
+- Minh-Thang Luong, Hieu Pham, Christopher D. Manning. [Effective Approaches to Attention-based Neural Machine Translation](https://aclanthology.org/D15-1166/). EMNLP, 2015, section 3.1: global attention, current-state timing and score functions. The calculations and gradient example here are independently specified.

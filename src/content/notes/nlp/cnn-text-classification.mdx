@@ -1,12 +1,156 @@
 ---
 title: CNNs for text classification
-description: "This note is withheld pending an independent source review."
+description: "Local filters preserve token order, pooling builds a fixed-width representation, and explicit masks separate real windows from padding. A constructed classifier makes every activation and update inspectable."
 course: nlp
 section: Neural Sequence Models
 order: 10
-status: needs-review
-tags: []
-prerequisites: []
+status: published
+tags: [cnn, text-classification, convolution, pooling, embeddings]
+prerequisites: [Word2Vec, Bag of words and TF-IDF, Convolutional networks]
 ---
 
-This note is withheld pending an independent source review.
+`lamp not ready` and `lamp ready not` contain the same word counts. A count vector loses the position of `not`; averaging the same token vectors loses it too. We can preserve a short ordered neighborhood by moving a learned filter along the sequence. Pooling then turns a variable number of neighborhoods into a fixed number of features.
+
+These short strings form a constructed pattern task: the positive label means that the adjacent pair `not ready` occurs. The awkward negative strings deliberately separate word counts from order. They do not represent natural message frequencies or an equipment-safety policy. The vectors and parameters below are supplied explicitly; no pretrained embedding or external corpus is used.
+
+## From a sequence of vectors to one vector
+
+Let a message contain $T$ tokens. An embedding table maps each token to $x_t\in\mathbb R^d$. Stacking them produces a matrix $X\in\mathbb R^{T\times d}$. Unlike a single average, this matrix retains the order of the rows. Moving a token changes which neighboring rows the filter observes.
+
+For a transparent example, choose two-dimensional vectors:
+
+| Token | First coordinate | Second coordinate |
+| --- | ---: | ---: |
+| `lamp` | 0 | 0 |
+| `not` | 1 | 0 |
+| `ready` | 0 | 1 |
+
+These are chosen feature codes, without a claim that a general semantic model would learn them. The first coordinate marks `not` and the second marks `ready`. The zero vector for `lamp` means that this deliberately narrow detector ignores its identity. A system deciding which particular item needs inspection would require additional information.
+
+### Batching variable-length sequences
+
+A batch with $B$ messages is often represented as $B\times T_{\max}\times d$, with shorter sequences padded. Some APIs instead expect $B\times d\times T_{\max}$: channels are embedding coordinates and time is the dimension along which the kernel moves. Transposing the array changes the arrangement, not the intended operation. The [PyTorch Conv1d contract](#references) specifies its channel-first layout.
+
+Store the actual lengths separately. With a width-two valid filter, messages of lengths three, five and two have two, four and one legitimate windows. A window is legitimate here only when every token belongs to the original message. This is an explicit valid-convolution convention; other boundary-padding conventions define a different operation.
+
+Zero padding does not automatically disappear after a biased filter. Suppose a real window has preactivation $-1$, while an all-padding window has preactivation $0.4$ from the bias. ReLU gives zero and $0.4$. An unmasked maximum selects the padding. Mask invalid windows before pooling, or compute only legitimate windows. If a sequence is shorter than the filter, define a fallback or reject that input; a maximum over an empty set is not an ordinary feature value.
+
+### One-dimensional convolution over time
+
+A width-$k$ filter has a weight matrix $W\in\mathbb R^{k\times d}$ and scalar bias $b$. At each valid starting position $t$, compute
+
+$$
+\begin{aligned}
+a_t&=b+\sum_{r=0}^{k-1}W_r^\top x_{t+r},\\
+u_t&=\max(0,a_t).
+\end{aligned}
+$$
+
+The same weights are used at every position. Consequently, a learned local pattern can be recognized wherever it appears. The ordered rows of $W$ still distinguish the first token of a window from the second. This cross-correlation operation is conventionally called convolution in neural-network APIs; it does not reverse the kernel as a mathematical convolution would.
+
+With stride one, no padding and no dilation, there are $T-k+1$ outputs when $T\ge k$. Increasing the stride skips some window starts. Dilation spaces out the kernel's sampled positions. Those settings change coverage and output length, so they belong to the saved model configuration rather than being invisible implementation details.
+
+Choose $k=2$, $W_0=(1,0)$, $W_1=(0,1)$ and $b=-0.7$. For `lamp not ready`, the first window contains neither a first-position `not` nor a second-position `ready`. The second window contains both:
+
+$$
+\begin{aligned}
+a_1&=0+0-0.7=-0.7,\\
+a_2&=1+1-0.7=1.3.
+\end{aligned}
+$$
+
+After ReLU, the map is $(0,1.3)$. For `lamp ready not`, the first window matches only its second coordinate, giving $0.3$ after ReLU; the other window gives zero. The filter therefore distinguishes these equal-count messages. The negative message still has a positive response: a filter value is evidence to interpret, rather than an already calibrated class probability.
+
+### Max-pooling over time
+
+Take the largest valid activation:
+
+$$
+p=\max_t u_t.
+$$
+
+Each filter contributes one number regardless of message length. Several filters produce a fixed-dimensional vector that a classifier can use. This convolution-plus-pooling mechanism is the relevant architecture described by [Kim](#references); the numerical case here is independently specified.
+
+The four supplied inputs give:
+
+| Input | Activation map | Pooled feature | Target |
+| --- | --- | ---: | ---: |
+| `lamp not ready` | $(0,1.3)$ | 1.3 | 1 |
+| `lamp ready not` | $(0.3,0)$ | 0.3 | 0 |
+| `not ready lamp` | $(1.3,0)$ | 1.3 | 1 |
+| `ready not lamp` | $(0,0.3)$ | 0.3 | 0 |
+
+Pooling preserves the largest match and discards its location. The first and third messages consequently have the same feature. This is useful for the chosen adjacency-presence label. It would be insufficient for a task asking whether the pattern appeared before a particular item name. Mean pooling would retain a different summary, sensitive to how many windows respond and to their denominator.
+
+## Two architectures
+
+One design applies several widths in parallel to the embedding sequence. Width-two filters recognize short transitions; wider filters can combine more neighboring tokens in one operation. Concatenating their pooled outputs gives the classifier evidence at several scales. For $C_k$ filters of width $k$, their parameter count is
+
+$$
+\sum_k C_k(kd+1).
+$$
+
+The term one counts a bias per filter. Parameters in the embedding table and output head are additional. For three width-two filters with $d=2$, the filters contain fifteen parameters. A binary head on their three pooled features has four parameters. The three-entry embedding table adds six, for twenty-five trainable parameters if every component is learned.
+
+A second design stacks convolutions before pooling. The second layer sees patterns of first-layer responses. With stride one and no dilation, widths two and three produce a receptive field of four input positions: the second layer spans three first-layer windows, and the last of those reaches one additional token. In general, each such layer adds its width minus one to the receptive field.
+
+Pooling between these two layers would remove the time axis needed for that composition. A stack also changes nonlinear interactions and parameterization; merely widening one filter is not an identical model. More layers or widths are candidates to evaluate, rather than a guarantee of better classification.
+
+## A constructed training result \{#results-on-ag-news\}
+
+We can fit a binary logistic head while keeping the preceding vectors and filter fixed. Let its logit be $z=wp+c$ and its probability be $\sigma(z)$. Starting at $w=c=0$, minimize the mean binary log loss with a weight penalty:
+
+$$
+J=\frac14\sum_{i=1}^{4}
+\left[\log(1+e^{z_i})-y_i z_i\right]
++\frac{0.05}{2}w^2.
+$$
+
+There is no penalty on the intercept. Because the derivative of a row loss with respect to its logit is $\sigma(z_i)-y_i$, each weight-gradient contribution multiplies that error by the pooled feature; intercept contributions use one. This is the logistic-regression calculation from the preceding machine-learning material, applied to convolutional features.
+
+Five hundred full-batch steps at learning rate $0.3$ reduce the regularized objective from $0.693147$ to $0.407187$. The fitted weight is $2.354177$ and the intercept is $-1.883083$. Training probabilities are approximately $0.764470$ on each positive row and $0.235623$ on each negative row. All four supplied labels are recovered at threshold one half.
+
+This experiment contains no held-out observations. It verifies the specified optimization on the constructed features. It does not estimate performance on ordinary language, and it does not compare a CNN with a TF-IDF model on an external benchmark. The task was designed so that the counted words coincide while the local order differs.
+
+### Trainable embeddings
+
+Frozen table values still enter the derivatives of trainable weights in later layers; the lookup rows themselves are not updated. With a trainable table, the same backward pass also accumulates changes into the rows selected by input tokens. Multiple occurrences of one token share a row, so their contributions must be added rather than overwritten.
+
+Consider a separate one-example update for `lamp not ready`. Keep the initial filter above, use head weight $0.7$ and intercept $-0.2$, and set the target to one. The pooled feature is $1.3$, the logit is $0.71$, and the probability is $0.670401$. Thus the derivative with respect to the logit is approximately $-0.329599$.
+
+The maximum is unique and its preactivation is positive. The derivative follows that winning window. Multiplying the logit derivative by the head weight gives approximately $-0.230719$. That value reaches the active filter coordinates, the convolution bias and the matching coordinates of `not` and `ready`. The unused `lamp` row receives zero from this example. ReLU and max ties require a chosen subgradient rule; this calculation stays away from those boundaries.
+
+Updating all thirteen scalar entries in this separate example—four kernel weights, convolution bias, head weight/intercept and six embedding coordinates—with step size $0.1$ lowers its unregularized loss from $0.399879$ to $0.345470$. Centered finite differences check every derivative. This is distinct from the four-row head-only fit; its updated filter is not silently substituted into that experiment.
+
+## Seeing what the classifier uses
+
+A pooled feature points to a window with the strongest response. Inspecting that window can reveal that a filter has become a negation detector, a formatting detector, or a shortcut tied to the training labels. In our chosen case, the winning window can be checked exactly. A large activation alone does not prove that a natural-language phrase is the cause of a correct decision.
+
+The downstream coefficient matters too. A strong response multiplied by a negative classifier weight can argue against the positive class. Contributions from other filters and the intercept can override one local pattern. To diagnose a decision, inspect the complete logit and specify what intervention or comparison is being made.
+
+## What changed
+
+The baseline's identical counts became different local activation maps. Parameter sharing allowed the same detector to work at two positions, and pooling produced a fixed-width input for a classifier. The price is another deliberate information loss: the pooled vector no longer tells us where each maximum occurred.
+
+## Limitations
+
+One narrow filter cannot relate distant phrases outside its receptive field. A wider or deeper stack increases the accessible neighborhood but may still lose distances and ordering after pooling. A sentence containing both an affirmative and a negated statement needs scope and entity association; detecting one adjacent phrase does not solve that task.
+
+Padding, truncation and unknown tokens are part of this limitation analysis. A correct mask cannot restore a relevant phrase removed by truncation. A learned embedding for an unseen inventory code does not appear merely because a lookup returns a vector. Evaluate the complete representation and decision rule on data whose sampling matches the intended use.
+
+## What you should remember
+
+A convolution shares an ordered local calculation across positions. A maximum retains one response per filter and drops its location. Real sequence lengths determine valid windows. Frozen and trainable embeddings differ in which parameters receive updates. A successful fit to supplied strings establishes arithmetic and optimization behavior within that example.
+
+## Reproducible example \{#notebook\}
+
+- The `cnn_case` calculation in the [standalone script](https://github.com/fpakhurov/fpakhurov.com/blob/main/scripts/notes/nlp-sequence-cases.py) contains all chosen vectors and strings, the 500-step head fit, the separate full gradient update and thirteen finite-difference checks. [Saved results](https://github.com/fpakhurov/fpakhurov.com/blob/main/docs/reports/2026-11-13-licensed-source-renewal/nlp-sequence-results.json) include activations, coefficients and losses. Everything uses the Python standard library and newly authored inputs.
+
+## Next
+
+A local filter has a fixed receptive field. [Recurrent neural networks](/notes/nlp/recurrent-networks) carry a state from one position to the next, making earlier information available through a repeated update and exposing a different training difficulty.
+
+## References
+
+- Yoon Kim. [Convolutional Neural Networks for Sentence Classification](https://aclanthology.org/D14-1181/). EMNLP, 2014, section 2: local filters, max-over-time pooling and fixed versus trainable word-vector channels. Paper figures, input sentences, code and benchmark results are not reproduced.
+- PyTorch contributors. [Conv1d source and API contract](https://github.com/pytorch/pytorch/blob/1d8e8560dc4c9182cba96c81c36e096fc2a063c1/torch/nn/modules/conv.py#L225), pinned revision `1d8e856`: cross-correlation, channel/length layout, stride, dilation and output shape. The API is a factual reference; the executable example is an independently written standard-library calculation.

@@ -1,12 +1,179 @@
 ---
 title: Recurrent neural networks
-description: "This note is withheld pending an independent source review."
+description: "A shared state transition carries information through a sequence. Follow its forward states, classifier loss and temporal derivatives, then separate padding, clipping and truncated backpropagation."
 course: nlp
 section: Neural Sequence Models
 order: 11
-status: needs-review
-tags: []
-prerequisites: []
+status: published
+tags: [rnn, recurrence, language-model, teacher-forcing, vanishing-gradient]
+prerequisites: [CNNs for text classification, N-gram language models, Backpropagation]
 ---
 
-This note is withheld pending an independent source review.
+A convolution recognizes patterns inside its receptive field. To make a decision depend on an earlier position, another option is to carry a state through the sequence. Every new token updates that state using the same parameters. The state can summarize a prefix of any length, but that does not guarantee that it retains every fact from the prefix or that training can recover a distant dependency.
+
+We will follow one scalar state through three chosen inputs, attach a classifier, and differentiate the complete computation. This small calculation exposes the same repeated Jacobian products that appear in a vector recurrent network. It also lets us separate the forward ability to carry information from the backward ability to learn which information matters.
+
+## The recurrence
+
+For an input vector $x_t\in\mathbb R^D$ and hidden state $h_t\in\mathbb R^H$, a tanh RNN computes
+
+$$
+\begin{aligned}
+a_t&=W_xx_t+W_hh_{t-1}+b,\\
+h_t&=\tanh(a_t).
+\end{aligned}
+$$
+
+The nonlinearity acts coordinate by coordinate. The input matrix has shape $H\times D$, the recurrent matrix has shape $H\times H$, and the bias has $H$ entries. With one combined bias, the cell has $H(D+H+1)$ parameters. For $D=3$ and $H=2$, that is twelve, independently of the number of input positions. An embedding table and prediction head are additional.
+
+Some implementations, including the pinned [PyTorch RNN contract](#references), store separate input and recurrent biases. Their sum enters the preactivation. Counting parameters must therefore state the bias convention; two arrays with equivalent forward effects still contain more stored parameters than one combined array.
+
+The initial state is another explicit choice. It can be zero, learned, or supplied by another model. Reset it between unrelated messages. Carrying a previous message's state into the next one creates a dependency that the dataset and evaluation protocol may never have intended. Within a continuous stream, state carry can be meaningful, but stream identity and ordering then become part of the model input.
+
+### Worked example
+
+Choose the scalar recurrence
+
+$$
+h_t=\tanh(0.6h_{t-1}+0.4x_t+0.1)
+$$
+
+with $h_0=0$ and inputs $(1,0,-1)$. These numbers are independently specified inputs, not learned word embeddings or measurements from a language corpus.
+
+| Step | Input | Previous state | New state |
+| --- | ---: | ---: | ---: |
+| 1 | 1 | 0 | 0.462117 |
+| 2 | 0 | 0.462117 | 0.360335 |
+| 3 | -1 | 0.360335 | -0.083604 |
+
+The first preactivation is $0.5$. At the next step, a zero input still changes the state: the recurrent contribution and bias remain. Reversing the supplied inputs yields final state $0.426173$. Unlike a mean of the three inputs, this state depends on order. Order sensitivity is a property of this computation, not a promise that every parameter setting distinguishes every sequence.
+
+### Step by step
+
+A forward pass stores each state needed by the next update. Training also needs the intermediate values for differentiation, or a plan to recompute them. The following miniature forward calculation reproduces the table:
+
+~~~python
+import math
+
+state = 0.0
+states = []
+for value in [1, 0, -1]:
+    state = math.tanh(0.6 * state + 0.4 * value + 0.1)
+    states.append(round(state, 6))
+print(states)
+# [0.462117, 0.360335, -0.083604]
+~~~
+
+Variable-length batching requires a mask or actual lengths. Appending a zero padding input to our example changes the final state to $0.049797$. A length-aware operation instead retains $-0.083604$ for that message. A zero vector is an input value, while a masked step means no update; they are different operations.
+
+The same issue appears at the output. If a classifier is meant to use the last real token, gathering the last position of the padded array selects the wrong state. Packed-sequence APIs and explicit masks are implementation options, but the invariant is that padding must not become additional evidence. A genuinely observed zero-valued input, in contrast, must still be processed.
+
+## Two ways to use the states
+
+A recurrent cell produces a sequence of states. A task determines which states are read and where loss terms are attached. Reusing the cell in a classifier and in a language model changes that readout and objective, even when the state-update formula stays the same.
+
+### RNN as a classifier
+
+For binary classification, read the final valid state and apply a logistic head:
+
+$$
+\begin{aligned}
+z&=w^\top h_T+c,\\
+p&=\sigma(z),\\
+\ell&=\log(1+e^z)-yz.
+\end{aligned}
+$$
+
+In our scalar case, choose $w=0.7$, $c=-0.2$ and target $y=1$. The logit is $-0.258523$, the probability is $0.435727$, and the loss is $0.830740$. These are outputs of chosen parameters before fitting, not an accuracy estimate. The positive target produces a negative derivative with respect to the logit, asking gradient descent to increase it.
+
+Using only the final state forces all useful evidence through one readout. Mean or max pooling over valid states offers other summaries. Concatenating them changes feature width and information retained. None of these readouts automatically guarantees recovery of every distinction in an arbitrarily long prefix. Select the readout according to the target and check its failure cases.
+
+### RNN as a language model
+
+For next-token prediction, each prefix state predicts a distribution over the next token. With output matrix $V$ and bias $c$, the conditional distribution is
+
+$$
+p(x_{t+1}=j\mid x_{1:t})
+=\operatorname{softmax}(Vh_t+c)_j.
+$$
+
+A beginning token starts the sequence and an end token lets the model represent termination. Training minimizes the sum or mean of negative log probabilities of the observed next tokens. Specify the reduction: averaging over messages gives different weights to long messages than averaging over valid tokens.
+
+During ordinary teacher-forced training, the next state consumes the observed token, even if the preceding prediction assigned it low probability. During generation, the model consumes its own selected or sampled token. The parameters are the same, but the prefix distribution can differ. A model evaluated only on observed prefixes has not yet been tested on the mistakes it feeds back into itself.
+
+This recurrent language model shares parameters across prefix lengths. An n-gram model instead has a fixed explicit context window. The recurrent state may carry information beyond that window, while also compressing and potentially forgetting the recent history. The distinction concerns the representation, not an automatic ordering of predictive quality.
+
+## Gradients through time
+
+Unroll the recurrence into a computation graph with one copy per time step and shared parameters. Backpropagation through time is ordinary chain-rule differentiation on that graph. Parameter sharing means that contributions from every use of a matrix must be summed.
+
+For the scalar recurrence $h_t=\tanh(ah_{t-1}+bx_t+d)$, let $g_t$ be the total gradient reaching its output. The preactivation gradient and contributions are
+
+$$
+\begin{aligned}
+\delta_t&=g_t(1-h_t^2),\\
+\frac{\partial\ell}{\partial a}&=\sum_t\delta_t h_{t-1},\\
+\frac{\partial\ell}{\partial b}&=\sum_t\delta_t x_t,\\
+\frac{\partial\ell}{\partial d}&=\sum_t\delta_t.
+\end{aligned}
+$$
+
+The signal sent to the preceding state is $a\delta_t$. If there is a local loss at that earlier state, add its derivative before continuing backward. Our final-state classifier has only the final readout loss. Its initial backward signal is $g_T=w(p-y)$; the head derivatives are $(p-y)h_T$ and $p-y$.
+
+Differentiating the recurrent coefficient gives approximately $-0.235967$; differentiating the input coefficient gives $0.295600$. Their signs differ because they multiply different saved quantities at each step. Updating a shared weight using only the last position's contribution would give the wrong result. All nine derivatives—including the initial state and three inputs—agree with centered finite differences at the supplied parameter point.
+
+The state-to-state derivative at one step is
+
+$$
+\frac{\partial h_t}{\partial h_{t-1}}=a(1-h_t^2).
+$$
+
+For our three steps its values are approximately $0.471869$, $0.522095$ and $0.595806$. A gradient from the final state to an earlier one multiplies these local derivatives. In a vector RNN they become Jacobian products, so directions and matrix singular values matter, not just one scalar coefficient. [Pascanu, Mikolov and Bengio](#references) analyze the difficulties created by these products.
+
+An especially transparent separate case stays on the zero trajectory: all inputs, the bias and initial state are zero. Then every tanh derivative equals one and the sensitivity of the final state to the initial state is $a^T$. At thirty steps,
+
+$$
+\begin{aligned}
+0.7^{30}&\approx 0.0000225393,\\
+1.3^{30}&\approx 2619.995644.
+\end{aligned}
+$$
+
+The hidden values themselves remain zero in both cases. A bounded activation therefore does not imply a bounded derivative of a long composition. In other trajectories, tanh saturation can shrink the derivative even with a large recurrent coefficient. The forward state range and backward sensitivity answer different questions.
+
+Gradient clipping addresses large updates after the gradient has been computed. Global norm clipping with threshold $\tau$ applies
+
+$$
+\widetilde g=g\min\left(1,\frac{\tau}{\lVert g\rVert_2}\right)
+$$
+
+for a nonzero gradient, and leaves zero unchanged. For $g=(3,4)$ and $\tau=2$, the result is $(1.2,1.6)$. The direction is retained while the norm decreases from five to two. Clipping cannot reconstruct an already vanished signal or remove the sequential dependency of the forward pass.
+
+Truncated backpropagation introduces a different boundary. A forward state may be carried into the next chunk while its gradient history is detached. Information can still move forward across chunks, but a later loss no longer differentiates through that detached boundary. This saves memory and limits the backward horizon at the cost of changing which temporal dependencies the update can directly train.
+
+## What changed
+
+The fixed local window became a repeatedly updated state. One parameter set can process varying lengths, and earlier inputs can affect later predictions. The same repeated composition that carries information also multiplies sensitivities during training. Sequence length therefore affects optimization and memory even when the number of cell parameters is fixed.
+
+## Limitations
+
+The plain recurrence computes each new state after the preceding one, limiting parallel work along time. A fixed-width state can overwrite task-relevant information. Padding errors can silently change its meaning. Long Jacobian products can suppress or amplify gradients. These are distinct failure modes: fixing the mask does not fix vanishing gradients, and clipping does not guarantee useful memory.
+
+The scalar example verifies one computation and its derivatives. It does not establish performance on translation, text classification or streaming events. A useful evaluation must test the actual sequence lengths, state-reset policy, tokenization and prediction objective. If a label depends only on a short phrase, a simpler local model may already represent what is needed.
+
+## What you should remember
+
+A recurrent network shares one transition across positions. The target determines which states receive losses. Backpropagation sums shared-parameter contributions and multiplies temporal Jacobians. A mask specifies absent steps. Carrying state and carrying gradient history are separate decisions. Gates will provide more controlled update paths, with assumptions that still need inspection.
+
+## Reproducible example \{#notebook\}
+
+- The recurrent calculation in the [standalone script](https://github.com/fpakhurov/fpakhurov.com/blob/main/scripts/notes/nlp-sequence-cases.py) calculates all states, the final classifier, nine analytic derivatives and their centered finite-difference checks. It also checks reversal, padding, zero-trajectory sensitivities and global norm clipping. [Saved results](https://github.com/fpakhurov/fpakhurov.com/blob/main/docs/reports/2026-11-13-licensed-source-renewal/nlp-sequence-results.json) retain full-precision values. No library model or external dataset is required.
+
+## Next
+
+[LSTM and GRU](/notes/nlp/lstm-and-gru) add gates that decide which state components to retain, write and expose. Their formulas explain which gradient paths change and why a gate is not a universal cure for long-range learning.
+
+## References
+
+- Razvan Pascanu, Tomas Mikolov, Yoshua Bengio. [On the difficulty of training Recurrent Neural Networks](https://arxiv.org/abs/1211.5063v2), 2013, sections 1.1, 2.1 and 3.2: recurrence, temporal gradient products and norm clipping. The numerical trajectories here are newly specified; paper experiments and figures are not reproduced.
+- PyTorch contributors. [RNN source and API contract](https://github.com/pytorch/pytorch/blob/1d8e8560dc4c9182cba96c81c36e096fc2a063c1/torch/nn/modules/rnn.py#L486), pinned revision 1d8e856: tanh recurrence, state shapes and separate biases. This is a factual API reference; the executable calculation is independently implemented with the standard library.
