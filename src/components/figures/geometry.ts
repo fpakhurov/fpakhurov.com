@@ -79,6 +79,8 @@ export const gaussian = (x: number, mu = 0, sigma = 1) =>
 
 export const sigmoid = (x: number) => 1 / (1 + Math.exp(-x));
 
+/** Mulberry32: Tommy Ettinger (2017), CC0-1.0; JavaScript by bryc, public domain.
+ * Pinned sources, local changes and dedication: /licenses/mulberry32.txt. */
 /** Deterministic pseudo-random numbers (mulberry32) for reproducible scatter plots. */
 export function seeded(seed: number) {
   let state = seed >>> 0;

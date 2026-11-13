@@ -6,6 +6,8 @@
 
 type M = number[][];
 
+/** Mulberry32: Tommy Ettinger (2017), CC0-1.0; JavaScript by bryc, public domain.
+ * Pinned sources, local changes and dedication: /licenses/mulberry32.txt. */
 /** Seeded standard normals: mulberry32 uniforms and the Box–Muller cosine branch. */
 function normals(seed: number) {
   let s = seed >>> 0;
