@@ -1,12 +1,124 @@
 ---
 title: Tokenization
-description: "This note is withheld pending an independent source review."
+description: "An executed BPE trace, new-word encoding, WordPiece and SentencePiece distinctions, vocabulary trade-offs, and masking contracts."
 course: nlp
 section: Text Foundations
 order: 2
-status: needs-review
-tags: []
-prerequisites: []
+status: published
+tags: [tokenization, bpe, wordpiece, sentencepiece, vocabulary]
+prerequisites: [Text as data]
 ---
 
-This note is withheld pending an independent source review.
+The equipment dictionary knows `lamp` and `clamp`. A new request contains `clamps`. Treating the complete word as an unseen identifier loses a useful relationship; spelling every input one character at a time makes sequences longer. Tokenization chooses reusable units between those extremes and records how they map to model inputs.
+
+## Baseline: words or characters
+
+A word tokenizer assigns an ID to each entry in a vocabulary. For a vocabulary of size $V$, an embedding table with vector width $d$ has $Vd$ entries. The ID selects a row; its numerical magnitude is not a measure of meaning. Two adjacent IDs are not necessarily related words.
+
+Whole-word units make common words compact. However, every inflection, spelling variant, and new item code may need a separate entry. A fixed vocabulary can map unknown strings to a shared unknown token, which makes those different strings indistinguishable to the next layer. Extending the vocabulary later also requires a model-side rule for new embedding rows.
+
+Character units share parts across words and reduce the need for whole-word entries. They increase the number of model positions. They still need an alphabet policy: a vocabulary learned from a limited set of Unicode characters does not automatically cover every script or symbol. A byte representation can cover arbitrary UTF-8 input with an alphabet of 256 byte values, but a visible character may occupy several positions before merges.
+
+Subword units retain common sequences as single entries and assemble less common strings from smaller pieces. Their segmentation need not match linguistic morphemes. The goal depends on the tokenizer: predictable coverage and useful sequence lengths can matter even when the pieces have no independent meaning.
+
+## Byte-pair encoding
+
+In the NLP form of byte-pair encoding, or BPE, we begin with a small alphabet and repeatedly add a merged symbol. [Sennrich, Haddow and Birch](#references) describe its use for open-vocabulary neural translation. Character-based and byte-based initial alphabets are different choices; the algorithm's name does not mean that every implementation starts from raw bytes.
+
+Fix the training inputs, their multiplicities, the initial segmentation, and a tie-breaking rule. At each step, count adjacent pairs in the current sequences, weighted by how often each sequence occurs. Select a pair with maximum count. Replace non-overlapping occurrences of that pair and record the merge in order. Subsequent counts are taken on the updated segmentation, so the next candidate can contain an already merged piece.
+
+In our constructed example, merges never cross the boundaries of the supplied words. We use Unicode characters as initial symbols, no end-of-word marker, and lexicographic tie-breaking over the two strings in a pair. These choices make the example reproducible; they are not claims about the configuration of a particular pretrained tokenizer.
+
+### Worked example
+
+The complete invented training collection contains `lamp` four times, `lamps` twice, `clamp` once, and `camp` twice. Its initial alphabet is `a, c, l, m, p, s`. There are nine word occurrences and 39 character-token positions.
+
+Initially, `(a,m)` and `(m,p)` each occur nine times. Our tie rule selects `(a,m)`. After replacing it, `(am,p)` occurs nine times. The next most common pair is `(l,amp)`, with seven occurrences. Finally `(c,amp)` and `(lamp,s)` tie at two, so `(c,amp)` is chosen.
+
+| Step | Selected pair | Weighted adjacent count | Positions after the merge |
+| ---: | --- | ---: | ---: |
+| 0 | Initial character segmentation | — | 39 |
+| 1 | `a` + `m` | 9 | 30 |
+| 2 | `am` + `p` | 9 | 21 |
+| 3 | `l` + `amp` | 7 | 14 |
+| 4 | `c` + `amp` | 2 | 12 |
+
+The final segmentations are `lamp`, `lamp | s`, `c | lamp`, and `camp`. Their weighted lengths give $4\cdot1+2\cdot2+1\cdot2+2\cdot1=12$. The tokenizer has added four symbols to the six-character alphabet. Special tokens, if used, would require additional entries.
+
+Notice the segmentation of `clamp`: `c | lamp`. The piece `lamp` occurs inside a word with a different meaning. The merge rule followed character co-occurrence, not an equipment ontology. A later model must learn how the pieces interact in context.
+
+### Why the most frequent pair
+
+Replacing two adjacent tokens by one reduces the current sequence by one position for every actual replacement. When selected occurrences do not overlap, a pair with weighted frequency $f$ removes $f$ positions. That is exactly what happens at every step of our table. A locally frequent pair therefore offers an immediate reduction in sequence length.
+
+There are two limits to this argument. First, a greedy choice need not give the globally shortest representation after a fixed number of later merges. Each choice changes the opportunities available next. Second, adjacent-pair counts can include overlapping occurrences: `aaa` contains `(a,a)` at two adjacent positions, but a left-to-right non-overlapping merge can replace only one of them. Its length falls from three to two, not to one. The fixture checks this boundary separately.
+
+Counting token positions also ignores the storage cost of the vocabulary and merge table. Adding many entries could shorten the training text while increasing the total serialized representation. BPE for model input is therefore not a proof of globally optimal byte compression or semantic quality.
+
+### Encoding new text
+
+Once training ends, the merge order is frozen. To encode a new word in this toy tokenizer, split it into initial characters and replay the recorded merges in order wherever they apply. We do not count frequencies again on the new request.
+
+For unseen `clamps`, the transformations are `c | l | a | m | p | s`, then `c | l | am | p | s`, then `c | l | amp | s`, and finally `c | lamp | s`. The fourth merge does not apply. Concatenating the pieces reproduces the input. A word absent from training can therefore be encoded without inventing a new vocabulary entry.
+
+The same guarantee does not cover an unseen initial character. Our toy alphabet lacks `z`; the implementation explicitly rejects `lampz` instead of silently deleting a character. A production design can use an unknown token, a larger alphabet, or a reviewed byte-fallback mechanism. The policy must be stated because these choices preserve different amounts of information.
+
+The vocabulary alone is insufficient to reproduce BPE encoding: merge ranks are part of the fitted tokenizer. Normalization, pre-tokenization, special tokens, and decoding rules also matter. Save them with the vocabulary and bind their revision to the model that uses their IDs.
+
+### What the merge count controls
+
+With a fixed initial alphabet and one new distinct entry per merge, $M$ merges create $V_0+M$ entries before special tokens. More merges tend to reduce positions on the training corpus, though the effect on new text depends on which patterns recur. The model inherits a trade-off between vocabulary storage and sequence length.
+
+An embedding table scales as $Vd$. A dense output projection for a model predicting every vocabulary item also depends on $V$. Meanwhile, processing a longer sequence consumes more position-dependent work. Full self-attention has a pairwise interaction array with $T^2$ positions for sequence length $T$; its actual runtime and memory depend on the implementation. A tokenizer can change $T$ without changing the human-readable message length.
+
+This is why vocabulary size alone is not a sufficient comparison. Measure fertility, such as tokens per word or byte under a specified definition, on the languages and domains that matter. A shared tokenizer may allocate compact entries unevenly. Equal character-length requests need not consume equal model budgets.
+
+## WordPiece and SentencePiece
+
+WordPiece uses a vocabulary of pieces and a longest-prefix matching rule during encoding. A continuation marker, conventionally `##` in BERT-style tokenizers, distinguishes pieces that continue a word. The [Hugging Face description](#references) explicitly labels its reconstruction of WordPiece *training* as an inference from published material. We use its documented encoding distinction here and do not claim that a tutorial training score is the exact original Google implementation.
+
+For an independently specified vocabulary `lamp`, `cl`, `##amp`, `##s`, greedy encoding of `clamps` yields `cl | ##amp | ##s`. At the first position, `cl` is the longest available beginning. At the second position, `##amp` is the longest matching continuation. If the next suffix cannot be covered, this toy WordPiece rule returns one unknown token for the entire word: `lampz` becomes `[UNK]`. This differs from our BPE example, both in segmentation and in the explicit unknown-input policy.
+
+SentencePiece is a tokenizer system, not a synonym for one subword algorithm. [Kudo and Richardson](#references) describe support for BPE and unigram language-model segmentation, training directly from raw sentences, whitespace representation, normalization, and a self-contained model file. A unigram tokenizer scores candidate segmentations using piece probabilities; it does not replay BPE merge ranks.
+
+Detokenization guarantees must state which string is recovered. If normalization has already changed the input, a lossless encoding of the normalized string cannot reconstruct the original typography. The original SentencePiece paper explicitly frames reversibility around normalized text. Particular whitespace and normalization settings must still be inspected for the selected model.
+
+## Special tokens, padding and masks
+
+Models often need symbols that do not represent ordinary input text: a sequence boundary, a separator, a mask, or a padding position. Their IDs and interpretation are part of the model contract. A literal string resembling a special token is not necessarily meant to trigger that function; input handling must distinguish ordinary text from control positions.
+
+Suppose a batch contains token sequences of lengths two, five, and three. Padding all three to length five allocates 15 positions, of which ten are real and five are padding. A mask records which positions should participate in the appropriate computation. Padding ID zero is merely a convention; zero does not inherently mean “ignore this position.”
+
+An attention mask and a loss mask serve different purposes. One controls permitted interactions, while the other selects target positions contributing to the objective. A causal mask additionally restricts access to future positions. A model can have the right padded shape and still train incorrectly if these masks express the wrong contract.
+
+For a mean token loss, excluding padding from the numerator but dividing by all padded positions reduces the average artificially. Divide by the count of included targets. In distributed or accumulated batches, preserve the same weighting convention across unequal sequence lengths rather than averaging already averaged losses indiscriminately.
+
+## What changed
+
+Whole-word unknowns have become compositions of reusable pieces when the initial alphabet covers the input. Our new word `clamps` no longer requires a new entry, and the training collection uses 12 positions after four merges instead of 39 character positions. Those are properties of the supplied collection, not model-quality measurements.
+
+The model now receives a vocabulary and segmentation policy that must stay synchronized with its parameters. It has gained coverage and a tunable size/length trade-off; it has not gained a guarantee of linguistic boundaries or correct interpretation.
+
+## Limitations
+
+This BPE implementation recounts pairs and scans sequences directly. It is designed for transparency on four word types, not large-corpus throughput. Its pre-tokenization, alphabet, tie rule, and unknown-character handling are explicit simplifications. No pretrained tokenizer, language-model weight, external dataset, or downloaded implementation is used.
+
+Training a tokenizer on evaluation documents can leak distributional information even without labels. Comparing downstream models therefore requires a clear rule for which text may fit the tokenizer. Results also need the tokenizer revision: a model evaluated with a different representation is a different experiment.
+
+## What you should remember
+
+Record training text, alphabet, normalization, boundary rules, merge ranks, and special IDs. BPE's local pair choice reduces positions in our example but does not establish global compression optimality. WordPiece encoding and SentencePiece's system boundary are different concepts. Padding, attention, and loss masks need separate meanings.
+
+## Reproducible example \{#notebook\}
+
+- The `tokenization` case in the [standalone script](https://github.com/fpakhurov/fpakhurov.com/blob/main/scripts/notes/nlp-foundations-cases.py) learns all four merges from the complete fictional frequency table. It checks input-order-independent tie-breaking, exact reconstruction, new-word encoding, explicit unknown-character failure, overlapping pairs, the separate WordPiece vocabulary, and padding arithmetic. [Saved output](https://github.com/fpakhurov/fpakhurov.com/blob/main/docs/reports/2026-11-13-licensed-source-renewal/nlp-foundations-results.json) contains every merge count and resulting sequence.
+
+## Next
+
+Encoding can be completely reproducible while the evaluation is misleading. [Corpora and evaluation](/notes/nlp/corpora-and-evaluation) defines which observations may fit the representation and how a held-out result relates to the intended use.
+
+## References
+
+- Rico Sennrich, Barry Haddow, Alexandra Birch. [Neural Machine Translation of Rare Words with Subword Units](https://aclanthology.org/P16-1162/). ACL, 2016, section 3. BPE mechanism and open-vocabulary motivation; no paper examples, code, results, or figures reproduced.
+- Taku Kudo, John Richardson. [SentencePiece: A Simple and Language Independent Subword Tokenizer and Detokenizer for Neural Text Processing](https://aclanthology.org/D18-2012/). EMNLP System Demonstrations, 2018, sections 2 and 3. System components, raw-sentence training, normalized-text reversibility, and model serialization.
+- Hugging Face course contributors. [BPE](https://github.com/huggingface/course/blob/8b893f0ede6c781045692a7f892f25a0c92b4805/chapters/en/chapter6/5.mdx) and [WordPiece](https://github.com/huggingface/course/blob/8b893f0ede6c781045692a7f892f25a0c92b4805/chapters/en/chapter6/6.mdx), revision `8b893f0`. Pair-frequency/rank mechanism and longest-prefix encoding, including the explicit limitation on the reconstructed training algorithm. Our data, code, tables, and numerical trace are independently authored.
