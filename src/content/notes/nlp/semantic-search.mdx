@@ -1,199 +1,105 @@
 ---
 title: Embeddings and semantic search
-description: "Find the passages that answer a query among thousands: lexical matching with BM25, dense retrieval with contrastively trained and instruction-conditioned sentence embeddings, persistent indexes, how documents are cut into chunks, cross-encoder reranking, hybrid retrieval and metadata filters written by a language model, and the metrics (hit rate at k, mean reciprocal rank) that measure a retriever on a golden set before any generation is involved."
+description: "Build and evaluate a document retriever on an original fictional support corpus. A reproducible BM25 baseline exposes vocabulary mismatch; a hand-calculated vector example explains the idea of semantic retrieval."
 course: nlp
 section: Modern LLM Systems
-order: 36
+order: 37
 status: published
-tags: [retrieval, embeddings, bm25, dense-retrieval, chunking, reranking, mrr]
-prerequisites: [BERT and masked language modeling, Bag of words and TF-IDF, Word embeddings]
+tags: [retrieval, bm25, embeddings, evaluation]
+prerequisites: []
 ---
 
-import RetrievalPipeline from '../../../components/figures/semantic-search/RetrievalPipeline.astro';
+A search system receives a question and returns documents that could answer it. Before adding a language model to write an answer, check this smaller task: did the search return the document containing the needed information?
 
-The previous sections built a language model, adapted it, turned it into an assistant and made it cheap to run ([quantization](/notes/nlp/quantization)). What such a model does not have is the user's documents, so this section builds systems around it, starting with retrieval. The [embeddings note](/notes/nlp/word-embeddings#from-words-to-sentences-for-now) ended with a nearest-neighbour search over averaged word vectors: embed a question, compare with every stored question by cosine, return the closest. That is the whole idea of semantic search; what has changed since is the encoder, the index, and the engineering around what to embed. This note builds a retriever over a corpus of Russian-language posts about machine learning, sets up how to measure it, and describes three variants to evaluate against it. No retrieval scores on this corpus are quoted: the variants are what to try, measured by the procedure below, not measured gains. Generation does not appear until the [next note](/notes/nlp/rag); a retriever has to be right on its own first.
+We will use **BIASED Retrieval Lab**, a new exercise with 14 fictional support documents and 10 queries in English and Russian. The texts, queries and relevance labels were prepared for this exercise with AI assistance. They describe an invented learning workspace; its rules are not the terms or features of BIASED School.
 
-**Notation.** A query $q$ and a corpus of passages $d_1, \dots, d_N$; an embedding model $e(\cdot) \in \mathbb R^{m}$; a similarity $\mathrm{sim}(q, d)$; the retriever returns the top-$k$ passages by similarity. For a query with a known relevant passage, $\mathrm{rank}(q)$ is the position of that passage in the returned list (or $\infty$ if absent).
+## The corpus and the relevance labels
 
-## The task
+Every document has a stable ID. Every query lists the IDs considered relevant. For example:
 
-Input: a query, typically short. Output: a ranked list of passages from a fixed corpus. The corpus here is a dump of a Telegram channel: 830 posts in Russian with English technical terms, most of them short (median about 47 words), 235 longer than 200 words and the longest 659. The test set is a **golden set** of 20 (question, passage) pairs written by hand: the passage is an excerpt of one post, about 60 words long, that contains the answer, and the question is phrased as a reader would ask it.
+| ID | Text or task |
+| --- | --- |
+| `d14` | Error R17 means that the output directory is read-only. Save the result in a personal folder and rerun the command. |
+| `q01` | `R17 error output directory`; relevant document: `d14`. |
+| `d05` | Download a lesson before travelling. Its text remains readable without a network connection; sending answers needs reconnection. |
+| `q08` | `study aboard an airplane`; relevant document: `d05`. |
 
-<RetrievalPipeline />
+The first query shares distinctive words with its answer. The second expresses a need without repeating the document's wording. Both are deliberately authored teaching cases, not a sample of real user requests.
 
-## Baseline: lexical matching
+Download the [dataset](/data/biased-retrieval-lab-v1/dataset.json), [provenance and method](/data/biased-retrieval-lab-v1/README.md), and [rights statement](/data/biased-retrieval-lab-v1/LICENSE). The source files contain the complete bilingual texts and labels.
 
-Score a passage by the query terms it contains, weighted as in the [TF-IDF note](/notes/nlp/bag-of-words-and-tf-idf#tf-idf-reweighting-the-counts). The standard refinement is **BM25** ([Robertson and Zaragoza, 2009](#references)):
+## A lexical baseline we can reproduce
 
-$$
-\mathrm{BM25}(q, d) = \sum_{t \in q} \mathrm{idf}(t)\cdot \frac{f(t, d)\,(k_1 + 1)}{f(t, d) + k_1\big(1 - b + b\,\frac{|d|}{\overline{|d|}}\big)},
-$$
-
-with $f(t, d)$ the count of term $t$ in $d$, $|d|$ the passage length, $\overline{|d|}$ the average length, and $k_1 \approx 1.2$, $b \approx 0.75$. Relative to raw TF-IDF, the count saturates (the 10th occurrence of a term adds little) and long passages are penalized. BM25 is fast (an inverted index), needs no training, is exact on rare terms and identifiers (`Log-Linear Attention`, an error code, a product name), and fails on **vocabulary mismatch**: a query about *speeding up attention for long sequences* does not share a term with a passage about *sub-quadratic complexity*.
-
-## Dense retrieval
-
-<aside class="callout"><strong>Key idea.</strong> Embed the query and every passage with an encoder trained so that a question and the passage that answers it have a high cosine, and search by vector similarity. Paraphrases and synonyms land near each other because the encoder learned that from pairs, not from shared terms.</aside>
-
-### The embedding model
-
-A **bi-encoder**: one Transformer encoder applied separately to the query and to each passage, pooled (mean of token vectors or the `[CLS]` vector) and normalized to unit length so that cosine is a dot product. It is trained contrastively on (query, positive passage) pairs with in-batch negatives: for a batch of $B$ pairs, the loss pushes each query's similarity to its own passage above its similarity to the other $B - 1$ passages,
+BM25 ranks documents by matching query terms. A term appearing in fewer documents contributes more; repeated occurrences have diminishing returns; document length adjusts the score. For a query $q$ and document $d$, our implementation uses
 
 $$
-\mathcal L = -\frac1B\sum_{i=1}^B \log \frac{\exp(\mathrm{sim}(q_i, d_i)/\tau)}{\sum_{j=1}^B \exp(\mathrm{sim}(q_i, d_j)/\tau)},
+S(q,d)=\sum_{t\in\operatorname{unique}(q)}
+\log\left(1+\frac{N-n_t+0.5}{n_t+0.5}\right)
+\frac{f_{t,d}(k_1+1)}{f_{t,d}+k_1(1-b+b|d|/\overline L)}.
 $$
 
-the InfoNCE objective ([Karpukhin et al., 2020](#references); [Reimers and Gurevych, 2019](#references)), the loss that SimCLR uses for images under the name [NT-Xent](/notes/deep-learning/self-supervised-learning#the-nt-xent-loss). The frozen `[CLS]` of a masked-language model is a poor sentence vector, as the [transfer learning note](/notes/nlp/transfer-learning#frozen-features-and-a-linear-model) found; contrastive training is what makes the vectors comparable across texts.
+Here $N$ is the number of documents, $n_t$ counts documents containing term $t$, $f_{t,d}$ counts occurrences in $d$, and $\overline L$ is mean document length. We set $k_1=1.2$ and $b=0.75$. This scoring family is described by [Robertson and Zaragoza](#references).
 
-Two conventions matter when using one. A **symmetric** model embeds queries and passages the same way (`BAAI/bge-m3`, 1,024 dimensions, multilingual). An **asymmetric** model expects a prefix that says which side a text is on (`intfloat/multilingual-e5-large`: `query: ` and `passage: `), because questions and answers are different kinds of text: the same encoder reads both, and the prefix it was trained with is what tells it which side a text is on. Omitting the prefix silently degrades an asymmetric model.
+The script splits lowercase text into Unicode word tokens, with no stemming or stopword removal. It scores all documents, returns only positive scores, and breaks ties by document ID. These choices are part of the experiment: a zero-score document cannot appear simply because we increase the requested result count.
 
-An **instruction-conditioned** embedder replaces the fixed prefix by a sentence that names the use. INSTRUCTOR ([Su et al., 2023](#references)) reads an instruction of the form *Represent the (domain) (text type) for (task):* before the text: for open-domain questions, *Represent the Wikipedia question for retrieving supporting documents:* on the query side and *Represent the Wikipedia document for retrieval:* on the passage side. The vector is the mean of the output vectors of the text tokens only, but each of them has attended to the instruction, so the same text gets different vectors for different tasks. Symmetric tasks such as similarity use one instruction for both texts; retrieval uses two. The model, a T5-based encoder of 335 M parameters, was trained contrastively on 330 datasets, each annotated with its instruction. Averaged over nine task categories of 70 evaluation datasets, 66 of them unseen in training, it scores 58.4, against 55.1 for the same encoder before instruction training and 56.5 for a 4.8 B-parameter embedder, Sent-T5-XXL. The gain over its starting encoder is above average on three domains absent from training (geography, biology, civil comments): instructions help most where the corpus is unlike what the encoder was trained on. The rule for prefixes still applies: every passage in the index is embedded with the same instruction and every query with its own, and changing the passage instruction means re-embedding the corpus.
+## Measure the returned IDs
 
-### The index
+Let $r_i$ be the rank of the first relevant document for query $i$. If no relevant document is returned, that query contributes zero. With $Q$ queries,
 
-Passages are embedded once and stored with their vectors in a vector store (here an in-memory Qdrant collection). A query costs one encoder pass plus a nearest-neighbour search; for corpora of millions of vectors the search is approximate (HNSW graphs, product quantization), trading a little recall for sub-millisecond lookups. At this corpus size, exact search is fine.
+$$
+\operatorname{Hit@}k=\frac{1}{Q}\sum_{i=1}^{Q}\mathbf{1}[r_i\leq k],
+\qquad
+\operatorname{MRR}=\frac{1}{Q}\sum_{i=1}^{Q}\frac{1}{r_i}.
+$$
 
-An in-memory index disappears with the process. A **persistent** store writes the vectors, texts and metadata to disk, or keeps them in a database server, so the corpus is embedded once and every later session opens the stored index and embeds only its queries. Two rules come with it. The index can only be queried with the encoder that built it, since vectors of different models live in different spaces, often of different dimension. And a changed document must be re-embedded and written under the same identifier, or the index answers from the old version. A large corpus does not have to be in memory to be indexed: documents can be read lazily, one at a time from a file, and added in batches. Embedding millions of documents is the expensive step, so a prototype indexes a sample and is measured on the golden set before the full run.
+In the second sum, an absent relevant result has reciprocal rank zero. Relevance is checked by exact document ID. The evaluator does not guess relevance by comparing snippets.
 
-### Chunking
+The saved run gives the same aggregate result in both languages:
 
-An encoder reads a few hundred tokens, and a long post contains several ideas; embedding the whole post averages them into one vector that matches none of the questions well. Documents are therefore cut into **chunks**, and the choice of unit shapes everything downstream:
+| Cases | Queries | First relevant rank |
+| --- | --- | --- |
+| Exact terms and the designed distractor case | `q01`–`q06`, `q09`, `q10` | 1 |
+| Vocabulary mismatch | `q07`, `q08` | Not returned |
+| Aggregate | All 10 | Hit@1 = Hit@3 = MRR = 0.8 |
 
-| Chunker | Unit | Keeps | Loses | Use |
-| --- | --- | --- | --- | --- |
-| Fixed token window (256 tokens, overlap 64) | tokens | exact size, predictable cost | sentence and word boundaries | billing-sensitive pipelines |
-| Sentence | sentences up to a size | whole thoughts | uniform size; ideas spanning sentences | texts with self-contained sentences |
-| Semantic (adjacent sentences merged while cosine ≥ 0.5) | topically coherent groups | one idea per chunk | predictable size | multi-topic documents |
-| Recursive (headings → paragraphs → sentences → tokens) | document structure | hierarchy | needs format-specific rules | Markdown, HTML, documentation |
+The English airplane query has no matching terms and returns no candidates. Its Russian counterpart returns some irrelevant documents sharing a common preposition, but still misses `d05`. Inspecting the failed cases tells us more than the aggregate: the relevant text receives no lexical evidence under this tokenizer.
 
-A second trick decouples what is *matched* from what is *returned*: **parent-document retrieval** indexes small child chunks (120 characters here) for precise matching, and returns the parent they came from (here the whole post, cut at 4,000 characters if longer), so the generator gets enough context. Overlap between chunks guards against an answer split across a boundary, at the cost of index size.
+The [saved results](/data/biased-retrieval-lab-v1/results.json) contain query-level ranks, top-three scores, the method settings and a hash of the dataset bytes.
 
-## Measuring a retriever
+## Why embeddings might help
 
-For each golden question, run the retriever, find the position of the first returned item that contains the golden passage, and aggregate:
+A learned encoder maps a text to a vector. Training can make related meanings nearby even when their words differ. A dual-encoder retriever computes document vectors beforehand and compares a query vector to them; [Sentence-BERT](#references) and [DPR](#references) describe related approaches.
 
-- **Hit rate at $k$**: the fraction of questions whose golden passage is found within the top $k$.
-- **Mean reciprocal rank**: $\mathrm{MRR} = \frac{1}{|Q|}\sum_{q} \frac{1}{\mathrm{rank}(q)}$, with $1/\infty = 0$. It rewards putting the right passage first and discounts lower ranks harmonically.
+For an arithmetic illustration only, choose a query vector $q=(1,0)$, an offline-reading document vector $u=(0.8,0.6)$ and an upload-limit document vector $v=(0,1)$. All three have length one, so cosine similarity equals their dot product:
 
-Whether a returned chunk contains the golden passage is decided by fuzzy string matching rather than substring search: the passages were copied with small edits (only 7 of the 20 occur verbatim in the dump, even after normalizing whitespace), and a chunk may hold only part of one. The criterion is a partial-ratio similarity of at least 80 %, which is itself a source of error: a chunk from a different post that quotes the same sentence counts as a hit.
+$$
+\cos(q,u)=0.8,\qquad\cos(q,v)=0.
+$$
 
-### Worked example
+These coordinates are hand-chosen, not outputs of a model. They explain how a vector ranking could put offline reading first; they do not demonstrate that a trained model will do so. No dense retriever was run for this lesson.
 
-Three questions; the golden passage is found at rank 1, rank 3, and not at all within the top 10:
+A fair next experiment keeps the same document IDs and relevance labels, runs a named encoder, and compares every changed ranking against the lexical baseline. For a larger corpus, retrieve candidates first and use a more expensive joint query-document scorer only on those candidates. Neither step is a guarantee of improvement.
 
-| Question | Rank | $1/\mathrm{rank}$ | Hit@1 | Hit@3 | Hit@10 |
-| --- | --- | --- | --- | --- | --- |
-| A | 1 | 1.000 | 1 | 1 | 1 |
-| B | 3 | 0.333 | 0 | 1 | 1 |
-| C | — | 0 | 0 | 0 | 0 |
-| **mean** | | **0.444** | **0.33** | **0.67** | **0.67** |
+## Run and change the experiment
 
-Hit@$k$ answers "how often is the answer somewhere in what we hand to the next stage"; MRR answers "how high is it". A generator that reads the top 5 cares about Hit@5; one that reads only the top passage cares about Hit@1, whether the relevant passage is ranked first. MRR also credits ranks 2, 3, … that such a generator never sees, so it summarizes ranking quality rather than measuring that generator's retrieval success.
+Save [the script](/data/biased-retrieval-lab-v1/retrieval-example.py) beside `dataset.json`, then run:
 
-The same evaluation applies to every variant below: the dense retriever, the parent-document retriever, BM25, the hybrid and the reranked pipeline. The procedure is the point: every retrieval change is measured on the golden set before it goes near a generator.
-
-## Three improvements
-
-Each of these is a variant to evaluate on the golden set, with the gain expected from the mechanism; none comes with a measured result on this corpus.
-
-### Reranking with a cross-encoder
-
-A bi-encoder scores a pair from two independent vectors; it never sees query and passage together. A **cross-encoder** reads `[CLS] q [SEP] d [SEP]` and outputs one relevance score, with full attention between the two texts. That is more accurate and far more expensive: nothing can be pre-computed, so scoring the whole corpus would take $N$ encoder passes per query. The standard pipeline uses both: retrieve the top 20–100 cheaply, then re-score only those with the cross-encoder (`BAAI/bge-reranker-v2-m3` here) and re-order. The cost is $k$ encoder passes per query; the expected gain is in precision at the top, where the generator reads.
-
-### Hybrid retrieval
-
-BM25 and dense retrieval fail on different queries: exact identifiers versus paraphrases. Running both and merging the lists covers both failure modes with no training. Raw scores of the two are on different scales, so the lists are usually merged by rank: **reciprocal rank fusion** scores a passage by $\sum_r w_r/(60 + \mathrm{rank}_r)$ over the lists $r$ it appears in ([Cormack et al., 2009](#references)). The hybrid used here puts weight 0.4 on the BM25 list and 0.6 on the dense one. On technical corpora full of names and codes, hybrid retrieval is usually the right default.
-
-### Query expansion
-
-Users write *чё делать если в промптах нерелевантная инфа?* and the corpus says *нерелевантная информация в контексте*. A small instruction-tuned model can rewrite the query into the register of the corpus, or generate several paraphrases that are all searched. It costs a generation per query and helps most when queries are short and informal.
-
-## Questions with conditions: self-query retrieval
-
-Some questions combine a topic with a condition on a field that the documents carry as metadata: *antibiotic treatment of pneumonia in studies published after 2015*, *posts by a given author about attention*. The topic is a matter of meaning; the condition is not. Cosine similarity cannot enforce *after 2015*: the condition moves the query vector toward texts that mention years, not toward texts from those years. Vector stores therefore accept **metadata filters**, exact conditions on stored fields applied together with the nearest-neighbour search. Someone has to write the filter.
-
-**Self-query retrieval** lets a language model write it. The model receives a description of the documents, the list of metadata fields with their types and meanings, the comparison operators the store supports, and the question. It returns a structured query in two parts: the text to match by similarity, with the conditions taken out of it, and a filter built from comparisons (`eq`, `lt`, `gt`, …) joined by `and` and `or`, or no filter when the question sets no condition. A parser checks the filter against a small grammar, a translator rewrites it in the store's own filter syntax, and the store runs a filtered search. For abstracts stored with a `year` field:
-
-```
-question:  antibiotic treatment of pneumonia in studies published after 2015
-query:     antibiotic treatment of pneumonia
-filter:    gt("year", 2015)
+```sh
+python3 retrieval-example.py --dataset dataset.json --output results.json
 ```
 
-Taking the condition out of the text matters twice: the query vector now encodes the topic alone, and the condition is enforced exactly instead of approximately.
+Python's standard library is sufficient. No external dataset, model download or paid service is required. A [self-contained notebook with the data and saved outputs](/data/biased-retrieval-lab-v1/nlp-retrieval-lab.ipynb) runs the same experiment.
 
-The costs are those of any model in the loop. Every query takes one generation before retrieval. The model can name a field that does not exist, use a value that the data spell differently (*Pneumonia* against *pneumonia*, a full name against initials), or turn a vague word into a hard condition (*recent* as a particular year). A wrong filter fails silently: it removes the right documents, and the search returns the best of the wrong ones. Self-query can only filter on metadata stored when the corpus was indexed. Like every change to retrieval, it is measured on the golden set before it is trusted.
+Start by changing one query while keeping its relevant ID fixed. Predict which terms will match, run the script, and inspect that query's rank. Then add an irrelevant document that repeats a query term: a higher lexical score is not proof that a document answers the question.
 
-## What changed
+## Limits
 
-| | BM25 | Dense bi-encoder | + reranker | Hybrid | + self-query |
-| --- | --- | --- | --- | --- | --- |
-| Matches on | terms | meaning (trained pairs) | meaning, jointly read | both | meaning + exact field conditions |
-| Training | none | contrastive, large pair sets | contrastive, pairs | none extra | none extra |
-| Query cost | inverted index lookup | 1 encoder pass + ANN | + $k$ encoder passes | both lookups | + 1 generation, filtered ANN |
-| Rare identifiers | exact | often missed | depends on candidates | exact | exact if stored as a field |
-| Paraphrase | missed | found | found | found | found |
+The ten queries were written together with the corpus to illustrate specific failures. This is not a held-out benchmark, and 0.8 is not an estimate of production quality. One query changes Hit@k by 0.1. The two locales have separate token matches; equal aggregate metrics do not mean identical rankings. Dense retrieval, reranking and generated answers remain unmeasured here.
 
-## Limitations
-
-- **The encoder's training distribution.** Embeddings trained on web Q&A pairs degrade on legal, medical or code corpora; a golden set is the only way to know.
-- **Chunk boundaries** cut answers; overlap and parent retrieval mitigate, not remove.
-- **Long and multi-topic passages** embed to a blurred vector; the fix is chunking, which creates the previous problem.
-- **Freshness.** Changing a document means re-embedding it; the index is a snapshot.
-- **The golden set is small and hand-made**, and the fuzzy-match criterion adds noise. With 20 questions one question moves Hit@$k$ by 5 points, so differences of a question or two between retrievers are not conclusions.
-- **Similarity is not relevance.** A passage about the same topic that does not contain the answer scores high; reranking helps, generation evaluation (next notes) catches the rest.
-- **Model-written filters fail silently.** A self-query filter with a wrong field or value removes the answer without any sign in the results, and it can only use metadata stored at indexing time.
-- **An index belongs to its encoder.** A persistent index has to be queried with the model and instructions that built it; changing either means embedding the corpus again.
-
-## What you should remember
-
-- BM25: saturated term counts with length normalization; exact on rare terms, blind to paraphrase.
-- Dense retrieval: a contrastively trained bi-encoder, cosine on normalized vectors, a vector index; respect symmetric vs asymmetric conventions.
-- Instruction-conditioned embedders (INSTRUCTOR) generalize the prefix to an instruction naming domain, text type and task; passages and queries each keep one instruction.
-- Persist the index to embed the corpus once; query it with the encoder that built it.
-- Self-query: a language model splits a question into a text query and a metadata filter; the filter is exact, and a wrong one silently removes the answer.
-- Chunk by a unit that holds one idea; index small, return large (parent retrieval); overlap guards boundaries.
-- Measure on a golden set with Hit@$k$ and MRR before touching generation.
-- Rerank the top candidates with a cross-encoder; fuse BM25 and dense lists for both failure modes; adopt either only after it wins on the golden set.
-
-## Notebook
-
-[`week09_RAG.ipynb`](https://github.com/xufana/dsba_nlp/blob/autumn-2025/seminars/week09_RAG.ipynb). Cell numbers count every cell, markdown included, from 1. Quoted numbers come from the run saved with the course; cells changed since then for current library versions have no saved output.
-
-- Cells 6–14 load the post dump, plot post lengths, print five long posts, and load the golden set of 20 question–passage pairs.
-- Cells 19–24 wrap posts as documents; cells 27–45 try the token, sentence, semantic and recursive chunkers on five long posts and print the chunks and their token counts.
-- Cells 47–49 configure the symmetric `bge-m3` embedder (normalized vectors) with the asymmetric `e5` alternative in a comment; cell 51 builds the in-memory Qdrant index with `QdrantVectorStore` (the run saved with the course stopped here on a library version error, so the retrieval cells after it have no saved outputs).
-- Cells 55–60 set up parent-document retrieval with 120-character child chunks.
-- Cells 62–67 implement the golden-set evaluation (Hit@k for $k \in \{1, 3, 5, 10\}$ and MRR), first with exact substring matching, then with an 80 % fuzzy threshold; the code calls the hit rate P@k. The parent-document retriever has added its child chunks to the same Qdrant collection by then, so this dense search runs over whole posts and 120-character fragments together.
-- Cells 68–71 build BM25 (top 10) and the 0.4 / 0.6 reciprocal-rank hybrid with `EnsembleRetriever`, and evaluate each. The evaluation is run for the dense retriever, the parent-document retriever, BM25, the hybrid and the reranked variants; the numeric outputs of those cells were not saved, so the note quotes no Hit@k or MRR values.
-- Cells 77–78 paraphrase an informal query with a 3 B instruction-tuned model.
-- Cells 81–85 load the `bge-reranker-v2-m3` cross-encoder and rerank what the parent-document retriever returns. The loop asks for 20 candidates, but this retriever ignores a `k` passed to `invoke`, so the reranker reorders at most four posts: the parents of the four nearest child chunks.
-
-The medical RAG task notebook of the HSE-LAMBDA *Deep Generative Models* course, [`05_hw_LLM-RAG.ipynb`](https://github.com/HSE-LAMBDA/DeepGenerativeModels/blob/spring-2025-long/homeworks/05_hw_LLM-RAG.ipynb), builds its index with LangChain (same cell-number convention). It is a template with the key lines left to fill in, so it has no outputs. Its data, MeDAL, and its generation cells are described in the [RAG note](/notes/nlp/rag#notebook).
-
-- Cells 7–8 read the CSV with `CSVLoader` and its `.lazy_load()` generator, which yields one `Document` per row without reading the file into memory. By default every column becomes a `name: value` line of the document text, so the abstract id and the position index are embedded with the abstract, and the metadata hold only the file path and the row number. `content_columns=["TEXT"]` and `metadata_columns=["LABEL"]` keep the abstract as the text and move the label into the metadata, where a filter can use it.
-- Cells 9–10 create `HuggingFaceInstructEmbeddings`, LangChain's wrapper for INSTRUCTOR, with the model name left to fill in; the wrapper's default is `hkunlp/instructor-large`, the 335 M model above. Its default instructions, "Represent the document for retrieval: " for passages and "Represent the question for retrieving supporting documents: " for queries, name no domain; `embed_instruction` and `query_instruction` change them.
-- Cells 11–16 create a Chroma store with `persist_directory='DB'`, add the first `N_DOCS = 2000` rows, one abstract per document without chunking (MeDAL abstracts have a median of 150 words), call `.persist()` and list the directory. The loop has to stop at `N_DOCS` itself, since `total=` only sizes the progress bar, and adding documents in batches embeds them in fewer, larger encoder calls.
-- Cells 18–20 import `SelfQueryRetriever` and `AttributeInfo`, the description of a metadata field that a self-query model reads, and the install line includes `lark`, the parser of its filters. The template itself builds a plain `vectordb.as_retriever()`, a similarity search that returns four documents by default, and tests it with the abbreviation query "ceftobiprole bpr". A self-query retriever over this corpus needs fields in the metadata, such as `LABEL`, which the default `CSVLoader` settings do not put there.
-
-Issues in these cells:
-
-- The install line pins `sentence-transformers==2.2.2`, the version the `InstructorEmbedding` package was written for. That version imports `cached_download` from `huggingface_hub`, which `huggingface_hub` 0.26 removed, so the import fails on a current environment unless `huggingface_hub<0.26` is pinned too.
-- `from langchain.embeddings import HuggingFaceInstructEmbeddings`, `from langchain.vectorstores import Chroma`, `from langchain.chains.query_constructor.base import AttributeInfo` and `from langchain.retrievers.self_query.base import SelfQueryRetriever` are paths of LangChain before 1.0. The install line does not pin LangChain and gets 1.x, where these classes live in `langchain-community`, `langchain-chroma` and `langchain-classic`.
-- `.persist()` exists only on the deprecated Chroma class of `langchain-community`, where it does nothing since Chroma 0.4: a store with a `persist_directory` is written to disk automatically. The `langchain_chroma.Chroma` class, which the install line also brings, has no such method, and the call fails.
-
-## Next
-
-A retriever hands over passages; something has to turn them into an answer. The [next note](/notes/nlp/rag) puts a language model after the retriever, decides how to build its context, lists the ways the combination fails, and separates the evaluation of the retrieval from the evaluation of the answer.
+To inspect the arithmetic further, review [vectors and linear maps](/notes/math/vectors-and-linear-maps). To extend the script, use [Python functions](/notes/python/functions). The useful habit is to keep documents, relevance labels, ranking settings and observed results together.
 
 ## References
 
-- S. Robertson, H. Zaragoza. [The Probabilistic Relevance Framework: BM25 and Beyond](https://doi.org/10.1561/1500000019). *Foundations and Trends in Information Retrieval*, 3(4), 2009.
-- V. Karpukhin et al. [Dense Passage Retrieval for Open-Domain Question Answering](https://aclanthology.org/2020.emnlp-main.550/). EMNLP, 2020.
-- N. Reimers, I. Gurevych. [Sentence-BERT: Sentence Embeddings using Siamese BERT-Networks](https://aclanthology.org/D19-1410/). EMNLP, 2019.
-- R. Nogueira, K. Cho. [Passage Re-ranking with BERT](https://arxiv.org/abs/1901.04085). arXiv, 2019. Cross-encoder reranking.
-- G. V. Cormack, C. L. A. Clarke, S. Büttcher. [Reciprocal Rank Fusion outperforms Condorcet and individual Rank Learning Methods](https://doi.org/10.1145/1571941.1572114). SIGIR, 2009.
-- J. Chen, S. Xiao, P. Zhang, K. Luo, D. Lian, Z. Liu. [BGE M3-Embedding: Multi-Lingual, Multi-Functionality, Multi-Granularity Text Embeddings](https://arxiv.org/abs/2402.03216). arXiv, 2024. The embedder used in the notebook.
-- H. Su, W. Shi, J. Kasai, Y. Wang, Y. Hu, M. Ostendorf, W. Yih, N. A. Smith, L. Zettlemoyer, T. Yu. [One Embedder, Any Task: Instruction-Finetuned Text Embeddings](https://arxiv.org/abs/2212.09741). Findings of ACL, 2023. INSTRUCTOR: §2.1 (instruction plus text, mean over the text tokens), §2.3 (instruction format, 330 training datasets), Table 2, §4.5 (unseen domains).
-- L. Wang et al. [Multilingual E5 Text Embeddings: A Technical Report](https://arxiv.org/abs/2402.05672). arXiv, 2024. The asymmetric prefix convention.
-- Yu. A. Malkov, D. A. Yashunin. [Efficient and robust approximate nearest neighbor search using Hierarchical Navigable Small World graphs](https://arxiv.org/abs/1603.09320). *IEEE TPAMI*, 42(4), 2020. HNSW.
+- S. Robertson, H. Zaragoza. [The Probabilistic Relevance Framework: BM25 and Beyond](https://doi.org/10.1561/1500000019). Foundations and Trends in Information Retrieval, 2009. Conceptual reference for lexical scoring; no source text or implementation is reproduced.
+- N. Reimers, I. Gurevych. [Sentence-BERT: Sentence Embeddings using Siamese BERT-Networks](https://aclanthology.org/D19-1410/). EMNLP-IJCNLP, 2019. Sentence embeddings compared by cosine similarity.
+- V. Karpukhin et al. [Dense Passage Retrieval for Open-Domain Question Answering](https://aclanthology.org/2020.emnlp-main.550/). EMNLP, 2020. Dual-encoder retrieval.

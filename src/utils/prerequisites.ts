@@ -8,10 +8,17 @@
  * cannot add an unlinked one.
  */
 
+import { publishedNoteHref } from './withdrawnNotes';
+
 export type PrerequisiteTarget = { note: string; anchor?: string } | { href: string };
 
 
 const background: Record<string, PrerequisiteTarget> = {
+  // Withheld topics resolve to their course index until independently revised.
+  'Designing an ML system': { note: 'mlops/ml-system-design' },
+  'Проектирование ML-системы': { note: 'mlops/ml-system-design' },
+  'Cost and efficiency of ML systems': { note: 'mlops/cost-and-efficiency' },
+  'Стоимость и эффективность ML-систем': { note: 'mlops/cost-and-efficiency' },
   // Probability: the notes of the probability course.
   'Probability': { note: 'probability/what-probability-is' },
   'Basic probability': { note: 'probability/what-probability-is' },
@@ -198,7 +205,7 @@ export function prerequisiteLinks(
     if (topic) return { label, href: `${prefix}/${topic}`, external: false };
     const target = background[label];
     if (target && 'href' in target) return { label, href: target.href, external: true };
-    if (target) return { label, href: `${prefix}/${target.note}${target.anchor ? `#${target.anchor}` : ''}`, external: false };
+    if (target) return { label, href: publishedNoteHref(prefix, target.note, target.anchor), external: false };
     if (lenient) return { label, href: '', external: false };
     throw new Error(`Prerequisite "${label}" links to nothing: add it to src/utils/prerequisites.ts`);
   });
