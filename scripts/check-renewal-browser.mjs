@@ -91,6 +91,7 @@ try {
       }
       if (width === 390 && theme === 'dark' && item.locale === 'ru') {
         const name = item.id.replaceAll('/', '-');
+        await page.evaluate(() => window.scrollTo({top: 0, left: 0, behavior: 'instant'}));
         await page.screenshot({path: `${output}/${name}-top.png`});
         for (let i = 0; i < await tables.count(); i++) {
           await tables.nth(i).screenshot({path: `${output}/${name}-table-${i + 1}.png`});
