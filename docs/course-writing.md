@@ -1,6 +1,8 @@
 # Writing course notes
 
-How the Generative Models notes were written and reviewed, as a guide for the next course or the next pass. The notes on the site are the official course notes: they stand on their own and never refer to the private material they were written from.
+How the Generative Models notes were written and reviewed, as a guide for the next course or the next pass. The notes on the site stand on their own. The source-rights policy below controls third-party reuse and attribution; private preparation details never override it.
+
+Read [Sources, licensing and course publication](content/source-policy.md) before drafting. It applies to every course. Maintain a current per-file review under `content-rights/reviews/`; the pre-policy inventory is not clearance. fpakhurov.com is the reviewed upstream text for BIASED.
 
 ## 1. Source material stays private
 
@@ -125,7 +127,7 @@ A note should leave the reader able to explain the method, derive its key formul
 
 Run after every change set:
 
-1. `npm run build` with 0 errors.
+1. `npm run rights:test`, `npm run rights:check`, and `npm run build` with 0 errors. Every teaching-file change must have a current source review; do not refresh the baseline to make the check pass.
 2. On every built note page: no `katex-error`, no duplicate `id`, no broken internal link or anchor (including links from the course map and between notes), and no withdrawn source, dataset, notebook-derived example or result. Run the publication-hold checks and verify both locales.
 3. A text search for banned source words (`scan`, `seminar`, `slide`, `page \d`, `handwrit`, `editorial`, `transcri`) in notes and figure captions, with notebook URLs excluded (their paths contain `seminars/`). Author names such as Pascanu are false positives.
 4. `COURSE_LENIENT=1 npm run build` builds a course whose map lists notes that do not exist yet (useful while drafting); the plain `npm run build` is strict and is what is published.
