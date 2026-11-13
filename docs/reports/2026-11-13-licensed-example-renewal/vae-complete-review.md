@@ -1,0 +1,67 @@
+# VAE: complete scoped source and example renewal
+
+Date: 2026-11-13. Reviewer/author: Codex `course_licenses`, for Fedor Pakhurov's project, with explicit AI assistance. This review covers the complete EN/RU VAE note, its seven imported figures and local import closure, the existing scalar optional practice, and the new verification scripts. It does not clear other VAE-related notes or the entire course. Independent root review, full-site CI and deployment are separate release steps, not claimed here.
+
+## Material disposition
+
+- The old schematic digit/scribble comparison and hand-morphed digit interpolation have been replaced. The new first figure evaluates two explicit scalar decoders that agree at three training observations but disagree at an unseen code. The new interpolation figure actually evaluates a specified three-pixel sigmoid decoder at five latent points. Neither is presented as a trained VAE result.
+- The previous CelebA-backed HSE notebook recommendation was already replaced by the original four-observation scalar Gaussian lab. Its obsolete bibliography entry and a CelebA attribute-editing example are now removed. A newly specified conditional Gaussian example gives a directly verifiable 1.6 shift; no photos, model weights, fonts or external dataset are inputs.
+- The PPCA-to-VAE exposition, gradient derivation and reconstruction/KL interpretation are source-informed adaptations of BMML lecture 6, not claimed wholly independent. A dedicated public notice preserves the exact MIT license and identifies the adaptation and changes. Both localized notes link it beside the relevant sections and in references.
+- Two additional diagrams are replaced with independently specified numerical constructions: exact scalar Gaussian conditioning and parameter shifts at four fixed noise values. The previous cloud-to-prior and sampling/backpropagation layouts could depend on the Kingma–Welling monograph Figures 2.1/2.3; its publisher restriction does not establish a commercial adaptation grant. Replacing them avoids relying on that unresolved expression boundary; this is not a finding of infringement. The replacement curves and coordinates come from the recorded formulas, with no source artwork.
+- The three retained figures (ELBO terms, Jensen and Gaussian KL) and their local helpers were read in full. ELBO's posterior sketch is corrected to an axis-aligned ellipse, matching the stated Gaussian family; its source-informed reconstruction/prior interpretation falls within the declared BMML adaptation. Jensen and KL curves evaluate elementary formulas directly. No external image payload is present.
+- `JointMarginals.astro` is not imported by this note or its closure and is not included in this review. No other course note is cleared by these file hashes.
+
+## Primary sources and exact use boundaries
+
+| Source | Pinned evidence and checked scope | Local disposition |
+| --- | --- | --- |
+| BMML lecture 6 | [`e68351cda47e224e0fe3465f2780ca7ff37b330b`](https://github.com/bmml-team/bmml_ftda/blob/e68351cda47e224e0fe3465f2780ca7ff37b330b/Lectures/lecture_6.pdf); PDF blob `8a669dd8f985e6380bf0da8be823f0ec266412ff`; complete six-page extracted text read, page 6 rendered figures inspected. [LICENSE](https://github.com/bmml-team/bmml_ftda/blob/e68351cda47e224e0fe3465f2780ca7ff37b330b/LICENSE) blob `d99a154d04e565bfe4166956485927f96f1ba3f3`, fresh primary read confirms MIT explicitly includes associated documentation. | Adaptation of §§6.1–6.3 acknowledged in `public/licenses/bmml-vae.txt`, complete unmodified license. Underlying VAE methods credited separately. No PDF image redistributed; grant does not cover separately credited third-party sources. Overstatements about universal REINFORCE variance, posterior non-overlap and Gaussianized latent space corrected. |
+| Kingma and Welling | [AEVB v11](https://arxiv.org/html/1312.6114v11), §§2.2–2.4, §3 and Appendix B; method and Gaussian-KL equations checked. | Scientific definitions/identities, not reused experiment images, code or training trace. Version pinned while retaining ICLR 2014 bibliographic date. |
+| Rezende, Mohamed and Wierstra | [1401.4082v3](https://arxiv.org/abs/1401.4082v3), title, authors, abstract and 2014 submission metadata. | Historical co-development attribution only; no source implementation or distinctive worked example. |
+| Kingma and Welling review | [1906.02691v3](https://arxiv.org/html/1906.02691v3), §§2.1–2.2.1, 2.7, 2.8.1–2.8.2. | Scientific reference; local algebra and new mechanism checks. The v3 PDF front matter limits redistribution/commercial use; no reusable grant is claimed. Potential diagram dependencies were removed (Figures 2.1/2.3), replacing them with scalar densities and fixed-noise point shifts. Joint-KL scope and free-bits minibatch averaging made explicit; blanket blur/variance guarantees removed. |
+| Hoffman and Johnson | [Author paper hosted by Columbia](https://www.cs.columbia.edu/~blei/fogm/2020F/readings/HoffmanJohnson2016.pdf), pp. 1–3, Eqs. 7–13. | Credited index-MI/aggregate-KL identity. New three-component mixture quadrature independently checks the formula. No paper figures, empirical tables or prose copied. Archive-only link replaced with this accessible paper copy. |
+| Roman Isachenko | [Course revision `3d0e73d96a3a08a908348e34b57a138efea5485e`](https://github.com/r-isachenko/2025-DGM-MIPT-YSDA-course/tree/3d0e73d96a3a08a908348e34b57a138efea5485e); lecture 3 TeX blob `19773fed499b7c4801c133734b77424a8e3856f7`, naive-MC section lines 234–257; lecture 4 TeX blob `aa46493ceb677025f01e4acbe5ee48eda859f51d`, ELBO surgery/prior sections lines 450–544 read. | Background mathematical attribution. No reuse permission inferred; no cited lecture images imported. The scalar variance ratio is independently derived, and the source's general exponential-cost claim is narrowed to the stated independent-coordinate example. |
+| Bowman et al. | [1511.06349v4](https://arxiv.org/html/1511.06349v4), §3.1 and KL cost annealing, authors verified. | Definition and method reference only. No sentence examples, corpus, architecture implementation or reported scores reused. |
+| Sohn, Yan and Lee | [NeurIPS 2015 primary PDF](https://papers.nips.cc/paper_files/paper/2015/file/8d55a249e6baa5c06772297520da2051-Paper.pdf), §4 Eq. 4. | Conditional-ELBO reference. Author order corrected in both versions. Local conditional Gaussian fixture is new and separate from their structured-output experiments. |
+| Carter and Nielsen | [Distill 2017 article](https://distill.pub/2017/aia/), attribute-vector/bolding mechanism and explicit limitations read. | One attributed factual illustration, with limitations; no fonts, glyphs, images, code, training corpus or model copied. Article access is not treated as a grant for font data. |
+| Vahdat and Kautz | [NVAE 2007.03898v3](https://arxiv.org/abs/2007.03898v3), authors, abstract and stated 256×256 result. | A qualified published-result citation, not a reproduced local experiment, global priority claim, or recommendation to download its data/checkpoints. |
+| Shared geometry helper | Existing reviewed Mulberry32 implementation and public-domain/CC0 evidence in `public/licenses/mulberry32.txt`. | Closure retained without changing code. This VAE revision uses deterministic plotting/math functions, not the helper's PRNG outputs. That grant does not license arbitrary teaching material. |
+
+References with restrictive, absent or unchecked reuse terms remain references. They do not supply a blanket reuse grant. The only newly delivered adapted-documentation notice is the explicitly scoped BMML MIT notice.
+
+## Substantive mathematical and teaching corrections
+
+1. Reconstruction alone is not a guarantee of prior-sample quality. The replacement polynomial counterexample proves the missing constraint without invented trained-image outcomes.
+2. Naive prior Monte Carlo has exponential relative variance in the explicit independent-coordinate Gaussian construction; the note no longer claims this rate for every latent model. Using the exact ratio gives 141 samples in one dimension and 634,983 in ten for relative standard deviation at most 10%.
+3. A single learned variance shared across the dataset minimizes the average expected squared residual, not each image's residual independently. The profiled loss involves the logarithm of the overall expected MSE. The one-code loss is labeled a stochastic estimate, with fixed decoder variance 1/2 stated.
+4. Minibatch scaling uses the average gradient times dataset size for a sum objective. Score-function and pathwise differentiation assumptions are stated. The 30-versus-4 variance calculation is checked and explicitly limited to its Gaussian polynomial example.
+5. Prior mismatch and conditional averaging are separate mechanisms. Positive-support Gaussian posteriors overlap; no automatic semantic interpolation, identity preservation, or Gaussian aggregate latent space is promised.
+6. The joint forward-KL interpretation assumes compatible densities and finite terms. Empirical point masses against a continuous model make that joint KL infinite; per-observation ELBO remains usable. No universal variance or blur theorem is inferred.
+7. ELBO surgery's index-information bound and unrestricted optimum prior are stated with scope. The collapse table is a constructed population example, not a neural-training measurement. Free bits uses a minibatch average per latent group; neither it nor annealing guarantees informative codes.
+8. A source's empirical attribute direction and NVAE result are clearly attributed and separated from local executed work.
+
+## Executed verification
+
+`python3 scripts/notes/check-vae-renewal.py` freshly regenerates and compares `vae-numerical-checks.json`. Checks cover:
+
+- Explicit two-decoder example and all fifteen displayed sigmoid pixel values.
+- PPCA posterior from two independent algebraic forms in a newly chosen two-dimensional observation example. The separate scalar figure is checked by quadrature of normalization, mean and variance and by the pointwise Bayes identity at six values. Its posterior has mean 0.4224137931 and variance 0.1551724138.
+- Fixed noise values −1.5, −0.5, 0.5 and 1.5 produce all twelve displayed positions. Finite changes in mean and standard deviation recover derivatives 1 and ε exactly within floating-point tolerance; the points are selected values, not claimed random draws.
+- Exact Gaussian prior-MC moment ratio and sample-count rounding; shared-variance stationary point and surrounding objective values.
+- Gaussian polynomial moments: score and pathwise mean 2, variances 30 and 4.
+- All seven KL table rows, correlation cost, KL curve clipping threshold, and Jensen values.
+- A new three-component Gaussian-mixture quadrature: average KL 0.8190387852 = index MI 0.6278213047 + marginal KL 0.1912174805. Simpson integration on [-12,12] uses 12,000 intervals and checks the identity to 2e-10; this is a numerical check, not a proof for all distributions.
+- All collapse-table rates and densities; original conditional means 0.6 and 2.2.
+- Fresh execution of the published `generative-practice.py vae` branch, comparing its rounded result to the existing saved artifact, including its 40,000 seeded Monte Carlo samples.
+
+`node scripts/notes/check-vae-figures.cjs` passes: all seven Astro figures and wrapper compile; frontmatter values agree with the Python fixtures; both notes compile with strict MDX/KaTeX; **292 math spans per locale** match exactly after whitespace normalization. No external image-model experiment is claimed.
+
+Actual Astro components were also rendered in a standalone container with project CSS and FigureDefs. Chromium 156.0.8078.4 checks EN/RU × 390/1000 pixels × light/dark preference: no page overflow or SVG text outside its viewport. All seven RU narrow and EN wide figures were visually inspected. The three new scalar/interpolation SVGs are capped at 440px so its three-pixel rows do not become oversized on desktop. This is a scoped standalone figure review, not a full-site/browser interaction or production claim. The saved geometry summary is `vae-visual-checks.json`; screenshots are ephemeral under `/tmp/vae-review`.
+
+The current complete scoped record retires the narrower practice-only record. Pending independent review and release checks must be recorded by their actual reviewer; this report does not assert them in advance.
+
+## Independent release review by root
+
+Root read the complete English explanation and verifier, selected Russian passages around the joint-KL and aggregate-KL assumptions, all seven figure implementations and direct first-party helpers/notices. The 292math-span parity check and fresh numerical/figure replays passed. The review agreed with the shared-variance optimum, support assumptions, variance30versus4 calculation, exact Gaussian conditioning, collapse-rate table and empirical-versus-constructed distinctions. No additional content blocker was found. This does not claim a second full primary-source or complete Russian-prose audit; those were performed by the named author/reviewer above.
+
+Actual Astro pages were checked together with PG in16EN/RU×390/1440×light/dark views. No document overflow, failed fonts, KaTeX errors or SVG text outside its viewport remained. Root visually inspected all seven Russian narrow figures. Full-site build/CI and public deployment are recorded separately by the release.

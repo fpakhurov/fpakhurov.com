@@ -48,11 +48,16 @@ function localDependencies(name, text, exists, project) {
   for (const match of text.matchAll(/(?:\]\(|(?:href|src)=['"])(\/[^\s'"<>\)]+)/g)) {
     const value = match[1].split(/[?#]/)[0];
     if (/^\/(?:ru\/)?notes(?:\/|$)/.test(value)) continue;
-    if (/^\/(?:data|assets|figures|images|notebooks)\//.test(value) || /\.[a-z0-9]{2,6}$/i.test(value)) refs.push({ value, public: true });
+    if (/^\/(?:data|assets|figures|images|notebooks)\//.test(value) || (project === 'biased' && /^\/api\/notebooks\//.test(value)) || /\.[a-z0-9]{2,6}$/i.test(value)) refs.push({ value, public: true });
   }
   return [...new Set(refs.map((ref) => {
     const value = ref.value.split(/[?#]/)[0];
-    const target = ref.public ? `${project === 'biased' ? 'apps/web/public' : 'public'}${value}` : path.posix.normalize(path.posix.join(path.posix.dirname(name), value));
+    // Match resolveNotebookFile: these are application routes backed by content,
+    // while URLs with extensions remain ordinary public assets.
+    const notebook = project === 'biased' && ref.public && value.match(/^\/(?:api\/)?notebooks\/([a-z0-9][a-z0-9-]{0,80})\/?$/);
+    const target = notebook ? `content/notebooks/${notebook[1]}.ipynb`
+      : ref.public ? `${project === 'biased' ? 'apps/web/public' : 'public'}${value}`
+        : path.posix.normalize(path.posix.join(path.posix.dirname(name), value));
     fail(safePath(target), `Invalid local asset reference in ${name}`);
     const candidates = [target, ...['.ts','.tsx','.js','.mjs','.json','.astro','.css','/index.ts','/index.js'].map((suffix) => target + suffix)];
     const resolved = candidates.find(exists);
