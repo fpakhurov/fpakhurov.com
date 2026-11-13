@@ -65,6 +65,13 @@ try {
       }
       const result = {...item, width, theme, ...state};
       delete result.localLinks;
+      const figures = page.locator('.prose figure.fig');
+      result.figureScreenshots = [];
+      for (let i = 0; i < await figures.count(); i++) {
+        const filename = `${item.id.replaceAll('/', '-')}-${item.locale}-${width}-${theme}-figure-${i + 1}.png`;
+        await figures.nth(i).screenshot({path: `${output}/${filename}`});
+        result.figureScreenshots.push(filename);
+      }
       const tables = page.locator('.prose table');
       result.scrollableTables = 0;
       for (let i = 0; i < await tables.count(); i++) {
