@@ -1,12 +1,167 @@
 ---
 title: "FastText: word vectors from character n-grams"
-description: "This note is withheld pending an independent source review."
+description: "Compose words from character features, trace hash collisions and unseen spellings, and distinguish subword vectors from supervised text classification."
 course: nlp
 section: Distributed Representations
 order: 9
-status: needs-review
-tags: []
-prerequisites: []
+status: published
+tags: [fasttext, embeddings, subwords, character-ngrams, oov, text-classification]
+prerequisites: [Word2Vec, "GloVe: embeddings from global co-occurrence counts"]
 ---
 
-This note is withheld pending an independent source review.
+The vocabulary contains `lamp`, but a new message says `lamps`. A static word table has no dedicated row for the new spelling. Its characters nevertheless overlap with a known word. Sharing parameters through character sequences lets the new spelling assemble a vector, while introducing a different failure mode: unrelated strings can share pieces or hash buckets too.
+
+## Baseline: one vector per word type
+
+Basic Word2Vec gives each retained word type an independent input row. Rare words get few updates, and an unseen word needs an unknown-token rule. Enlarging the vocabulary assigns more independent rows without supplying more observations for each one. A separate row also treats a small spelling change as a completely different symbol.
+
+Subword sharing adds an inductive assumption: some useful properties are shared by words with overlapping character sequences. That can help related forms, but spelling overlap does not prove related meaning. The useful question is whether the shared parts receive relevant training signals for the intended task and language.
+
+## A word is a bag of character n-grams
+
+FastText's subword model surrounds a word with boundary symbols and collects character n-grams. The boundaries distinguish an initial or final sequence from the same characters inside a word. A known vocabulary word also has a whole-word row, separate from hashed character components.
+
+For our independently specified example, use only trigrams. The bounded spelling `<lamp>` yields `<la`, `lam`, `amp`, `mp>`. The unseen spelling `<lamps>` yields `<la`, `lam`, `amp`, `mps`, `ps>`. Three components are shared; the ending changes. These are character features, not a claim that the tokenizer has discovered morphological units.
+
+Let $G(w)$ be the list of feature occurrences used for word $w$, and let $z_g$ be their vectors. A summed subword input and its context score are
+
+$$
+\begin{aligned}
+u_w&=\sum_{g\in G(w)}z_g,\\
+s(w,c)&=u_w^\top v_c.
+\end{aligned}
+$$
+
+The paper describes this summed scoring form. The pinned library's `getWordVector` API averages the selected input rows when returning a vector. Sum and mean have the same direction when nonzero, but different magnitudes. They are interchangeable for cosine under positive rescaling, not for every score or downstream classifier. State which representation an experiment uses.
+
+For a logistic training event with scalar score derivative $\delta$, every participating component receives the context vector scaled by that derivative. Repeated features or bucket collisions add repeated contributions:
+
+$$
+\nabla_{z_b}\ell=m_b(w)\,\delta\,v_c,
+$$
+
+where $m_b(w)$ counts occurrences mapped to bucket $b$ for the summed representation. An averaged representation adds the appropriate denominator. Accumulating these gradients lets observations of one word change components used by another word.
+
+## Hashing
+
+Storing every distinct character sequence can be expensive. A hash maps a sequence to one of $B$ buckets; each bucket holds a vector. This bounds the subword-table size, at the cost of collisions. Two different features assigned to one bucket are forced to share parameters. A larger bucket table reduces some collisions but consumes more memory; it cannot guarantee collision-free representation of arbitrarily many sequences.
+
+For transparent arithmetic, our fixture defines its own small teaching hash for an ASCII trigram $c_1c_2c_3$:
+
+$$
+\begin{aligned}
+a&=\operatorname{ord}(c_1)+2\operatorname{ord}(c_2)\\
+&\quad+3\operatorname{ord}(c_3),\\
+h(c_1c_2c_3)&=a\bmod7.
+\end{aligned}
+$$
+
+This is deliberately not the fastText hash. The actual implementation uses an FNV-derived byte hash and handles UTF-8 character boundaries when constructing substrings. Our seven-bucket rule is chosen so every collision can be inspected, not recommended for a language system.
+
+| Feature | Teaching bucket |
+| --- | ---: |
+| `<la` | 0 |
+| `lam` | 6 |
+| `amp` | 0 |
+| `mp>` | 1 |
+| `mps` | 6 |
+| `ps>` | 3 |
+
+`<la` and `amp` collide although they are different trigrams. Both occur in `lamp`, so bucket zero contributes twice. Converting the bucket list to a set would change the representation and the gradient weights. Repeated identical substrings matter too: bounded `aaaa` has trigram occurrences `<aa`, `aaa`, `aaa`, `aa>`.
+
+With dedicated vocabulary rows, storage for one input table is proportional to $(V+B)d$. For a hypothetical 12,000-word vocabulary, 50,000 buckets and dimension 48, this is 2,976,000 numbers, or 11,904,000 float32 bytes before output tables and training state. These are arithmetic estimates, not measured library memory. Serialized dictionaries, optimizer choices and output structure add their own costs.
+
+## Vectors for unseen words
+
+A new spelling has no trained whole-word row, but its character features can still select subword rows. To make the arithmetic fully visible, assign these seven two-dimensional bucket vectors by hand:
+
+| Bucket | Coordinates |
+| ---: | --- |
+| 0 | (-3/4, -1/2) |
+| 1 | (-1/2, 0) |
+| 2 | (-1/4, 1/2) |
+| 3 | (0, -1/4) |
+| 4 | (1/4, 1/4) |
+| 5 | (1/2, -1/2) |
+| 6 | (3/4, 0) |
+
+Give the known word `lamp` an additional whole-word row `(1/2, -1/4)`. The other example spellings have none. All coordinates are chosen for a reproducible mechanism example; none is a trained semantic estimate.
+
+| Word | Bucket occurrences | Sum | Mean |
+| --- | --- | --- | --- |
+| lamp | 0, 6, 0, 1 + word row | (-3/4, -5/4) | (-3/20, -1/4) |
+| lamps | 0, 6, 0, 6, 3 | (0, -5/4) | (0, -1/4) |
+| clamp | 1, 4, 6, 0, 1 | (-3/4, -1/4) | (-3/20, -1/20) |
+
+Each mean divides by five in this particular example. For `lamp`, that includes four trigrams and one whole-word component; for the other words it includes five trigrams. The rule counts components, not letters. Different lengths or n-gram ranges generally produce different denominators.
+
+The result for `lamps` is computable even though it has no word row. Computability is weaker than useful coverage. A selected bucket may have received little relevant training, may be influenced by unrelated collisions or may never have been updated. If no eligible components exist, a vector-returning API needs an explicit empty-case behavior; cosine with a resulting zero vector remains undefined.
+
+## What subwords do to neighbours
+
+Shared parts can pull related spellings into similar regions because their updates affect overlapping parameters. The same mechanism can also connect unrelated words with similar fragments. A typo may preserve useful parts or destroy most of them, depending on its location and the n-gram lengths. Adding boundary markers changes which beginning and ending fragments survive.
+
+Character ranges balance different kinds of evidence. Short pieces are common and shared widely; long pieces are more specific but rarer. The paper's chosen range is an experimental configuration rather than a rule for every language. Our trigram-only calculation isolates the mechanism and makes no claim about the best range.
+
+Unicode normalization, case handling and token boundaries remain upstream decisions. Two visually similar strings can have different character sequences. FastText's substring construction does not replace a documented normalization policy. The small fixture accepts only nonempty ASCII alphabetic words, rejecting other inputs explicitly; it does not purport to reimplement the library's multilingual behavior.
+
+Subwords also do not make the representation contextual. Every occurrence of a spelling assembles the same static vector unless another model introduces context. Distinct meanings remain mixed. Evaluate unseen spellings separately from seen words, and distinguish genuinely new forms from duplicate messages or normalized variants of training data.
+
+## fastText as a classifier
+
+The fastText name also covers a supervised text classifier. Its targets are document labels rather than neighboring words. A basic version averages embeddings of text features and feeds the result to a linear output layer followed by softmax. Word n-grams can supply additional order-sensitive features; they are distinct from the character n-grams used to compose word representations.
+
+Let $x$ be normalized feature counts, $E$ the feature table and $A$ the class-output matrix. The logits are
+
+$$
+\begin{aligned}
+h&=E^\top x,\\
+z&=Ah.
+\end{aligned}
+$$
+
+With fixed feature extraction, the combined mapping is linear in $x$, with rank at most the embedding dimension before biases. Learning its two factors is still a coupled optimization problem. Parameter sharing across classes and features is the architectural benefit; choosing a nonlinear feature extractor would define a different input mapping.
+
+For a separate supplied example, set word rows `ready` to `(1, 0)`, `repair` to `(0, 1)` and `lamp` to `(1/2, 1/2)`. Use two class rows `(2, 0)` and `(0, 2)`. These are independent chosen classifier parameters, not the subword vectors in the previous table.
+
+| Text | Mean | Class probabilities |
+| --- | --- | --- |
+| lamp ready | (3/4, 1/4) | 0.731059; 0.268941 |
+| ready lamp | (3/4, 1/4) | 0.731059; 0.268941 |
+| lamp repair | (1/4, 3/4) | 0.268941; 0.731059 |
+
+The first text has logits 3/2 and 1/2. Their softmax yields the displayed probabilities. Reversing the words leaves the mean unchanged, so the classifier cannot infer order from those unigram features alone. Adding word bigram features would distinguish the two strings, but a finite bag of local n-grams still does not encode every long-range dependency.
+
+These probabilities are a calculation under chosen parameters, not measured classifier accuracy or calibrated estimates of equipment condition. A trained classifier would require labeled examples, a declared class definition and an evaluation split. Subword composition, text classification and their speed/quality comparisons should therefore be evaluated as separate claims.
+
+## What changed
+
+A word representation can now combine parameters shared with other spellings. This reduces dependence on a dedicated row for every form and allows a vector to be assembled for some unseen words. Hashing bounds the memory used by those components while coupling collisions. Supervised fastText uses a related feature-pooling architecture for labels, with a different target and evaluation contract.
+
+## Limitations
+
+Character overlap is an imperfect proxy for a useful relationship. Hashing loses identity, rare components have weak estimates, and unknown strings can receive misleading vectors. Malformed text, case changes and Unicode variants also affect the selected features. A complete model artifact needs its vocabulary, hashing/subword settings and trained tables; an exported list of known-word vectors alone cannot reconstruct every new word.
+
+Averaging ignores global order unless order information is encoded in the features. Static composition does not resolve polysemy or connect a statement to the physical world. Validate rare forms, new vocabulary and domain changes on the actual task; a plausible nearest neighbor is a diagnostic observation, not a general performance guarantee.
+
+## What you should remember
+
+Character features share input parameters across spellings. Boundaries distinguish positions inside a word. Hash collisions and repeated components accumulate. Known words may add a whole-word row; unseen words cannot use one. Sum and mean differ in scale. The supervised classifier predicts labels and needs its own evaluation.
+
+## Reproducible example \{#notebook\}
+
+The `fasttext` section of the [original standard-library cases](https://github.com/fpakhurov/fpakhurov.com/blob/main/scripts/notes/nlp-representations-cases.py) lists character features, teaching buckets, collisions, sums/means and the separate two-class calculation. [Saved JSON](https://github.com/fpakhurov/fpakhurov.com/blob/main/docs/reports/2026-11-13-licensed-source-renewal/nlp-representations-results.json) contains all inputs and outputs. Fractions verify the component arithmetic; Python 3.9.7 records the softmax values. No fastText binary, pretrained weights, external messages or benchmark data are loaded.
+
+## Code
+
+`character_trigrams` declares its limited ASCII input domain. `toy_bucket` is the transparent custom hash, not the library implementation. `subword_case` preserves multiplicity and adds a whole-word row only when present in its explicit dictionary. Keeping these stages separate allows a reviewer to trace every numerical contribution and prevents a collision from disappearing through accidental deduplication.
+
+## Next
+
+Static word and subword vectors do not know which part of a message is being interpreted. [Convolutional models for text](/notes/nlp/cnn-text-classification) introduce learned local patterns across positions, giving the next stage access to neighboring representations and their order.
+
+## References
+
+- Piotr Bojanowski, Edouard Grave, Armand Joulin, Tomas Mikolov. [Enriching Word Vectors with Subword Information](https://aclanthology.org/Q17-1010/), 2017, sections 3.1–3.2 and 6.3: summed subword scores, boundaries, hashing and unseen-word representations. No paper examples, figures, trained vectors or benchmark results are reused.
+- Armand Joulin, Edouard Grave, Piotr Bojanowski, Tomas Mikolov. [Bag of Tricks for Efficient Text Classification](https://arxiv.org/abs/1607.01759v3), 2016, section 2: averaged feature embeddings and linear label prediction.
+- Facebook, Inc.; fastText contributors. [Dictionary/subword implementation](https://github.com/facebookresearch/fastText/blob/1142dc4c4ecbc19cc16eee5cdd28472e689267e6/src/dictionary.cc) and [word-vector API](https://github.com/facebookresearch/fastText/blob/1142dc4c4ecbc19cc16eee5cdd28472e689267e6/src/fasttext.cc), revision `1142dc4`, MIT. `getSubwords`, `computeSubwords`, `hash` and `getWordVector` were checked for the stated implementation distinctions. The teaching hash, vectors and Python code are independently specified.
