@@ -53,6 +53,7 @@ const dist = (a: V2, b: V2) => Math.hypot(a[0] - b[0], a[1] - b[1]);
 /** Gradient of the motion-supervision loss with respect to s for handle p, latent s; with or without stop-gradient. */
 export const msGrad = (p: V2, s: V2, stopGrad: boolean): { g: V2; loss: number; d: V2 } => {
   const len = dist(GOAL, p);
+  if (len === 0) return { g: [0, 0], loss: 0, d: [0, 0] };
   const d: V2 = [(GOAL[0] - p[0]) / len, (GOAL[1] - p[1]) / len];
   let gx = 0, gy = 0, loss = 0;
   for (const q of disk(p, R1)) {
