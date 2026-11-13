@@ -65,12 +65,34 @@ try {
       }
       const result = {...item, width, theme, ...state};
       delete result.localLinks;
+      const tables = page.locator('.prose table');
+      result.scrollableTables = 0;
+      for (let i = 0; i < await tables.count(); i++) {
+        const tableState = await tables.nth(i).evaluate(table => {
+          const maxScroll = table.scrollWidth - table.clientWidth;
+          table.scrollLeft = maxScroll;
+          const reachedEnd = Math.abs(table.scrollLeft - maxScroll) <= 1;
+          const splitTokens = [...table.querySelectorAll('code')].filter(code => code.getClientRects().length > 1).map(code => code.textContent);
+          table.scrollLeft = 0;
+          return {maxScroll, reachedEnd, splitTokens};
+        });
+        assert.deepEqual(tableState.splitTokens, [], `${item.route}: table splits literal tokens`);
+        if (tableState.maxScroll > 1) {
+          assert.ok(tableState.reachedEnd, `${item.route}: final table columns are unreachable`);
+          result.scrollableTables++;
+        }
+      }
       if (width === 390 && theme === 'dark' && item.locale === 'ru') {
         const name = item.id.replaceAll('/', '-');
         await page.screenshot({path: `${output}/${name}-top.png`});
-        const tables = page.locator('.prose table');
         for (let i = 0; i < await tables.count(); i++) {
           await tables.nth(i).screenshot({path: `${output}/${name}-table-${i + 1}.png`});
+          const scrolled = await tables.nth(i).evaluate(table => {
+            table.scrollLeft = table.scrollWidth;
+            return table.scrollLeft > 1;
+          });
+          if (scrolled) await tables.nth(i).screenshot({path: `${output}/${name}-table-${i + 1}-end.png`});
+          await tables.nth(i).evaluate(table => { table.scrollLeft = 0; });
         }
         result.screenshots = name;
       }
