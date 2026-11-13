@@ -5,6 +5,7 @@ import { unified, rehypeHeadingIds } from '@astrojs/markdown-remark';
 import remarkMath from 'remark-math';
 import rehypeKatex from 'rehype-katex';
 import remarkHeadingIds from './src/plugins/remark-heading-ids.mjs';
+import rehypeWithdrawnNotes from './src/plugins/rehype-withdrawn-notes.mjs';
 
 interface HastNode {
   type: string;
@@ -53,7 +54,7 @@ export default defineConfig({
   markdown: {
     processor: unified({
       remarkPlugins: [remarkMath, remarkHeadingIds],
-      rehypePlugins: [rehypeKatex, rehypeHeadingIds, rehypeHeadingAnchors],
+      rehypePlugins: [rehypeKatex, rehypeHeadingIds, rehypeHeadingAnchors, rehypeWithdrawnNotes],
     }),
     shikiConfig: { theme: 'github-dark-default' },
   },

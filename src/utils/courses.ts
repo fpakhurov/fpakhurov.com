@@ -1,4 +1,5 @@
 import { dataEngineeringCourses } from './dataEngineering';
+import { withdrawnNotes } from './withdrawnNotes';
 
 export type CourseKey = 'probability' | 'ml' | 'deep-learning' | 'bayesian-methods' | 'generative-models' | 'nlp' | 'acos' | 'agents' | 'math' | 'python' | 'devops' | 'mlops' | 'sql' | 'databases' | 'big-data';
 
@@ -46,6 +47,7 @@ export interface Course {
 // A string is a planned topic. Published topics explicitly name their note and,
 // where useful, a section: article titles are not a reliable coverage map.
 function noteTopic(title: string, note: string, anchor?: string): CourseTopic {
+  if (withdrawnNotes.has(note)) return title;
   return { title, note, anchor };
 }
 
@@ -757,9 +759,9 @@ export const courses: Record<CourseKey, Course> = {
     title: 'Natural Language Processing',
     requires: ['deep-learning'],
     shortTitle: 'NLP',
-    description: 'One path from raw text to modern LLM systems. Each note says what it adds: a fix for a limitation of the previous method, or a new task, objective or system component.',
-    entry: 'Before you start: Deep Learning (training networks, normalization, optimizers), which builds on Machine Learning (logistic regression, cross-entropy, backpropagation), and the Programming in Python course, or basic Python. Notebook sections describe the course\'s public notebooks; the notes read without them.',
-    guide: [{ label: 'The plan of the course', note: 'nlp/natural-language-processing', anchor: 'the-plan-of-the-course' }],
+    description: 'This course is being revised. The available retrieval lesson uses an original fictional corpus and a reproducible Python example.',
+    entry: 'For the retrieval example, basic Python and an understanding of averages are enough. Other topics will return after their source review and revision.',
+    guide: [],
     progression: [
       { label: 'Text', section: 'Text Foundations' },
       { label: 'Classical NLP', section: 'Classical NLP' },
@@ -780,8 +782,8 @@ export const courses: Record<CourseKey, Course> = {
     ru: {
       title: 'Обработка естественного языка',
       shortTitle: 'NLP',
-      description: 'Один путь от сырого текста к современным LLM-системам. Каждая заметка говорит, что она добавляет: исправление ограничения предыдущего метода или новую задачу, цель обучения или компонент системы.',
-      entry: 'Что нужно знать: глубинное обучение (обучение сетей, нормализация, оптимизаторы), которое опирается на машинное обучение (логистическая регрессия, кросс-энтропия, обратное распространение), и курс программирования на Python или основы Python. Разделы «Ноутбук» описывают открытые ноутбуки курса; заметки читаются и без них.',
+      description: 'Курс перерабатывается. Доступная тема о поиске использует новый вымышленный корпус и воспроизводимый пример на Python.',
+      entry: 'Для примера о поиске достаточно основ Python и понимания среднего значения. Остальные темы вернутся после проверки источников и переработки.',
       progression: ['Текст', 'Классический NLP', 'Представления', 'Последовательности', 'Трансформеры', 'Предобучение', 'Масштабирование', 'Современные архитектуры', 'Адаптация', 'Задачи', 'Постобучение', 'Инференс', 'LLM-системы', 'Не слева направо'],
       labels: {
         'Scaling and LLM Pretraining': 'Масштабирование и предобучение LLM',
@@ -1675,9 +1677,9 @@ export const courses: Record<CourseKey, Course> = {
     title: 'MLOps: Machine Learning in Production',
     requires: ['devops', 'deep-learning'],
     shortTitle: 'MLOps',
-    description: 'How a model becomes a dependable product: ML system design, data pipelines, validation and features, reproducible and distributed training, serving and LLM inference, safe rollouts, monitoring and drift, retraining, LLMOps, and the fairness, privacy and cost of running models.',
+    description: 'How a model becomes a dependable product: data pipelines, reproducible training, serving, safe rollouts, monitoring, retraining and responsible operation. The system-design and cost topics are being revised.',
     entry: 'Before you start: the DevOps course for CI/CD, containers, Kubernetes and observability, and the Deep Learning course for how models are trained; the Machine Learning course is assumed through it. Quantization, efficient attention and agent evaluation are developed in the NLP and AI Agents courses and are linked here, not repeated. The notes explain concepts with worked examples; hands-on practice lives outside the site.',
-    guide: [{ label: 'The plan of the course', note: 'mlops/what-mlops-is', anchor: 'the-plan-of-the-course' }, { label: 'The course in one paragraph', note: 'mlops/cost-and-efficiency', anchor: 'the-course-in-one-paragraph' }],
+    guide: [{ label: 'The plan of the course', note: 'mlops/what-mlops-is', anchor: 'the-plan-of-the-course' }],
     progression: [
       { label: 'Systems', section: 'ML Systems' },
       { label: 'Data', section: 'Data' },
@@ -1689,7 +1691,7 @@ export const courses: Record<CourseKey, Course> = {
     ru: {
       title: 'MLOps: машинное обучение в продакшене',
       shortTitle: 'MLOps',
-      description: 'Как модель становится надёжным продуктом: проектирование ML-системы, конвейеры данных, валидация и признаки, воспроизводимое и распределённое обучение, инференс и системы инференса LLM, безопасная выкатка, мониторинг и дрейф, переобучение, LLMOps, а также справедливость, приватность и стоимость работы моделей.',
+      description: 'Как модель становится надёжным продуктом: конвейеры данных, воспроизводимое обучение, инференс, безопасные выпуски, мониторинг, переобучение и ответственная эксплуатация. Темы о проектировании системы и стоимости перерабатываются.',
       entry: 'Что нужно знать: курс DevOps (CI/CD, контейнеры, Kubernetes, наблюдаемость) и курс глубинного обучения (как обучают модели); курс машинного обучения подразумевается через него. Квантизация, эффективное внимание и оценка агентов разобраны в курсах NLP и об ИИ-агентах — здесь на них ссылки, а не повтор. Заметки объясняют идеи на разобранных примерах; практика живёт вне сайта.',
       progression: ['Системы', 'Данные', 'Обучение', 'Инференс', 'Эксплуатация', 'Ответственность'],
       labels: {

@@ -72,6 +72,9 @@ A note should leave the reader able to explain the method, derive its key formul
 
 ## 6. Sources
 
+- Record source ownership, exact revision, applicable license or written permission, and the material actually reused before publication. Public availability and a citation do not establish reuse rights. Treat text, figures, notebooks, datasets and model assets separately.
+- Keep independently authored examples and measured results reproducible. Never disguise a third-party example by changing names, numbers, or the wording. If permission or independence cannot be established, remove the derived material or withhold the note with `needs-review`.
+- The private-source wording rules above concern the owner's own working notes only. They never override required third-party attribution, license notices, or disclosure of adapted material.
 - Cite the primary paper for every model, loss and named result, plus a textbook or review for background. Cite inline as `([Ho, Jain and Abbeel, 2020](#references))` and list full entries under **References**: authors, linked title (arXiv abstract page or DOI), venue, year, and the section or theorem when a specific result is used.
 - Cite only what has been checked. If a claim comes from general knowledge of a codebase or paper that was not re-read, either verify it or soften it.
 - Prefer stable links: arXiv `abs/` pages, DOIs, proceedings pages. Open each link once before publishing.
@@ -80,7 +83,7 @@ A note should leave the reader able to explain the method, derive its key formul
 ## 7. Notebooks
 
 - A note works on its own. Links to notebooks, cell numbers, what a notebook prints or plots, its variable names and its implementation issues belong only in the Notebook section; the body never sends the reader to the notebook, not even with "see the Notebook section". Numbers from saved runs are welcome in the body as self-contained results: state the setup (data, model, size) in the body's own words, then the number. Figure captions follow the same rule.
-- Link notebooks at the maintained branch of their repository, so readers land on the version that runs today. Generative Models: the default branch of HSE-LAMBDA, `https://github.com/HSE-LAMBDA/DeepGenerativeModels/blob/spring-2025-long/seminars/...` (the newer `spring-2026-long` has only the first seminars so far). NLP: the public copy, `https://github.com/xufana/dsba_nlp/blob/autumn-2025/seminars/...`, which holds the notebooks with pinned environments; the original course repository (`glkuzi/nlp_dsba`) is private, so do not link it. State the convention once per Notebook section: cell numbers count every cell, markdown included, from 1, and quoted numbers come from the run saved with the course (cells changed since then have no saved output). When a notebook on the branch changes, recheck the cell numbers the notes cite and the descriptions of the cells that changed.
+- Use only notebooks whose reuse rights and scope have been recorded. Pin a reviewed revision for any derived explanation or result. The 2025 NLP notebooks previously used by this course are withdrawn as sources: their datasets, examples, results and cell narratives must not be restored without a separate rights review. The independent retrieval lab uses newly authored fictional data with its own provenance record. State how cells and saved outputs are counted when that matters; changed cells need new execution evidence.
 - Describe each part of the notebook in one bullet: what it does, the setting that matters (dataset, hyperparameter, loss reduction, sampling detail) and the one saved result worth knowing. No cell-by-cell narration.
 - Separate procedure from results. Quote numbers only from saved outputs and say so; if a notebook has no saved outputs, say that it documents procedures.
 - Report implementation issues plainly and briefly (a reused tensor, a missing `eval()`, a mislabelled plot). They are useful to readers who run the notebook.
@@ -123,7 +126,7 @@ A note should leave the reader able to explain the method, derive its key formul
 Run after every change set:
 
 1. `npm run build` with 0 errors.
-2. On every built note page: no `katex-error`, no duplicate `id`, no broken internal link or anchor (including links from the course map and between notes), and no link to `glkuzi/nlp_dsba`: it is private, and every NLP notebook link goes to `xufana/dsba_nlp` on `autumn-2025`.
+2. On every built note page: no `katex-error`, no duplicate `id`, no broken internal link or anchor (including links from the course map and between notes), and no withdrawn source, dataset, notebook-derived example or result. Run the publication-hold checks and verify both locales.
 3. A text search for banned source words (`scan`, `seminar`, `slide`, `page \d`, `handwrit`, `editorial`, `transcri`) in notes and figure captions, with notebook URLs excluded (their paths contain `seminars/`). Author names such as Pascanu are false positives.
 4. `COURSE_LENIENT=1 npm run build` builds a course whose map lists notes that do not exist yet (useful while drafting); the plain `npm run build` is strict and is what is published.
 5. Visual check of changed figures in light, dark and narrow layouts.

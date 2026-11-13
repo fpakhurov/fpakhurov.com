@@ -2,6 +2,13 @@
 
 Notable changes to the site, newest first. Each entry gives the date, what changed and why.
 
+## 2026-11-13
+
+- Removed the previous NLP notebook-derived lesson bodies and examples from current source. Forty topics in both languages are withheld with explicit publication guards while their sources are reviewed. Their practice offers and unused figures were removed; cross-course links lead to the course index.
+- Rewrote semantic search around BIASED Retrieval Lab: fourteen newly authored fictional documents, ten bilingual queries, exact-ID relevance labels and a standard-library BM25 implementation. The downloaded example reproduces the committed rankings and dataset hash. Its manually selected vectors are illustrations, not model outputs.
+- Removed the reused NLP benchmark claim from the logistic-regression notes. Added a per-topic review matrix, publication-hold checks and explicit source-rights requirements for future course work.
+- Withheld the MLOps system-design and cost notes after identifying documented source adaptation. Six other MLOps source references remain pending review without a rights-clearance claim. Repaired the NVIDIA CUDA reference in both data-level-parallelism notes with the versioned official CUDA 13.0 guide.
+
 ## 2026-10-27
 
 - **Generative Models rewritten, a new note, and every step derived.** 34 notes, English and Russian.
