@@ -1,0 +1,46 @@
+# Conditional probability and Bayes: complete scoped renewal
+
+Reviewed 2026-11-14. This covers both entire current note bodies, two new diagrams, all local imported helpers, exact code, checkers and saved artifacts. Whole-page visual review, repository gates, CI and publication remain separate. It is not whole-course or whole-source clearance.
+
+## Replacement and teaching scope
+
+The old full EN/RU notes and both old figure sources were read before replacement. The medical prevalence/sensitivity example, repeated 1:99 odds ladder, Monty Hall case, Sally Clark narrative, dice/card illustrations, coin-parity example and 100,000-sample NumPy simulation were retired. No old metric, plot, random stream or code remains in this topic. Filenames DiceConditioning and OddsLadder and their figure IDs remain only for compatibility. The curriculum ID, prerequisite, order and all 11 heading anchors are retained.
+
+The full exposition is newly composed around 72 fictional job records in two processing modes and two flags. Counts, two reporting kernels, prior-change inputs, calibration counterexample, exact code and all diagrams were specified for the Fedor Pakhurov project with Codex assistance. They are not empirical measurements, an imported dataset, or a claim of novelty in probability theory. Separate 48-ticket weights give pairwise independence with unequal margins, positive mass in all eight cells and no deterministic checksum. This construction does not reuse the old parity example.
+
+The first table gives H|U=3/5 and U|H=3/4; the same intersection has different denominators. Conditional independence holds within both modes, while marginal U,V independence fails. Odds change from 1:2 to 3:2 to 6:1 by different likelihood ratios 3 and 4. Repeating the same U observation does not update the posterior. Under a priority-U reporter, report V implies H with probability 2/5; under uniform selection of present flags the answer is 10/17, versus 2/3 for plain V presence. The randomized reporter uses exact expected reporting weights, not a promise of exact realized half-splits.
+
+The new prior 1/2 yields posteriors 3/4 and 12/13 only with unchanged class-conditionals; a changed U likelihood instead yields 2/3. A constant old prediction 1/3 is marginally calibrated but cannot recover the U-specific posterior. The pairwise-independence fixture has margins 1/2,1/3,1/4 and independent pair intersections 1/6,1/8,1/12, but triple 1/16 rather than 1/24.
+
+Every conditional fraction has an explicit positive denominator requirement. The chain rule requires positive conditioning prefixes; a null prefix terminates the calculation. Null partition cells are omitted from conditional sums without being excluded from the definition of a partition. Bayes' displayed likelihood form requires positive H and evidence probabilities. Continuous point conditioning is deferred to later definitions. Label shift is distinguished from observed frequency change and calibration from feature-conditional recovery. Conditional independence, selection and intervention are not conflated.
+
+## Sources and assets
+
+Kyle Siegrist's author-owned Conditional Probability and Independence pages were read in their selected definition/multiplication/total-probability/Bayes and event-independence passages. Random's author/homepage rights declaration and the linked CC BY 2.0 deed were verified in this same batch. These are mathematical references, with visible attribution and links. No source exercise expression, figure, code, experimental result or dataset is imported; the homepage license is not treated as clearance for separately credited assets or assigned to new project work.
+
+Lipton, Wang and Smola's arXiv v3 (26 July 2018) abstract and Section 1 were read for the fixed p(x|y) label-shift assumption and its limits. Its arXiv perpetual non-exclusive license is not a content adaptation grant. Use is scientific reference only: neither the medical narrative nor BBSE implementation, data or experimental findings are reproduced. The finite prior/calibration calculations are new consequences of the specified table. No full-paper audit is asserted.
+
+Both diagram sources are newly authored; their only imported local dependencies are the unchanged Figure wrapper and URL-language helper. The verifier also imports the unchanged heading-ID helper, comparing candidate bytes to the host used for execution. All three helpers were read completely and their exact hashes and Git lineage are included in this topic's source evidence. Runtime Astro/TypeScript/MDX/KaTeX and Python standard-library packages are operational dependencies, not rights grants for educational assets. No external model, corpus, random generator, photograph or source illustration is used.
+
+## Validation and limits
+
+The full EN/RU bodies and current diagram/code closure were read. Exact Fraction enumeration expands the 72-record and 48-ticket populations, verifies the conditional/marginal identities, reporting kernels, repeated-evidence case, label-shift examples and all independence counts. Fresh script stdout matches the saved JSON byte-for-byte. Both identical inline code listings execute to their displayed output. Strict actual MDX compilation checks all 11 preserved IDs, 71 paired formula spans and 13 correctly parsed display blocks. Actual Astro container rendering runs each new component in both languages; its displayed counts, probabilities and odds are compared with the independent Python representation. Complete local closure is saved in conditional-verification.json.
+
+No browser screenshots, full application build, hosted execution, CI, global rights check or deployment was run on this outside-served package. The component render verifies generated content, not full-page CSS appearance. Two independent scoped peers have now passed, as recorded below. New examples have intentionally small exact scope and do not validate any real service or classifier. No general license/legal guarantee is inferred from these checks.
+
+
+## Independent full scoped peer, 2026-11-14
+
+Codex root read the full EN/RU notes, both new diagrams, fixture/checker and report/source evidence. The final opening wording was read back. All 13 then-current file hashes matched, and a fresh bounded replay passed 71 paired math spans, 11 headings, two exact inline outputs and four actual component renders. Fresh selected Siegrist conditional definition, chain/total/Bayes and mutual/conditional independence passages were read, together with Lipton v3 abstract/Section 1.
+
+An independent reconstruction from Bernoulli kernels and direct class-prior reweighting verified plain V versus the two reporting policies (2/3,2/5,10/17), changed-prior results (3/4,12/13), and the 48-ticket marginals, pairs and triple (1/16 versus product 1/24). No technical or source-boundary finding remained. The small authoring-guide opening adjustment was applied and read back. Coordinator evidence: renewal-verification/conditional-root-peer.json and conditional-root-replay.json. No browser/full-page, whole-site CI or production claim. A second peer is pending and is not implied by this pass.
+
+
+## Second independent full scoped peer
+
+Codex course_licenses read both entire locales, both figures, the complete Figure/lang/heading helper closure, both verifiers and the record/report/source evidence. The final odds wording explicitly requires positive prior probabilities for both hypotheses and positive likelihood of the evidence under each; the paired clarification was read back and closes the only finding in this pass. All 13 current local hashes and three cached primary-source hashes matched. Fresh checks passed 71 matching formulas, 13 displays, 11 headings, two exact inline outputs and four actual Astro renders.
+
+A separate oracle reconstructs the Bernoulli cell probabilities and adds a fair reporting coin, producing 144 equiprobable outcomes. It reproduces H|U=3/5, H|V=2/3, H|UV=6/7, the two report posteriors 2/5 and 10/17 and repeated-U invariance. Direct reweighting of the old joint distribution gives shifted posteriors 3/4 and 12/13. An independently built product table with an alternating one-ticket perturbation reproduces all 48 ticket weights and twelve pairwise joint cells, with triple 1/16 versus independent product 1/24. Selected primary conditional/independence definitions and Lipton v3 abstract/Section 1 were read freshly; the author rights declaration was read in the axioms pass. No additional copied-asset or source-boundary issue was found within this scope. Durable coordinator oracle: renewal-verification/conditional-peer/. No full-source, browser, CI or production claim.
+
+Integration theme check found undefined CSS text tokens. Figure label fill now uses the shared ink token and secondary text uses the shared muted token, defined in both themes. Numerical values and geometry are unchanged; final browser review remains pending.
+Scoped integration peer by Codex course_licenses: exact HEAD-to-working-file comparison confirms only the three token substitutions; current record hashes match and shared ink/muted tokens exist in both themes. No numerical/geometry change or browser claim.

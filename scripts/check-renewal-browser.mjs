@@ -65,6 +65,13 @@ try {
       }
       const result = {...item, width, theme, ...state};
       delete result.localLinks;
+      const figures = page.locator('.prose figure.fig');
+      result.figureScreenshots = [];
+      for (let i = 0; i < await figures.count(); i++) {
+        const filename = `${item.id.replaceAll('/', '-')}-${item.locale}-${width}-${theme}-figure-${i + 1}.png`;
+        await figures.nth(i).screenshot({path: `${output}/${filename}`});
+        result.figureScreenshots.push(filename);
+      }
       const tables = page.locator('.prose table');
       result.scrollableTables = 0;
       for (let i = 0; i < await tables.count(); i++) {
@@ -84,6 +91,7 @@ try {
       }
       if (width === 390 && theme === 'dark' && item.locale === 'ru') {
         const name = item.id.replaceAll('/', '-');
+        await page.evaluate(() => window.scrollTo({top: 0, left: 0, behavior: 'instant'}));
         await page.screenshot({path: `${output}/${name}-top.png`});
         for (let i = 0; i < await tables.count(); i++) {
           await tables.nth(i).screenshot({path: `${output}/${name}-table-${i + 1}.png`});
