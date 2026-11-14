@@ -48,3 +48,9 @@ Root read both complete bodies, the new figure, all three local helpers, the fix
 ## Second independent technical and figure review
 
 Codex xufana_scope read both complete teaching bodies, all current figure sources and shared helper/heading closure, complete fixture/checker and record/report. All current local pins matched before and after copied-snapshot execution. Verified 76 paired formula spans, eight displays, eleven anchors, exact fixture and inline output replays, actual localized Astro component; independent separator-position compositions, multinomial weights, capacity probabilities and branch weights. No remaining mathematical, bilingual or figure-data finding. EN/RU assumptions and conclusions agree. The independent oracle imports no author fixture. Exact scope, oracle and reviewed hashes are retained in coordinator renewal-verification/cyclegan-counting-second-peer/. This pass did not repeat the separately recorded primary-source review, inspect browser screenshots, run the full site build or verify publication. It makes no whole-course or universal rights claim.
+
+## Visual review correction
+
+CI figure visual review corrected singular/plural order labels in English and Russian. Counts, calculations and figure structure are unchanged. Final full-page readback pending.
+
+Scoped visual-fix peer: Codex xufana_scope independently read the changed figure/checker and shared styles. The paper/ink tokens, scoped table display/word wrapping, and count labels preserve data and semantics. Diff review passed; refreshed full-page browser evidence remains a separate CI check.

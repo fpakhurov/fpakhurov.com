@@ -67,3 +67,9 @@ Evidence is retained in the coordinator's durable renewal-verification/cyclegan-
 ## Second independent technical and figure review
 
 Codex xufana_scope read both complete teaching bodies, all current figure sources and shared helper/heading closure, complete fixture/checker and record/report. All current local pins matched before and after copied-snapshot execution. Verified 60 paired formula spans, 15 retained anchors, five-file figure closure and four actual SVGs per locale; independent center-first bottleneck optimization, all bijections/anchors, exact patch reductions and explicit convolution-index footprint. No remaining mathematical, bilingual or figure-data finding. EN/RU assumptions and conclusions agree. The independent oracle imports no author fixture. Exact scope, oracle and reviewed hashes are retained in coordinator renewal-verification/cyclegan-counting-second-peer/. This pass did not repeat the separately recorded primary-source review, inspect browser screenshots, run the full site build or verify publication. It makes no whole-course or universal rights claim.
+
+## Visual review correction
+
+CI full-page visual review found an undefined --bg token in CycleToy, which rendered black nodes with dark labels in the light theme. Replaced it with the defined --paper token; geometry and teaching data are unchanged. Final full-page readback pending.
+
+Scoped visual-fix peer: Codex xufana_scope independently read the changed figure/checker and shared styles. The paper/ink tokens, scoped table display/word wrapping, and count labels preserve data and semantics. Diff review passed; refreshed full-page browser evidence remains a separate CI check.

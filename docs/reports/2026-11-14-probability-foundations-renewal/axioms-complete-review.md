@@ -45,3 +45,9 @@ Two narrow findings were corrected: rational shifts are now explicitly distinct 
 ## Second independent numerical and figure review
 
 Codex root read both complete final bodies, both diagram sources and the fixture/checker, including the distinct rational-shift clarification. All 13 then-current local pins matched. Fresh scoped verification passed 59 paired spans, 14 headings, two exact inline outputs and four actual Astro renders. A separate bitmask calculation reproduced singleton weights 12,13,7, pair weights 5,3,2, union 23/36, upper bound 8/9, lower truncation 11/18 and stated caps 11/400; the first 100 telescoping partial sums matched exactly. Evidence: coordinator renewal-verification/axioms-root-peer.json and axioms-root-replay.json. No new finding. Primary sources were not reread in this second numerical pass; those belong to the separately recorded course_licenses review. No browser/full-page, CI or production claim.
+
+## Visual review correction
+
+CI visual review found figure tables inheriting block display and splitting short Russian labels. Scoped figure CSS restores table display/automatic columns and normal word wrapping; all labels, values and semantics unchanged. Final full-page readback pending.
+
+Scoped visual-fix peer: Codex xufana_scope independently read the changed figure/checker and shared styles. The paper/ink tokens, scoped table display/word wrapping, and count labels preserve data and semantics. Diff review passed; refreshed full-page browser evidence remains a separate CI check.

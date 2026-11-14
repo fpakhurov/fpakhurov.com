@@ -72,7 +72,7 @@ try{
   const html=await container.renderToString(component,{request:new Request(`https://fpakhurov.com/${loc==='ru'?'ru/':''}notes/probability/outcomes-events-and-counting`)});
   assert(!/NaN|undefined/.test(html));assert(html.includes('id="fig-four-ways-to-choose"'));
   assert.equal((html.match(/class="order-dots\b/g)||[]).length,3);
-  for(const row of exact.allocation_shapes)assert(html.includes(`${row.allocations} ${loc==='en'?'allocations':'записей'} × ${row.sequences_per_allocation} ${loc==='en'?'orders':'порядков'} = ${row.sequences_total}`));
+  for(const row of exact.allocation_shapes)assert(html.includes(`${row.allocations} ${loc==='en'?'allocations':'записей'} × ${row.sequences_per_allocation} ${{en:{1:'order',3:'orders',6:'orders'},ru:{1:'порядок',3:'порядка',6:'порядков'}}[loc][row.sequences_per_allocation]} = ${row.sequences_total}`));
   const ids=[...html.matchAll(/\sid="([^"]+)"/g)].map(m=>m[1]);assert.equal(ids.length,new Set(ids).size);
   result.figures.push({locale:loc,render:'Actual Astro component',fourCounts:exact.four_counts,allocationShapes:exact.allocation_shapes});
  }
