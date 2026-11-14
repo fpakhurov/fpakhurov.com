@@ -1,0 +1,9 @@
+# Transformer foundations and image translation release
+
+Five complete bilingual NLP replacements restore attention, Transformers, positional encoding, Transformer machine translation and BERT. Image translation receives an independent complete bilingual replacement and two original numerical figures. Existing course identities, prerequisite graph, heading and figure anchors are preserved. Twenty other NLP notes remain held; the withdrawal history is retained.
+
+All twelve complete note bodies and their declared local assets were read by the author and two independent reviewers. Per-topic reports record each review's exact scope, source and mathematical checks and resolved findings. Source references do not clear paper expression, upstream software, datasets or model assets for reuse. Original examples are explicitly finite calculations, not photographic or language-model benchmarks.
+
+Integration copies only the frozen package manifests and updates current file hashes, six topic inventory entries and five publication holds. Seven image-translation reference entries received the schema's required verification field from the checks already performed and recorded; teaching bytes are unchanged. No legacy baseline was regenerated. The BIASED inventory remains its explicitly identified older snapshot and is not a current production claim.
+
+Local checks pass 17 source-rights gate tests, current rights/holds, practice mapping, strict scoped MDX/math, exact standard-library results and bilingual parity. The NLP fixture covers 76 anchors and 140 paired mathematical spans across five pairs; image translation covers 25 anchors, 14 paired spans, two inline outputs and five local figure dependencies. Full build, internal links, actual-page visual inspection, publication and live artifact verification are separate CI/release steps. BIASED derivation must wait for the exact reviewed, published and live-verified FP revision.
