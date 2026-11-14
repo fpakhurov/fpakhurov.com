@@ -1,12 +1,214 @@
 ---
 title: Transformer Architecture
-description: "This note is withheld pending an independent source review."
+description: "Build residual attention and feed-forward blocks, compare normalization placement, count an exact variant and train a small head on independently specified fixed states."
 course: nlp
 section: Transformers
 order: 16
-status: needs-review
-tags: []
-prerequisites: []
+status: published
+tags: [transformers, attention, residual, layernorm, feed-forward, encoder, decoder]
+prerequisites: [Self-Attention, Neural networks]
 ---
 
-This note is withheld pending an independent source review.
+An attention output combines information from several positions, but a useful sequence model must also preserve what each position already knew and transform the combined features. Repeatedly replacing every state with another mixture leaves those responsibilities implicit. A Transformer block makes them separate computations with a shared width, so one block can feed the next.
+
+## What a stack must preserve \{#baseline-a-stack-of-attention-layers\}
+
+[Self-attention](/notes/nlp/attention) supplies content-dependent communication. Its output depends nonlinearly on the input because the attention weights depend on queries and keys. However, the resulting value mixture alone does not provide every transformation we want at a position. The layer also needs a route for retaining its input and a way to combine features after communication.
+
+These roles should be distinguished when debugging. An incorrect padding mask changes who can communicate. A missing residual changes what can pass through unchanged. A normalization axis error mixes statistics that should remain separate. A wider feed-forward layer increases per-position capacity without directly adding new connections between positions.
+
+## One block, two residual updates \{#the-block\}
+
+Let $X$ contain one width-$d$ state per position. Denote multi-head attention by $\operatorname{MHA}$, the position-wise network by $\operatorname{FFN}$, and per-position layer normalization by $\operatorname{LN}$. A pre-normalized encoder block computes
+
+$$
+\begin{aligned}
+H&=X+\operatorname{MHA}(\operatorname{LN}_1(X)),\\
+Y&=H+\operatorname{FFN}(\operatorname{LN}_2(H)).
+\end{aligned}
+$$
+
+Both branches return width $d$ so they can be added to their inputs. The normalization instances have separate learned affine parameters. A full stack can add a final normalization before the prediction head. That final operation is a separate architectural choice and should not disappear from an implementation merely because normalization already appears inside each block.
+
+Dropout, when used, changes the training computation through random masks. We omit it in the numerical case to obtain a deterministic trace. Disabling dropout at evaluation does not disable attention masks: an information-flow restriction remains necessary in both modes.
+
+## The position-wise network transforms features \{#position-wise-feed-forward-network\}
+
+For a row vector $x$, a two-layer feed-forward network with inner width $m$ is
+
+$$
+\operatorname{FFN}(x)=\phi(xW_1+b_1)W_2+b_2.
+$$
+
+The matrices have shapes $d\times m$ and $m\times d$. The same parameters act on every position, but different blocks usually have different parameters. This computation does not mix positions. It transforms the features already assembled at each one.
+
+Without the nonlinearity, the two affine maps could be combined into one affine map. The intermediate width would then change a factorization without adding the same family of nonlinear decisions. ReLU keeps positive intermediate values and discards negative ones; other activations change the transformation and its derivative. A gated variant adds another projection, so its parameter count must be recomputed rather than copied from the two-matrix formula.
+
+Choose a width-two input and inner width three:
+
+$$
+\begin{aligned}
+W_1&=\begin{bmatrix}1/2&-1/4&3/4\\1/4&1/2&-1/2\end{bmatrix},\\
+b_1&=(0.1,-0.2,0.05),\\
+W_2&=\begin{bmatrix}1/2&1/4\\-1/4&1/2\\1/4&-1/2\end{bmatrix},\\
+b_2&=(0.05,-0.1).
+\end{aligned}
+$$
+
+At input `(0.6, −0.2)`, the first affine output is `(0.35, −0.45, 0.6)`. ReLU gives `(0.35, 0, 0.6)`, and the final output is `(0.375, −0.3125)`. The inactive middle unit contributes neither its output value nor a local ReLU derivative at this point. A different input can activate it without changing which positions are connected.
+
+## A residual supplies an identity route \{#residual-connections\}
+
+For a residual update $y=x+F(x)$, differentiation gives
+
+$$
+\frac{\partial y}{\partial x}=I+J_F(x).
+$$
+
+The identity term provides a direct route for information and gradients. If the branch is zero, the update can leave the state unchanged. This does not guarantee that every deep stack is stable: the branch Jacobians can still amplify, cancel or redirect gradients, and many successive updates can change the residual state's scale.
+
+The addition requires matching shapes and meaningfully aligned axes. A broadcast that adds one position's vector to all positions can pass a tensor-shape check while implementing another computation. Checking a small multi-position trace is therefore useful even when a framework accepts the arrays.
+
+## Normalize coordinates within each position \{#normalization\}
+
+For one width-$d$ row, layer normalization uses its coordinate mean and mean squared deviation:
+
+$$
+\begin{aligned}
+\mu&=\frac1d\sum_{j=1}^{d}x_j,\\
+s^2&=\frac1d\sum_{j=1}^{d}(x_j-\mu)^2,\\
+\operatorname{LN}(x)_j
+&=\gamma_j\frac{x_j-\mu}{\sqrt{s^2+\epsilon}}+\beta_j.
+\end{aligned}
+$$
+
+The positive $\epsilon$ protects a constant row from division by zero. The denominator uses $d$, without the correction used in an unbiased sample-variance estimator. Learned gain and bias allow the normalized coordinates to adopt another scale and offset. These statistics are calculated from the current row at both training and evaluation; no running mean over previous batches is required.
+
+For a tensor with batch, position and coordinate axes, ordinary Transformer LayerNorm normalizes only the last axis. Different tokens and examples retain separate statistics. Normalizing across positions would let one token's scale depend on how much padding was appended, even before attention is applied.
+
+Take `(1, 3, 8)`, gain `(1, 1.5, 0.5)`, bias `(0.1, −0.2, 0.3)` and epsilon `0.01`. The mean is four and the variance is `26/3`. The affine-normalized output is approximately `(−0.918462, −0.709231, 0.978975)`. Adding five to every input coordinate leaves the normalized values unchanged, because the mean shifts by the same amount.
+
+RMS normalization uses the uncentered second moment instead:
+
+$$
+\operatorname{RMSNorm}(x)_j
+=\gamma_j\frac{x_j}{\sqrt{d^{-1}\sum_r x_r^2+\epsilon}}.
+$$
+
+For the same input, gain and epsilon, with no additive bias, it yields `(0.201306, 0.905877, 0.805224)`. The distinction comes from retaining the row mean. A constant additive shift generally changes RMS-normalized values. Positive rescaling cancels exactly only when epsilon is zero and the denominator is nonzero; with positive epsilon the invariance is approximate. The same qualification applies to the scale-invariance claim for LayerNorm.
+
+The derivative also exposes the difference. For LayerNorm before its affine transformation, write $z_j=(x_j-\mu)/\sqrt{s^2+\epsilon}$ and let $g_j$ include the downstream derivative and learned gain. Then
+
+$$
+\frac{\partial\mathcal L}{\partial x_j}
+=\frac{g_j-\overline g-z_j\overline{gz}}
+{\sqrt{s^2+\epsilon}}.
+$$
+
+A bar denotes the mean over coordinates. The mean-gradient subtraction comes from differentiating centering; differentiating the denominator gives the last term. RMSNorm omits the centering subtraction and uses its own uncentered normalization and denominator. Both analytic derivatives are checked against finite differences for the supplied three-coordinate case.
+
+## Moving normalization changes the computation \{#pre-norm-versus-post-norm\}
+
+The original Transformer uses post-normalized residual updates. In the same notation, its encoder block is
+
+$$
+\begin{aligned}
+H&=\operatorname{LN}_1(X+\operatorname{MHA}(X)),\\
+Y&=\operatorname{LN}_2(H+\operatorname{FFN}(H)).
+\end{aligned}
+$$
+
+This is not a change that can generally be made after training while retaining identical predictions. A post-normalized residual has derivative $J_{\mathrm{LN}}(I+J_F)$; a pre-normalized update has $I+J_FJ_{\mathrm{LN}}$. The latter exposes an identity term outside the normalization derivative. The formulas explain a different gradient route, without proving universal optimization superiority for either arrangement.
+
+Use the three input rows and attention projections from the [worked self-attention example](/notes/nlp/attention#worked-example), the FFN above, identity attention output projection, normalization gain one and bias zero. Set epsilon to `0.1`, deliberately larger than common library defaults so its role is visible. Apply no dropout or final stack normalization.
+
+| Row | Pre-normalized output | Post-normalized output |
+| --- | --- | --- |
+| 1 | 0.855020; 1.925668 | 0.870015; −0.870015 |
+| 2 | −1.171561; 0.968727 | −0.931544; 0.931544 |
+| 3 | 2.485068; −0.728210 | 0.980392; −0.980392 |
+
+The first pre-normalized attention branch reads `(-0.845154, 0.845154)` at position one, whereas the post-normalized branch reads `(1, 2)`. Their different attention weights are already expected before the later normalization. Comparing the final rows without tracing this earlier difference would miss where the computations diverged.
+
+## The block needs an input contract \{#where-the-input-comes-from\}
+
+Token IDs select embedding rows. The input may also contain positional and segment information, depending on the model. Their dimensions, scaling and addition order are part of the architecture. A block cannot infer whether an input coordinate represents a word, a position or some other supplied feature; it operates on the resulting numerical states.
+
+Keep padding IDs separate from masks. A padding embedding equal to zero can still produce a nonzero key or value after biases, and even zero values can absorb softmax mass if their scores are included. Similarly, excluding padding keys does not remove padded query positions from a later mean. The input contract must describe all three: token values, permitted connections and which outputs contribute to the objective.
+
+## Count the specified block \{#parameters-of-a-block\}
+
+Consider an encoder block with four full-width attention projections, a two-matrix FFN of inner width $m$, all linear biases, and two affine LayerNorms. The parameter contributions are
+
+| Component | Scalars |
+| --- | ---: |
+| Attention projection weights | $4d^2$ |
+| FFN weights | $2dm$ |
+| Attention biases | $4d$ |
+| FFN biases | $m+d$ |
+| Two normalization gains and biases | $4d$ |
+
+The total is
+
+$$
+N_{\mathrm{block}}=4d^2+2dm+m+9d.
+$$
+
+At width four and inner width seven, the contributions are 64, 56, 16, 11 and 16: 163 scalars. This hypothetical count is separate from the fixed small numerical block, whose identity output projection and normalization parameters are supplied constants. A stack also needs embeddings, prediction heads and perhaps a final normalization. Shared parameters should be counted once, while optimizer state and gradients are additional memory rather than additional model parameters.
+
+## Encoders, decoders and their combination \{#three-arrangements\}
+
+An encoder usually allows bidirectional communication over the available input. Its outputs can support token labels, pooled classification or a separate decoder. A causal decoder restricts every prediction to an allowed prefix. During teacher-forced training, known prefixes permit parallel calculation of positions, but the mask still forbids future information.
+
+An encoder-decoder adds cross-attention: queries come from the decoder state, while keys and values come from the encoded source. Source length and target length can differ. Its decoder block therefore has an additional attention branch and usually another normalization. The 163-parameter formula above does not apply unchanged to that block.
+
+The names describe information flow, not task guarantees. An encoder does not automatically produce useful sentence embeddings, and a causal decoder does not automatically follow instructions. The objective, training data and output head determine what the arrangement learns to do.
+
+## Specify variants rather than relying on a name \{#original-versus-modern-transformer\}
+
+The original architecture combined post-normalized residuals, ReLU feed-forward networks and explicit positional inputs. Later families use different normalization placement, activation/gating, positional mechanisms and attention layouts. These choices interact with parameter counts, checkpoints and inference behavior. There is no single configuration that the word Transformer completely specifies.
+
+For a reproducible comparison, record the placement of normalization, its epsilon and affine parameters, attention and FFN widths, biases, dropout behavior, positional method, masks, output tying and pooling. Changing several of them at once prevents attributing an observed difference to only one component. A reference implementation is useful for checking contracts, while its examples and benchmark numbers remain separate from a newly constructed experiment.
+
+## Fit a small head on explicit states \{#a-small-encoder-on-ag-news\}
+
+We can test a training path without importing a benchmark. Keep the pre-normalized block fixed and mean-pool its two output rows. Supply these four two-position inputs and binary labels:
+
+| Example | Input rows | Label |
+| --- | --- | ---: |
+| A | `(1, 0)`; `(0.5, −0.5)` | 0 |
+| B | `(1.5, 0)`; `(0.5, −1)` | 0 |
+| C | `(−1, 0)`; `(−0.5, 0.5)` | 1 |
+| D | `(−1.5, 0)`; `(−0.5, 1)` | 1 |
+
+These are independently chosen numerical inputs, not encoded documents. Their pooled states feed a width-two, two-class linear softmax head with six trainable values, initialized to zero. Minimize mean cross-entropy plus `0.02/2` times the squared head weights; biases are unpenalized. Five hundred simultaneous full-batch steps of size `0.2` lower this objective from `0.6931471806` to `0.0616702591`.
+
+The probabilities of the supplied labels become approximately `0.968844`, `0.988471`, `0.969054` and `0.987489`. Initial and final analytic head gradients agree with finite differences. The attention, FFN and normalization parameters did not train. This result establishes that a head can fit these four fixed representations; it neither evaluates a trained Transformer encoder nor compares architectures on language data.
+
+## What changed \{#what-changed\}
+
+Attention now sits inside a reusable state update with a residual route, a per-position nonlinear network and a specified normalization order. A prediction head can be attached without changing the block's width. Each component has a distinct place in the forward computation, so numerical traces and controlled changes can isolate it.
+
+## Limitations \{#limitations\}
+
+A valid block formula does not establish that a deep model trains well, that its tokenizer preserves the right distinctions or that evaluation data remain unseen. Width, depth and initialization affect optimization; masks and pooling affect information leakage. The constructed example makes these boundaries explicit instead of treating a decreasing training loss as language competence.
+
+## What to remember \{#what-you-should-remember\}
+
+Attention mixes positions; the FFN transforms each position. Residuals preserve an identity route. Normalization axes and epsilon are part of the computation. Pre-norm and post-norm generally differ. Parameter counts require an exact variant. A trained head on a fixed block is a different experiment from training the encoder.
+
+## Notebook \{#notebook\}
+
+- The [standalone script](https://github.com/fpakhurov/fpakhurov.com/blob/main/scripts/notes/nlp-transformer-foundations-cases.py) records the FFN, both normalization statistics and derivatives, pre/post block traces and the 163-scalar hypothetical count.
+- The separate four-example head fit stores initialization, labels, feature states, final parameters, probabilities and loss checkpoints. It uses only Python's standard library and downloads no data or model.
+
+## Next \{#next\}
+
+A stack of content-only encoder blocks still cannot distinguish arbitrary row permutations after symmetric pooling. [Positional representations](/notes/nlp/positional-encoding) supply order information and examine what fixed, learned and rotary choices actually guarantee.
+
+## References \{#references\}
+
+- Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N. Gomez, Łukasz Kaiser, Illia Polosukhin. [Attention Is All You Need](https://arxiv.org/abs/1706.03762v7). NeurIPS, 2017; version 7, 2023. Sections 3.1, 3.3 and 3.4: residual blocks, FFNs and embeddings. No architecture diagram or benchmark result is reproduced.
+- Jimmy Lei Ba, Jamie Ryan Kiros, Geoffrey E. Hinton. [Layer Normalization](https://arxiv.org/abs/1607.06450v1). 2016. Section 3, equation 3: per-example coordinate statistics and learned affine parameters.
+- Biao Zhang, Rico Sennrich. [Root Mean Square Layer Normalization](https://arxiv.org/abs/1910.07467v1). NeurIPS, 2019. Section 4: uncentered RMS normalization. Numerical comparison and derivative checks here use independently chosen inputs.
+- PyTorch contributors. [Transformer contract](https://github.com/pytorch/pytorch/blob/1d8e8560dc4c9182cba96c81c36e096fc2a063c1/torch/nn/modules/transformer.py) and [normalization contracts](https://github.com/pytorch/pytorch/blob/1d8e8560dc4c9182cba96c81c36e096fc2a063c1/torch/nn/modules/normalization.py), revision `1d8e856`. `norm_first`, `LayerNorm` and `RMSNorm` definitions are referenced; no framework implementation or sample is copied into the standard-library calculation.

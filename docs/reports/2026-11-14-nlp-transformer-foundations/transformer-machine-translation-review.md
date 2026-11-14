@@ -1,0 +1,44 @@
+# transformer-machine-translation: complete candidate review
+
+Reviewed 2026-11-14 by Codex xufana_scope. This outside-served candidate has complete author review and two independent scoped reviews. Coordinator actual-page and publication checks remain pending. It is not a published BIASED source and is not an all-course rights determination.
+
+## Material and clean-input boundary
+
+Encoder/decoder information paths, teacher-forcing shift, mask semantics, selected token loss, fixed-state source retrieval, smoothing and beam bookkeeping.
+
+Both complete English and Russian bodies were newly authored for the Fedor Pakhurov project with Codex assistance. Only existing topic identity, prerequisites and heading metadata were retained from revision cd446dc8d2f68249eb62ff3598b202d8d5854315. Old descriptions and dataset tags were discarded before authoring. No withdrawn body, notebook, prose, code, figure, input data, query, example or output was used as rewriting input. No exclusive copyright guarantee is asserted.
+
+All old MT experiment/results/attention-plot content is replaced; historical anchor IDs preserved only for links. The new branch table and source-removal diagnostic are independently authored and executable.
+
+## Claims and reproducible calculations
+
+A newly specified fixed-state decoder with four output IDs uses source sign+1/-1, identity keys and chosen values; this is not a trained translation system. Both constructed targets have mean NLL .311052481734596. Zeroing the cross-attention contribution yields middle-token probability .25 and NLL .689266756315384. The chosen uniform-including-gold smoothing epsilon .2 gives target(.05,.85,.05,.05), loss .65350846697352 and four analytic logit derivatives checked by finite differences. A separate exact Fraction tree yields a/EOS33/100, b/EOS81/200, and unfinished ax11/50,bx9/200. The latter are bounded by their current prefix probabilities, making the limited raw-probability search conclusion explicit.
+
+Supplied source states/sign and fixed prefix-dependent logits are exposed rather than attributed to encoded words or learned Transformer parameters. No Multi30k or other dataset, BLEU score, depth benchmark or trained alignment map is used. The two x paths are unfinished, not completed hypotheses. Mask polarity is tied to exact API contracts, not generalized to every interface.
+
+The shared standard-library script records all explicit arrays, labels, intermediate values and diagnostic results in results.json. A fresh Python3.9.7 run is byte-identical to the saved JSON. Floating-point last digits can differ in another interpreter/environment; this is not an external-model or hosted-notebook run. The author check uses numerical differentiation of independently implemented forward losses as a sanity check; the separate independent peer calculations below have also passed.
+
+## Recorded sources
+
+- Attention Is All You Need. https://arxiv.org/abs/1706.03762v7. Checked: Sections 3.1-3.5, section 4 and section 5.4 selected primary paragraphs freshly read 2026-11-14; no figures or empirical tables reused. Use: reference only. Paper perpetual arXiv license and special restricted figure/table grant are not default commercial teaching reuse permission. Scientific mechanisms only; original numerical cases/derivations.
+- PyTorch normalization, Transformer and attention contracts. https://github.com/pytorch/pytorch/tree/1d8e8560dc4c9182cba96c81c36e096fc2a063c1. Checked: normalization.py LayerNorm lines98-149 and RMSNorm lines348-390; transformer.py boolean-mask paragraph lines196-202 and norm_first branches lines944-958; functional.py scaled_dot_product_attention mask semantics lines6531-6541 and6590-6604; selected file headers, root LICENSE and NOTICE. Use: reference only. Root BSD-3-Clause grant and separate historical/third-party NOTICE read; the 23866-entry nontruncated tree has only root LICENSE/NOTICE on selected ancestors. Selected file headers contain no license override. Mathematical/API contracts referenced only. Neither implementation/docstrings/example arrays nor historical third-party components are redistributed. Root library permission is not clearance for separate datasets, models or other teaching assets.
+
+Exact primary code revisions, SHA256 and Git-blob identities, ancestor-license findings, author names and scope decisions are in source-evidence.json. PyTorch and Google BERT source files are privately cached review inputs, excluded from this release manifest. No upstream implementation or docstring is adapted. The scientific papers are credited factual references, not grants to reproduce their expression. New examples and explanatory text are original work for the project; no citation was simply removed to relabel an old example.
+
+## Bilingual and asset closure
+
+The EN/RU pair has 13 identical retained anchors and 19 literal matching math spans, including 5 display formulas. Both versions contain 2 original tables. Both full narratives were author-reviewed for definitions, assumptions, limitations, parameter distinctions and numerical values. The scoped checker compiles real MDX with GFM, heading IDs and strict KaTeX; all ten candidates pass. Batch-local anchor targets are checked separately from the pending full-site link check.
+
+No external figure, image, screenshot, audio, dataset, model weights, tokenizer asset or notebook is imported. There are no copied third-party teaching assets requiring new distribution notices in this candidate. The unchanged first-party heading helper is a verifier dependency, explicitly pinned; existing installed MDX/KaTeX runtime packages remain application dependencies, not learner-facing copied teaching content.
+
+## Review and release limits
+
+Both independent scoped reviews passed; no browser, full-site build, CI, restoration or production validation is claimed here. The coordinator must run rights:test, rights:check, normal build/content/links and actual-page checks before atomically restoring publication holds. After publication BIASED must use exact published note/review hashes, not this draft package. Other course topics and unresolved historic assets remain outside this complete five-topic candidate review.
+
+## Independent coordinator review
+
+Codex root read all ten full EN/RU bodies, the complete 338-line fixture, scoped checker, helper, source evidence and reports. Fresh 192 MiB checks passed ten MDX notes, 76 anchors, 140 paired math spans, 33 displays and ten tables per locale, and exact Python3.9.7 stdout. A separate no-author-import scalar/complex-step oracle compared265 quantities (maximum gap3.56e-15), including36 attention derivatives, both norm placements, six normalization derivatives, complete independently coded500/600-step head fits and48 endpoint head derivatives, positional rotations, MT losses and exact selection/search arithmetic. Ten cached source files matched SHA256/Git blobs. Selected primary passages across Vaswani/Ba/Zhang-Sennrich/Su/Devlin and selected implementation contracts/licenses were freshly checked; root did not claim a full NOTICE, whole-tree or universal source audit. Full review: durable transformer-root-peer.md in renewal-verification. All coordinated terminology, row-vector, formatting, RMS evidence and held-GPT handoff corrections were read back. No remaining scoped finding; browser/build/CI/publication remain separate.
+
+## Separate independent topical review
+
+Codex course_licenses independently read all four complete positional-encoding/Transformer-MT bodies, relevant fixture functions/dependencies, full checker/helper and both records/reports. A no-author-import complex-rotation/Decimal70/Fraction oracle compared107 quantities (maximum gap5.33e-15), checking sinusoid/relative identities, all13 offset scores and21 extra common shifts, norms, stretch/cache counterexamples, both source-sign context/probability/NLL traces, smoothing and four complex-step derivatives, and four exact beam paths including unfinished-prefix upper bounds. Thirteen distinct file pins matched. Fresh192MiB shared checks and exact Python3.9.7 stdout passed; personally read pairs have30/19 math spans and14/13 anchors. Fresh selected Vaswani sections3.1–3.5/5.4, Su sections3.1–3.2/equations11–16 with restrictive license header, and pinned PyTorch mask contracts were compared. Three wording/domain findings and per-source material scope were corrected. Durable complete scope: transformer-position-mt-peer/peer-review.md. No exhaustive license-tree/full-paper/browser/build/CI/production claim. Final bounded readback also confirmed the two-row smoothing display, Russian per-position/shared-parameter wording and separate Vaswani/Su source-material fields; current record hashes matched. The numerical oracle was not repeated because fixture bytes were unchanged.
