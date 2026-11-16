@@ -1,12 +1,221 @@
 ---
 title: "Efficient Transformers: FlashAttention and mixture of experts"
-description: "This note is withheld pending an independent source review."
+description: "Compute attention without storing its full matrix, count the parameters that an expert layer actually uses, and separate memory savings from changes to the model."
 course: nlp
 section: Modern Transformer Architectures
 order: 25
-status: needs-review
-tags: []
-prerequisites: []
+status: published
+tags: [flashattention, online-softmax, mixture-of-experts, routing, grouped-query-attention]
+prerequisites: [Self-Attention, Transformer Architecture, Scaling laws and compute-optimal training, Backpropagation]
 ---
 
-This note is withheld pending an independent source review.
+import AttentionStorage from '../../../components/figures/efficient-transformers/AttentionStorage.astro';
+import ExpertCapacity from '../../../components/figures/efficient-transformers/ExpertCapacity.astro';
+
+A longer document can exhaust memory before its model runs out of parameters. Increasing the model width creates a different problem: every token must pass through more weights. We need to identify which objects occupy memory and which operations every token actually executes before deciding how to scale.
+
+## Stored scores and dense transformations \{#baseline-standard-attention-and-a-dense-ffn\}
+
+Consider one attention head with sequence length $n$ and head width $d$. Its query, key and value matrices have shape $n\times d$. The output has the same shape. Scaled dot-product attention is
+
+$$
+\begin{aligned}
+S&=QK^\top/\sqrt d,\\
+P&=\operatorname{softmax}_{\mathrm{row}}(S),\\
+O&=PV.
+\end{aligned}
+$$
+
+Both $S$ and $P$ contain $n^2$ entries. The two matrix multiplications require work proportional to $n^2d$. Doubling the length therefore quadruples the score count, even though $Q$, $K$, $V$ and $O$ only double in size. These are different growth rates within the same operation.
+
+The feed-forward network has another scaling rule. A two-matrix FFN maps width $d$ to hidden width $f$ and back, independently at each token. Its matrix weights number $2df$, and every token uses both matrices. Attention mixes positions; the FFN spends its computation transforming a position's features. Their [definitions and shapes](/notes/nlp/transformers) remain unchanged here.
+
+## Following the movement of arrays \{#where-the-time-goes-memory-traffic-not-arithmetic\}
+
+A GPU has a large device-memory store and much smaller fast storage close to its arithmetic units. A straightforward implementation writes the complete score array, reads it for softmax, writes probabilities, then reads them for the value mixture. Extra reads and writes can dominate runtime even when the formulas contain relatively little arithmetic between them.
+
+That observation depends on hardware and workload. A large matrix multiplication may be limited by arithmetic throughput, while a small elementwise pass may be limited by memory bandwidth. Counting floating-point operations alone cannot identify the bottleneck. FlashAttention reorganizes these particular operations around the memory hierarchy ([Dao et al., 2022](#references), §§2.2–3.2).
+
+## FlashAttention
+
+We can form each output row while keeping only a small piece of its scores. The difficulty is softmax: a new score can change the normalization of every contribution already processed. A running maximum and a rescaled sum make those contributions compatible.
+
+### Combining partial softmax sums \{#online-softmax-one-pass-instead-of-three\}
+
+For already processed keys, let $m$ be the largest score, $\ell$ the sum of shifted exponentials, and $u$ their value-weighted numerator. Here $u$ is a vector of width $d$. For a new nonempty block $B$, define
+
+$$
+\begin{aligned}
+m'&=\max\bigl(m,\max_{j\in B}s_j\bigr),\\
+\ell'&=e^{m-m'}\ell+\sum_{j\in B}e^{s_j-m'},\\
+u'&=e^{m-m'}u+\sum_{j\in B}e^{s_j-m'}v_j.
+\end{aligned}
+$$
+
+Why rescale the previous terms? Each old exponential satisfies $e^{s_j-m'}=e^{m-m'}e^{s_j-m}$. The same factor therefore converts both the old denominator and numerator to the new reference level. After the final block, $o=u/\ell$. This derives the merge from ordinary softmax; no probabilities are discarded.
+
+Initialize from the first nonempty allowed block. A fully masked block contributes nothing and is skipped. If a whole query row has no allowed key, the normalized distribution is undefined; our construction rejects it. Computing a difference between two negative infinities would not define a meaningful output.
+
+**Worked example.** Specify five scores as logarithms of masses $(3,1,6,2,4)$ and five two-coordinate values:
+
+| Key | Mass | Value |
+| --- | ---: | --- |
+| 1 | 3 | $(2,-1)$ |
+| 2 | 1 | $(-3,2)$ |
+| 3 | 6 | $(1,4)$ |
+| 4 | 2 | $(5,0)$ |
+| 5 | 4 | $(-2,-2)$ |
+
+These are newly specified mathematical inputs. Process keys 1–2, then key 3, then keys 4–5. The running states are
+
+| Processed keys | $m$ | $\ell$ | $u$ |
+| --- | --- | --- | --- |
+| 1–2 | $\log 3$ | $4/3$ | $(1,-1/3)$ |
+| 1–3 | $\log 6$ | $5/3$ | $(3/2,23/6)$ |
+| 1–5 | $\log 6$ | $8/3$ | $(11/6,5/2)$ |
+
+The output is $(11/16,15/16)=(0.6875,0.9375)$. Directly weighting the values by their masses and dividing by the total mass 16 gives the same result. If only keys 2–4 are allowed, their masses sum to 9 and the output becomes $(13/9,26/9)$. Masking changes the allowed distribution before normalization.
+
+### Applying the merge to tiles \{#tiling-attention-one-block-at-a-time\}
+
+For several query rows, retain one state per row. Load a tile of keys and values, compute a small rectangle of scores, apply the allowed-key mask, then merge its contribution. The rectangle can be discarded once those row states have been updated. Causal attention can skip rectangles entirely beyond the diagonal; a rectangle crossing the boundary still needs elementwise masking.
+
+The merge rule does not prescribe the best tile size or thread layout. Those choices depend on how many query, key, value, score and accumulator entries fit in fast memory. Our scalar-loop implementation verifies the algebra and mask behavior. It does not implement a GPU kernel or measure its speed.
+
+### Reconstructing intermediates during differentiation \{#the-backward-pass-recompute-instead-of-store\}
+
+Backpropagation needs probabilities to propagate derivatives through the value mixture and softmax. Given $Q$, $K$ and saved row normalization statistics, the same score tiles and probabilities can be reconstructed when needed. This trades additional arithmetic for less persistent storage and less movement of the large intermediate arrays. Dropout, when used, additionally requires reproducible mask information; replaying a different mask would differentiate a different computation.
+
+### What equality means in finite precision \{#exact-not-approximate\}
+
+With the same scores, values and mask, tiled and materialized attention represent the same real-arithmetic function. Floating-point sums depend on their order, and intermediate precision can differ between implementations. Bitwise identity is therefore a separate requirement. Our checks compare all six orders of the three blocks, and shifts of every score by $+1000$ or $-1000$, with a tolerance of $10^{-12}$. The shift test also exercises the subtraction of the running maximum.
+
+### Separating stored bytes from memory traffic \{#how-many-memory-accesses\}
+
+For an explicit storage inventory, use one head, $d=48$, two-byte entries in $Q,K,V,O,S,P$, and four-byte entries for each running $m$ and $\ell$. The reference retains both complete $S$ and $P$. The streamed version retains $Q,K,V,O$ and two row statistics:
+
+$$
+\begin{aligned}
+B_{\mathrm{reference}}&=8nd+4n^2,\\
+B_{\mathrm{streamed}}&=8nd+8n.
+\end{aligned}
+$$
+
+These byte counts exclude on-chip tiles, allocator overhead, other layers, gradients and optimizer state. They describe this stated inventory, not peak framework memory or every conventional implementation.
+
+<AttentionStorage />
+
+The IO analysis counts transfers rather than simultaneous stored bytes. With fast-memory capacity $M$ measured in scalar entries, a key/value tile can contain on the order of $M/d$ rows. Visiting all key tiles requires on the order of $nd/M$ passes over query/output states of size $nd$, giving the term $n^2d^2/M$. Dao et al.'s Theorem 2 formalizes this analysis for its two-level memory model with $d\le M\le nd$. The practical advantage over materialized attention requires enough fast memory relative to $d^2$; it is not a universal speed guarantee. Dense arithmetic still scales as $n^2d$.
+
+### Improving the execution schedule \{#flashattention-2\}
+
+FlashAttention-2 reduces non-matrix arithmetic, parallelizes query-row blocks and changes how work is divided among warps. Keeping an unnormalized output accumulator until the final division is one such reduction. Its row-oriented work split can also avoid combining partial output vectors between warps. These are execution choices for the same attention function ([Dao, 2023](#references), §§3.1–3.3). Our arithmetic example does not establish a speedup for either kernel version.
+
+## Mixture of experts
+
+An expert layer provides several FFNs and routes a token to a subset of them. Attention still determines which positions communicate. The expert choice determines which feature transformation a position receives. Experts are learned parameter sets; their index does not establish a human-readable specialty.
+
+### Conditional use of larger parameter sets \{#why-not-just-make-the-ffn-wider\}
+
+Increasing the width of one dense FFN makes every token use the extra weights. Providing $E$ separate FFNs with top-$k$ routing lets a token use only $k$ experts. Increasing $E$ at fixed expert size and $k$ increases the available parameter set without proportionally increasing expert matrix multiplication per token. Router work and communication still grow or change, so the entire layer's cost is not constant.
+
+### Specifying the gate convention \{#the-router-and-top-k-gating\}
+
+A router maps a token vector $x\in\mathbb R^d$ to $E$ logits. Softmax gives probabilities $p_e(x)$. Let $T(x)$ be the selected top-$k$ indices. For our illustrative renormalized gate,
+
+$$
+\begin{aligned}
+g_e(x)&=\frac{p_e(x)}{\sum_{j\in T(x)}p_j(x)},\\
+y(x)&=\sum_{e\in T(x)}g_e(x)F_e(x).
+\end{aligned}
+$$
+
+For probabilities $(1/2,1/4,1/8,1/16,1/16)$, top-2 weights become $(2/3,1/3)$. If one output coordinate of the selected experts is 3 and −6, the mixture coordinate is 0. A large routing probability does not prevent cancellation between expert outputs.
+
+Switch uses top-1 with the selected probability retained, rather than renormalizing that single weight to one ([Fedus, Zoph and Shazeer, 2022](#references), §2.1). For the same first expert, that convention gives $3/2$. The retained probability supplies a differentiable path to router logits while the selected index is fixed. The discrete choice itself remains nondifferentiable at a routing boundary.
+
+### Counting allocated and touched weights \{#total-and-active-parameters\}
+
+Use $d=6$, hidden width $f=9$, $E=5$ experts and $k=2$. Include both affine biases in each two-matrix expert and a router bias. A token touches the router and two selected experts.
+
+| Quantity | Calculation | Parameters |
+| --- | --- | ---: |
+| One expert | $2df+f+d$ | 123 |
+| Router | $dE+E$ | 35 |
+| Whole expert layer | $5\cdot123+35$ | 650 |
+| Touched by one token | $2\cdot123+35$ | 281 |
+
+This count excludes attention, normalization, embeddings and all other layers. It is not a FLOP count: a parameter can be used multiple times, routing requires reductions, and batching changes reuse. A model may also use most experts somewhere within a batch, so sparsity per token does not imply sparse optimizer storage for the entire training run.
+
+### Balancing assignments and probabilities \{#load-balancing\}
+
+For top-1 routing of $T$ tokens, let $f_e$ be the fraction assigned to expert $e$, and $\bar p_e$ its mean router probability before capacity filtering. The Switch auxiliary term is
+
+$$
+L_{\mathrm{balance}}=\alpha E\sum_{e=1}^E f_e\bar p_e.
+$$
+
+The assignment fractions are treated as constants for differentiation; the mean probabilities carry gradients ([Fedus, Zoph and Shazeer, 2022](#references), §2.2). With assignment counts $(6,4,3,2,0)$ out of 15 and mean probabilities $(0.35,0.25,0.20,0.15,0.05)$, the value before multiplying by $\alpha$ is $4/3$. Uniform assignments and probabilities give 1; complete collapse onto one expert gives 5. These are comparison cases, not a claim that 1 is a universal mathematical lower bound over all coupled router configurations.
+
+### Capacity and unprocessed assignments \{#capacity-factor-and-dropped-tokens\}
+
+An implementation may allocate $C=\lceil cT/E\rceil$ token slots per expert, with capacity factor $c$. Using the same top-1 counts, capacity 3 leaves four assignments unprocessed, although four allocated slots elsewhere are empty. Increasing capacity to 4 reduces unprocessed assignments to two and creates seven empty slots.
+
+<ExpertCapacity />
+
+In the Switch policy, a token whose expert assignment exceeds capacity bypasses that expert computation through the residual path. It is not deleted from the sequence. Other systems can choose a different overflow policy; rerouting, dropping and capacity-free scheduling are different algorithms and must be specified separately.
+
+### Storage and communication remain \{#compute-is-saved-memory-is-not\}
+
+All experts need weights somewhere, even when one token uses only a few. Sharding experts across devices exchanges token representations and expert outputs between their owners. Skewed routing can make one device determine the completion time while others wait. A sparse parameter count therefore needs to be accompanied by allocated memory, assignment balance, capacity policy and communication measurements before it becomes a performance argument.
+
+## The modern Transformer block
+
+Several changes address distinct costs and can be combined. Pre-normalization controls the residual path; [RMSNorm](/notes/nlp/transformers) and [rotary positions](/notes/nlp/positional-encoding) change specific computations inside it. Neither implies an expert layer or FlashAttention.
+
+**SwiGLU** uses two input projections whose outputs are multiplied coordinatewise, followed by an output projection. With column-vector inputs and no biases,
+
+$$
+\begin{aligned}
+F(x)&=W_o\bigl(\operatorname{SiLU}(W_gx)\odot W_ax\bigr),\\
+\operatorname{SiLU}(z)&=z\sigma(z).
+\end{aligned}
+$$
+
+Here $W_g,W_a$ have shape $f\times d$ and $W_o$ has shape $d\times f$, giving $3df$ weights. A width-4 input with hidden width 6 uses 72 weights, the same as a two-matrix bias-free FFN with hidden width 9. Equal counts do not make their functions identical ([Shazeer, 2020](#references), §2).
+
+**Grouped-query attention (GQA)** shares a key/value head among several query heads ([Ainslie et al., 2023](#references), §2.2). With $L$ layers, batch size $b$, cached length $n$, $h_{kv}$ key/value heads, head width $d_h$ and $s$ bytes per entry, a plain KV cache occupies
+
+$$
+B_{\mathrm{KV}}=2Lbn h_{kv}d_hs.
+$$
+
+For $L=3$, $b=2$, $n=96$, six query heads, $d_h=8$ and $s=2$, using six, two or one KV heads gives 108, 36 or 18 KiB. This excludes padding, metadata and other stored tensors. Sharing heads changes the model's parameterization; it cannot generally preserve an arbitrary multi-head checkpoint's output. FlashAttention instead changes how the chosen attention function is evaluated. The two savings can coexist.
+
+## What changed
+
+Tiled attention removes full persistent score/probability matrices while retaining every allowed interaction. Expert routing changes which feature transformation a token receives. GQA reduces the number of distinct cached keys and values. Each needs a different correctness comparison: attention outputs, routing behavior or the adapted model's quality.
+
+## Limitations
+
+Dense attention still has quadratic arithmetic in sequence length. Small workloads may not benefit from a more elaborate schedule. An imbalanced expert layer can waste capacity and communication time. Fewer KV heads constrain the model. None of the synthetic calculations above measures language quality, accelerator utilization or end-to-end latency.
+
+## What you should remember
+
+Keep normalization state when merging attention blocks. Apply masks before normalization. Count all allocated experts separately from the experts visited by one token. State the gate and overflow conventions. Treat hardware timing as an experiment with its own configuration.
+
+## Code
+
+The [standard-library construction](https://github.com/fpakhurov/fpakhurov.com/blob/main/scripts/notes/nlp-adaptation-cases.py) reproduces the two-coordinate attention outputs, the storage inventory, expert counts, capacity losses and KV-cache table. It checks block reorderings, large common score shifts and an empty allowed set. Its loops verify arithmetic; they are not implementations or benchmarks of GPU attention or distributed routing.
+
+## Next
+
+An affordable backbone still needs to solve a particular task. [Transfer learning](/notes/nlp/transfer-learning) examines which information a frozen representation exposes and what changes when its parameters are allowed to move.
+
+## References
+
+- Tri Dao, Daniel Y. Fu, Stefano Ermon, Atri Rudra and Christopher Ré. [FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness](https://arxiv.org/abs/2205.14135v2). NeurIPS, 2022. §§2.2–3.2, Theorems 1–2: tiling, normalization, recomputation and the two-level memory model.
+- Tri Dao. [FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning](https://arxiv.org/abs/2307.08691v1). 2023. §§3.1–3.3: accumulator, sequence parallelism and work partitioning.
+- William Fedus, Barret Zoph and Noam Shazeer. [Switch Transformers: Scaling to Trillion Parameter Models with Simple and Efficient Sparsity](https://arxiv.org/abs/2101.03961v3). JMLR, 2022. §§2.1–2.2: top-1 gate, capacity and auxiliary loss.
+- Noam Shazeer. [GLU Variants Improve Transformer](https://arxiv.org/abs/2002.05202v1). 2020. §2: gated FFN definitions and matrix count.
+- Joshua Ainslie, James Lee-Thorp, Michiel de Jong, Yury Zemlyanskiy, Federico Lebrón and Sumit Sanghai. [GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints](https://arxiv.org/abs/2305.13245v3). EMNLP, 2023. §2.2: shared key/value heads.
