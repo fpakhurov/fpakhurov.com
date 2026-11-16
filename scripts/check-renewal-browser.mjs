@@ -21,6 +21,22 @@ fs.mkdirSync(output, {recursive: true});
 const server = spawn('python3', ['-m', 'http.server', '4329', '--bind', '127.0.0.1', '--directory', 'dist'], {stdio: 'ignore'});
 let browser;
 const results = [];
+async function splitHeadingWords(page) {
+  return page.locator('.note-header h1').evaluate(heading => {
+    const split = [];
+    const nodes = document.createTreeWalker(heading, NodeFilter.SHOW_TEXT);
+    for (let node = nodes.nextNode(); node; node = nodes.nextNode()) {
+      for (const match of node.textContent.matchAll(/[\p{L}\p{M}]+/gu)) {
+        const range = document.createRange();
+        range.setStart(node, match.index);
+        range.setEnd(node, match.index + match[0].length);
+        const lines = new Set([...range.getClientRects()].map(rect => Math.round(rect.top)));
+        if (lines.size > 1) split.push(match[0]);
+      }
+    }
+    return split;
+  });
+}
 try {
   for (let n = 0; n < 100; n++) {
     try { if ((await fetch('http://127.0.0.1:4329/')).ok) break; } catch {}
@@ -55,11 +71,27 @@ try {
       }
       const result = {...item, width, theme, ...state};
       delete result.localLinks;
+      result.splitHeadingWords = await splitHeadingWords(page);
+      assert.deepEqual(result.splitHeadingWords, [], `${item.route} ${width}: heading splits words`);
+      if (width === 390) {
+        await page.setViewportSize({width: 320, height: 900});
+        result.narrowHeadingWords = await splitHeadingWords(page);
+        assert.deepEqual(result.narrowHeadingWords, [], `${item.route} 320: heading splits words`);
+        if (theme === 'dark' && item.locale === 'ru') {
+          await page.locator('.note-header').screenshot({
+            path: `${output}/${item.id.replaceAll('/', '-')}-heading-320.png`,
+            style: '.site-header { visibility: hidden !important; }',
+          });
+        }
+        await page.setViewportSize({width, height: 900});
+      }
       const figures = page.locator('.prose figure.fig');
       result.figureScreenshots = [];
       for (let i = 0; i < await figures.count(); i++) {
         const filename = `${item.id.replaceAll('/', '-')}-${item.locale}-${width}-${theme}-figure-${i + 1}.png`;
-        await figures.nth(i).screenshot({path: `${output}/${filename}`});
+        // Isolated tall figures can scroll under the fixed navbar during capture.
+        // Hide it only for these crops; full-page screenshots retain the real header.
+        await figures.nth(i).screenshot({path: `${output}/${filename}`, style: '.site-header { visibility: hidden !important; }'});
         result.figureScreenshots.push(filename);
       }
       const tables = page.locator('.prose table');
