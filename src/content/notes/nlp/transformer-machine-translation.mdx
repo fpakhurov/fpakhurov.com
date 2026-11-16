@@ -1,12 +1,162 @@
 ---
 title: Transformer for machine translation
-description: "This note is withheld pending an independent source review."
+description: "Trace source and target information through encoder-decoder attention, masks and shifted inputs; separate an explicit conditional diagnostic from training, ablation and search claims."
 course: nlp
 section: Transformers
 order: 18
-status: needs-review
-tags: []
-prerequisites: []
+status: published
+tags: [transformers, machine-translation, bleu, beam-search, cross-attention]
+prerequisites: [Positional representations, Sequence-to-sequence models]
 ---
 
-This note is withheld pending an independent source review.
+A translator must use two different kinds of evidence: the complete source message and the target prefix it has already produced. Giving the decoder the next correct target token makes training deceptively easy; hiding the source makes the task an ordinary language-model problem. The architecture and its masks must preserve the intended conditional prediction.
+
+## Define the conditional problem \{#the-model\}
+
+Let $x$ be a source sequence and $y_1,\ldots,y_T$ a target that includes an end-of-sequence token. An autoregressive translator assigns
+
+$$
+p(y\mid x)=\prod_{t=1}^{T}p(y_t\mid y_{<t},x).
+$$
+
+This factorization is the same conditional problem introduced in [sequence-to-sequence models](/notes/nlp/seq2seq). Transformer changes how the source and prefix states are calculated. It does not remove the conditioning, the need to indicate completion or the difference between a training prefix and a generated prefix.
+
+During teacher forcing, the decoder input is the target shifted right with a beginning token. For the explicit target `check light <eos>`, the input is `<bos> check light`. Position one predicts `check` from the beginning token and source; position two predicts `light` from the supplied `check`; position three predicts completion. Feeding the unshifted target to the same prediction positions creates a direct label leak.
+
+For a batch, let $\mathcal I$ contain the real target prediction positions, including completion tokens and excluding padding. The unsmoothed objective is
+
+$$
+\mathcal L=-\frac1{|\mathcal I|}\sum_{(b,t)\in\mathcal I}
+\log p(y_{b,t}\mid y_{b,<t},x_b).
+$$
+
+This averages over tokens. Averaging each sentence first and then averaging sentences gives a different weighting when their lengths differ. Either can be specified deliberately; the denominator should not change accidentally with padding length.
+
+## Three attention paths have different inputs \{#what-the-encoder-and-the-decoder-do\}
+
+The encoder uses source self-attention and [position-wise Transformer updates](/notes/nlp/transformers). With no causal restriction, a source position can use the other real source positions. Padding keys are excluded. The resulting source states remain available to the decoder, instead of being compressed into one fixed context vector.
+
+The decoder first uses causal target self-attention. Its queries, keys and values come from the shifted target-side states. At a prediction position, allowed keys include the supplied prefix up to that position and exclude later shifted inputs. All teacher-forced positions can be calculated in parallel because their inputs are known, provided the mask prevents each prediction from using its future.
+
+Cross-attention then uses decoder-side queries and encoder-side keys and values. For target length $T$, source length $S$ and key width $d_k$, the query–key product has shape $T\times S$. Each target position can select a different mixture of source values. Cross-attention does not use a target causal triangle over the source: source order is already represented in source states and the complete source is available.
+
+Three contracts are therefore separate. A source padding mask identifies valid source keys. A target causal mask restricts target information flow. A target loss mask excludes padded predictions. A target key padding mask can be combined with the causal restriction for batches. Boolean polarity is an API convention, not a property of attention itself; the small script defines `True` as allowed.
+
+For three target positions its allowed matrix is
+
+$$
+\begin{bmatrix}
+1&0&0\\
+1&1&0\\
+1&1&1
+\end{bmatrix}.
+$$
+
+For a padded source with two real positions, the key mask is `(True, True, False)`. A zero padding value does not replace that mask: if its score is included, it still absorbs part of the softmax denominator. The shared attention primitive also rejects a row with no allowed keys instead of silently manufacturing a distribution.
+
+## Trace a fixed conditional decoder \{#results\}
+
+We can isolate source conditioning with a completely specified numerical diagnostic. It is not a trained Transformer or an implemented text encoder. Name two fictional source messages “inspect lamp” and “inspect tripod”, and assign them supplied source signs +1 and −1. These signs are explicit inputs, not values learned from the words.
+
+Both sources have keys `(1, 0)` and `(0, 1)`. Their values are `(0, 0)` and `(s, 0)`, where the sign $s$ identifies the supplied case. Use scaled dot-product attention with key width two. The target vocabulary, in order, is `check`, `light`, `stand`, `<eos>`.
+
+The decoder's internal query and output rule are also supplied:
+
+| Prefix state | Query | Output logits |
+| --- | --- | --- |
+| Empty | `(1, 0)` | `(2, 0, 0, 0)` |
+| Last token is `check` | `(0, 1)` | `(0, 3c, −3c, 0)` |
+| Otherwise | `(1, 1)` | `(0, 0, 0, 2)` |
+
+Here $c$ is the first coordinate of the cross-attention context. These rules stand in for decoder states and a prediction head so that every dependency is visible. The experiment does not claim that they arose from learned self-attention or language training.
+
+At the middle prediction, the two scaled scores are zero and $1/\sqrt2$. The weight on the second source position is
+
+$$
+a=\frac{e^{1/\sqrt2}}{1+e^{1/\sqrt2}}
+\approx0.6697615493.
+$$
+
+The context coordinate is $c=as$. For the positive source sign, the middle logits are approximately `(0, 2.009285, −2.009285, 0)`. The probability of `light` is `0.7775156260`. Changing only the source sign swaps the two object logits and makes `stand` equally probable. The attention weights themselves stay the same, because the keys did not change; their values carry the distinction.
+
+The first and final correct-token probabilities are both `0.7112345942`. The three-token mean negative log-likelihood is therefore `0.3110524817` for either supplied target. Greedy decoding produces `check light <eos>` or `check stand <eos>`. These saved results validate the constructed conditioning path, without measuring translation accuracy.
+
+## Remove exactly the source contribution \{#what-cross-attention-is-worth\}
+
+Set the context coordinate used by the head to zero and keep every other rule unchanged. The middle logits become all zero, giving probability one quarter to every vocabulary item. The first and last predictions do not depend on context under the supplied rule and retain their probabilities. Mean target negative log-likelihood increases to `0.6892667563`.
+
+This controlled intervention has a narrow conclusion: the object decision in this specified decoder needs the supplied source value. It is not an empirical estimate of cross-attention's contribution to a trained translation system. A real ablation should specify whether the remaining parameters are retrained, how capacity is matched and how the removed path affects normalization or optimization.
+
+A decoder that sees fluent target prefixes can otherwise produce plausible text while underusing the source. Check source sensitivity and source fidelity in addition to target likelihood. A lower teacher-forced loss does not alone establish that every generated sentence preserves the input meaning.
+
+Label smoothing changes the training target too. For vocabulary size $V$ and a chosen coefficient $0\le\epsilon\le1$, define a mixture that includes the correct class in the uniform part:
+
+$$
+\begin{aligned}
+\widetilde y_j&=(1-\epsilon)\mathbf1\{j=y\}+\frac\epsilon V,\\
+\mathcal L_{\mathrm{smooth}}&=-\sum_j\widetilde y_j\log p_j.
+\end{aligned}
+$$
+
+With four classes and epsilon `0.2`, the middle target for `light` is `(0.05, 0.85, 0.05, 0.05)`. Its loss is `0.6535084670` under the same prediction. The gradient with respect to each logit is $p_j-\widetilde y_j$, verified for all four coordinates by finite differences. Smoothing only the incorrect classes would use another convention. Smoothed loss values cannot be compared numerically with unsmoothed loss as though only model quality had changed.
+
+## Depth changes capacity and the comparison \{#what-depth-is-worth\}
+
+An additional encoder block can refine each source state after another round of communication and nonlinear transformation. An additional decoder block can revise a prefix state and retrieve source information using a later query. These are extra computations, not an automatic guarantee of better translation.
+
+A useful depth comparison holds the task and evaluation pipeline fixed and records which resources change. Holding width fixed increases parameters and work with depth. Holding parameter count fixed requires another capacity change, often width. Holding training steps fixed may still change total compute. Without this specification, “deeper is better” can confuse architecture, optimization and budget.
+
+The fixed diagnostic above has no trainable encoder/decoder stack, so it supplies no depth curve. Its small head rules are deliberately transparent. A comparison of trained depths would require a separately documented dataset, initialization, training run and saved held-out evaluation; no earlier benchmark scores can fill those roles.
+
+## Read attention as a computation \{#what-the-cross-attention-learned\}
+
+A cross-attention row records weights used to combine the available values for one query. It can reveal a padding bug, a uniform distribution or a response to a controlled perturbation. It does not by itself certify a word alignment or explain the entire prediction: multiple heads, residual paths, transformed values and later layers also contribute.
+
+In our diagnostic, the middle query gives weight `0.669762` to the object position for both messages. The output changes because its value changes sign. Looking only at the identical weights would miss that source dependence. Conversely, changing an attention weight can have little effect if the corresponding values are similar or another path compensates.
+
+All these weights were specified by explicit arrays and computed exactly as described. None was learned from a bilingual corpus. For a trained model, compare a visual pattern with interventions that preserve or remove the proposed evidence, while accounting for other routes to the prediction. A heatmap is a view of one intermediate operation, not a substitute for an evaluation design.
+
+## Search complete hypotheses carefully \{#beam-search\}
+
+At inference the next prefix contains generated tokens. Greedy decoding chooses the largest conditional probability at each step; it need not find the most probable completed sequence. Beam search retains several candidate prefixes and compares sums of token log-probabilities. See the general [decoding discussion](/notes/nlp/seq2seq#result) for the conditional sequence objective.
+
+Consider a separate finite probability tree, unrelated to the source-state diagnostic. The first token is a with probability `11/20` or b with probability `9/20`. After a, completion has probability `3/5` and x has probability `2/5`. After b, completion has probability `9/10` and x has probability `1/10`.
+
+| Two-token path | Joint probability | Status at the two-step limit |
+| --- | ---: | --- |
+| a, `<eos>` | 33/100 | complete |
+| a, x | 11/50 | unfinished |
+| b, `<eos>` | 81/200 | complete |
+| b, x | 9/200 | unfinished |
+
+Greedy chooses a first and then completes, obtaining probability `0.33`. A beam of width two keeps both first-step prefixes and can return the completed b path with probability `0.405`. The x paths are not completed sentences just because a step limit was reached. A search implementation must distinguish “stopped at EOS” from “truncated by a resource limit”.
+
+A partial path's probability is an upper bound on the probability of any particular extension under this unnormalized objective, since each future factor is at most one. Here neither unfinished prefix can beat the b completion even before its continuation is defined. Length normalization or other rewards change that comparison and require their own stopping rule.
+
+A wider beam can find a better score without improving translation quality. The score is the model's preference, while reference adequacy is an external criterion. Report the search objective, maximum length, EOS handling and any normalization alongside corpus evaluation. The worked tree proves a search distinction, not a BLEU improvement.
+
+## What changed \{#what-changed\}
+
+The source and target prefix now have explicit routes into the prediction. Encoder self-attention reads the source; causal target attention constructs a permitted prefix state; cross-attention retrieves source values for that state. Shifted inputs and distinct masks make the conditional objective operational. A separate search policy turns next-token distributions into a completed output.
+
+## Limitations \{#limitations\}
+
+The numerical diagnostic supplies internal states and a head rule rather than training a translator. It cannot establish bilingual competence, learned alignment, a benefit of depth or generalization. Real translation evaluation also depends on source–target data quality, tokenization, split independence and the treatment of alternative valid outputs. The [corpus and evaluation note](/notes/nlp/corpora-and-evaluation) is the home for those measurement boundaries.
+
+## What to remember \{#what-you-should-remember\}
+
+Predict the next target token from the source and permitted prefix. Shift teacher-forced inputs and mask future target positions. Source padding, target causality and loss masks do different jobs. Cross-attention uses decoder queries with encoder keys and values. A computed attention pattern is not a learned alignment claim. Search scores and translation quality require separate evidence.
+
+## Notebook \{#notebook\}
+
+- The [standalone executable](https://github.com/fpakhurov/fpakhurov.com/blob/main/scripts/notes/nlp-transformer-foundations-cases.py) records both fixed decoder traces, the source-value intervention, token probabilities, greedy completion and mean losses.
+- It separately verifies the chosen label-smoothing gradient and the exact finite beam tree. All inputs are new explicit mathematical cases; no parallel corpus, external notebook, trained model or benchmark output is used.
+
+## Next \{#next\}
+
+Translation trains a decoder to predict the next token. A bidirectional encoder can instead recover selected hidden tokens from both sides of an input. [BERT and masked language modeling](/notes/nlp/bert) specify that objective, the corruption process and which positions actually contribute to its loss.
+
+## References \{#references\}
+
+- Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N. Gomez, Łukasz Kaiser, Illia Polosukhin. [Attention Is All You Need](https://arxiv.org/abs/1706.03762v7). NeurIPS, 2017; version 7, 2023. Sections 3.1–3.2: encoder/decoder information flow and masks; Section 5.4: label smoothing as a training choice. The source paper's data, architecture diagram, visualized heads and measured translation results are not reproduced.
+- PyTorch contributors. [Transformer interface and mask contracts](https://github.com/pytorch/pytorch/blob/1d8e8560dc4c9182cba96c81c36e096fc2a063c1/torch/nn/modules/transformer.py), revision `1d8e856`. Referenced to distinguish source, target and memory inputs and Boolean-mask conventions. The standard-library diagnostic is independently implemented and does not import that model.

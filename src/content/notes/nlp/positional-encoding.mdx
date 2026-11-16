@@ -1,12 +1,178 @@
 ---
 title: Positional representations
-description: "This note is withheld pending an independent source review."
+description: "Derive sinusoidal shift and rotary offset identities, compare learned table bounds and test projection-order, periodicity and cached-key errors with explicit vectors."
 course: nlp
 section: Transformers
 order: 17
-status: needs-review
-tags: []
-prerequisites: []
+status: published
+tags: [positional-encoding, sinusoidal, rope, transformers, permutation]
+prerequisites: [Transformer Architecture, Trigonometry]
 ---
 
-This note is withheld pending an independent source review.
+“Pack the lamp before the stand” and “Pack the stand before the lamp” contain the same tokens but request different actions. A content-only encoder can move its output rows along with a rearranged input, yet a symmetric average of those rows loses the distinction. The model needs an observable relation between content and order before the output is pooled.
+
+## What the content-only baseline can distinguish \{#baseline-no-positions\}
+
+The [self-attention derivation](/notes/nlp/attention#self-attention-does-not-see-word-order) established permutation equivariance for unmasked content-only attention. Position-wise networks, residual additions and per-row normalization preserve that property. They can transform a token using the other supplied tokens while still treating a joint rearrangement of the rows consistently.
+
+This is useful for a set and insufficient for many sequences. The limitation is conditional on the computation: a causal mask already distinguishes which positions can see which earlier inputs. It is therefore inaccurate to say that every Transformer without an explicit position vector ignores all order. We focus first on the unmasked encoder, then separate positional transformations from masking.
+
+A positional mechanism can add a vector to a token state, alter the compatibility score between two positions, or transform queries and keys before their product. Each choice exposes information at a different point. Merely storing the position index next to an array does nothing unless the forward computation uses it.
+
+## A deterministic vector for every index \{#sinusoidal-encoding\}
+
+For even width $d$, choose a positive base $B$ and frequencies $\omega_i=B^{-2i/d}$, with $i=0,\ldots,d/2-1$. A sinusoidal position vector has coordinates
+
+$$
+\begin{aligned}
+p(t)_{2i}&=\sin(t\omega_i),\\
+p(t)_{2i+1}&=\cos(t\omega_i).
+\end{aligned}
+$$
+
+The position $t$ starts at zero in this convention. Angles are in radians. The original Transformer uses base 10,000; the small calculation below deliberately uses another base so several changes are visible over a few positions. No position-table parameters are learned when this formula is fixed.
+
+An additive input is $h_t=e_t+p(t)$, where $e_t$ is the token embedding of the same width. Addition keeps the block width fixed. It also means a later projection sees both components: the query or key can respond to content, position and their interaction in the score. This is not an automatic separation into one part that represents a word and another part that represents its index.
+
+The relative scale matters. Multiplying token embeddings by a constant while leaving positional vectors unchanged changes the balance presented to the first block. The original architecture's embedding scaling is one specified choice, not a consequence that every additive implementation must follow. A reproducible model description records the scale and placement along with the formula.
+
+## Four coordinates, two frequencies \{#worked-example\}
+
+Set $d=4$ and $B=16$. The two frequencies are one and one quarter, giving
+
+$$
+p(t)=(\sin t,\cos t,\sin(t/4),\cos(t/4)).
+$$
+
+The independently computed values are:
+
+| Position | Coordinate 1 | Coordinate 2 | Coordinate 3 | Coordinate 4 |
+| --- | ---: | ---: | ---: | ---: |
+| 0 | 0.000000 | 1.000000 | 0.000000 | 1.000000 |
+| 1 | 0.841471 | 0.540302 | 0.247404 | 0.968912 |
+| 2 | 0.909297 | −0.416147 | 0.479426 | 0.877583 |
+| 3 | 0.141120 | −0.989992 | 0.681639 | 0.731689 |
+
+At position zero the vector is not zero. Every sine–cosine pair has squared norm one; therefore the whole vector has squared norm two in this example. Its changing direction, rather than a growing magnitude, represents the position.
+
+Moving a token from position one to position three changes its additive input even if its word embedding stays fixed. Rearranging both token embeddings and positional vectors together would simply rename positions again. For a sequence, the position vector belongs to the destination slot, not permanently to the token type being moved.
+
+## A shift is a predictable transformation \{#properties\}
+
+The angle-addition identities explain why two coordinates are paired. For one frequency and shift $\Delta$,
+
+$$
+\begin{bmatrix}
+\sin((t+\Delta)\omega)\\
+\cos((t+\Delta)\omega)
+\end{bmatrix}
+=
+\begin{bmatrix}
+\cos(\Delta\omega)&\sin(\Delta\omega)\\
+-\sin(\Delta\omega)&\cos(\Delta\omega)
+\end{bmatrix}
+\begin{bmatrix}
+\sin(t\omega)\\
+\cos(t\omega)
+\end{bmatrix}.
+$$
+
+For fixed shift, the matrix does not depend on the starting position. Its sign pattern follows our coordinate order “sine, cosine”; reversing that order changes the matrix convention. The script checks shift two at starting positions zero, one and four, with discrepancies no larger than floating-point rounding.
+
+This property makes a relative displacement available through a linear transformation of the position features. It does not force a trained attention score to depend only on displacement. Content projections and additive cross terms remain. Nor does it establish that unseen lengths will be processed correctly: the formula exists at a large index even if training never constrained the model there.
+
+A fixed formula avoids a hard table lookup limit, but numerical representation still matters. Very large angles and low-precision calculations can lose distinctions. Frequencies, positional scaling, arithmetic precision and the range encountered during training are separate pieces of the contract. They should not be compressed into an unsupported claim of unlimited context.
+
+## Learn a table instead \{#learned-absolute-positions\}
+
+A learned absolute table stores one width-$d$ row for each supported index. For maximum length $M$, it has $Md$ parameters. In the toy count, six positions of width four need 24 values; valid indices are zero through five, and index six has no stored row.
+
+The table can adapt freely within the training signal supplied at each index. Rows used rarely receive different evidence from common early positions. Unused rows do not become useful merely because memory was allocated for them. Increasing the table size, copying rows or interpolating them specifies an additional rule whose quality needs evaluation; a successful array operation does not verify semantic extrapolation.
+
+Padding creates a practical distinction between a token's position in a batch array and its intended position in the example. If left padding shifts all real tokens to larger absolute indices, a model using the raw array indices receives different inputs. Position IDs and masks must agree with the training convention. Resetting indices at a new independent sequence is also a policy choice, especially when several examples are packed together.
+
+Neither a learned nor a fixed additive vector guarantees unique recovery of the token and position from their sum. Two combined vectors can coincide for some embedding values. The useful claim is that the mechanism supplies a learnable signal, not that addition is universally an injective encoding of both variables.
+
+## Put displacement into attention \{#relative-and-rotary-positions\}
+
+One way to specify a relative score is to add a scalar indexed by the displacement:
+
+$$
+s_{mn}=\frac{q_m^\top k_n}{\sqrt{d_k}}+b_{n-m}.
+$$
+
+Here $b_{n-m}$ is a defined offset bias. A finite table, clipping or bucketing would further specify how large distances share parameters. This equation illustrates the distinction between content compatibility and an offset preference; it does not imply that every relative-position method uses this exact design.
+
+Rotary position embedding instead transforms paired query and key coordinates. Use column vectors for the following two-dimensional derivation, and define
+
+$$
+R(\alpha)=
+\begin{bmatrix}
+\cos\alpha&-\sin\alpha\\
+\sin\alpha&\cos\alpha
+\end{bmatrix}.
+$$
+
+For projected content vectors $q,k$ at positions $m,n$, the rotated vectors are $R(m\theta)q$ and $R(n\theta)k$. The frequency $\theta$ is fixed for this pair. Su and colleagues introduced this positional construction as RoPE; the calculations here use new explicit vectors and elementary rotation algebra.
+
+Each rotation preserves the norm of its input. Rotating queries and keys changes their dot product through their relative angle. In the form considered here, values remain unrotated. Changing how values are handled would define another computation and needs to be stated separately.
+
+## Why the score contains the offset \{#why-the-rotated-score-depends-only-on-the-offset\}
+
+Rotation matrices satisfy $R(\alpha)^\top=R(-\alpha)$ and $R(\alpha)R(\beta)=R(\alpha+\beta)$. Substitute them directly into the score:
+
+$$
+\begin{aligned}
+(R(m\theta)q)^\top R(n\theta)k
+&=q^\top R(m\theta)^\top R(n\theta)k\\
+&=q^\top R((n-m)\theta)k.
+\end{aligned}
+$$
+
+For these fixed content vectors, the positions enter only through their difference. Shifting both indices by the same amount leaves the score unchanged. The sign is key position minus query position under our stated rotation and column-vector conventions. A different convention can reverse the sign consistently; mixing two conventions silently changes the score.
+
+Take $q=(2,-1)^\top$, $k=(-1,3)^\top$, frequency $\theta=\pi/6$, query position two and key position five. Their offset angle is a right angle, so the rotated key in the relative expression is `(-3, −1)`. Its dot product with the query is `−6 + 1 = −5`.
+
+Directly rotating both vectors gives approximately `(1.866025, 1.232051)` and `(−0.633975, −3.098076)`, also with dot product −5. Increasing both positions by five preserves the result. These are mathematical checks for specified vectors, not attention observations from a trained language model.
+
+The qualification “fixed content vectors” matters. In a deep model those vectors may themselves depend on earlier layers, masks and contextual changes. The identity proves the local positional dependence of this score. It does not prove invariance of every full-model prediction under inserting arbitrary prefixes or altering its available context.
+
+For larger even widths, apply such rotations to coordinate pairs and add their dot-product contributions. Each pair can use a different frequency. The matrix is block diagonal, so the same identity holds pair by pair. A dense matrix need not be built: each output pair needs only its sine, cosine, two multiplications per coordinate and an addition.
+
+## Implementation choices and their limits \{#why-rope-became-the-default\}
+
+Projection order is important. Rotate the already projected query and key. An arbitrary nonorthogonal transformation after rotation can break the relative-only identity. In our example, stretching the first coordinate of both rotated vectors by two changes the score to approximately `−8.549038`; shifting both indices by one then gives `−2.000000`, despite the unchanged relative displacement. The shared stretch does not commute with all rotations in the required dot-product metric.
+
+This counterexample is narrower than saying every later operation is forbidden. A transformation that preserves the relevant metric can preserve the identity. The point is to derive the property for the actual operation order instead of assuming that a method name guarantees it.
+
+Rotations also do not force every score to decrease with distance. For the same fixed vectors and frequency, offsets zero, three, six, nine and twelve give scores −5, −5, 5, 5 and −5. The pair is periodic with period twelve. Multiple frequencies and learned content can produce other behavior, but no monotone-distance claim follows for arbitrary individual scores.
+
+Caching must preserve the position convention. At key position seven, our key rotates to approximately `(2.366025, −2.098076)`. If that rotated key is stored, rotating it again by the same position produces `(−3.098076, 0.633975)` and changes subsequent scores. A cache should state whether it stores pre-rotation or post-rotation keys. Reusing positions after truncating a cache likewise requires a consistent rule for both old keys and new queries.
+
+The positional transform costs work proportional to the number of coordinate pairs. It does not remove the quadratic number of query–key comparisons in full attention. Nor does it by itself define the model's supported context length or guarantee useful behavior beyond its training range.
+
+## What changed \{#what-changed\}
+
+Content now reaches the block with an explicit positional signal, or its compatibility score incorporates a specified relation between indices. Fixed vectors, learned tables and rotations solve different representation constraints. Their concrete formulas make shift behavior, table bounds and cache conventions checkable.
+
+## Limitations \{#limitations\}
+
+The numerical examples check algebra and implementation boundaries. They do not select the best positional method for a dataset. A useful evaluation must separate changes in tokenization, training lengths, masks, positional scaling and compute budget. Formula availability beyond the training range is weaker than demonstrated generalization there.
+
+## What to remember \{#what-you-should-remember\}
+
+Content-only unmasked encoders are permutation equivariant. Sinusoidal pairs encode shifts through angle addition. Learned tables have explicit index bounds. RoPE introduces relative offsets into dot products for fixed projected content. The operation order and cache convention matter. Neither rotation nor a defined large-index formula proves unlimited or monotonic-distance behavior.
+
+## Notebook \{#notebook\}
+
+- The [standard-library script](https://github.com/fpakhurov/fpakhurov.com/blob/main/scripts/notes/nlp-transformer-foundations-cases.py) saves the width-four, base-16 sinusoidal table and shift checks.
+- Its independent rotation case verifies norms, direct and relative products, common shifts, periodic scores, the nonorthogonal counterexample and a double-rotation cache error. No pretrained model, corpus or external position table is loaded.
+
+## Next \{#next\}
+
+Positions supply order, but a translator must also distinguish its source from the output prefix it has generated. [Transformer machine translation](/notes/nlp/transformer-machine-translation) connects encoder states, a causal decoder and cross-attention, then traces how source evidence changes a prediction.
+
+## References \{#references\}
+
+- Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N. Gomez, Łukasz Kaiser, Illia Polosukhin. [Attention Is All You Need](https://arxiv.org/abs/1706.03762v7). NeurIPS, 2017; version 7, 2023. Section 3.5: fixed and learned positional inputs and the shift motivation. Our numerical table uses independently chosen base, width and positions.
+- Jianlin Su, Yu Lu, Shengfeng Pan, Ahmed Murtadha, Bo Wen, Yunfeng Liu. [RoFormer: Enhanced Transformer with Rotary Position Embedding](https://arxiv.org/abs/2104.09864v5). Version 5, 2023. Sections 3.1–3.2: query/key rotations and relative dot-product identity. Cited for the scientific mechanism; no paper figure, code, benchmark or distinctive worked example is reproduced.
