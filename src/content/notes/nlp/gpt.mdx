@@ -1,12 +1,185 @@
 ---
 title: GPT and autoregressive language modeling
-description: "This note is withheld pending an independent source review."
+description: "Predict the next token with a causal Transformer, count its parameters and cache, and calculate how sampling changes its output distribution."
 course: nlp
 section: Pretrained Language Models
 order: 20
-status: needs-review
-tags: []
-prerequisites: []
+status: published
+tags: [gpt, language-model, autoregressive, decoding, sampling, temperature, top-p, beam-search, speculative-decoding]
+prerequisites: [BERT and masked language modeling, N-gram language models]
 ---
 
-This note is withheld pending an independent source review.
+After the prefix `amber box`, a language model must assign probabilities to possible continuations. Predicting `moves` and `waits` needs no manually supplied class label: the next token in each training sequence supplies the target. A causal Transformer learns this prediction repeatedly, with shared parameters across positions.
+
+## Baseline: the recurrent language model \{#baseline-the-recurrent-language-model\}
+
+The [recurrent network](/notes/nlp/recurrent-networks) carries a state from one position to the next. This provides a compact representation of the prefix, but computing later training states requires earlier ones. The [Transformer](/notes/nlp/transformers) lets each position retrieve earlier representations directly through attention. During training the entire observed sequence is available, so all positions within a layer can be computed together. The attention mask determines which of those observations each prediction may use.
+
+Generation still has a sequential dependency. We cannot condition on the next generated token until we have selected it. Parallel training positions therefore do not imply that ordinary autoregressive generation produces every future token in one pass.
+
+## The objective \{#the-objective\}
+
+Let a document contain tokens $x_1,\ldots,x_T$, with $x_0$ a start marker. Include an end marker among the targets when the model should learn when to stop. The probability chain rule gives
+
+$$
+p_\theta(x_{1:T})=\prod_{t=1}^T p_\theta(x_t\mid x_{<t}).
+$$
+
+This factorization specifies an order of conditioning. It does not restrict the conditional model to a fixed number of earlier tokens. A finite context window imposes that additional modeling restriction. As in the [n-gram model](/notes/nlp/n-gram-language-models), a long document may then be approximated using only a suffix of its prefix.
+
+Maximum likelihood increases the probability assigned to the observed targets. Taking a negative logarithm turns the product into a sum. For $M$ scored target positions across documents, the mean negative log-likelihood is
+
+$$
+\mathcal L(\theta)=-\frac1M\sum_{(x,t)}\log p_\theta(x_t\mid x_{<t}).
+$$
+
+Natural logarithms measure loss in nats per scored token. Padding positions are excluded from both the sum and $M$. Including padding only in the denominator would artificially reduce the reported loss. Perplexity is $\exp(\mathcal L)$; comparisons require the same tokenization and scored data.
+
+The input row at position $i$ represents $x_i$ and predicts $x_{i+1}$. With hidden width $d$, vocabulary size $V$ and token embedding matrix $E\in\mathbb R^{V\times d}$, a tied output head forms logits and probabilities as
+
+$$
+\begin{aligned}
+z_i&=h_iE^\top\in\mathbb R^V,\\
+p_\theta(x_{i+1}\mid x_{\le i})&=\operatorname{softmax}(z_i).
+\end{aligned}
+$$
+
+Tying means that the same trainable matrix is used for input lookup and output projection. An implementation can instead use an independent output matrix. That changes its parameter count.
+
+For query position $i$ and key position $j$, the causal mask is
+
+$$
+M_{ij}=\begin{cases}0,&j\le i,\\-\infty,&j>i.\end{cases}
+$$
+
+Adding it before softmax gives future positions zero attention weight. The diagonal is allowed because the current input token is known; the target is shifted one position ahead. Allowing the next input token into this row would reveal the answer during training. The causal condition holds in every layer, so changing a later input cannot alter an earlier hidden state when other operations act independently at each position.
+
+**Worked example.** Construct three documents: `amber box moves`, `blue box waits`, and `amber box waits`. With start and end markers these give 12 prediction pairs. Fit the simple bigram maximum-likelihood baseline to those same pairs. Its only uncertain contexts are the start marker and `box`; each has probabilities 2/3 and 1/3. The other transitions are deterministic.
+
+$$
+\begin{aligned}
+\mathcal L_{\mathrm{train}}
+&=-\frac{2}{12}\left(2\log\frac23+\log\frac13\right)\\
+&\approx0.318257,\\
+\operatorname{PPL}_{\mathrm{train}}&\approx1.374730.
+\end{aligned}
+$$
+
+These are exact computations on a constructed training set, not a generalization score or a result from training GPT. A Transformer changes how context is represented while keeping the same likelihood objective. The GPT pretraining objective is specified in Radford et al. (2018), §3.1.
+
+## From GPT-1 to GPT-3 \{#from-gpt-1-to-gpt-3\}
+
+The original GPT report studied generative pretraining followed by supervised adaptation to individual tasks. GPT-2 emphasized applying a language model to tasks expressed in its input text without task-specific weight updates. GPT-3 systematically compared zero-shot, one-shot and few-shot prompting, again without gradient updates in those evaluations. These are changes in scale, data and the transfer procedure; a new version number alone does not define a new probability factorization.
+
+The GPT-2 report also describes moving layer normalization before each sublayer and adding a final normalization. GPT-3 retained much of that design while alternating dense and locally banded sparse attention. A description of “GPT” should therefore state which architecture and training recipe it means. The reports are historical primary evidence, not a specification for every later model carrying a similar name.
+
+## Two models by the numbers \{#two-models-by-the-numbers\}
+
+We can check a configuration without loading any weights. Consider two hypothetical dense decoders with $L=2$ blocks, vocabulary size $V=11$ and learned position-table length $S=8$. Each block has four $d\times d$ attention projections, an ordinary two-matrix feed-forward network of width $m$, all linear biases and two affine layer normalizations. The output head is tied, with no output bias; a final affine normalization follows the blocks.
+
+The four attention matrices contribute $4d^2$ weights and $4d$ biases. The feed-forward part contributes $2dm+m+d$. The two normalizations add $4d$. Together with token and position embeddings and the final normalization,
+
+$$
+\begin{aligned}
+N_{\mathrm{block}}&=4d^2+2dm+9d+m,\\
+N&=Vd+Sd+LN_{\mathrm{block}}+2d.
+\end{aligned}
+$$
+
+| Configuration | $d$ | $m$ | Parameters |
+| --- | ---: | ---: | ---: |
+| A | 4 | 9 | 446 |
+| B | 6 | 12 | 834 |
+
+These are newly specified examples, not counts for released GPT checkpoints. Removing biases, using rotary positions, adding a gated feed-forward projection, changing the number of key/value heads or untying the output head changes the formula. The pinned GPT-2 implementation provides a concrete reference for pre-normalization, tied embeddings and its particular cache layout.
+
+## What a base model does \{#what-a-base-model-does\}
+
+A base model assigns a continuation distribution to its token prefix. A prefix formatted as a question may induce an answer; another prefix may induce a quotation, a second question or an unrelated continuation. Likelihood training alone does not define an instruction-following contract or a factual-verification step.
+
+In-context demonstrations add tokens to the conditioning sequence. The model's weights stay fixed. Fine-tuning changes those weights through an optimization procedure. Both can change the final answer, but they have different storage, cost and evaluation requirements. Prompt format and demonstration selection therefore belong in a reported experiment, even when the model weights are unchanged.
+
+## Decoding: turning probabilities into text \{#decoding-turning-probabilities-into-text\}
+
+The model supplies logits; the decoder chooses a token from them. **Greedy decoding** picks a maximum-probability token at each step. A locally best choice need not maximize the complete sequence probability. Beam search keeps several partial sequences and approximately searches their cumulative log-probabilities. Neither objective automatically measures usefulness or factual accuracy.
+
+For positive temperature $\tau$, reshape the distribution by
+
+$$
+p_\tau(v)=\frac{\exp(z_v/\tau)}{\sum_u\exp(z_u/\tau)}.
+$$
+
+Lower temperature concentrates probability on larger logits. The limit as temperature approaches zero picks maximizers, with tie behavior specified separately. Directly dividing by zero is not a sampling formula.
+
+Choose four hypothetical logits with exponentials 4, 2, 1 and 1. Their original probabilities are $(1/2,1/4,1/8,1/8)$. At $\tau=1/2$, squaring these unnormalized weights gives probabilities $(8/11,2/11,1/22,1/22)$. No model was trained to obtain these inputs.
+
+**Top-$k$** retains the $k$ largest probabilities and renormalizes them. **Nucleus sampling**, also called top-$p$, retains the shortest descending prefix whose cumulative mass reaches a threshold $p$. A deterministic rule resolves equal-probability ties. With threshold 0.7, our example retains the first two tokens with total mass 0.75, producing $(2/3,1/3,0,0)$. The token that first crosses the threshold must be included.
+
+Temperature and truncation alter the sampling distribution. Their order matters, so a configuration should record whether temperature is applied before the nucleus is selected. Holtzman et al., §3, defines these decoding operations and studies open-ended generation. Its empirical findings do not guarantee a universally best setting for every task.
+
+## Making generation faster \{#making-generation-faster\}
+
+A new token needs keys and values from earlier positions. Causal attention lets us retain them: later tokens cannot change earlier states. A **key–value cache** therefore avoids recomputing those earlier projections at every generation step. The prompt is processed in a prefill pass; subsequent passes append new cache entries and evaluate new queries.
+
+For batch size $B$, $L$ layers, $T$ stored positions, $H_{kv}$ key/value heads, head width $d_h$ and $b$ bytes per stored number, the cache payload is
+
+$$
+\operatorname{bytes}_{KV}=2BLTH_{kv}d_hb.
+$$
+
+The factor two counts keys and values. With one sequence, two layers, eight positions, width $H_{kv}d_h=4$ separately for keys and values and two-byte storage, this is 256 bytes. This deliberately tiny calculation excludes weights, temporary activations, allocator overhead and implementation metadata.
+
+Caching preserves the mathematical result for the same model and positions; numerical kernels can still differ in rounding. Our three-row attention example uses rows $(1,0)$, $(0,2)$ and $(1,1)$, identity query/key/value projections and dot-product scores divided by $\sqrt{2}$ before masked softmax. Its last output is approximately $(0.598888,1.203336)$ whether the earlier two keys and values are reused or computed together. Replacing only the final input by $(-3,4)$ leaves the first two causal outputs unchanged. This checks the dependency argument on a small case, not the throughput of a serving system.
+
+Speculative decoding takes a different approach: a cheaper model proposes tokens and the target model checks them in parallel. The acceptance and correction rules are essential. Under the algorithm's assumptions they preserve the target sampling distribution; accepting arbitrary draft tokens does not. See Leviathan, Kalman and Matias, Algorithm 1 and Appendix A.1. Speed depends on agreement, draft cost and hardware; no speedup is measured here.
+
+## What changed \{#what-changed\}
+
+The recurrent baseline builds each training state through its predecessor. A causal Transformer gives each layer parallel access to permitted prefix positions. The next-token objective remains. At inference, caching removes repeated prefix work, while the decoder determines how the predicted probabilities become a sequence.
+
+## Limitations \{#limitations\}
+
+The context window limits accessible history. Training on observed prefixes does not ensure reliable behavior after a generated error changes the prefix. A low average loss can coexist with rare but consequential mistakes, and fluent continuations need not be true. Training-corpus permissions, model-weight terms and output risks are separate from the architecture; a code license alone settles none of them.
+
+## What you should remember \{#what-you-should-remember\}
+
+Next-token targets are shifted relative to inputs. The causal mask prevents future-token leakage. Training can process positions together, while ordinary generation chooses tokens sequentially. Sampling settings change the output distribution. A cache saves repeated work at a memory cost.
+
+## Code \{#notebook\}
+
+The following original calculation reproduces the four-token decoding example. It downloads no model or data.
+
+```python
+weights = [4, 2, 1, 1]
+p = [w / sum(weights) for w in weights]
+sharp_weights = [w ** 2 for w in weights]
+sharp = [w / sum(sharp_weights) for w in sharp_weights]
+kept = []
+for i in sorted(range(len(p)), key=lambda i: (-p[i], i)):
+    kept.append(i)
+    if sum(p[j] for j in kept) >= 0.7:
+        break
+mass = sum(p[i] for i in kept)
+nucleus = [p[i] / mass if i in kept else 0 for i in range(len(p))]
+print('base', [round(v, 6) for v in p])
+print('temperature', [round(v, 6) for v in sharp])
+print('nucleus', [round(v, 6) for v in nucleus])
+```
+
+```text
+base [0.5, 0.25, 0.125, 0.125]
+temperature [0.727273, 0.181818, 0.045455, 0.045455]
+nucleus [0.666667, 0.333333, 0, 0]
+```
+
+## Next \{#next\}
+
+A model can improve because its objective, data, architecture or training procedure changed. [The evolution of pretrained models](/notes/nlp/evolution-of-pretrained-models) separates these changes so that a comparison does not attribute every gain to model size.
+
+## References \{#references\}
+
+- Alec Radford, Karthik Narasimhan, Tim Salimans and Ilya Sutskever. [Improving Language Understanding by Generative Pre-Training](https://cdn.openai.com/research-covers/language-unsupervised/language_understanding_paper.pdf), 2018, §3.1–3.2: causal likelihood and supervised transfer.
+- Alec Radford et al. [Language Models are Unsupervised Multitask Learners](https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf), 2019, §2–2.3: zero-shot transfer and architecture changes. OpenAI, [GPT-2 implementation](https://github.com/openai/gpt-2/blob/9b63575ef42771a015060c964af2c3da4cf7c8ab/src/model.py), exact revision: tied output, normalization and cache structure; consulted as a reference, no implementation copied.
+- Tom B. Brown et al. [Language Models are Few-Shot Learners](https://arxiv.org/abs/2005.14165v4), NeurIPS 2020, §2–2.1: prompting without weight updates and attention layout.
+- Ari Holtzman et al. [The Curious Case of Neural Text Degeneration](https://arxiv.org/abs/1904.09751v2), ICLR 2020, §3.1–3.3: nucleus, top-$k$ and temperature definitions.
+- Yaniv Leviathan, Matan Kalman and Yossi Matias. [Fast Inference from Transformers via Speculative Decoding](https://proceedings.mlr.press/v202/leviathan23a.html), ICML 2023, Algorithm 1 and Appendix A.1: corrected speculative sampling and its distributional guarantee.

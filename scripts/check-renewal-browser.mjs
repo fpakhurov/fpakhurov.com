@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import path from 'node:path';
 import {execFileSync, spawn} from 'node:child_process';
 import {chromium} from 'playwright';
+import {selectPublishedNoteRoutes} from './lib/renewal-browser-routes.mjs';
 
 // Review the built pages affected by this release, including changed assets
 // reached through a current per-file review. Keep browser work in CI.
@@ -10,18 +10,8 @@ let base = process.env.REVIEW_BASE_REVISION || 'HEAD^';
 try { execFileSync('git', ['rev-parse', '--verify', `${base}^{commit}`], {stdio: 'ignore'}); }
 catch { base = 'HEAD^'; }
 const changed = execFileSync('git', ['diff', '--name-only', base, 'HEAD'], {encoding: 'utf8'}).trim().split('\n');
-const notes = new Set(changed.filter(p => /^src\/content\/(notes|notes-ru)\/.+\.mdx$/.test(p)));
-for (const file of changed.filter(p => /^content-rights\/reviews\/.+\.json$/.test(p) && fs.existsSync(p))) {
-  const review = JSON.parse(fs.readFileSync(file, 'utf8'));
-  for (const file of Object.keys(review.files || {})) {
-    if (/^src\/content\/(notes|notes-ru)\/.+\.mdx$/.test(file)) notes.add(file);
-  }
-}
 const held = new Set(JSON.parse(fs.readFileSync('src/data/withdrawnNotes.json', 'utf8')));
-const routes = [...notes].filter(p => fs.existsSync(p)).map(p => {
-  const [, locale, id] = p.match(/^src\/content\/(notes|notes-ru)\/(.+)\.mdx$/);
-  return {id, locale: locale === 'notes-ru' ? 'ru' : 'en', route: `/${locale === 'notes-ru' ? 'ru/' : ''}notes/${id}/`};
-}).filter(p => !held.has(p.id) && fs.existsSync(path.join('dist', p.route, 'index.html')));
+const routes = selectPublishedNoteRoutes(process.cwd(), changed, held);
 if (!routes.length) {
   console.log('No changed published note pages to review.');
   process.exit(0);
