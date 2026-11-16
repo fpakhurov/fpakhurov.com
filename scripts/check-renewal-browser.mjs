@@ -54,10 +54,16 @@ async function headerGeometry(page) {
       const rect = element.getBoundingClientRect();
       return {tag: element.tagName, text: element.textContent.trim(), left: rect.left, right: rect.right, width: rect.width};
     });
+    const escapedHeadingAnchors = [...document.querySelectorAll('.heading-anchor')].flatMap(anchor => {
+      const rect = anchor.getBoundingClientRect();
+      if (rect.left >= -1 && rect.right <= innerWidth + 1) return [];
+      return [{heading: anchor.parentElement?.textContent.trim(), left: rect.left, right: rect.right}];
+    });
     return {
       pageOverflow,
       overflowElements,
       paginationBounds,
+      escapedHeadingAnchors,
       headerWidth: bounds.width,
       escapedText,
     };
@@ -119,7 +125,7 @@ try {
         await page.setViewportSize({width: 320, height: 900});
         await settleLayout(page);
         result.narrowHeader = await headerGeometry(page);
-        if (result.narrowHeader.pageOverflow || result.narrowHeader.escapedText.length) {
+        if (result.narrowHeader.pageOverflow || result.narrowHeader.escapedText.length || result.narrowHeader.escapedHeadingAnchors.length) {
           narrowHeaderFailures.push({route: item.route, theme, ...result.narrowHeader});
         }
         result.narrowHeadingWords = await splitHeadingWords(page);
@@ -134,6 +140,12 @@ try {
             path: `${output}/${item.id.replaceAll('/', '-')}-pagination-320.png`,
             style: '.site-header { visibility: hidden !important; }',
           });
+          if (item.id === 'nlp/efficient-transformers') {
+            await page.locator('#baseline-standard-attention-and-a-dense-ffn').screenshot({
+              path: `${output}/nlp-efficient-transformers-section-heading-320.png`,
+              style: '.site-header { visibility: hidden !important; } .heading-anchor { opacity: 1 !important; }',
+            });
+          }
         }
         await page.setViewportSize({width, height: 900});
         await settleLayout(page);
@@ -208,7 +220,7 @@ try {
           await settleLayout(page);
           const geometry = await headerGeometry(page);
           headerRegressions.push({id, locale, route, width: 320, ...geometry});
-          if (geometry.pageOverflow || geometry.escapedText.length) narrowHeaderFailures.push({route, theme, ...geometry});
+          if (geometry.pageOverflow || geometry.escapedText.length || geometry.escapedHeadingAnchors.length) narrowHeaderFailures.push({route, theme, ...geometry});
           if (locale === 'ru') await page.locator('.note-header').screenshot({
             path: `${output}/${id.replaceAll('/', '-')}-metadata-320.png`,
             style: '.site-header { visibility: hidden !important; }',
