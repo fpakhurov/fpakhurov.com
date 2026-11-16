@@ -1,12 +1,251 @@
 ---
 title: Parameter-efficient fine-tuning
-description: "This note is withheld pending an independent source review."
+description: Derive low-rank adaptation, verify its first gradient step, and distinguish trainable-parameter savings from the memory still needed by the model.
 course: nlp
 section: Adapting Pretrained Models
 order: 28
-status: needs-review
-tags: []
-prerequisites: []
+status: published
+tags: [peft, lora, adapters, prompt-tuning, qlora, low-rank]
+prerequisites: [Fine-tuning, Linear algebra]
 ---
 
-This note is withheld pending an independent source review.
+import LowRankUpdate from '../../../components/figures/nlp/peft/LowRankUpdate.astro';
+import RankAddition from '../../../components/figures/nlp/peft/RankAddition.astro';
+import StateBudget from '../../../components/figures/nlp/peft/StateBudget.astro';
+
+A useful representation may still need to change for a downstream task. Full fine-tuning can make that change, but storing gradients and optimizer states for every weight is expensive. Parameter-efficient fine-tuning (PEFT) gives the task a smaller set of adjustable parameters while retaining a shared base model.
+
+The central question is what those new parameters can change. We will compare a nonlinear bottleneck, a low-rank weight update, and trainable context. Their parameter counts alone do not describe their expressive limits or total training memory.
+
+## Choose a smaller space of updates \{#baseline-all-or-nothing\}
+
+[Fine-tuning](/notes/nlp/fine-tuning) established two baselines: update the whole representation and head, or freeze the representation and train a head. PEFT can intervene inside the network while keeping most existing weights fixed.
+
+Let a frozen linear layer have $W_0\in\mathbb{R}^{m\times n}$ and input $x\in\mathbb{R}^n$. A full update stores an arbitrary $m\times n$ correction. A restricted update is described by fewer parameters $\phi$:
+
+$$
+y=W_0x+u_\phi(x).
+$$
+
+The loss still depends on the entire forward computation. Freezing $W_0$ suppresses its weight gradient and optimizer updates. It does not generally remove the need to differentiate through the layer with respect to its input: an earlier trainable module may depend on that path.
+
+We must specify the exact trainable set. A task head, biases, or normalization parameters may be trained in addition to the advertised PEFT component. Their states belong in the count too.
+
+## Add a nonlinear bottleneck \{#adapters\}
+
+A residual bottleneck adapter takes a hidden vector $h\in\mathbb{R}^d$, reduces it to width $b$, applies a nonlinearity, and maps it back:
+
+$$
+a(h)=h+U\rho(Dh).
+$$
+
+Here $D\in\mathbb{R}^{b\times d}$ and $U\in\mathbb{R}^{d\times b}$. Without biases, the added count is $2db$; including a bias after each projection adds $b+d$. Houlsby and coauthors use bottleneck adapters with residual paths and also adapt layer-normalization parameters [1, §2]. Our displayed formula isolates one bias-free module rather than reproducing their full architecture.
+
+Why can this module usually not be absorbed into one fixed linear matrix? Set $D=[1\;1]$, $U=[2\;-1]^\top$, and $\rho=\operatorname{ReLU}$. For $h=(2,1)^\top$, the bottleneck value is 3 and
+
+$$
+\begin{aligned}
+a(h)&=(8,-2)^\top,\\
+a(-h)&=(-2,-1)^\top.
+\end{aligned}
+$$
+
+Their sum is $(6,-3)^\top$, whereas any linear map must send $h$ and $-h$ to vectors summing to zero. A single constant merged matrix cannot represent this adapter globally. Keeping the nonlinear branch therefore adds computation during inference. The amount of latency must be measured in the actual implementation.
+
+## Parameterize a low-rank correction \{#lora-a-low-rank-update\}
+
+LoRA restricts the correction to a matrix product [2, §4.1]. With rank parameter $r$, define
+
+$$
+\begin{aligned}
+A&\in\mathbb{R}^{r\times n},\\
+B&\in\mathbb{R}^{m\times r},\\
+\Delta W&=sBA,\\
+y&=W_0x+sB(Ax).
+\end{aligned}
+$$
+
+The scalar $s$ is fixed; the original LoRA convention uses $s=\alpha/r$. The factors $A,B$ are trainable and $W_0$ is frozen. The rank of the correction is at most $r$, but the rank of the complete matrix $W_0+\Delta W$ need not be small.
+
+For a scalar loss, let $g=\partial\ell/\partial y\in\mathbb{R}^m$. The chain rule gives
+
+$$
+\begin{aligned}
+\nabla_B\ell&=s\,g(Ax)^\top,\\
+\nabla_A\ell&=s\,(B^\top g)x^\top.
+\end{aligned}
+$$
+
+The shapes are $m\times r$ and $r\times n$, respectively. Initializing $B=0$ and $A$ to nonzero values makes the correction initially zero, while allowing $B$ to receive a gradient. The gradient of $A$ is zero on that first pass. Once $B$ changes, later gradients can reach $A$. Initializing **both** factors to zero makes both displayed gradients zero, so this gradient-descent update cannot leave that state by itself.
+
+During deployment, a fixed linear correction can be merged:
+
+$$
+W_{\mathrm{merged}}=W_0+sBA.
+$$
+
+In exact arithmetic, multiplying by this matrix equals evaluating the two branches. Finite precision can introduce rounding differences. The merge assumes fixed factors and scale; a training-time stochastic branch must be disabled for the same deterministic inference function. A nonlinear adapter has no such general merge, as the preceding counterexample showed.
+
+## Execute one LoRA update \{#worked-example\}
+
+Choose a two-output, three-input layer with a rank-one correction:
+
+$$
+\begin{aligned}
+W_0&=\begin{bmatrix}1&0&-1\\0&1&1\end{bmatrix},\\
+A&=\begin{bmatrix}1&-1&2\end{bmatrix},\\
+B&=\begin{bmatrix}0\\0\end{bmatrix},\\
+x&=\begin{bmatrix}2\\1\\-1\end{bmatrix}.
+\end{aligned}
+$$
+
+Set $s=2$, target $t=(2,2)^\top$, and loss $\ell=\tfrac12\lVert y-t\rVert_2^2$. Then $Ax=-1$, $y=W_0x=(3,0)^\top$, $g=y-t=(1,-2)^\top$, and the initial loss is $2.5$.
+
+Substituting into the gradients,
+
+$$
+\begin{aligned}
+\nabla_B\ell&=(-2,4)^\top,\\
+\nabla_A\ell&=(0,0,0).
+\end{aligned}
+$$
+
+One simultaneous step with $\eta=0.1$ yields $B=(0.2,-0.4)^\top$ and leaves $A$ unchanged. Its correction and merged matrix are
+
+$$
+\begin{aligned}
+\Delta W&=\begin{bmatrix}0.4&-0.4&0.8\\-0.8&0.8&-1.6\end{bmatrix},\\
+W_{\mathrm{merged}}&=\begin{bmatrix}1.4&-0.4&-0.2\\-0.8&1.8&-0.6\end{bmatrix}.
+\end{aligned}
+$$
+
+Both evaluation paths return $(2.6,0.8)^\top$, with loss $0.9$. The saved calculation checks finite-difference gradients and branch/merge equality. It demonstrates one valid update, without training or evaluating a language model.
+
+<LowRankUpdate />
+
+## Count parameters and state arrays \{#parameter-count\}
+
+A full correction has $mn$ parameters. The two factors have
+
+$$
+P_{\mathrm{LoRA}}=r(m+n).
+$$
+
+A factorization saves parameters only when $r(m+n)<mn$. In our tiny $2\times3$ example, rank 1 uses 5 parameters instead of 6. Rank 2 would use 10, exceeding the six entries of a full correction. Low rank is not a synonym for a small count at every shape.
+
+For a hypothetical square $2048\times2048$ layer and rank 8, the full matrix has 4,194,304 entries and the factors have 32,768: 128 times fewer trainable entries. This ratio concerns this layer only.
+
+Now declare a specific storage model: each weight, gradient, and each of two Adam moment arrays uses FP32, four bytes per entry. Ignore activations, temporary buffers, allocator overhead, and every other layer. Full training needs four such arrays, or 64 MiB. A frozen FP32 base needs 16 MiB, while the LoRA weights and their three state arrays need 0.5 MiB. Together they need 16.5 MiB under these assumptions; one MiB is $2^{20}$ bytes.
+
+<StateBudget />
+
+This is array accounting, not a measured peak-memory result. Mixed precision, master copies, optimizer implementation, and checkpointing change the actual allocation. Activations can remain substantial because gradients must flow through the frozen computation into trainable modules. Saving trainable parameters does not imply a 128-fold reduction in total memory.
+
+## Understand the rank restriction \{#result\}
+
+Every rank-one $2\times2$ outer product has determinant zero. If its factors are $u=(u_1,u_2)^\top$ and $v=(v_1,v_2)^\top$, then
+
+$$
+\det(uv^\top)=u_1v_1u_2v_2-u_1v_2u_2v_1=0.
+$$
+
+It therefore cannot equal the identity matrix, whose determinant is one. Yet two different rank-one corrections can sum to the identity:
+
+$$
+\begin{bmatrix}1&0\\0&0\end{bmatrix}
++\begin{bmatrix}0&0\\0&1\end{bmatrix}
+=\begin{bmatrix}1&0\\0&1\end{bmatrix}.
+$$
+
+<RankAddition />
+
+Combining two trained rank-one updates need not produce a rank-one update. Keeping both pairs of factors preserves their sum; compressing that sum back to rank one can lose information. More generally, the rank of a sum is at most the sum of the ranks.
+
+Increasing $r$ enlarges the representable correction space, but does not guarantee better task performance. Data, optimization, target layers, and the evaluation distribution still matter. The first LoRA paper studies particular attention projections [2, §4.2]; that choice is not a rule that all other projections should always be frozen.
+
+## Learn context instead of a weight correction \{#prompt-tuning\}
+
+Soft prompt tuning learns continuous input embeddings while freezing the language model [3, §2]. A prompt of length $p$ and embedding width $d$ has $pd$ parameters. These vectors need not equal the embeddings of any words, so reading them as a natural-language instruction is generally unjustified.
+
+Prefix tuning intervenes in per-layer prefix activations [4, §4]. For an explicitly chosen implementation storing independent key and value prefixes at each of $L$ layers, with each key/value vector of width $d$, the stored prefix count is $2Lpd$. Additional projections used to parameterize those prefixes during training must be counted separately.
+
+Choose $p=6$, $d=16$, and $L=4$. The input prompt has 96 parameters; the declared per-layer key/value prefix has 768. These are original dimension counts, not a claim that every prefix implementation has that exact layout. Encoder–decoder prefixes and different key/value widths require their own count.
+
+Both methods condition a frozen network. They may consume context positions or additional attention state. Their small parameter files do not remove the underlying model or guarantee performance equal to full fine-tuning. Prompt initialization, length, model, and task remain experimental choices.
+
+## Keep the base in a quantized representation \{#fine-tuning-a-quantized-model-qlora\}
+
+LoRA reduces trainable state; the frozen base still occupies memory. QLoRA combines a quantized frozen base with trainable low-rank components [5, §§2–3]. Its proposed system uses a 4-bit NormalFloat storage format, quantization of scaling constants, and paged optimizers. Those names identify distinct mechanisms rather than one uniform four-bit arithmetic pipeline.
+
+The original method separates storage and computation types: base blocks are dequantized for operations, and gradients train the higher-precision low-rank factors. The four-bit base weights are not updated as ordinary continuous parameters. Storage scales and metadata also occupy space, and activations still need their own budget.
+
+A conceptual layer is
+
+$$
+y=\widetilde W_0x+sBAx,
+$$
+
+where $\widetilde W_0$ denotes the effective dequantized approximation of the frozen base. A merged correction may need a different representation or another quantization step; requantization can introduce further error. The exact branch/merge equality above does not imply equality after an additional lossy quantizer.
+
+The separate quantization topic develops that approximation. No quantized checkpoint, external quantizer implementation, or benchmark result is used in these arithmetic examples.
+
+## Match the method to the constraint \{#trade-offs\}
+
+| Component | What becomes trainable | A constraint to check |
+| --- | --- | --- |
+| Linear head | Readout of frozen features | Required information may be absent from the features |
+| Nonlinear adapter | Bottleneck projections, possibly other declared parameters | Additional branch remains during inference |
+| LoRA | Factors of selected weight corrections | Rank, target layers, and merge precision |
+| Soft prompt | Input embedding vectors | Context usage and control through a frozen model |
+| Prefix | Declared per-layer prefix states | Attention state and any training reparameterization |
+| QLoRA | Low-rank factors with a quantized base | Quantization error and total memory, including activations |
+
+If many task variants share one base, small task-specific files can reduce duplicated storage. A merged full matrix per task gives up that particular storage benefit. Conversely, serving unmerged task-specific branches requires the runtime to select the correct factors. Evaluate that serving design separately from training accuracy.
+
+## What PEFT has changed \{#what-changed\}
+
+We replaced an unrestricted weight update with a particular family of interventions. LoRA changes the allowed matrix correction; adapters add nonlinear transformations; prompts and prefixes change the context used by a frozen model. Quantizing the base addresses a further storage cost.
+
+The loss and evaluation protocol from fine-tuning still apply. Fewer trainable parameters do not repair mislabeled targets, leakage, an incorrect loss mask, or an unsuitable validation metric.
+
+## Limits of the calculation \{#limitations\}
+
+The matrix examples prove algebraic properties for their specified values. They provide no ranking of methods on NLP tasks. The memory example excludes real runtime costs by construction. The rank restriction is a statement about a layer's correction, not the entire model's ability to learn a task.
+
+Freezing the base preserves its stored weights, but activating an adapter changes the model's behavior. Previous-task performance can still deteriorate while that adapter is active. Turning it off restores the original computation only if every other relevant weight, preprocessing choice, and inference setting has also been preserved.
+
+## Keep three counts separate \{#what-you-should-remember\}
+
+Count trainable entries, stored model state, and runtime memory separately. For LoRA, write down the shapes, initialization, scale, and target matrices. Verify the merge under the intended precision. Then compare quality with the same data and evaluation discipline used for full fine-tuning.
+
+## Reproduce the arithmetic \{#notebook\}
+
+The standard-library script `scripts/notes/finetuning-peft-cases.py` prints the complete saved calculation. It checks the two factor gradients, the first update, merging, zero initialization, rank identities, and state counts. It shares no training dependency with a real language model.
+
+```python
+m = n = 2048
+rank = 8
+base = m * n
+update = rank * (m + n)
+full_mib = 16 * base / 2**20
+lora_mib = (4 * base + 16 * update) / 2**20
+print(f"trainable entries: {base} -> {update}")
+print(f"declared state MiB: {full_mib:.1f} -> {lora_mib:.1f}")
+```
+
+```text
+trainable entries: 4194304 -> 32768
+declared state MiB: 64.0 -> 16.5
+```
+
+## Adapt the objective as well \{#next\}
+
+A compact trainable component still needs a useful learning signal. Instruction tuning develops how examples specify desired responses. These decisions are separate from whether the trainable update is low rank.
+
+## References \{#references\}
+
+1. Houlsby et al. [Parameter-Efficient Transfer Learning for NLP](https://arxiv.org/abs/1902.00751v2), ICML 2019. §2: residual bottleneck adapters and trained normalization parameters.
+2. Hu et al. [LoRA: Low-Rank Adaptation of Large Language Models](https://arxiv.org/abs/2106.09685v2), 2021. §§4.1–4.2: factorization, initialization, merging, and selected target matrices.
+3. Lester, Al-Rfou, and Constant. [The Power of Scale for Parameter-Efficient Prompt Tuning](https://arxiv.org/abs/2104.08691v2), EMNLP 2021. §2: continuous input prompts with a frozen model.
+4. Li and Liang. [Prefix-Tuning: Optimizing Continuous Prompts for Generation](https://arxiv.org/abs/2101.00190v1), 2021. §§4.1–4.3: per-layer prefix activations and training reparameterization.
+5. Dettmers et al. [QLoRA: Efficient Finetuning of Quantized LLMs](https://arxiv.org/abs/2305.14314v1), 2023. §§2–3: frozen quantized base, low-rank factors, storage and computation types.

@@ -1,12 +1,209 @@
 ---
 title: Fine-tuning
-description: "This note is withheld pending an independent source review."
+description: Choose which parameters to update, check the supervised loss, and select a checkpoint without confusing training fit with useful adaptation.
 course: nlp
 section: Adapting Pretrained Models
 order: 27
-status: needs-review
-tags: []
-prerequisites: []
+status: published
+tags: [fine-tuning, linear-probing, lp-ft, learning-rate, catastrophic-forgetting]
+prerequisites: [Transfer learning in NLP, GPT and autoregressive language modeling, Gradient descent]
 ---
 
-This note is withheld pending an independent source review.
+import UpdateComparison from '../../../components/figures/nlp/fine-tuning/UpdateComparison.astro';
+import CheckpointLoss from '../../../components/figures/nlp/fine-tuning/CheckpointLoss.astro';
+
+A pretrained model already maps inputs to useful representations. A new task changes what we ask those representations to predict. We must choose which parameters may move, which outputs receive a loss, and which evidence decides when to stop.
+
+[Transfer learning](/notes/nlp/transfer-learning) supplies the starting point: reuse an existing representation and evaluate it on the intended task. We now make the update itself explicit. Every numerical example below is a small constructed calculation, with no pretrained checkpoint or external dataset.
+
+## Define the prediction and the update \{#the-setting\}
+
+Write a classifier as a feature map $h_\theta(x)\in\mathbb{R}^d$ followed by a linear head with weights $v\in\mathbb{R}^d$. For a binary label $y\in\{0,1\}$, its score and probability are
+
+$$
+\begin{aligned}
+z&=v^\top h_\theta(x),\\
+p&=\sigma(z)=\frac{1}{1+e^{-z}}.
+\end{aligned}
+$$
+
+The head interprets the representation for this task. A new head need not initially assign sensible scores even when the features are useful. We minimize binary cross-entropy,
+
+$$
+\ell(z,y)=-y\log p-(1-y)\log(1-p).
+$$
+
+Logarithms are natural throughout. Differentiating gives $\partial\ell/\partial z=p-y$: a confident correct prediction produces a small update; a confident wrong one produces a large score gradient. The selected trainable parameters determine where that signal is allowed to change the model.
+
+For a dataset, we also need a declared averaging rule, a train/validation/test split, and a metric tied to the application. Splitting by user, document family, or time may be necessary when nearby examples are dependent. A random row split does not by itself prevent leakage.
+
+## Update the representation and the head \{#baseline-train-everything\}
+
+Full fine-tuning updates both $\theta$ and $v$. This is the end-to-end adaptation used for the task-specific inputs and outputs in BERT [1, §3.2]. To see the mechanics without a large network, replace $h_\theta$ by $Wx$ and stipulate
+
+$$
+\begin{aligned}
+W_0&=\begin{bmatrix}1&0\\0&1\end{bmatrix},\\
+v_0&=\begin{bmatrix}1\\-1\end{bmatrix},\\
+x&=\begin{bmatrix}2\\1\end{bmatrix},\\
+y&=1.
+\end{aligned}
+$$
+
+Here $W\in\mathbb{R}^{2\times2}$. Initially $z=1$, $p=0.731059$, and $\ell=0.313262$. Let $\delta=p-y$. The chain rule gives
+
+$$
+\begin{aligned}
+\nabla_v\ell&=\delta Wx,\\
+\nabla_W\ell&=\delta vx^\top.
+\end{aligned}
+$$
+
+The first gradient has two entries; the second has four. With step size $\eta=0.1$, a simultaneous gradient step uses the old $W_0,v_0$ for **both** gradients:
+
+$$
+\begin{aligned}
+W_1&=\begin{bmatrix}
+1.053788&0.026894\\
+-0.053788&0.973106
+\end{bmatrix},\\
+v_1&=\begin{bmatrix}1.053788\\-0.973106\end{bmatrix}.
+\end{aligned}
+$$
+
+The new score is $1.407029$ and the loss is $0.219031$. Updating the head first and then computing a feature gradient with that new head would be a different algorithm. The companion calculation checks both analytic gradients against centered finite differences.
+
+A lower loss on this single example proves only that the chosen step improved that example. It says nothing about language understanding, other inputs, or the retention of an earlier task.
+
+## Hold the representation fixed \{#linear-probing-train-only-the-head\}
+
+Linear probing freezes $W$ and updates only $v$. Starting from the same state, the head receives the same first gradient, so it reaches the same $v_1$. The feature matrix remains exactly $W_0$. Consequently the score is $1.134471$ and the loss is $0.278837$.
+
+This isolates a useful question: can a linear decision rule read the target information from the current features? Failure can mean poor features, an unsuitable linear head, or a faulty training setup. It does not uniquely diagnose the representation.
+
+With a frozen feature extractor and no trainable module before or inside it, we can compute its output without retaining its backward graph. Features may be cached if the input preprocessing and model mode are fixed. Changing augmentations, dropout, or the feature extractor invalidates that cache. Freezing parameters alone does not automatically set evaluation mode.
+
+A probe also gives a practical baseline. It requires fewer trainable states and leaves the original features unchanged. It cannot repair features that discard information the downstream decision needs.
+
+## Fit the head, then release the features \{#lp-ft-head-first-then-everything\}
+
+A randomly initialized head determines the gradient sent into the representation. Fitting the head first can change that starting direction. LP–FT uses a linear-probing stage followed by full fine-tuning [3, §§2, 3.4]. The supporting theory in that paper has particular linear-model assumptions, and its empirical comparison concerns distribution shifts in vision. It is not a theorem that this schedule wins for every NLP task.
+
+In our calculation, take the one probing step above and then one simultaneous full step, again with $\eta=0.1$. We obtain
+
+$$
+\begin{aligned}
+W_2&=\begin{bmatrix}
+1.051285&0.025643\\
+-0.047359&0.976321
+\end{bmatrix},\\
+v_2&=\begin{bmatrix}1.102456\\-0.948772\end{bmatrix}.
+\end{aligned}
+$$
+
+The score is $1.509819$ and the loss is $0.199629$. This run used two updates while the earlier comparisons used one. Its lower loss is therefore an illustration of a different trajectory, not a fair performance ranking of methods.
+
+<UpdateComparison />
+
+For an actual comparison, hold the data split and evaluation procedure fixed, state the update or compute budget, and tune each method within that budget. Record the head initialization and random seed as well as the final metric.
+
+## Choose the schedule and the checkpoint \{#hyperparameters-that-matter\}
+
+The learning rate controls the size of each parameter move. Different rates for the head and earlier layers are possible; ULMFiT introduced a concrete layer-dependent schedule and gradual unfreezing for its language-model adaptation [2, §§3.2–3.3]. These are methods to evaluate, not universal settings to copy. Releasing another layer means updating it together with the layers already released.
+
+Batch size, accumulated gradients, the loss denominator, clipping, weight decay, and total optimizer steps also affect the update. Doubling accumulation while averaging the accumulated gradient preserves its scale; summing it without compensating changes that scale. A learning-rate schedule expressed in steps also changes when the number of batches changes.
+
+Inspect training loss and gradient behavior when optimization stalls. Inspect validation behavior when training succeeds. A study of BERT fine-tuning explicitly separates these two sources of variation [4, §§5–6]; it does not supply one reliable epoch count for all models.
+
+We can separate the objectives exactly in a scalar example. Let $X$ be equally likely to be $-1$ or $1$, and predict $P(Y=1\mid X)=\sigma(\theta X)$. In the training distribution, $Y=1$ exactly when $X=1$. In a separately stipulated validation distribution, that label rule holds with probability $3/4$ and flips otherwise. Their expected losses are
+
+$$
+\begin{aligned}
+L_{\mathrm{train}}(\theta)&=\log(1+e^{-\theta}),\\
+L_{\mathrm{val}}(\theta)&=\tfrac34\log(1+e^{-\theta})
++\tfrac14\log(1+e^\theta).
+\end{aligned}
+$$
+
+Since $L_{\mathrm{val}}=L_{\mathrm{train}}+\theta/4$, its derivative is $\sigma(\theta)-3/4$. The validation optimum is $\theta=\log3$; the training loss keeps decreasing as $\theta$ grows.
+
+Start at $\theta_0=0$ and perform 40 training-gradient updates with $\eta=0.25$. Among checkpoints 0 through 40, validation chooses step 12: its validation loss is $0.562336$. At step 40, training loss has fallen from $0.288374$ at the selected checkpoint to $0.105297$, while validation loss has risen to $0.654763$.
+
+<CheckpointLoss />
+
+These are exact expectations under two constructed distributions. There is no sampled validation dataset here and no statistical uncertainty estimate. In a real experiment, repeated checkpoint and hyperparameter selection also fits the validation set; reserve an untouched test set for the final assessment.
+
+## Account for padding and boundaries \{#padding-each-batch-not-the-dataset\}
+
+Suppose three sequences have lengths 3, 6, and 4. Padding all three to length 6 allocates 18 token positions for 13 real tokens. For dense square attention, it allocates 108 query–key score slots, although separately processing the real lengths needs 61. These counts ignore causal triangular masking and do not measure runtime.
+
+If we batch lengths 3 and 4 together and process length 6 separately, padding uses 14 token positions and 68 square score slots. Grouping nearby lengths can reduce wasted slots. Kernels, device utilization, and backward computation determine whether that improves elapsed time.
+
+A key-padding mask prevents real queries from attending to padded keys. A loss mask removes padded predictions from the objective. They serve different purposes. Packing several independent examples into one sequence requires a boundary-aware attention policy if one example must not read another. A causal mask alone allows later examples to see earlier ones.
+
+## Specify which tokens teach the task \{#task-fine-tuning-and-instruction-tuning\}
+
+A classification task scores a label. Supervised generative adaptation scores target tokens, conditioned on a supplied prefix and earlier target tokens. Instruction-style examples can use that same conditional objective with a task description in the prefix. The presence of an instruction does not by itself establish broad instruction-following ability.
+
+Let $m_t\in\{0,1\}$ mark scored target positions and let $p_t$ be the probability assigned to the correct token. For at least one scored token,
+
+$$
+L=-\frac{\sum_t m_t\log p_t}{\sum_t m_t}.
+$$
+
+Construct a prefix `sort teal disk` and a two-token answer `left EOS`. Treat these as stipulated tokens, without a real tokenizer. If the assigned probabilities for `left` and `EOS` are $0.4$ and $0.8$, answer-only loss is
+
+$$
+L=-\frac{\log0.4+\log0.8}{2}=0.569717.
+$$
+
+The prefix remains visible as context; its own next-token predictions are excluded from this objective. Padding contributes neither loss nor denominator. Including the end token explicitly teaches when the answer should stop. Scoring the prefix as well is another objective and must be declared.
+
+Now add a second example with one scored token of probability $0.5$. Averaging all three scored tokens gives $0.610860$; averaging the two per-example losses gives $0.631432$. Longer answers receive more weight under token averaging. Across batches or accumulation steps, preserve the intended denominator rather than averaging unequal group means accidentally.
+
+Teacher forcing supplies earlier correct answer tokens during training. At generation time the model consumes its own previous outputs. Low teacher-forced loss alone does not test that rollout, formatting, factuality, or the application's error costs.
+
+## What each intervention actually changes \{#what-changed\}
+
+Full fine-tuning moves the representation and head. Probing moves the readout only. LP–FT changes the starting head before releasing the representation. Loss masking changes the target being optimized, and checkpoint selection changes which point on the trajectory we keep.
+
+These decisions are separable. A good head-only baseline does not decide the loss mask; a carefully masked objective does not choose the deployment metric. Record each decision so a later comparison changes one identifiable assumption.
+
+## Limits of the evidence \{#limitations\}
+
+The arithmetic examples verify gradients, masking, and selection under their declared inputs. They cannot estimate an NLP task's accuracy or recommend a learning rate for a pretrained transformer.
+
+Catastrophic forgetting means that performance on a previously learned task deteriorates after adaptation. Detect it with a separate old-task evaluation. A falling new-task loss neither measures nor rules it out. Likewise, a failed optimization run and a well-fit run that generalizes poorly require different diagnosis.
+
+Before training on real material, establish rights for each dataset, checkpoint, tokenizer, and evaluation asset. An available library and a paper citation do not grant permission to use those assets. No such assets are required for the calculations here.
+
+## Keep the update and the evidence distinct \{#what-you-should-remember\}
+
+Name the trainable parameters and the scored outputs before comparing runs. Check a small gradient or masked batch by hand. Select with validation evidence that reflects the intended task, then evaluate once on the reserved test protocol. Measure retention separately if previous capabilities matter.
+
+## Reproduce the arithmetic \{#notebook\}
+
+The standard-library companion is `scripts/notes/finetuning-peft-cases.py` in the site repository. Run it with Python 3; it prints the complete JSON result, including the 41-point checkpoint trajectory and the PEFT calculations used next. It downloads nothing and trains no language model. Figures use the saved results from that same execution.
+
+```python
+import math
+
+probabilities = [0.4, 0.8]
+loss = -sum(math.log(p) for p in probabilities) / len(probabilities)
+print(f"answer loss: {loss:.6f}")
+```
+
+```text
+answer loss: 0.569717
+```
+
+## Reduce the trainable state \{#next\}
+
+If changing the head is insufficient but full-model training states are expensive, [parameter-efficient fine-tuning](/notes/nlp/peft) introduces smaller trainable components. We will derive a low-rank update and count both its savings and the frozen weights that still remain.
+
+## References \{#references\}
+
+1. Devlin et al. [BERT: Pre-training of Deep Bidirectional Transformers for Language Understanding](https://arxiv.org/abs/1810.04805v2), 2019. §3.2: task-specific outputs and end-to-end fine-tuning.
+2. Howard and Ruder. [Universal Language Model Fine-tuning for Text Classification](https://arxiv.org/abs/1801.06146v5), ACL 2018. §§3.2–3.3: layer-dependent rates and gradual unfreezing.
+3. Kumar et al. [Fine-Tuning can Distort Pretrained Features and Underperform Out-of-Distribution](https://arxiv.org/abs/2202.10054v1), ICLR 2022. §§2, 3.4: probing, full updates, and LP–FT with bounded assumptions.
+4. Mosbach, Andriushchenko, and Klakow. [On the Stability of Fine-tuning BERT: Misconceptions, Explanations, and Strong Baselines](https://arxiv.org/abs/2006.04884v3), ICLR 2021. §§4–6: distinguish optimization, generalization, and forgetting measurements.

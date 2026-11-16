@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import {execFileSync, spawn} from 'node:child_process';
 import {chromium} from 'playwright';
 import {selectPublishedNoteRoutes} from './lib/renewal-browser-routes.mjs';
+import {captureOverflowEvidence} from './lib/overflow-diagnostics.mjs';
 
 // Review the built pages affected by this release, including changed assets
 // reached through a current per-file review. Keep browser work in CI.
@@ -23,6 +24,69 @@ let browser;
 const results = [];
 const headerRegressions = [];
 const narrowHeaderFailures = [];
+const isolatedCaptures = [];
+const keyboardSkipChecks = [];
+const skipChecked = new Set();
+const isolatedCaptureStyle = '.site-header, .skip-link { visibility: hidden !important; }';
+async function captureIsolated(page, locator, options) {
+  const state = await page.evaluate(() => {
+    const active = document.activeElement;
+    const skip = document.querySelector('.skip-link');
+    const bounds = skip?.getBoundingClientRect();
+    return {
+      activeElement: active ? {tag: active.tagName, id: active.id, className: String(active.className)} : null,
+      skipLink: skip ? {
+        focused: skip.matches(':focus'),
+        focusVisible: skip.matches(':focus-visible'),
+        cssTop: getComputedStyle(skip).top,
+        bounds: {left: bounds.left, top: bounds.top, right: bounds.right, bottom: bounds.bottom},
+      } : null,
+    };
+  });
+  isolatedCaptures.push({file: options.path.split('/').at(-1), ...state});
+  // Tall element crops can include fixed content outside the visible viewport.
+  // Suppression is capture-only; full-page and keyboard checks use the real UI.
+  await locator.screenshot({...options, style: `${isolatedCaptureStyle} ${options.style || ''}`});
+}
+async function checkKeyboardSkipLink(page, item, theme) {
+  const originalUrl = page.url();
+  await page.keyboard.press('Tab');
+  const focused = await page.locator('.skip-link').evaluate(link => {
+    const bounds = link.getBoundingClientRect();
+    const style = getComputedStyle(link);
+    return {
+      focused: document.activeElement === link,
+      focusVisible: link.matches(':focus-visible'),
+      href: link.getAttribute('href'),
+      visible: style.display !== 'none' && style.visibility === 'visible' && Number(style.opacity) > 0,
+      bounds: {left: bounds.left, top: bounds.top, right: bounds.right, bottom: bounds.bottom},
+      contained: bounds.width > 0 && bounds.height > 0 && bounds.left >= 0 && bounds.top >= 0 && bounds.right <= innerWidth && bounds.bottom <= innerHeight,
+    };
+  });
+  const result = {route: item.route, locale: item.locale, theme, width: 390, focused};
+  keyboardSkipChecks.push(result);
+  assert.ok(focused.focused && focused.focusVisible && focused.visible && focused.contained, `${item.route} ${theme}: keyboard skip link is not visibly focused`);
+  assert.equal(focused.href, '#content', `${item.route}: skip target`);
+  await page.keyboard.press('Enter');
+  await page.waitForFunction(() => location.hash === '#content');
+  // Fragment navigation must also move the sequential keyboard starting point.
+  await page.keyboard.press('Tab');
+  const activated = await page.evaluate(() => ({
+    hash: location.hash,
+    targetExists: !!document.querySelector('main#content'),
+    nextFocusWithinMain: !!document.activeElement?.closest('main#content'),
+    activeElement: {tag: document.activeElement?.tagName, id: document.activeElement?.id},
+  }));
+  result.activated = activated;
+  assert.ok(activated.targetExists && activated.nextFocusWithinMain, `${item.route}: skip link does not bypass navigation for keyboard users`);
+  await page.evaluate(url => {
+    document.activeElement?.blur();
+    history.replaceState(history.state, '', url);
+    window.scrollTo({top: 0, left: 0, behavior: 'instant'});
+  }, originalUrl);
+  await settleLayout(page);
+}
+
 async function settleLayout(page) {
   await page.evaluate(async () => {
     await document.fonts.ready;
@@ -100,6 +164,11 @@ try {
       assert.equal(response.status(), 200, item.route);
       await page.locator('h1').waitFor({state: 'visible'});
       await page.evaluate(() => document.fonts.ready);
+      const skipKey = `${item.locale}:${theme}`;
+      if (width === 390 && !skipChecked.has(skipKey)) {
+        await checkKeyboardSkipLink(page, item, theme);
+        skipChecked.add(skipKey);
+      }
       const state = await page.evaluate(() => {
         const fonts = [];
         document.fonts.forEach(f => { if (f.status === 'error') fonts.push(f.family); });
@@ -125,25 +194,26 @@ try {
         await page.setViewportSize({width: 320, height: 900});
         await settleLayout(page);
         result.narrowHeader = await headerGeometry(page);
+        if (result.narrowHeader.pageOverflow) {
+          result.overflowEvidence = await captureOverflowEvidence(page, {output, name:`${item.id.replaceAll('/', '-')}-${item.locale}-${theme}-320-overflow`});
+        }
         if (result.narrowHeader.pageOverflow || result.narrowHeader.escapedText.length || result.narrowHeader.escapedHeadingAnchors.length) {
           narrowHeaderFailures.push({route: item.route, theme, ...result.narrowHeader});
         }
         result.narrowHeadingWords = await splitHeadingWords(page);
         assert.deepEqual(result.narrowHeadingWords, [], `${item.route} 320: heading splits words`);
         if (theme === 'dark' && item.locale === 'ru') {
-          await page.locator('.note-header').screenshot({
+          await captureIsolated(page, page.locator('.note-header'), {
             path: `${output}/${item.id.replaceAll('/', '-')}-heading-320.png`,
-            style: '.site-header { visibility: hidden !important; }',
           });
           const pagination = page.locator('.note-pagination');
-          if (await pagination.count()) await pagination.screenshot({
+          if (await pagination.count()) await captureIsolated(page, pagination, {
             path: `${output}/${item.id.replaceAll('/', '-')}-pagination-320.png`,
-            style: '.site-header { visibility: hidden !important; }',
           });
           if (item.id === 'nlp/efficient-transformers') {
-            await page.locator('#baseline-standard-attention-and-a-dense-ffn').screenshot({
+            await captureIsolated(page, page.locator('#baseline-standard-attention-and-a-dense-ffn'), {
               path: `${output}/nlp-efficient-transformers-section-heading-320.png`,
-              style: '.site-header { visibility: hidden !important; } .heading-anchor { opacity: 1 !important; }',
+              style: '.heading-anchor { opacity: 1 !important; }',
             });
           }
         }
@@ -166,11 +236,11 @@ try {
         });
         result.figureGeometry.push(geometry);
         assert.ok(geometry.captionContained, `${item.route}: figure ${i + 1} caption escapes its box`);
-        await figures.nth(i).screenshot({path: `${output}/${filename}`, style: '.site-header { visibility: hidden !important; }'});
+        await captureIsolated(page, figures.nth(i), {path: `${output}/${filename}`});
         result.figureScreenshots.push(filename);
         if (width === 390 && theme === 'dark') {
           const caption = figures.nth(i).locator('figcaption');
-          if (await caption.count()) await caption.screenshot({path: `${output}/${filename.replace('.png', '-caption.png')}`, style: '.site-header { visibility: hidden !important; }'});
+          if (await caption.count()) await captureIsolated(page, caption, {path: `${output}/${filename.replace('.png', '-caption.png')}`});
         }
       }
       const tables = page.locator('.prose table');
@@ -195,12 +265,12 @@ try {
         await page.evaluate(() => window.scrollTo({top: 0, left: 0, behavior: 'instant'}));
         await page.screenshot({path: `${output}/${name}-top.png`});
         for (let i = 0; i < await tables.count(); i++) {
-          await tables.nth(i).screenshot({path: `${output}/${name}-table-${i + 1}.png`});
+          await captureIsolated(page, tables.nth(i), {path: `${output}/${name}-table-${i + 1}.png`});
           const scrolled = await tables.nth(i).evaluate(table => {
             table.scrollLeft = table.scrollWidth;
             return table.scrollLeft > 1;
           });
-          if (scrolled) await tables.nth(i).screenshot({path: `${output}/${name}-table-${i + 1}-end.png`});
+          if (scrolled) await captureIsolated(page, tables.nth(i), {path: `${output}/${name}-table-${i + 1}-end.png`});
           await tables.nth(i).evaluate(table => { table.scrollLeft = 0; });
         }
         result.screenshots = name;
@@ -219,15 +289,14 @@ try {
           assert.equal(response.status(), 200, route);
           await settleLayout(page);
           const geometry = await headerGeometry(page);
+          if (geometry.pageOverflow) geometry.overflowEvidence = await captureOverflowEvidence(page, {output, name:`${id.replaceAll('/', '-')}-${locale}-${theme}-320-overflow`});
           headerRegressions.push({id, locale, route, width: 320, ...geometry});
           if (geometry.pageOverflow || geometry.escapedText.length || geometry.escapedHeadingAnchors.length) narrowHeaderFailures.push({route, theme, ...geometry});
-          if (locale === 'ru') await page.locator('.note-header').screenshot({
+          if (locale === 'ru') await captureIsolated(page, page.locator('.note-header'), {
             path: `${output}/${id.replaceAll('/', '-')}-metadata-320.png`,
-            style: '.site-header { visibility: hidden !important; }',
           });
-          if (locale === 'ru' && await page.locator('.note-pagination').count()) await page.locator('.note-pagination').screenshot({
+          if (locale === 'ru' && await page.locator('.note-pagination').count()) await captureIsolated(page, page.locator('.note-pagination'), {
             path: `${output}/${id.replaceAll('/', '-')}-pagination-320.png`,
-            style: '.site-header { visibility: hidden !important; }',
           });
         }
       }
@@ -239,7 +308,7 @@ try {
   assert.deepEqual(narrowHeaderFailures, [], '320px header geometry failures');
   console.log(`Reviewed ${results.length} built note views (${routes.length} localized routes).`);
 } finally {
-  fs.writeFileSync(`${output}/results.json`, JSON.stringify({base, head: execFileSync('git', ['rev-parse', 'HEAD'], {encoding: 'utf8'}).trim(), results, headerRegressions, narrowHeaderFailures}, null, 2) + '\n');
+  fs.writeFileSync(`${output}/results.json`, JSON.stringify({base, head: execFileSync('git', ['rev-parse', 'HEAD'], {encoding: 'utf8'}).trim(), results, headerRegressions, narrowHeaderFailures, keyboardSkipChecks, isolatedCaptures}, null, 2) + '\n');
   await browser?.close();
   server.kill();
 }

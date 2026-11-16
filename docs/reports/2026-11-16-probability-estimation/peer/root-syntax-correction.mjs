@@ -1,0 +1,24 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import crypto from 'node:crypto';
+import assert from 'node:assert/strict';
+import {execFileSync} from 'node:child_process';
+import {createRequire} from 'node:module';
+const root=process.cwd();
+const req=createRequire(path.join(root,'package.json'));
+const {convertToTSX}=await import(req.resolve('@astrojs/compiler'));
+const {default:ts}=await import(req.resolve('typescript'));
+const p='src/components/figures/estimators/ShrinkageRisk.astro';
+const base='2b6ea072ef065d5c7287c3508dec592eb5771b89';
+const sh=s=>crypto.createHash('sha256').update(s).digest('hex');
+const before=execFileSync('git',['show',`${base}:${p}`],{encoding:'utf8'});
+const after=fs.readFileSync(p,'utf8');
+const diagnostics=async(s,p)=>{const r=await convertToTSX(s,{filename:p});const f=ts.createSourceFile(p+'.tsx',r.code,ts.ScriptTarget.Latest,true,ts.ScriptKind.TSX);return f.parseDiagnostics.map(d=>({code:d.code,message:ts.flattenDiagnosticMessageText(d.messageText,' ')}));};
+const oldErrors=await diagnostics(before,p);assert(oldErrors.length>0);
+const changed=execFileSync('git',['diff','32fff9ab5de7e5da2aa083c9e397f2a1015fd796','--name-only','--diff-filter=AM'],{encoding:'utf8'}).trim().split('\n').filter(p=>p.endsWith('.astro'));
+const parsed=[];for(const file of changed){assert.deepEqual(await diagnostics(fs.readFileSync(file,'utf8'),file),[]);parsed.push(file)};
+const artifacts='/Users/fedorpakhurov/code/_work/renewal-verification';
+const normalize=s=>s.replace(/astro-[a-z0-9]{8}/g,'astro-SCOPE').replace(/>\s+</g,'><');
+const renders=[];for(const lang of ['en','ru']){const a=fs.readFileSync(path.join(artifacts,'estimation-root-render',`estimation-${lang}.html`),'utf8');const b=fs.readFileSync(path.join(artifacts,'estimation-root-syntax-final',`estimation-${lang}.html`),'utf8');assert.equal(normalize(a),normalize(b));renders.push({lang,frozenRenderSha256:sh(a),currentRenderSha256:sh(b),normalizedSha256:sh(normalize(a))})}
+const strict=JSON.parse(fs.readFileSync(path.join(artifacts,'estimation-root-syntax-final-strict.json'),'utf8'));
+console.log(JSON.stringify({date:'2026-11-16',base,path:p,beforeSha256:sh(before),afterSha256:sh(after),correction:'Expand the inner SVG grid map onto separate lines with explicit expression parentheses. No numeric data, teaching text, axis geometry or CSS change.',beforeTsxParseDiagnostics:oldErrors,afterTsxParseDiagnostics:0,allChangedAstroFilesParsed:parsed,renders,normalization:'Only generated filename-dependent astro scope tokens and whitespace between tags. Captions, values, geometry, accessibility attributes, styles and all other bytes preserved.',strictArithmeticAssertions:strict.arithmeticAssertions,strictCoordinateChecks:strict.figures.coordinateChecks,limits:'Bounded local source correction and actual-fragment replay, not full Astro typecheck, whole-site build, browser or live publication.'},null,2));
