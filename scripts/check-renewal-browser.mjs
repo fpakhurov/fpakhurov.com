@@ -21,6 +21,30 @@ fs.mkdirSync(output, {recursive: true});
 const server = spawn('python3', ['-m', 'http.server', '4329', '--bind', '127.0.0.1', '--directory', 'dist'], {stdio: 'ignore'});
 let browser;
 const results = [];
+const headerRegressions = [];
+const narrowHeaderFailures = [];
+async function headerGeometry(page) {
+  return page.locator('.note-header').evaluate(header => {
+    const bounds = header.getBoundingClientRect();
+    const escapedText = [];
+    const walker = document.createTreeWalker(header, NodeFilter.SHOW_TEXT);
+    for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+      if (!node.textContent.trim()) continue;
+      const range = document.createRange();
+      range.selectNodeContents(node);
+      for (const rect of range.getClientRects()) {
+        if (rect.width && (rect.left < bounds.left - 1.5 || rect.right > bounds.right + 1.5)) {
+          escapedText.push({text: node.textContent.trim(), left: rect.left - bounds.left, right: rect.right - bounds.right});
+        }
+      }
+    }
+    return {
+      pageOverflow: document.documentElement.scrollWidth > innerWidth + 1,
+      headerWidth: bounds.width,
+      escapedText,
+    };
+  });
+}
 async function splitHeadingWords(page) {
   return page.locator('.note-header h1').evaluate(heading => {
     const split = [];
@@ -75,6 +99,10 @@ try {
       assert.deepEqual(result.splitHeadingWords, [], `${item.route} ${width}: heading splits words`);
       if (width === 390) {
         await page.setViewportSize({width: 320, height: 900});
+        result.narrowHeader = await headerGeometry(page);
+        if (result.narrowHeader.pageOverflow || result.narrowHeader.escapedText.length) {
+          narrowHeaderFailures.push({route: item.route, theme, ...result.narrowHeader});
+        }
         result.narrowHeadingWords = await splitHeadingWords(page);
         assert.deepEqual(result.narrowHeadingWords, [], `${item.route} 320: heading splits words`);
         if (theme === 'dark' && item.locale === 'ru') {
@@ -128,11 +156,35 @@ try {
       }
       results.push(result);
     }
+    if (width === 390 && theme === 'dark') {
+      // Keep the two previously observed metadata edge cases in this browser job.
+      // Only inspect headers here; do not repeat their complete figure audit.
+      await page.setViewportSize({width: 320, height: 900});
+      for (const id of ['probability/joint-distributions', 'probability/continuous-distributions']) {
+        for (const locale of ['en', 'ru']) {
+          if (routes.some(item => item.id === id && item.locale === locale)) continue;
+          const route = `/${locale === 'ru' ? 'ru/' : ''}notes/${id}/`;
+          const response = await page.goto(`http://127.0.0.1:4329${route}`, {waitUntil: 'networkidle'});
+          assert.equal(response.status(), 200, route);
+          await page.evaluate(() => document.fonts.ready);
+          const geometry = await headerGeometry(page);
+          headerRegressions.push({id, locale, route, width: 320, ...geometry});
+          if (geometry.pageOverflow || geometry.escapedText.length) narrowHeaderFailures.push({route, theme, ...geometry});
+          if (locale === 'ru') await page.locator('.note-header').screenshot({
+            path: `${output}/${id.replaceAll('/', '-')}-metadata-320.png`,
+            style: '.site-header { visibility: hidden !important; }',
+          });
+        }
+      }
+    }
     await context.close();
   }
+  // Collect every new geometry finding and its crop before failing the gate.
+  // A single batch run then supplies enough evidence to fix all affected pages.
+  assert.deepEqual(narrowHeaderFailures, [], '320px header geometry failures');
   console.log(`Reviewed ${results.length} built note views (${routes.length} localized routes).`);
 } finally {
-  fs.writeFileSync(`${output}/results.json`, JSON.stringify({base, head: execFileSync('git', ['rev-parse', 'HEAD'], {encoding: 'utf8'}).trim(), results}, null, 2) + '\n');
+  fs.writeFileSync(`${output}/results.json`, JSON.stringify({base, head: execFileSync('git', ['rev-parse', 'HEAD'], {encoding: 'utf8'}).trim(), results, headerRegressions, narrowHeaderFailures}, null, 2) + '\n');
   await browser?.close();
   server.kill();
 }
