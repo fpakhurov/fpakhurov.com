@@ -1,0 +1,13 @@
+# Input separation for the two limit-theorem replacements
+
+2026-11-16. Scope: probability/law-of-large-numbers and probability/central-limit-theorem only.
+
+The author first read the project's AGENTS.md, source policy and course-writing guide, then extracted only historic identity fields (title, course, section, order, tags, prerequisite names), headings outside fenced code and figure import/identifier strings. The source revision was fbb8dc973193324e20b9532261ad2c10284ee757. The extraction output is preserved in curriculum-identity.json. Historical descriptions, body prose, code/fenced comments, figures' implementations, example values and outputs were not printed or retained as authoring context. No claim is made about erasing general model prior knowledge.
+
+The original construction plan was written before primary-source passage reading and before numerical execution; a copy is plan.md. It chose the finite law {-1,2,4} with masses {3,2,1}/6, the fixed deviation threshold, distinct growing-window events and the integrand 1+u². An explicitly logged pre-execution refinement chose the integer interval8..22 and the known-sigma coverage multiplier1.96. CLT reuses the newly authored finite law through a handoff to its LLN home rather than importing another teaching example.
+
+New explanations, rational/integer calculations, figures and counterexample presentations were composed from those inputs and primary mathematical mechanisms. The iid Cauchy stability property is a standard mathematical fact, independently derived from the characteristic function, and is attributed to Durrett. No distinctive external exercise narrative, empirical result, code or image is reused. Auxiliary online textbook introductions were consulted as logged in source-evidence.json; they supplied no release asset or chosen computational example.
+
+Existing first-party Figure, language and explicit-heading helpers are unchanged, full-read and hash-pinned. The scoped checker adapts the author's earlier first-party adaptation checker infrastructure and supplies new tests of these two topics. It is not third-party teaching code. Raw source PDFs/HTML/text remain in the outside draft and are excluded from the release manifest.
+
+The historical MonteCarloPi component is replaced by MonteCarloPrecision with a new meaningful figure ID. A filename-only reference scan found the old import/ID only in the old component and the two replaced LLN bodies; no other live source refers to it. The explicit release manifest requests deletion of that obsolete component. All11LLN and12CLT heading anchors, curriculum identity and prerequisites remain intact. No baseline, curriculum map or release state is changed by this author package.

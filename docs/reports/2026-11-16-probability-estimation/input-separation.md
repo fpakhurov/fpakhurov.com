@@ -1,0 +1,13 @@
+# Input separation
+
+The initial extraction at FP identity revision 9a6815795fdf0a507041044782c5b345616f9a4e emitted only the following fields: title, course, section, order, tags, prerequisites; true Markdown heading lines outside backtick or tilde fences; single-line Astro import declarations. Historical descriptions, narrative, code, comments, observations, numerical outputs and figure implementations were not emitted or retained as teaching inputs. The model saw the resulting allowlisted identity JSON, not the historical bodies.
+
+PLAN.md selected the new binomial shrinkage, variance, binary likelihood, noise-location and shifted-exponential cases before reading the primary sources. Its release copy is unchanged from that pre-source plan. Cases are generated from those selected parameters, not from prior examples or benchmark results.
+
+After the plan and draft prose, the author extended the identity extraction to the literal value of `const id = '...'` in the four already identified historical figure paths. The first literal `<Figure id='...'>` regex returned no values; the bounded `const id` extraction returned only four strings. No other old component text was output. The complete allowed output is figure-identity.json. The identifiers uniform-estimators, bias-variance-polys, likelihood-curves and losses-as-likelihoods are retained solely as existing fig-* URL anchors. The new pedagogical figures use new component filenames and implementations. No historical uniform example or polynomial-fit example was read or reconstructed from those names.
+
+The shared first-party Figure wrapper, language detector and heading-ID plugin were read in full and copied unchanged. Their Git revision/blob and SHA-256 evidence is recorded separately. The author also consulted its own already newly authored LLN checker/figure to reuse first-party rendering/check patterns; none of that topic's teaching examples were transplanted.
+
+Source reading checked standard definitions and mechanisms in Zhou Fan's original Stanford 2016 lectures. It did not import source teaching prose, figures, data, programs or source-specific worked cases. Reference-only snapshots are retained outside the release manifest. No guarantee of exclusive copyright is asserted for assisted composition. No claim is made to erase the model's general mathematical knowledge.
+
+The old four figure implementations become unused after replacement of both localized imports. Filename-only reference scans found no other teaching imports. The release manifest therefore explicitly requests their removal and preserves the current numeric/heading/figure anchor identity. The immutable rights baseline is not regenerated.
