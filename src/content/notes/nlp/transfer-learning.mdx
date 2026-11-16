@@ -1,12 +1,158 @@
 ---
 title: Transfer learning in NLP
-description: "This note is withheld pending an independent source review."
+description: "Use a pretrained representation for a new task, identify information that a head over frozen features cannot recover, and trace the tradeoff when the representation itself changes."
 course: nlp
 section: Adapting Pretrained Models
 order: 26
-status: needs-review
-tags: []
-prerequisites: []
+status: published
+tags: [transfer-learning, feature-extraction, fine-tuning, representation, evaluation]
+prerequisites: [BERT and masked language modeling, "Encoder, decoder and encoder–decoder models", Corpora and evaluation]
 ---
 
-This note is withheld pending an independent source review.
+import RepresentationBottleneck from '../../../components/figures/transfer-learning/RepresentationBottleneck.astro';
+import AdaptationTrajectory from '../../../components/figures/transfer-learning/AdaptationTrajectory.astro';
+
+A representation can preserve exactly the distinction that mattered during pretraining and discard the distinction needed for a new task. Adding a more elaborate classifier cannot reconstruct information that its input no longer contains. The first adaptation decision is therefore which parts of the pretrained system remain fixed.
+
+## Starting with the inherited interface \{#baseline-the-pretrained-model-as-a-black-box\}
+
+Write the representation as $h=f_\theta(x)$, where $x$ is an input and $\theta$ contains the backbone parameters. A task head $g_\phi$ maps $h$ to predictions. Pretraining supplies $\theta_0$ and sometimes an existing output head. It also supplies a tokenizer and input conventions. Those components form an interface: token IDs, special tokens, position handling and output semantics have to agree.
+
+The target task supplies labels and a loss. A language-model output is a distribution over tokens; a document classifier needs a distribution over classes. These sets do not become interchangeable because both are represented by vectors. We must specify how the existing output is interpreted or replace it with a head having the required meaning.
+
+Peters, Ruder and Smith distinguish frozen feature extraction from directly fine-tuning the pretrained model ([2019](#references), §§1–3.2). This is a choice of trainable parameters, not a ranking that holds for every target distribution. The usefulness of the representation and the reliability of target evaluation determine which choice succeeds.
+
+## Mapping a vocabulary output to labels \{#zero-shot-classification-with-the-mlm-head\}
+
+For a [masked-language-model head](/notes/nlp/bert), one possible hand-designed interface assigns one vocabulary token to each class and reads their probabilities at a selected masked position. The template, position and label words are part of that classifier. They need no gradient updates, but they can still be chosen using labeled development data. Calling a procedure zero-shot does not establish that those choices were independent of the test set.
+
+Consider an explicitly constructed vocabulary distribution: a first label token has probability 0.3, a second has probability 0.1, and all remaining tokens have total probability 0.6. Renormalizing over the two chosen tokens gives
+
+$$
+\begin{aligned}
+q_1&=\frac{0.3}{0.3+0.1}\\
+&=0.75.
+\end{aligned}
+$$
+
+This is a conditional probability under the vocabulary distribution, given that the output belongs to the chosen pair. It is not automatically a calibrated probability of the real-world class. The excluded mass remains relevant to how well the prompt matches the model's objective. These values are specified inputs, not an evaluation of a pretrained model.
+
+A class name split into several tokens introduces another decision. A masked model's conditional probabilities for separate positions do not automatically define one joint phrase probability. A causal model can score a specified continuation by its conditional token factors, but length and tokenization then affect the score. Define the scoring rule before comparing verbalizers. If a small target training set is available, a learned task head offers a direct alternative.
+
+## Frozen features and a linear model
+
+Freeze $\theta=\theta_0$, compute $h_i=f_{\theta_0}(x_i)$ and optimize the head on target training examples. For $K$ classes and representation width $d$, a linear softmax head has matrix $W\in\mathbb R^{K\times d}$ and bias $b\in\mathbb R^K$:
+
+$$
+\begin{aligned}
+z_i&=Wh_i+b,\\
+p_i&=\operatorname{softmax}(z_i),\\
+\widehat R_T(W,b)&=-\frac1N\sum_{i=1}^N\log p_{i,y_i}.
+\end{aligned}
+$$
+
+Here $N$ is the number of target training examples, and $y_i$ is the correct class index. The head has $Kd+K$ parameters. The training objective averages over the examples used for fitting; a target validation estimate is computed on a separate set with the same label meaning.
+
+For 30 constructed examples, width 7 and three classes, cached four-byte features occupy $30\cdot7\cdot4=840$ bytes, while the head contains 24 parameters. This counts only the feature array. The encoder weights, temporary inference memory, labels and classifier optimizer require additional storage. Feature caching is valid only while preprocessing and the encoder computation remain fixed; changing either invalidates the cache.
+
+**Worked example: a lost coordinate.** Specify four inputs and two labeling rules:
+
+| Input $x$ | Original label | Target label |
+| --- | ---: | ---: |
+| $(-2,-1)$ | 0 | 0 |
+| $(-2,1)$ | 0 | 1 |
+| $(2,-1)$ | 1 | 0 |
+| $(2,1)$ | 1 | 1 |
+
+The original label records the sign of the first coordinate; the target label records the sign of the second. These four vectors are mathematical objects, not extracted text embeddings. Suppose the inherited scalar representation is $f_{\theta_0}(x)=x_1$. At each represented value, one example belongs to each target class. Every deterministic classifier receiving only this scalar must give the pair the same prediction. Its target accuracy on these four equally weighted points cannot exceed one half, regardless of classifier complexity.
+
+For a probabilistic prediction $p$ on either such pair, the mean binary loss is
+
+$$
+\begin{aligned}
+r(p)&=-\tfrac12\log p-\tfrac12\log(1-p),\\
+r'(p)&=\frac{2p-1}{2p(1-p)}.
+\end{aligned}
+$$
+
+For $0<p<1$, the derivative is negative below $1/2$ and positive above it. The minimum is therefore at $p=1/2$, with loss $\log2=0.693147$. A zero-weight, zero-bias logistic head attains it. The obstruction comes from identical representations with conflicting labels; more head parameters cannot remove it.
+
+<RepresentationBottleneck />
+
+## Allowing the representation to change \{#fine-tuning-the-whole-encoder\}
+
+Fine-tuning optimizes both the chosen backbone parameters and the task head from a pretrained initialization. The loss derivative must now pass through the representation:
+
+$$
+\nabla_\theta\ell
+=J_\theta f_\theta(x)^\top\nabla_h\ell.
+$$
+
+The Jacobian $J_\theta f_\theta(x)$ describes how representation coordinates change with the parameters. Freezing the backbone stops this update. Freezing the final task head alone does not stop gradients from passing through its computation to an earlier trainable component.
+
+For the four-point construction, use scalar representation $h=a_1x_1+a_2x_2$, logit $z=wh+b$ and probability $p=\sigma(z)$. A single example's binary-logistic derivative with respect to the logit is $p-y$. Applying the chain rule gives
+
+$$
+\begin{aligned}
+\nabla_a\ell&=(p-y)wx,\\
+\partial_w\ell&=(p-y)h,\\
+\partial_b\ell&=p-y.
+\end{aligned}
+$$
+
+Start with $a=(1,0)$, $w=1$ and $b=0$. Average the derivatives over all four points and update all four scalar parameters simultaneously with step size 0.2. Initially the mean gradient of $a$ is $(0.761594,-0.5)$, the head-weight gradient is 0.761594 and the bias gradient is zero. The first update therefore gives $a=(0.847681,0.1)$ and $w=0.847681$. The second coordinate begins to enter the representation because the target labels produce a nonzero derivative along it.
+
+| Updates | Target NLL | Target accuracy | Agreement with original labels |
+| ---: | ---: | ---: | ---: |
+| 0 | 1.126928 | 1/2 | 1 |
+| 5 | 0.640821 | 1/2 | 1 |
+| 20 | 0.221297 | 1 | 1/2 |
+| 60 | 0.019927 | 1 | 1/2 |
+| 240 | 0.002325 | 1 | 1/2 |
+
+At 240 updates, $a\approx(0.000010,2.470097)$ and $w\approx2.454543$. The learned classifier mostly uses the second coordinate. These are executed training-set calculations for a four-parameter surrogate; they do not measure generalization, language understanding or the advantage of pretraining over training from scratch. A direct classifier on the original two coordinates could also solve this target problem.
+
+<AdaptationTrajectory />
+
+We can verify the representation issue without an optimization run. Choosing $a=(0,2)$, $w=1$ and $b=0$ gives logits −2 or 2 with the target sign. Every target example then has loss $\log(1+e^{-2})=0.126928$. The target distinction was available in the inputs and inaccessible only after the original projection.
+
+## What is being transferred
+
+Transferred parameters provide an initial function and a starting point for optimization. A frozen backbone additionally restricts every target predictor to depend on the same representation. A tokenizer transfers a particular decomposition of input strings. An inherited output head transfers particular prediction semantics. These are separable commitments, and a new task may benefit from some while requiring others to change.
+
+The four-point example also exposes a competing objective. The adapted classifier agrees with the original labels on only half the points. It does not prove that the entire earlier task is irrecoverable from all internal states of a real network; it shows that optimizing the target objective need not preserve the original predictor. If retention matters, evaluate the old objective separately rather than infer it from the target score.
+
+Continuing language-model training on unlabeled target-domain text and learning a target classifier are distinct stages. ULMFiT explicitly separates general language-model pretraining, target-domain language-model adaptation and classifier fine-tuning ([Howard and Ruder, 2018](#references), §3). This provides one example of separating a domain shift from the supervised task. It does not guarantee that an extra adaptation stage helps every dataset.
+
+**Negative transfer** is an empirical comparison: under a specified target protocol and resource budget, transferring a particular source system performs worse than a defined alternative, often training without that source initialization. To establish it, run the comparator. The frozen-feature obstruction above explains one possible failure mechanism; it is not an experiment establishing negative transfer for a pretrained NLP model.
+
+## One backbone, many tasks
+
+Several heads can share a fixed encoder, allowing features to be reused when the input and pooling rule agree. Separate fine-tuned copies can instead change their representations independently. Their model weights, optimizer state and versioning costs differ. Parameter-efficient adaptation provides another boundary between shared and task-specific weights; its mechanisms belong to the later PEFT topic.
+
+The output structure also matters. A sentence classifier consumes one pooled vector, a tagger needs token-level states and a span model must map positions back to input tokens. A decoder scores continuations. Pooling and token alignment can remove or misassign information even when the encoder is appropriate. A successful head for one output structure is not evidence that the same head fits another.
+
+## Limitations
+
+Training and test sets must use the same task definition, while still being separated so that labels, template choices, preprocessing statistics and duplicates do not leak across the boundary. Choose a split reflecting the intended deployment: documents from the same source or near-duplicates can make a random split overly easy. Keep all adaptation decisions on training and validation data; reserve the test set for the final defined comparison.
+
+Compare a prompt interface, frozen features and fine-tuning on the same examples and metrics, including their preprocessing and any tuning budget. Report whether the backbone or data changed. A training-loss decrease establishes successful optimization of that objective. It does not establish calibration, robustness to new domains or improved held-out performance.
+
+Gradient freezing and inference mode solve different problems. Disabling parameter updates does not by itself disable dropout or changes to mutable layer state. Cached features require a reproducible encoder evaluation mode. Conversely, a frozen prefix can save its own backward activations, but trainable layers after that prefix still need their ordinary forward and backward computations. Resource savings depend on where the boundary lies.
+
+## What you should remember
+
+Name the transferred representation and its input contract. Define the target head and loss separately. A head receiving a frozen representation cannot recover an erased distinction. Target updates can change old behavior. Compare methods on one held-out protocol before calling a transfer useful or harmful.
+
+## Reproduce the construction \{#notebook\}
+
+The [standard-library calculation](https://github.com/fpakhurov/fpakhurov.com/blob/main/scripts/notes/nlp-adaptation-cases.py) supplies all four vectors and both labeling rules, verifies the frozen optimum, executes 240 simultaneous gradient updates and saves their loss/accuracy trace. It also computes the vocabulary renormalization and feature-cache counts. No text corpus, tokenizer, pretrained weights or model download is required.
+
+## Next
+
+Once the trainable boundary is chosen, update size and validation determine whether adaptation is useful. The next topic, fine-tuning, develops that optimization problem.
+
+## References
+
+- Matthew E. Peters, Sebastian Ruder and Noah A. Smith. [To Tune or Not to Tune? Adapting Pretrained Representations to Diverse Tasks](https://arxiv.org/abs/1903.05987v2). RepL4NLP, 2019. §§1–3.2: frozen feature extraction, task-specific models and fine-tuning.
+- Jeremy Howard and Sebastian Ruder. [Universal Language Model Fine-tuning for Text Classification](https://arxiv.org/abs/1801.06146v5). ACL, 2018. §3: separating source pretraining, target-domain language modeling and supervised adaptation.
