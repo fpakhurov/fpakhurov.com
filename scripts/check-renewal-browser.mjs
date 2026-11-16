@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import {execFileSync, spawn} from 'node:child_process';
 import {chromium} from 'playwright';
 import {selectPublishedNoteRoutes} from './lib/renewal-browser-routes.mjs';
+import {captureOverflowEvidence} from './lib/overflow-diagnostics.mjs';
 
 // Review the built pages affected by this release, including changed assets
 // reached through a current per-file review. Keep browser work in CI.
@@ -193,6 +194,9 @@ try {
         await page.setViewportSize({width: 320, height: 900});
         await settleLayout(page);
         result.narrowHeader = await headerGeometry(page);
+        if (result.narrowHeader.pageOverflow) {
+          result.overflowEvidence = await captureOverflowEvidence(page, {output, name:`${item.id.replaceAll('/', '-')}-${item.locale}-${theme}-320-overflow`});
+        }
         if (result.narrowHeader.pageOverflow || result.narrowHeader.escapedText.length || result.narrowHeader.escapedHeadingAnchors.length) {
           narrowHeaderFailures.push({route: item.route, theme, ...result.narrowHeader});
         }
@@ -285,6 +289,7 @@ try {
           assert.equal(response.status(), 200, route);
           await settleLayout(page);
           const geometry = await headerGeometry(page);
+          if (geometry.pageOverflow) geometry.overflowEvidence = await captureOverflowEvidence(page, {output, name:`${id.replaceAll('/', '-')}-${locale}-${theme}-320-overflow`});
           headerRegressions.push({id, locale, route, width: 320, ...geometry});
           if (geometry.pageOverflow || geometry.escapedText.length || geometry.escapedHeadingAnchors.length) narrowHeaderFailures.push({route, theme, ...geometry});
           if (locale === 'ru') await captureIsolated(page, page.locator('.note-header'), {

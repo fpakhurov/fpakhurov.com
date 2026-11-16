@@ -1,0 +1,29 @@
+# Complete independent root review: intervals and tests
+
+Reviewer: Codex root. Date: 2026-11-16. Result: PASS for the frozen author package, manifest SHA256 `0b8726ecad7c5e27571dcec68c0b620e19196d612cfef6419d0492d7e724ea3b`. This is a complete scoped content/source/technical review, not publication confirmation or universal rights clearance.
+
+## Full reading and teaching scope
+
+I read all four EN/RU note bodies, all four replacement figure implementations, the unchanged numeric plan, both validation scripts, shared Figure/language/heading helpers, author review, input-separation report, current provenance mappings and source-evidence decisions. Final body hashes equal my earlier full-reading snapshot. I checked every explanatory section, stated assumption, derivation, worked example, caption, literal code output and course handoff. Both languages make the same qualified claims and preserve existing identities and anchors. The short optional code is not necessary to understand the lesson.
+
+The coverage definition distinguishes a fixed unknown parameter from random intervals and avoids a posterior interpretation. Exact Gaussian/Student statements name their assumptions and n>=2; the normal mean/residual independence argument is valid. Wilson inversion is derived, finite binomial coverage is calculated rather than assumed, and boundary clipping is not offered as calibration. Bootstrap enumeration is explicitly conditional on the empirical support; its zero-support failure is demonstrated without claiming universal validity. The paired example uses differences and qualifies its normal approximation.
+
+The testing note separates size and power, accounts for binomial discreteness and composite-null monotonicity, and defines p-value superuniformity with ties. A/B pooled testing and unpooled interval calculations are explicitly approximate. Repeated looks are calculated on overlapping paths, not independent tests. Bonferroni does not assume independence; the separate independent-tests illustration does. Holm handles zero true nulls before dividing by their count. Randomization conditions distinguish a uniform experimental assignment under a sharp null from arbitrary permutation under equality of means. The three preliminary peer corrections are present in the frozen package; I found no remaining content defect.
+
+## Independent execution
+
+I wrote and ran an independent standard-library oracle without importing candidate calculation functions. Its 462 assertions cover normal/Student bounds, all 17 Wilson/Wald outcomes from quadratic roots, all coverage rows, bootstrap polynomial convolution, paired moments, all null/alternative masses and power rows, A/B calculations, exact repeated-look first-crossing subtraction, multiplicity and every experimental assignment. Student's quantile was independently inverted using numerical quadrature. Maximum difference from saved results is 3.997e-14. The assertion count includes frozen-file/private-snapshot hash checks; it is not a count of reviewed rights.
+
+I separately ran the frozen scoped checker with a 192 MiB Node heap. Read-only saved-output replay, 94 author arithmetic checks, strict MDX/KaTeX, 75/71 ordered math spans per locale, 13/14 displays, 11/12 anchors, code/import parity, actual Astro and TSX parsing all passed. Actual component output checks all 1108 expected data/coordinate values across six SVG panels per locale, accessibility IDs/descriptions and finite values. This is component-render evidence, not browser layout evidence. The independent oracle covers their underlying numbers; the coordinate replay covers their implementation.
+
+## Source and asset review
+
+I read these bounded primary passages directly from the pinned private snapshots: Neyman 1937 pp.347-349; Student 1908 pp.1-3 and 7-8 (scans; my scope excludes the author's additional pp.4/6); Wilson 1927 pp.209-211 (scans); Efron 1979 section 2 pp.2-4; Neyman/Pearson 1933 pp.296-297; Johari/Pekelis/Walsh v3 pp.11-13; Holm 1979 pp.66-67 (scans; I do not claim p.65); Hemerik/Goeman v2 pp.3-5 and 8-9. These support the named mechanisms, mathematical conditions and limitations, not reproduction of source expressions or assets. The historical Student statistic uses a different variance divisor; the modern scaling in this note is consistent with the original density.
+
+I checked the restrictive/unestablished reuse decisions, exact snapshot hashes and source-to-file mappings. All primary papers are reference-only. Public scans, citations, age and arXiv distribution terms are not recorded as commercial asset licenses. No source PDF, scan, image, text extract, code, data, paper example or empirical result is included in the release manifest. The nine cached PDF/text pairs include an unused initial Efron download; the final bibliography uses eight specific references. Their hashes are verified separately from content review.
+
+The unchanged plan predates source reading and specifies constructed inputs. Historical teaching input was limited to metadata, headings, imports, literal figure IDs and hashes. All four figures and four bodies are replaced; no old implementation is retained beside a new one. Shared first-party rendering helpers and adapted checker plumbing have explicit provenance; this is not a repository-wide clearance assumption. Original composition is described as assisted work, not a claim of exclusive ownership.
+
+## Limits and remaining gates
+
+No full build, browser, model/data download, training, server, publication or Actions run was performed by this review. Final repository checks, Linux browser/visual checks, publication and exact live verification remain. BIASED must derive only from the later pinned reviewed and live FP revision. This review covers two topics and does not complete the all-course audit.

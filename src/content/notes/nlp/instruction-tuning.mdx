@@ -1,12 +1,220 @@
 ---
 title: Instruction tuning and alignment
-description: "This note is withheld pending an independent source review."
+description: Turn demonstrations and pairwise preferences into training signals, track exactly which tokens contribute, and separate preference improvement from reliable task performance.
 course: nlp
 section: LLM Post-training
 order: 34
-status: needs-review
-tags: []
-prerequisites: []
+status: published
+tags: [instruction-tuning, sft, rlhf, dpo, alignment, chat-template, reward-model]
+prerequisites: [Parameter-efficient fine-tuning, GPT and autoregressive language modeling, Summarization]
 ---
 
-This note is withheld pending an independent source review.
+import AssistantMask from '../../../components/figures/instruction-tuning/AssistantMask.astro';
+import LossWeighting from '../../../components/figures/instruction-tuning/LossWeighting.astro';
+import RewardTilt from '../../../components/figures/instruction-tuning/RewardTilt.astro';
+import PreferenceShift from '../../../components/figures/instruction-tuning/PreferenceShift.astro';
+
+An instruction asks for one integer. A fluent continuation supplies an explanation, repeats the request and eventually gives a number. The answer may contain the right fact while failing the output contract. We need training signals that reward the response behavior we intend to use.
+
+## A continuation model needs an output contract \{#baseline-the-base-model-and-the-chat-template\}
+
+A base autoregressive model assigns probabilities to token continuations. Its [next-token objective](https://fpakhurov.com/notes/nlp/gpt#the-objective) does not identify every imperative sentence as a request addressed to an assistant. Examples in the pretraining distribution can include quoted requests, dialogue transcripts and descriptions of tasks. The same words can play different roles.
+
+A **chat template** serializes roles and messages into the model's token sequence. A user/assistant boundary says where a response begins; an end marker says where it stops. These markers must agree with the model's tokenizer and training convention. Writing role names as ordinary text does not create reserved tokens. Our symbolic examples below use invented markers and make no claim about a particular tokenizer.
+
+The prompt includes the task, available context and response constraints. During generation we supply the prefix through the assistant boundary and sample the continuation. Changing the template changes that prefix. It can therefore change behavior even if the checkpoint and visible user sentence remain fixed.
+
+## Separate the training signals \{#the-stages-of-llm-training\}
+
+Pretraining fits broad token statistics. **Supervised fine-tuning (SFT)** fits selected demonstrations of how to respond to specified inputs. **Preference optimization** uses comparisons between responses. These stages consume different observations: a demonstration supplies one desired sequence, whereas a comparison says which of two sequences an annotator favors under a rubric.
+
+FLAN studied instruction-formatted tasks and evaluated transfer to held-out task types ([Wei et al., 2022](#references), §2). InstructGPT used demonstrations, a learned comparison model and reinforcement learning ([Ouyang et al., 2022](#references), §§3.1, 3.5). These are particular experimental designs. An application may use SFT alone or a different preference method; the stage names do not establish a universal quality ranking.
+
+## Decide which targets contribute \{#supervised-fine-tuning\}
+
+Let conversation $i$ contain token sequence $z_i$ of length $T_i$, indexed from zero. At position $t$, the model predicts token $z_{i,t}$ from earlier tokens $z_{i,<t}$. Define $m_{i,t}$ to be one for scored assistant targets and zero otherwise. With at least one scored target, the token-averaged negative log-likelihood is
+
+$$
+\begin{aligned}
+\ell_{i,t}&=-\log\pi_\theta(z_{i,t}\mid z_{i,<t}),\\
+N_{\mathrm{target}}&=\sum_i\sum_{t=1}^{T_i-1}m_{i,t},\\
+L_{\mathrm{SFT}}&=\frac{1}{N_{\mathrm{target}}}
+\sum_i\sum_{t=1}^{T_i-1}m_{i,t}\ell_{i,t}.
+\end{aligned}
+$$
+
+Here $\pi_\theta$ is the model distribution. Scoring an assistant end marker teaches stopping as well as content. An implementation may score all assistant turns or only the final turn; that choice changes the objective and must be recorded. A **loss mask** selects targets. An **attention mask** controls which earlier positions are visible. Removing a prompt token's direct loss does not remove its information from the response or prevent gradients through its contextual computation.
+
+### Shift inputs and targets together \{#a-training-example-in-the-chat-template\}
+
+Consider two newly specified symbolic sequences:
+
+| Conversation | Full sequence | Scored targets |
+| --- | --- | --- |
+| A | `BOS USER x ASSISTANT a EOS` | `a EOS` |
+| B | `BOS USER u ASSISTANT b c d EOS` | `b c d EOS` |
+
+The input ending in `ASSISTANT` predicts the first response token. The input ending in `a` predicts `EOS`. Thus the target mask must shift with the targets, rather than being applied to unshifted input positions. Future answer tokens remain hidden by causal attention even though their reference values are present in the training array.
+
+<AssistantMask />
+
+Assign correct-target probabilities $(0.75,0.5)$ to A and $(0.8,0.6,0.5,0.25)$ to B. These are chosen inputs, not model predictions. Their losses are:
+
+| Conversation | Scored targets | Summed NLL | Mean NLL |
+| --- | ---: | ---: | ---: |
+| A | 2 | 0.980829 | 0.490415 |
+| B | 4 | 2.813411 | 0.703353 |
+
+The shared token mean is 0.632373. Averaging the two conversation means instead gives 0.596884. The latter gives A and B equal total weight; the former gives B twice A's weight because it has twice as many scored tokens. Neither reduction is defined by the word SFT alone.
+
+<LossWeighting />
+
+### Demonstrations determine what is reinforced \{#what-sft-teaches\}
+
+Teacher forcing evaluates each target after the reference prefix. At deployment the prefix includes the model's own earlier outputs. A mistake can move generation into contexts absent from the demonstrations. Lower reference-token loss therefore measures fit to the scored distribution, while task success needs a separate generation-based check.
+
+Demonstrations can teach formatting, how supplied context is used, when to request missing information and how to end a response. They also reinforce systematic defects in those demonstrations. A completion that sounds confident while inventing an unsupported detail remains a positive target if the dataset labels it as desired behavior.
+
+### Trace the demonstrations to their inputs \{#where-the-data-comes-from\}
+
+Possible inputs include newly written examples, permissioned interactions and generated drafts reviewed against a task specification. Each route needs a record of its provenance and selection rule. A notebook's code license does not establish rights to its conversations, source documents or model outputs. For an original fixture, preserve the authoring procedure and exact evaluated values.
+
+For a concrete new task, we can ask for the sum of two provided integers as a JSON object containing only an integer-valued `sum` field. We can calculate the target from the input and check its schema independently. This construction isolates output-format compliance and arithmetic. It supplies no evidence about open-ended reasoning or factual assistance.
+
+### Coverage and label consistency \{#quality-and-diversity-over-quantity\}
+
+Define which variations matter before collecting more examples: missing inputs, negative numbers, language, length, output schema and allowed sources of evidence. Keep related variants together when splitting data. A split that puts paraphrases of the same item on both sides can reward recognition of that item rather than transfer to a new situation.
+
+Repeated examples change their effective training weight. Conflicting examples change which conditional distribution minimizes the loss. Counting examples cannot resolve either issue. FLAN's held-out task-cluster design illustrates that excluding an individual dataset and excluding a whole task type are distinct evaluation questions ([Wei et al., 2022](#references), §2.2); neither establishes that pretraining contained no related material.
+
+### A demonstration leaves alternatives unranked \{#what-demonstrations-cannot-express\}
+
+A target sequence states what to imitate. It does not directly say whether an alternative was equally acceptable, slightly worse or unacceptable. For open-ended answers, several sequences may satisfy the same request. Pairwise comparisons can add information about such alternatives, provided the annotator's criterion is explicit.
+
+## Model a comparison under a stated rubric \{#preference-optimization\}
+
+For prompt $x$, let $y_w$ be the preferred response and $y_l$ the other response. A scalar reward model $r_\phi(x,y)$ can represent the comparison using a logistic assumption:
+
+$$
+\begin{aligned}
+p_\phi(y_w\succ y_l\mid x)
+&=\sigma\bigl(r_\phi(x,y_w)-r_\phi(x,y_l)\bigr),\\
+\sigma(v)&=\frac{1}{1+e^{-v}},\\
+\ell_R&=-\log p_\phi(y_w\succ y_l\mid x).
+\end{aligned}
+$$
+
+This is the Bradley–Terry comparison model used in the stated RLHF formulation ([Rafailov et al., 2023](#references), §3). It is an assumption about labels, not a definition of objective quality. Adding the same constant to both rewards changes no comparison probability. A reward gap $\log3$ gives preference probability $3/4$ and loss 0.287682. Larger gaps make this observed comparison less surprising.
+
+Annotators can disagree because of noise or because their criteria differ. A single score compresses these differences. Ties, unsupported factual claims and violations of an output contract need an annotation rule; silently forcing every case into a strict preference changes the observation being modeled.
+
+### Use a reward model with a reference distribution \{#with-a-reward-model-rlhf\}
+
+A learned reward can evaluate newly generated responses, enabling updates on outputs beyond a fixed comparison list. Optimizing it without limits can favor regions where it was never validated. A common formulation penalizes deviation from a fixed reference distribution, often the SFT model. For one prompt and a finite response set, take $q_j>0$, rewards $r_j$ and coefficient $\beta>0$:
+
+$$
+J(\pi)=\sum_j\pi_jr_j
+-\beta\sum_j\pi_j\log\frac{\pi_j}{q_j}.
+$$
+
+We optimize over probability vectors $\pi$. Terms with $\pi_j=0$ contribute zero by continuity. Define
+
+$$
+\begin{aligned}
+Z&=\sum_j q_j e^{r_j/\beta},\\
+\pi_j^*&=\frac{q_j e^{r_j/\beta}}{Z}.
+\end{aligned}
+$$
+
+Substituting $\log\pi_j^*=\log q_j+r_j/\beta-\log Z$ into the KL divergence gives
+
+$$
+\begin{aligned}
+\beta D_{\mathrm{KL}}(\pi\Vert\pi^*)
+&=\beta\sum_j\pi_j\log\frac{\pi_j}{q_j}\\
+&\quad-\sum_j\pi_jr_j+\beta\log Z,\\
+J(\pi)&=\beta\log Z-\beta D_{\mathrm{KL}}(\pi\Vert\pi^*).
+\end{aligned}
+$$
+
+KL is nonnegative and vanishes at identical distributions, so $\pi^*$ maximizes this unrestricted finite problem. This is the optimal-policy identity underlying DPO ([Rafailov et al., 2023](#references), Appendix A.1). A neural network's parameter constraints and finite training need not attain this optimum.
+
+**Worked example.** Specify $q=(0.5,0.3,0.2)$, rewards $(0,\log2,\log4)$ and $\beta=1$. The unnormalized masses are $(0.5,0.6,0.8)$ and $Z=1.9$. Normalization gives $\pi^*=(5/19,6/19,8/19)$. The objective increases from 0.485203 at $q$ to 0.641854 at $\pi^*$. These are three abstract response outcomes; no assistant was trained or rated.
+
+<RewardTilt />
+
+InstructGPT sampled responses, scored them with a learned reward and used PPO with a reference penalty ([Ouyang et al., 2022](#references), §3.5). PPO compares each sampled action's new probability with its probability under the behavior policy used to collect that batch. Its clipped surrogate removes some incentives for large favorable ratio changes; this does not enforce a hard global KL bound ([Schulman et al., 2017](#references), §3). The behavior policy and the fixed reference play different roles. Reward reliability, sampling, value estimation and optimization all remain parts of this training system.
+
+### Eliminate the explicit reward fit with DPO \{#without-a-reward-model-dpo\}
+
+The optimum identity can be rearranged into a reward representation:
+
+$$
+r_j=\beta\log\frac{\pi_j^*}{q_j}+\beta\log Z.
+$$
+
+For two responses to the same prompt, the $\beta\log Z$ term cancels in their reward difference. Substitute a parameterized policy for $\pi^*$ and keep $q$ fixed. Define the relative margin and comparison loss:
+
+$$
+\begin{aligned}
+s_\theta(x,y)&=\log\frac{\pi_\theta(y\mid x)}{q(y\mid x)},\\
+\Delta_\theta&=\beta\bigl(s_\theta(x,y_w)-s_\theta(x,y_l)\bigr),\\
+\ell_{\mathrm{DPO}}&=-\log\sigma(\Delta_\theta).
+\end{aligned}
+$$
+
+This reparameterizes the comparison model; it removes the separate reward-network fit and online RL rollout loop from this objective ([Rafailov et al., 2023](#references), §4, Appendix A.2). It still needs preference data, a reference distribution and response log probabilities. Each response probability is the product of its conditional token factors, so implementation uses their sum in log space. Averaging those logs by response length would define a different margin.
+
+For the three-outcome reference above, prefer outcome 2 over outcome 1. A new policy $(0.2,0.5,0.3)$ produces likelihood ratios $5/3$ and $2/5$. With $\beta=1$, the margin is $\log(25/6)$, modeled preference is $25/31$ and loss is 0.215111. At the reference policy the margin is zero and loss is $\log2$.
+
+The scalar derivative is
+
+$$
+\frac{\partial\ell_{\mathrm{DPO}}}{\partial\Delta_\theta}
+=-\bigl(1-\sigma(\Delta_\theta)\bigr).
+$$
+
+The chain rule weights the chosen-minus-rejected log-probability gradient by this negative factor and $\beta$. A badly ordered pair receives a larger magnitude. The parameters are shared across responses, so one update can also change probabilities of responses outside that pair.
+
+## Evaluate absolute behavior as well as comparisons \{#evaluating-an-assistant\}
+
+A better relative margin does not require the preferred outcome's probability to increase. Compared with the reference policy $q$, policy $(0.2,0.25,0.55)$ lowers outcome 2 from 0.3 to 0.25, while outcome 1 falls more. The same pair's modeled preference rises to $25/37$ and its loss falls to 0.392042. Unobserved outcome 3 receives the displaced mass. This is a limitation of what that single comparison establishes.
+
+<PreferenceShift />
+
+Evaluate generated responses against the task contract and held-out rubrics. Report format validity, supported content and preference separately when they answer different questions. The [LLM evaluation](https://fpakhurov.com/notes/nlp/llm-evaluation) topic develops matched comparisons, judge agreement and system-level evidence.
+
+## Check the inherited interface before updating \{#choosing-a-model-to-adapt\}
+
+Record the checkpoint revision, tokenizer, template, context limit, supported language and intended output contract. Confirm that the exact model and data assets permit the intended use. A library license does not settle those asset permissions. Compare against the unchanged model using the same decoding and evaluation protocol before attributing a difference to adaptation.
+
+The [fine-tuning](https://fpakhurov.com/notes/nlp/fine-tuning#task-fine-tuning-and-instruction-tuning) and PEFT topics determine which parameters move and what state training stores. Instruction tuning instead determines which response behavior supplies the signal. These choices can be combined, but changing the trainable parameter count does not repair a mislabeled target or a shifted loss mask.
+
+## What the additional signals establish \{#what-changed\}
+
+SFT changes the target distribution toward selected demonstrations. Preference fitting adds relative judgments about candidate outputs. A reward-based loop can obtain scores on new generations; DPO fits a reference-relative comparison loss on a fixed dataset. Each mechanism changes a specific objective. None of their names substitutes for evaluating the resulting system.
+
+## Where these objectives remain incomplete \{#limitations\}
+
+A perfectly fitted demonstration can violate an unstated requirement. A reward can overvalue a superficial property shared by its positive examples. A comparison dataset can omit a whole response class. A reference penalty limits distributional movement according to its coefficient, while leaving the rubric's omissions intact. Test these failure modes with explicitly constructed cases and independent labels.
+
+The finite calculations here verify loss weighting, normalization and relative margins. They do not estimate human preference, model capability or training stability. Demonstrations, comparisons and deployment requests can come from different distributions; a successful fit on one does not establish reliability on the others.
+
+## Keep the target, rubric and evidence separate \{#what-you-should-remember\}
+
+Specify roles, stopping and scored targets before training. Preserve the causal information boundary separately from the loss mask. Name the averaging unit. Preference probabilities depend on a rubric and model assumptions. Check absolute task outcomes after improving a relative loss.
+
+## Reproduce the finite calculations \{#notebook\}
+
+The [standard-library calculation](https://github.com/fpakhurov/fpakhurov.com/blob/main/scripts/notes/instruction-evaluation-cases.py) contains all symbolic probabilities and finite distributions. It computes the two SFT reductions, verifies the KL objective identity over 1176 positive probability vectors and checks DPO loss derivatives by finite differences. The saved outputs are 0.632373 and 0.596884 for the two loss reductions, with optimal three-outcome objective 0.641854. No model, external dataset or accelerator is required.
+
+## Reduce the cost of using the adapted model \{#next\}
+
+The next topic, quantization, asks how reducing numerical precision changes model storage and computation. The behavior established by adaptation must be evaluated again after that representation changes.
+
+## References \{#references\}
+
+- Jason Wei, Maarten Bosma, Vincent Y. Zhao, Kelvin Guu, Adams Wei Yu, Brian Lester, Nan Du, Andrew M. Dai and Quoc V. Le. [Finetuned Language Models Are Zero-Shot Learners](https://arxiv.org/abs/2109.01652v5). ICLR, 2022. §2: instruction-formatted training and held-out task clusters; §6: evaluation limitations.
+- Long Ouyang, Jeff Wu, Xu Jiang, Diogo Almeida, Carroll L. Wainwright, Pamela Mishkin, Chong Zhang, Sandhini Agarwal, Katarina Slama, Alex Ray, John Schulman, Jacob Hilton, Fraser Kelton, Luke Miller, Maddie Simens, Amanda Askell, Peter Welinder, Paul Christiano, Jan Leike and Ryan Lowe. [Training Language Models to Follow Instructions with Human Feedback](https://arxiv.org/abs/2203.02155v1). NeurIPS, 2022. §§3.1, 3.5: demonstrations, reward comparisons, PPO and the reference penalty.
+- Rafael Rafailov, Archit Sharma, Eric Mitchell, Stefano Ermon, Christopher D. Manning and Chelsea Finn. [Direct Preference Optimization: Your Language Model is Secretly a Reward Model](https://arxiv.org/abs/2305.18290v3). NeurIPS, 2023; revision 2024. §§3–4 and Appendices A.1–A.2: comparison model, optimal-policy identity, DPO loss and gradient.
+- John Schulman, Filip Wolski, Prafulla Dhariwal, Alec Radford and Oleg Klimov. [Proximal Policy Optimization Algorithms](https://arxiv.org/abs/1707.06347v2). 2017. §3: clipped probability-ratio surrogate and its scope.
